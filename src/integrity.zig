@@ -13,12 +13,14 @@ pub const Integrity = struct {
     /// (bytes 16..20, little-endian u32) must match the CRC32C computed
     /// over the body (everything after the 32-byte header).
     /// Returns true if valid, false if corrupted.
-    /// An all-zero page is considered valid (uninitialized).
+    /// An all-zero header is considered valid (uninitialized page).
     pub fn verifyPage(page_buf: []const u8) bool {
         if (page_buf.len <= PAGE_HEADER_SIZE) return false;
 
-        // All-zero pages are valid (uninitialized)
-        if (isAllZeros(page_buf)) return true;
+        // Check if the header is all zeros (uninitialized page) — only checks
+        // the 32-byte header instead of the full page buffer.
+        if (std.mem.readInt(u128, page_buf[0..16], .little) == 0 and
+            std.mem.readInt(u128, page_buf[16..32], .little) == 0) return true;
 
         const body = page_buf[PAGE_HEADER_SIZE..];
         const stored_checksum = std.mem.readInt(u32, page_buf[16..20], .little);
@@ -38,14 +40,6 @@ pub const Integrity = struct {
         return true;
     }
 };
-
-/// Check if every byte in the buffer is zero.
-fn isAllZeros(buf: []const u8) bool {
-    for (buf) |byte| {
-        if (byte != 0) return false;
-    }
-    return true;
-}
 
 // ============================================================================
 // Unit Tests

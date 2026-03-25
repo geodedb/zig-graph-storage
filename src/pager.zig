@@ -36,8 +36,11 @@ pub const Pager = struct {
 
         if (bytes_read < self.page_size) return error.PageNotFound;
 
-        // Check if entire buffer is all zeros (fresh/uninitialized page)
-        if (isAllZeros(buf)) return;
+        // Check if the header is all zeros (fresh/uninitialized page).
+        // Only checks the 32-byte header instead of the full page — a valid
+        // page always has non-zero fields (page_type, checksum, etc.) in the header.
+        if (std.mem.readInt(u128, buf[0..16], .little) == 0 and
+            std.mem.readInt(u128, buf[16..32], .little) == 0) return;
 
         // Parse header and validate checksum
         const body = buf[PAGE_HEADER_SIZE..];
@@ -74,14 +77,6 @@ pub const Pager = struct {
         try self.file.sync();
     }
 };
-
-/// Check if every byte in the buffer is zero.
-fn isAllZeros(buf: []const u8) bool {
-    for (buf) |byte| {
-        if (byte != 0) return false;
-    }
-    return true;
-}
 
 // ============================================================================
 // Unit Tests
