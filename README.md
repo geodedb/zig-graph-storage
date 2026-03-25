@@ -53,7 +53,7 @@ pub fn main() !void {
 
     // Create a new graph (or use GraphEngine.open() for an existing one)
     const engine = try gs.GraphEngine.create(allocator, "data", graph_uuid, cfg);
-    defer engine.close();
+    defer engine.close() catch {};
 }
 ```
 

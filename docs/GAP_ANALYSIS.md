@@ -8,10 +8,10 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 6 |
+| Closed | 5 |
 | Won't Do | 2 |
 | Blocked | 1 |
-| Deferred | 1 |
+| Deferred | 2 |
 
 ---
 
