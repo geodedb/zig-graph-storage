@@ -123,7 +123,7 @@ pub const GraphStorage = struct {
     pub fn edgeCount(self: GraphStorage) anyerror!u64 {
         return self.vtable.edgeCount(self.ptr);
     }
-    pub fn checkpoint_(self: GraphStorage) anyerror!void {
+    pub fn doCheckpoint(self: GraphStorage) anyerror!void {
         return self.vtable.checkpoint(self.ptr);
     }
     pub fn close(self: GraphStorage) void {

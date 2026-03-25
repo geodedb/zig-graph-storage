@@ -54,6 +54,7 @@ pub fn computeChecksum(body: []const u8) u32 {
 /// Create a zeroed header with the given page_id and page_type.
 /// free_end is set to page_size - PAGE_HEADER_SIZE.
 pub fn initHeader(page_id: PageId, page_type: PageType, page_size: u32) PageHeader {
+    std.debug.assert(page_size >= PAGE_HEADER_SIZE);
     return PageHeader{
         .page_id = page_id,
         .lsn = 0,
