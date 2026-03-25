@@ -277,10 +277,10 @@ strategy for crash-safe updates.
 |--------------------|------------------------------|
 | `MANIFEST_MAGIC`   | `GEOMNF01` (8 bytes ASCII)   |
 | `MANIFEST_VERSION` | 1 (u32)                      |
-| `FIELD_SIZE`       | 152 bytes                    |
-| `SERIALIZED_SIZE`  | 164 bytes (8 + 152 + 4)      |
+| `FIELD_SIZE`       | 148 bytes                    |
+| `SERIALIZED_SIZE`  | 160 bytes (8 + 148 + 4)      |
 
-### 5.2 Serialized Layout (164 bytes)
+### 5.2 Serialized Layout (160 bytes)
 
 | Offset | Size | Field                  | Type    | Description                              |
 |--------|------|------------------------|---------|------------------------------------------|
@@ -304,12 +304,11 @@ strategy for crash-safe updates.
 | 132    | 8    | `free_pages`           | u64 LE  | Total free pages across all stores       |
 | 140    | 8    | `node_count`           | u64 LE  | Total number of nodes in the graph       |
 | 148    | 8    | `edge_count`           | u64 LE  | Total number of edges in the graph       |
-| 156    | 4    | --                     | --      | (end of fields region)                   |
-| 160    | 4    | checksum               | u32 LE  | CRC32C over bytes [0..160)              |
+| 156    | 4    | checksum               | u32 LE  | CRC32C over bytes [0..156)              |
 
 ### 5.3 Integrity
 
-The CRC32C checksum at offset 160 covers all preceding bytes (magic through
+The CRC32C checksum at offset 156 covers all preceding bytes (magic through
 the last field). On deserialization, the stored CRC is compared against a
 freshly computed CRC over `data[0 .. SERIALIZED_SIZE - 4]`.
 

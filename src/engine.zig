@@ -237,7 +237,10 @@ pub const GraphEngine = struct {
         // Try to load label dictionary if it exists
         const labels_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path});
         defer allocator.free(labels_path);
-        self.label_dict.loadFromFile(labels_path) catch {};
+        self.label_dict.loadFromFile(labels_path) catch |err| switch (err) {
+            error.FileNotFound => {}, // Expected on fresh graphs
+            else => return err,
+        };
 
         // Rebuild label index from node store
         try self.label_index.rebuild(&self.node_store, self.manifest.next_node_id);

@@ -10,8 +10,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields (see below) + CRC32(4)
-const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 152
-const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4; // magic + fields + crc = 164
+const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 148
+const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4; // magic + fields + crc = 160
 
 pub const Manifest = struct {
     format_version: u32 = MANIFEST_VERSION,
