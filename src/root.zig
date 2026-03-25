@@ -17,6 +17,7 @@ pub const buffer_pool = @import("buffer_pool.zig");
 pub const node = @import("node.zig");
 pub const edge = @import("edge.zig");
 pub const property = @import("property.zig");
+pub const file_manager = @import("file_manager.zig");
 pub const interface = @import("interface.zig");
 
 // Re-export key types for convenience
