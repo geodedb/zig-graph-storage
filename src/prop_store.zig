@@ -139,24 +139,17 @@ pub const PropStore = struct {
 
     /// Put a property. Returns the (possibly new) prop_head.
     /// If the key already exists, it is replaced (remove + re-add).
+    ///
+    /// PERF-0002: Combined find-and-remove pass reduces 3 chain traversals
+    /// to at most 2 (find+remove in pass 1, insert in pass 2).
     pub fn putProperty(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
-        // If key already exists, remove it first
-        const current_head = prop_head;
-        if (current_head != 0) {
-            const exists = try self.getProperty(current_head, key, self.buffer_pool.allocator);
-            if (exists) |v| {
-                property_mod.freeDecoded(self.buffer_pool.allocator, v);
-                try self.removeProperty(current_head, key);
-            }
-        }
-
-        // Encode value
+        // Encode value up front (needed for size calculation)
         const encoded_val = try property_mod.encode(self.buffer_pool.allocator, val);
         defer self.buffer_pool.allocator.free(encoded_val);
 
         const entry_size: u32 = 2 + @as(u32, @intCast(key.len)) + @as(u32, @intCast(encoded_val.len));
 
-        if (current_head == 0) {
+        if (prop_head == 0) {
             // Allocate new property page
             const new_page = try self.free_space.allocPage();
             const frame = try self.buffer_pool.pinNew(.props, new_page);
@@ -171,8 +164,68 @@ pub const PropStore = struct {
             return new_page;
         }
 
-        // Try to find space in existing pages
-        var current_page: PageId = current_head;
+        // Pass 1: Scan chain to find and remove existing key (combined find+remove).
+        // This replaces the separate getProperty + removeProperty calls.
+        var current_page: PageId = prop_head;
+        while (current_page != 0) {
+            const frame = try self.buffer_pool.pin(.props, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+
+            const next_page = readNextPage(data);
+            var entry_count = readEntryCount(data);
+
+            var offset: u32 = PROP_DATA_OFFSET;
+            var i: u32 = 0;
+            while (i < entry_count) : (i += 1) {
+                const entry_start = offset;
+                const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
+                offset += 2;
+                const entry_key = data[offset..][0..key_len];
+                offset += key_len;
+
+                const val_size = try encodedSizeFromBytes(data[offset..]);
+                offset += @intCast(val_size);
+
+                if (std.mem.eql(u8, entry_key, key)) {
+                    // Found existing key: compact it out (same logic as removeProperty).
+                    // Scan remaining entries to find total used end.
+                    var ri: u32 = i + 1;
+                    var scan_end = offset;
+                    while (ri < entry_count) : (ri += 1) {
+                        const rkl = std.mem.bytesToValue(u16, data[scan_end..][0..2]);
+                        scan_end += 2;
+                        scan_end += rkl;
+                        const rsize = try encodedSizeFromBytes(data[scan_end..]);
+                        scan_end += @intCast(rsize);
+                    }
+
+                    const remaining = scan_end - offset;
+                    if (remaining > 0) {
+                        std.mem.copyForwards(u8, data[entry_start..], data[offset..][0..remaining]);
+                    }
+                    const new_end = entry_start + remaining;
+                    @memset(data[new_end..scan_end], 0);
+
+                    entry_count -= 1;
+                    writeEntryCount(data, entry_count);
+                    self.buffer_pool.unpin(frame_idx, true);
+
+                    // Key removed; now fall through to pass 2 (insert)
+                    break;
+                }
+            } else {
+                // Didn't find key on this page, move to next
+                self.buffer_pool.unpin(frame_idx, false);
+                current_page = next_page;
+                continue;
+            }
+            // If we broke out of the inner loop (key found and removed), stop pass 1
+            break;
+        }
+
+        // Pass 2: Find space and insert the new entry
+        current_page = prop_head;
         while (current_page != 0) {
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
@@ -203,7 +256,7 @@ pub const PropStore = struct {
                 self.writePropertyEntry(data, write_offset, key, encoded_val);
                 writeEntryCount(data, entry_count + 1);
                 self.buffer_pool.unpin(frame_idx, true);
-                return current_head;
+                return prop_head;
             }
 
             if (next_page == 0) {
@@ -221,7 +274,7 @@ pub const PropStore = struct {
                 // Link from current page
                 writeNextPage(data, new_page);
                 self.buffer_pool.unpin(frame_idx, true);
-                return current_head;
+                return prop_head;
             }
 
             self.buffer_pool.unpin(frame_idx, false);
