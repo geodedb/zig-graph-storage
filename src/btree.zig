@@ -44,17 +44,20 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             }
 
             fn deinit(self: *Node, allocator: Allocator) void {
-                if (!self.is_leaf) {
-                    if (self.children) |*ch| {
-                        for (ch.items) |child| {
-                            child.deinit(allocator);
-                        }
-                        ch.deinit(allocator);
-                    }
-                }
+                self.deinitChildren(allocator);
                 self.keys.deinit(allocator);
                 if (self.values) |*v| v.deinit(allocator);
                 allocator.destroy(self);
+            }
+
+            /// Recursively free child nodes for internal (non-leaf) nodes.
+            fn deinitChildren(self: *Node, allocator: Allocator) void {
+                if (self.is_leaf) return;
+                const ch = &(self.children orelse return);
+                for (ch.items) |child| {
+                    child.deinit(allocator);
+                }
+                ch.deinit(allocator);
             }
 
             /// Lower bound: returns the index of the first key >= `key`.
@@ -221,18 +224,12 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
 
         /// Search for a key. Returns null if not found.
         pub fn search(self: *const Self, key: K) ?V {
-            var node = self.root orelse return null;
-            while (true) {
-                if (node.is_leaf) {
-                    const pos = node.lowerBound(key);
-                    if (pos < node.keys.items.len and node.keys.items[pos] == key) {
-                        return node.values.?.items[pos];
-                    }
-                    return null;
-                }
-                const child_idx = node.upperBound(key);
-                node = node.children.?.items[child_idx];
+            const leaf = self.findLeaf(key) orelse return null;
+            const pos = leaf.lowerBound(key);
+            if (pos < leaf.keys.items.len and leaf.keys.items[pos] == key) {
+                return leaf.values.?.items[pos];
             }
+            return null;
         }
 
         /// Delete a key. Returns true if found and removed.
@@ -262,26 +259,34 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             var result = std.ArrayList(V){};
             errdefer result.deinit(allocator);
 
-            // Find the leaf containing `lo`.
-            var node = self.root orelse return try result.toOwnedSlice(allocator);
+            const start_leaf = self.findLeaf(lo) orelse
+                return try result.toOwnedSlice(allocator);
+
+            try collectRange(start_leaf, lo, hi, allocator, &result);
+            return try result.toOwnedSlice(allocator);
+        }
+
+        /// Traverse from root to the leaf node that would contain `key`.
+        fn findLeaf(self: *const Self, key: K) ?*Node {
+            var node = self.root orelse return null;
             while (!node.is_leaf) {
-                const idx = node.upperBound(lo);
+                const idx = node.upperBound(key);
                 node = node.children.?.items[idx];
             }
+            return node;
+        }
 
-            // Walk the leaf linked list.
-            var leaf: ?*Node = node;
-            outer: while (leaf) |cur| {
+        /// Walk the leaf linked list from `start`, collecting values
+        /// for keys in [lo, hi].
+        fn collectRange(start: *Node, lo: K, hi: K, allocator: Allocator, result: *std.ArrayList(V)) !void {
+            var leaf: ?*Node = start;
+            while (leaf) |cur| {
                 for (cur.keys.items, 0..) |k, i| {
-                    if (k > hi) break :outer;
-                    if (k >= lo) {
-                        try result.append(allocator, cur.values.?.items[i]);
-                    }
+                    if (k > hi) return;
+                    if (k >= lo) try result.append(allocator, cur.values.?.items[i]);
                 }
                 leaf = cur.next_leaf;
             }
-
-            return try result.toOwnedSlice(allocator);
         }
 
         /// Number of entries.
