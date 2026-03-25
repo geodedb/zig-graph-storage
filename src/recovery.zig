@@ -37,9 +37,11 @@ const TxnRecoveryState = enum {
 /// to a consistent state.
 pub const Recovery = struct {
     allocator: Allocator,
+    /// Count of WAL records skipped due to checksum mismatch during recovery.
+    skipped_checksum_failures: u64 = 0,
 
     pub fn init(allocator: Allocator) Recovery {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .skipped_checksum_failures = 0 };
     }
 
     /// Recover a graph from its directory.
@@ -116,11 +118,17 @@ pub const Recovery = struct {
             return m;
         }
 
-        // 4. Classify transactions
+        // 4. Classify transactions (skip records with checksum failures)
         var txn_states = std.AutoHashMap(u64, TxnRecoveryState).init(self.allocator);
         defer txn_states.deinit();
 
         for (records) |rec| {
+            // Verify checksum before trusting the record
+            if (rec.checksum != rec.computeChecksum()) {
+                self.skipped_checksum_failures += 1;
+                continue;
+            }
+
             switch (rec.record_type) {
                 .begin_txn => {
                     try txn_states.put(rec.txn_id, .active);
@@ -138,6 +146,12 @@ pub const Recovery = struct {
         // 5. Replay committed page_update records into buffer pool
         for (records) |rec| {
             if (rec.record_type != .page_update) continue;
+
+            // Verify checksum before applying record
+            if (rec.checksum != rec.computeChecksum()) {
+                // Already counted in step 4; skip silently here
+                continue;
+            }
 
             const state = txn_states.get(rec.txn_id) orelse continue;
             if (state != .committed) continue;
@@ -430,6 +444,93 @@ test "recovery with uncommitted transaction: changes discarded" {
         }
     }
     try testing.expect(!has_uncommitted_data);
+}
+
+test "recovery skips WAL records with corrupted checksums" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write initial manifest
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    // Open WAL directory and create WAL
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+    defer wal_dir.close();
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+
+    // BEGIN txn 1 (correct checksum, via appendRecord)
+    var begin_rec = WalRecord{
+        .lsn = 0,
+        .txn_id = 1,
+        .record_type = .begin_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
+    };
+    _ = try wal.appendRecord(&begin_rec);
+
+    // PAGE_UPDATE with intentionally WRONG checksum.
+    // Write raw serialized bytes directly to the inner WAL to bypass
+    // appendRecord's automatic checksum computation.
+    var page_data: [4096]u8 = undefined;
+    @memset(&page_data, 0xEE);
+    var bad_update = WalRecord{
+        .lsn = 2,
+        .txn_id = 1,
+        .record_type = .page_update,
+        .file_id = 0,
+        .page_id = 1,
+        .payload = &page_data,
+        .checksum = 0xDEADBEEF, // intentionally wrong
+    };
+    const bad_bytes = try bad_update.serialize(allocator);
+    defer allocator.free(bad_bytes);
+    _ = try wal.inner.append(bad_bytes);
+    wal.current_lsn = 2;
+
+    // COMMIT txn 1 (correct checksum, via appendRecord)
+    var commit_rec = WalRecord{
+        .lsn = 0,
+        .txn_id = 1,
+        .record_type = .commit_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
+    };
+    _ = try wal.appendRecord(&commit_rec);
+
+    try wal.sync();
+    wal.deinit();
+
+    // Run recovery
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator);
+    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // The corrupted page_update record should have been skipped
+    try testing.expect(recovery.skipped_checksum_failures >= 1);
 }
 
 test {
