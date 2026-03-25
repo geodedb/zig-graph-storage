@@ -8,9 +8,9 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 5 |
+| Closed | 6 |
 | Won't Do | 2 |
-| Deferred | 8 |
+| Deferred | 7 |
 
 ---
 
@@ -42,9 +42,10 @@
 
 ## PERF-0005: Engine.nodeCount/edgeCount O(N)/O(N*E) scans
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** P1
-- **Description:** Requires manifest schema change and counter maintenance across all mutation paths. Deferred to post-v1.
+- **Resolution:** Added `node_count`/`edge_count` fields to Manifest. Counters maintained in allocNode/deleteNode/addEdge/removeEdge. nodeCount/edgeCount now O(1). Manifest serialization updated.
+- **Commit:** `09698b7`
 
 ## PERF-0006: FreeSpaceManager.allocPage linear scan from bit 1
 

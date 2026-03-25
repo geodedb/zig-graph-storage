@@ -8,10 +8,10 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 5 |
+| Closed | 7 |
 | Won't Do | 2 |
 | Blocked | 1 |
-| Deferred | 2 |
+| Deferred | 0 |
 
 ---
 
@@ -84,9 +84,10 @@
 
 ## GAP-0007: Example is a stub referencing non-existent API
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** Low
-- **Description:** Low severity, cosmetic issue. Not a correctness or security concern.
+- **Resolution:** Replaced stub with full working example demonstrating all major API operations. Added `run-example` build step.
+- **Commit:** `ae73baf`
 
 ## GAP-0008: README claims "Zero Dependencies" (has 2)
 
@@ -101,9 +102,10 @@
 
 ## GAP-0009: No benchmark harness
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** Medium
-- **Description:** Valuable but large scope (new tooling). Does not affect correctness. Deferred to post-v1.
+- **Resolution:** Created `benchmarks/bench.zig` with 8 benchmarks: node insert, edge insert, property write/read, expandOut, scanLabel, checkpoint, cold start. Runnable via `zig build bench` or `make bench`.
+- **Commit:** `92035ff`
 
 ## GAP-0010: SECURITY.md references GitHub (project is on GitLab)
 

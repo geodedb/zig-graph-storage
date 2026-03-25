@@ -739,15 +739,25 @@ test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
     // Allocate and write two nodes
     const n1 = try engine.allocNode();
     try engine.putNode(n1, NodeRec{
-        .out_head = 0, .in_head = 0, .prop_head = 0,
-        .label_set = 0, .flags = 0, ._pad = 0, .txn_stamp = 1,
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_set = 0,
+        .flags = 0,
+        ._pad = 0,
+        .txn_stamp = 1,
     });
     try testing.expectEqual(@as(u64, 1), try engine.nodeCount());
 
     const n2 = try engine.allocNode();
     try engine.putNode(n2, NodeRec{
-        .out_head = 0, .in_head = 0, .prop_head = 0,
-        .label_set = 0, .flags = 0, ._pad = 0, .txn_stamp = 1,
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_set = 0,
+        .flags = 0,
+        ._pad = 0,
+        .txn_stamp = 1,
     });
     try testing.expectEqual(@as(u64, 2), try engine.nodeCount());
 
