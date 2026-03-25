@@ -270,6 +270,10 @@ pub const GraphEngine = struct {
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
+
+        // SEC-0003: Zero encryption key material before freeing memory
+        self.config.zeroKey();
+
         allocator.destroy(self);
     }
 

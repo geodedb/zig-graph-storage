@@ -14,6 +14,15 @@ pub const GraphConfig = struct {
     encryption_key: ?[32]u8 = null,
     data_dir: []const u8 = "data",
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
+
+    /// Securely zero the encryption key if present. Should be called during
+    /// engine shutdown to prevent key material from lingering in memory.
+    pub fn zeroKey(self: *GraphConfig) void {
+        if (self.encryption_key) |*key| {
+            std.crypto.secureZero(u8, key);
+            self.encryption_key = null;
+        }
+    }
 };
 
 // ============================================================================
@@ -54,6 +63,30 @@ test "config with custom values" {
     try std.testing.expectEqual(@as(u64, 120_000), cfg.checkpoint_time_threshold_ms);
     try std.testing.expectEqual(@as(u8, 0xAB), cfg.encryption_key.?[0]);
     try std.testing.expectEqualStrings("/tmp/graph", cfg.data_dir);
+}
+
+test "zeroKey zeros encryption key and sets to null" {
+    var cfg = GraphConfig{
+        .encryption_key = [_]u8{0xBB} ** 32,
+    };
+
+    // Key should be present before zeroKey
+    try std.testing.expect(cfg.encryption_key != null);
+
+    cfg.zeroKey();
+
+    // After zeroKey, encryption_key must be null
+    try std.testing.expectEqual(@as(?[32]u8, null), cfg.encryption_key);
+}
+
+test "zeroKey is safe to call when no key is set" {
+    var cfg = GraphConfig{};
+    try std.testing.expectEqual(@as(?[32]u8, null), cfg.encryption_key);
+
+    // Should not panic
+    cfg.zeroKey();
+
+    try std.testing.expectEqual(@as(?[32]u8, null), cfg.encryption_key);
 }
 
 test {

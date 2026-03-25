@@ -19,6 +19,13 @@ pub const PageEncryption = struct {
         return .{ .key = key };
     }
 
+    /// Securely zero the encryption key in memory. Must be called when the
+    /// PageEncryption instance is no longer needed to prevent key material
+    /// from lingering in process memory.
+    pub fn deinit(self: *PageEncryption) void {
+        std.crypto.secureZero(u8, &self.key);
+    }
+
     /// Build a nonce from page_id, file_id, and write_count.
     /// Nonce = page_id(8 bytes LE) + file_id(1 byte) + write_count(3 bytes LE) = 12 bytes
     ///
@@ -276,6 +283,19 @@ test "wrong write_count fails decryption" {
     // Decrypt with write_count=4 — must fail
     const result = enc.decryptPage(buf, page_id, file_id, 4);
     try testing.expectError(error.DecryptionFailed, result);
+}
+
+test "deinit zeros key memory" {
+    var enc = PageEncryption.init([_]u8{0xAA} ** KEY_SIZE);
+
+    // Key should be non-zero before deinit
+    const all_zero = [_]u8{0} ** KEY_SIZE;
+    try testing.expect(!std.mem.eql(u8, &enc.key, &all_zero));
+
+    enc.deinit();
+
+    // After deinit, key must be all zeros
+    try testing.expectEqualSlices(u8, &all_zero, &enc.key);
 }
 
 test {
