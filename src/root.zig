@@ -31,6 +31,10 @@ pub const var_store = @import("var_store.zig");
 pub const wal_record = @import("wal_record.zig");
 pub const wal = @import("wal.zig");
 pub const txn = @import("txn.zig");
+pub const checkpoint = @import("checkpoint.zig");
+pub const recovery = @import("recovery.zig");
+pub const engine = @import("engine.zig");
+pub const GraphEngine = engine.GraphEngine;
 
 // Re-export key types for convenience
 pub const GraphStorage = interface.GraphStorage;

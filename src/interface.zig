@@ -165,7 +165,15 @@ pub const GraphStorage = struct {
 
     /// Comptime helper that generates a type-erased wrapper function for a vtable method.
     /// Casts `*anyopaque` back to `*T` and forwards the call to `T.<method_name>`.
-    fn typeErasedFn(comptime T: type, comptime method_name: []const u8) @TypeOf(@field(VTable{}, method_name)) {
+    fn vtableFieldType(comptime field_name: []const u8) type {
+        @setEvalBranchQuota(5000);
+        for (std.meta.fields(VTable)) |f| {
+            if (std.mem.eql(u8, f.name, field_name)) return f.type;
+        }
+        @compileError("Unknown vtable field: " ++ field_name);
+    }
+
+    fn typeErasedFn(comptime T: type, comptime method_name: []const u8) vtableFieldType(method_name) {
         const Wrapper = struct {
             fn getNodeFn(ptr: *anyopaque, id: NodeId) anyerror!?NodeRec {
                 const self: *T = @ptrCast(@alignCast(ptr));

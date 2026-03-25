@@ -112,12 +112,12 @@ pub const WalManager = struct {
     }
 
     /// Current LSN (read-only accessor).
-    pub fn currentLsn(self: *const WalManager) u64 {
+    pub fn currentLsn(self: *WalManager) u64 {
         return self.inner.currentLsn();
     }
 
     /// Bytes written since last compaction.
-    pub fn bytesSinceCompact(self: *const WalManager) u64 {
+    pub fn bytesSinceCompact(self: *WalManager) u64 {
         return self.inner.bytesSinceCompact();
     }
 };
