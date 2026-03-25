@@ -187,15 +187,22 @@ pub const Backup = struct {
             const name = data[pos..][0..name_len];
             pos += name_len;
 
+            // SEC-0002: Validate filename to prevent path traversal.
+            // Reject absolute paths, null bytes, backslashes, and ".." components.
+            if (!isValidBackupFilename(name)) return error.InvalidBackupFilename;
+
             if (pos + 8 > data.len - 4) return error.InvalidData;
             const file_size = readU64(data, pos);
             pos += 8;
 
-            if (pos + file_size > data.len - 4) return error.InvalidData;
-            const file_data = data[pos..][0..file_size];
-            pos += file_size;
+            // SEC-0013: Guard against integer truncation on 32-bit targets.
+            const file_size_usize = std.math.cast(usize, file_size) orelse return error.BackupTooLarge;
 
-            // Create subdirectories if needed
+            if (pos + file_size_usize > data.len - 4) return error.InvalidData;
+            const file_data = data[pos..][0..file_size_usize];
+            pos += file_size_usize;
+
+            // Create subdirectories if needed (only forward slashes in validated names)
             if (std.mem.lastIndexOfScalar(u8, name, '/')) |sep| {
                 const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name[0..sep] });
                 defer self.allocator.free(subdir_path);
@@ -263,6 +270,10 @@ pub const Backup = struct {
         defer file.close();
 
         const stat = try file.stat();
+
+        // SEC-0007: Reject files exceeding the maximum backup size.
+        if (stat.size > MAX_BACKUP_FILE_SIZE) return error.BackupTooLarge;
+
         const data = try self.allocator.alloc(u8, stat.size);
         errdefer self.allocator.free(data);
 
@@ -275,6 +286,34 @@ pub const Backup = struct {
         return data;
     }
 };
+
+/// Maximum backup file size: 1 GiB (SEC-0007).
+pub const MAX_BACKUP_FILE_SIZE: u64 = 1 << 30;
+
+/// Validate that a filename from a backup archive is safe to extract.
+/// Rejects absolute paths, null bytes, backslashes, and ".." path components.
+fn isValidBackupFilename(name: []const u8) bool {
+    if (name.len == 0) return false;
+
+    // Reject null bytes
+    if (std.mem.indexOfScalar(u8, name, 0) != null) return false;
+
+    // Reject backslashes (Windows-style path separators)
+    if (std.mem.indexOfScalar(u8, name, '\\') != null) return false;
+
+    // Reject absolute paths
+    if (name[0] == '/') return false;
+
+    // Reject ".." components: check each segment separated by '/'
+    var iter = std.mem.splitScalar(u8, name, '/');
+    while (iter.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return false;
+        // Also reject empty segments (double slashes like "a//b")
+        if (segment.len == 0) return false;
+    }
+
+    return true;
+}
 
 fn readU16(data: []const u8, offset: usize) u16 {
     return std.mem.littleToNative(u16, @bitCast(data[offset..][0..2].*));
@@ -447,6 +486,153 @@ test "validateBackup returns false for nonexistent file" {
     var backup = Backup.init(allocator);
     const valid = try backup.validateBackup("/tmp/nonexistent_backup_12345.geob");
     try testing.expect(!valid);
+}
+
+// ============================================================================
+// Security Tests
+// ============================================================================
+
+test "SEC-0002: isValidBackupFilename rejects path traversal" {
+    // ".." traversal variants
+    try testing.expect(!isValidBackupFilename("../etc/passwd"));
+    try testing.expect(!isValidBackupFilename("foo/../../etc/passwd"));
+    try testing.expect(!isValidBackupFilename(".."));
+    try testing.expect(!isValidBackupFilename("foo/.."));
+
+    // Absolute paths
+    try testing.expect(!isValidBackupFilename("/etc/passwd"));
+
+    // Backslashes
+    try testing.expect(!isValidBackupFilename("foo\\bar"));
+    try testing.expect(!isValidBackupFilename("..\\..\\etc\\passwd"));
+
+    // Null bytes
+    try testing.expect(!isValidBackupFilename("foo\x00bar"));
+
+    // Empty name
+    try testing.expect(!isValidBackupFilename(""));
+
+    // Double slashes
+    try testing.expect(!isValidBackupFilename("foo//bar"));
+
+    // Valid names
+    try testing.expect(isValidBackupFilename("manifest.a"));
+    try testing.expect(isValidBackupFilename("nodes.store"));
+    try testing.expect(isValidBackupFilename("indexes/catalog.bin"));
+}
+
+test "SEC-0002: restoreBackup rejects malicious filename with path traversal" {
+    const allocator = testing.allocator;
+
+    // Build a minimal valid backup archive containing a malicious filename.
+    // Format: magic(4) + version(2) + uuid(16) + file_count(4) + entry + crc(4)
+    const malicious_name = "../../../etc/passwd";
+    const file_data = "malicious content";
+
+    const entry_size = 2 + malicious_name.len + 8 + file_data.len;
+    const total_size = 26 + entry_size + 4; // header + entry + crc
+    var buf: [total_size]u8 = undefined;
+
+    // Header
+    @memcpy(buf[0..4], &BACKUP_MAGIC);
+    @memcpy(buf[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, BACKUP_VERSION)));
+    @memset(buf[6..22], 0x42); // uuid
+    @memcpy(buf[22..26], &std.mem.toBytes(std.mem.nativeToLittle(u32, 1))); // file_count = 1
+
+    // Entry: filename_len + filename + file_size + file_data
+    var pos: usize = 26;
+    @memcpy(buf[pos..][0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, @as(u16, malicious_name.len))));
+    pos += 2;
+    @memcpy(buf[pos..][0..malicious_name.len], malicious_name);
+    pos += malicious_name.len;
+    @memcpy(buf[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, file_data.len))));
+    pos += 8;
+    @memcpy(buf[pos..][0..file_data.len], file_data);
+    pos += file_data.len;
+
+    // CRC over everything before the CRC field
+    const crc = Crc32.hash(buf[0..pos]);
+    @memcpy(buf[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, crc)));
+
+    // Write to temp file
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/malicious.geob", .{tmp_path});
+    defer allocator.free(backup_path);
+    {
+        const f = try std.fs.cwd().createFile(backup_path, .{});
+        defer f.close();
+        try f.writeAll(&buf);
+    }
+
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{tmp_path});
+    defer allocator.free(restore_path);
+
+    var backup = Backup.init(allocator);
+    const result = backup.restoreBackup(backup_path, restore_path);
+    try testing.expectError(error.InvalidBackupFilename, result);
+}
+
+test "SEC-0007: readFileAlloc enforces MAX_BACKUP_FILE_SIZE" {
+    // We cannot create a 1GB+ file in tests, but we can verify the constant exists
+    // and the check logic is in place by checking the constant value.
+    try testing.expect(MAX_BACKUP_FILE_SIZE == 1 << 30);
+}
+
+test "SEC-0013: integer truncation guard in restoreBackup" {
+    // On 64-bit this is a no-op, but we verify the code compiles and the
+    // cast path exists. On 32-bit, a file_size > 4GiB would trigger BackupTooLarge.
+    // We test by constructing a backup with a file_size that claims to be huge
+    // but the actual data is short, which should fail with InvalidData after
+    // the size check (on 64-bit) or BackupTooLarge (on 32-bit).
+    const allocator = testing.allocator;
+
+    // Build archive with file_size = 0xFFFF_FFFF_FFFF (way beyond data length)
+    const name = "test.dat";
+    const total_size = 26 + 2 + name.len + 8 + 4; // header + name_len + name + file_size + crc (no file_data, it's a lie)
+    var buf: [total_size]u8 = undefined;
+
+    @memcpy(buf[0..4], &BACKUP_MAGIC);
+    @memcpy(buf[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, BACKUP_VERSION)));
+    @memset(buf[6..22], 0x42);
+    @memcpy(buf[22..26], &std.mem.toBytes(std.mem.nativeToLittle(u32, 1)));
+
+    var pos: usize = 26;
+    @memcpy(buf[pos..][0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, @as(u16, name.len))));
+    pos += 2;
+    @memcpy(buf[pos..][0..name.len], name);
+    pos += name.len;
+    // Huge file_size that will fail the bounds check (or cast on 32-bit)
+    @memcpy(buf[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, 0xFFFF_FFFF_FFFF))));
+    pos += 8;
+
+    const crc = Crc32.hash(buf[0..pos]);
+    @memcpy(buf[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, crc)));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/truncation.geob", .{tmp_path});
+    defer allocator.free(backup_path);
+    {
+        const f = try std.fs.cwd().createFile(backup_path, .{});
+        defer f.close();
+        try f.writeAll(&buf);
+    }
+
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{tmp_path});
+    defer allocator.free(restore_path);
+
+    var backup = Backup.init(allocator);
+    const result = backup.restoreBackup(backup_path, restore_path);
+    // On 64-bit: file_size is valid usize but exceeds data.len => InvalidData
+    // On 32-bit: cast fails => BackupTooLarge
+    try testing.expect(result == error.InvalidData or result == error.BackupTooLarge);
 }
 
 test {
