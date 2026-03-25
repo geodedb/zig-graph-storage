@@ -3,78 +3,51 @@
 
 //! # graph-storage
 //!
-//! A Zig library for graph-storage
-//!
-//! ## Features
-//!
-//! - Feature 1
-//! - Feature 2
-//! - Feature 3
-//!
-//! ## Quick Start
-//!
-//! ```zig
-//! const graph_storage = @import("graph_storage");
-//!
-//! pub fn main() !void {
-//!     // Your code here
-//! }
-//! ```
-//!
-//! ## License
-//!
-//! Apache-2.0
+//! A high-performance graph storage engine built in Zig.
 
 const std = @import("std");
 
-/// Library version
+pub const types = @import("types.zig");
+pub const errors = @import("errors.zig");
+pub const config = @import("config.zig");
+
+// Re-export key types for convenience
+pub const NodeId = types.NodeId;
+pub const EdgeId = types.EdgeId;
+pub const PageId = types.PageId;
+pub const Lsn = types.Lsn;
+pub const TxnId = types.TxnId;
+pub const LabelId = types.LabelId;
+pub const GraphUuid = types.GraphUuid;
+pub const FileId = types.FileId;
+pub const PropertyValue = types.PropertyValue;
+pub const StorageError = errors.StorageError;
+pub const GraphConfig = config.GraphConfig;
+
 pub const version = "0.1.0";
-
-// Re-export submodules here as the library grows:
-// pub const submodule = @import("submodule.zig");
-
-// ============================================================================
-// Public Types
-// ============================================================================
-
-/// Example configuration structure
-pub const Config = struct {
-    /// Enable debug output
-    debug: bool = false,
-    /// Maximum retry attempts
-    max_retries: u32 = 3,
-    /// Timeout in milliseconds
-    timeout_ms: u64 = 30_000,
-};
-
-// ============================================================================
-// Public Functions
-// ============================================================================
-
-/// Initialize the library with the given configuration.
-///
-/// Returns an error if the configuration is invalid.
-pub fn init(config: Config) !void {
-    _ = config;
-    // Implementation here
-}
 
 // ============================================================================
 // Unit Tests
 // ============================================================================
 
-test "Config default values" {
-    const config = Config{};
-    try std.testing.expectEqual(false, config.debug);
-    try std.testing.expectEqual(@as(u32, 3), config.max_retries);
-    try std.testing.expectEqual(@as(u64, 30_000), config.timeout_ms);
+test "re-exported types match source types" {
+    try std.testing.expect(NodeId == types.NodeId);
+    try std.testing.expect(EdgeId == types.EdgeId);
+    try std.testing.expect(PageId == types.PageId);
+    try std.testing.expect(Lsn == types.Lsn);
+    try std.testing.expect(TxnId == types.TxnId);
+    try std.testing.expect(LabelId == types.LabelId);
+    try std.testing.expect(GraphUuid == types.GraphUuid);
+    try std.testing.expect(FileId == types.FileId);
+    try std.testing.expect(PropertyValue == types.PropertyValue);
+    try std.testing.expect(StorageError == errors.StorageError);
+    try std.testing.expect(GraphConfig == config.GraphConfig);
 }
 
-test "init with default config" {
-    try init(.{});
+test "version is set" {
+    try std.testing.expectEqualStrings("0.1.0", version);
 }
 
 test {
-    // Ensure all declarations are referenced for test coverage
     std.testing.refAllDecls(@This());
 }
