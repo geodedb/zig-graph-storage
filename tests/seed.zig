@@ -147,8 +147,8 @@ pub const SeedConfig = struct {
     pub fn totalEdges(self: SeedConfig) u64 {
         const user_edges = @as(u64, self.users) *
             (@as(u64, self.memberships_per_user) +
-            @as(u64, self.devices_per_user) +
-            @as(u64, self.signins_per_user));
+                @as(u64, self.devices_per_user) +
+                @as(u64, self.signins_per_user));
         const drive_edges = @as(u64, self.drives) * @as(u64, self.items_per_drive);
         return user_edges + drive_edges;
     }
