@@ -166,11 +166,14 @@ pub const IndexCatalog = struct {
             try self.owned_keys.append(self.allocator, key_buf);
             errdefer _ = self.owned_keys.pop();
 
+            const index_type = std.meta.intToEnum(IndexType, type_byte) catch return error.InvalidData;
+            const state = std.meta.intToEnum(IndexState, state_byte) catch return error.InvalidData;
+
             try self.indexes.append(self.allocator, .{
                 .label_id = label_id,
                 .property_key = key_buf,
-                .index_type = @enumFromInt(type_byte),
-                .state = @enumFromInt(state_byte),
+                .index_type = index_type,
+                .state = state,
             });
         }
     }
@@ -296,6 +299,85 @@ test "multiple indexes for same label" {
     try testing.expect(catalog.findIndex(1, "name") != null);
     try testing.expect(catalog.findIndex(1, "age") != null);
     try testing.expect(catalog.findIndex(1, "email") == null);
+}
+
+test "loadFromFile rejects invalid index_type byte" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+
+    const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/bad_catalog.bin", .{path});
+    defer testing.allocator.free(full_path);
+
+    // Craft a catalog file with 1 entry whose index_type byte (0xFF) is invalid.
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    // entry_count = 1
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+    pos += 4;
+    // label_id = 1
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+    pos += 4;
+    // index_type = 0xFF (invalid)
+    buf[pos] = 0xFF;
+    pos += 1;
+    // state = 0 (valid)
+    buf[pos] = 0;
+    pos += 1;
+    // key_len = 3
+    std.mem.writeInt(u16, buf[pos..][0..2], 3, .little);
+    pos += 2;
+    // key = "foo"
+    @memcpy(buf[pos..][0..3], "foo");
+    pos += 3;
+
+    const file = try std.fs.cwd().createFile(full_path, .{});
+    try file.writeAll(buf[0..pos]);
+    file.close();
+
+    var catalog = IndexCatalog.init(testing.allocator);
+    defer catalog.deinit();
+
+    try testing.expectError(error.InvalidData, catalog.loadFromFile(full_path));
+}
+
+test "loadFromFile rejects invalid state byte" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+
+    const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/bad_state.bin", .{path});
+    defer testing.allocator.free(full_path);
+
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little);
+    pos += 4;
+    // index_type = 0 (valid: btree_property)
+    buf[pos] = 0;
+    pos += 1;
+    // state = 0xAA (invalid)
+    buf[pos] = 0xAA;
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 3, .little);
+    pos += 2;
+    @memcpy(buf[pos..][0..3], "bar");
+    pos += 3;
+
+    const file = try std.fs.cwd().createFile(full_path, .{});
+    try file.writeAll(buf[0..pos]);
+    file.close();
+
+    var catalog = IndexCatalog.init(testing.allocator);
+    defer catalog.deinit();
+
+    try testing.expectError(error.InvalidData, catalog.loadFromFile(full_path));
 }
 
 test {

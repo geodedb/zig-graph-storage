@@ -184,7 +184,7 @@ pub const PropStore = struct {
             const entry_count = readEntryCount(data);
 
             // Calculate used space
-            const used = self.usedBytes(data, entry_count);
+            const used = try self.usedBytes(data, entry_count);
             const available = self.dataCapacity() - used;
 
             if (available >= entry_size) {
@@ -254,7 +254,7 @@ pub const PropStore = struct {
 
                 if (std.mem.eql(u8, entry_key, key)) {
                     // Found: shift remaining entries
-                    const total_used = PROP_DATA_OFFSET + self.usedBytes(data, entry_count);
+                    const total_used = PROP_DATA_OFFSET + try self.usedBytes(data, entry_count);
                     const remaining = total_used - offset;
                     if (remaining > 0) {
                         std.mem.copyForwards(u8, data[entry_start..], data[offset..][0..remaining]);
@@ -287,14 +287,14 @@ pub const PropStore = struct {
         @memcpy(data[off..][0..encoded_val.len], encoded_val);
     }
 
-    fn usedBytes(_: *const PropStore, data: []const u8, entry_count: u32) u32 {
+    fn usedBytes(_: *const PropStore, data: []const u8, entry_count: u32) !u32 {
         var i: u32 = 0;
         var off: u32 = PROP_DATA_OFFSET;
         while (i < entry_count) : (i += 1) {
             const key_len = std.mem.bytesToValue(u16, data[off..][0..2]);
             off += 2;
             off += key_len;
-            const esize = encodedSizeFromBytes(data[off..]);
+            const esize = try encodedSizeFromBytes(data[off..]);
             off += @intCast(esize);
         }
         return off - PROP_DATA_OFFSET;
@@ -303,9 +303,9 @@ pub const PropStore = struct {
 
 /// Determine the encoded size of a property value from its raw bytes.
 /// This avoids needing to fully decode the value.
-fn encodedSizeFromBytes(bytes: []const u8) usize {
+fn encodedSizeFromBytes(bytes: []const u8) error{InvalidData}!usize {
     if (bytes.len < 1) return 0;
-    const tag: property_mod.Tag = @enumFromInt(bytes[0]);
+    const tag: property_mod.Tag = std.meta.intToEnum(property_mod.Tag, bytes[0]) catch return error.InvalidData;
     return switch (tag) {
         .null => 1,
         .bool => 2,
@@ -553,6 +553,17 @@ test "getProperty returns null for empty prop_head" {
 
     const val = try store.getProperty(0, "anything", testing.allocator);
     try testing.expect(val == null);
+}
+
+test "encodedSizeFromBytes rejects invalid property tag byte" {
+    const bad_bytes = [_]u8{0xFF}; // 0xFF is not a valid property_mod.Tag
+    try testing.expectError(error.InvalidData, encodedSizeFromBytes(&bad_bytes));
+}
+
+test "encodedSizeFromBytes returns 0 for empty input" {
+    const empty: []const u8 = &.{};
+    const result = try encodedSizeFromBytes(empty);
+    try testing.expectEqual(@as(usize, 0), result);
 }
 
 test {

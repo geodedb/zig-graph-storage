@@ -143,7 +143,7 @@ pub const Recovery = struct {
             if (state != .committed) continue;
 
             // Apply the page image to the buffer pool
-            const file_id: FileId = @enumFromInt(rec.file_id);
+            const file_id: FileId = std.meta.intToEnum(FileId, rec.file_id) catch return error.InvalidFormat;
             const frame = try buffer_pool.pinNew(file_id, rec.page_id);
             const frame_idx = buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
