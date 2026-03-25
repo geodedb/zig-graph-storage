@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2025 CodePros
+
+const std = @import("std");
+const types = @import("types.zig");
+const page_frame_mod = @import("page_frame.zig");
+const pager_mod = @import("pager.zig");
+
+const Allocator = std.mem.Allocator;
+const PageFrame = page_frame_mod.PageFrame;
+const Pager = pager_mod.Pager;
+const PageId = types.PageId;
+const FileId = types.FileId;
+const Lsn = types.Lsn;
+
+pub const BufferPoolError = error{
+    BufferPoolFull,
+    NoPagerRegistered,
+};
+
+pub const PageKey = struct {
+    file_id: FileId,
+    page_id: PageId,
+};
+
+/// LRU buffer pool that caches pages in memory with dirty tracking and eviction.
+pub const BufferPool = struct {
+    allocator: Allocator,
+    page_size: u32,
+    capacity: u32,
+    frames: []PageFrame,
+    page_buf: []align(4096) u8, // contiguous allocation for all frame data
+    page_table: std.AutoHashMap(PageKey, u32),
+    // LRU list (doubly-linked via frame indices)
+    lru_head: ?u32 = null, // most recently used
+    lru_tail: ?u32 = null, // least recently used (eviction candidate)
+    // Free list
+    free_list: std.ArrayList(u32),
+    // Pagers: one per FileId
+    pagers: [8]?*Pager, // indexed by @intFromEnum(FileId)
+
+    /// Initialize a buffer pool with the given capacity (number of frames).
+    pub fn init(allocator: Allocator, page_size: u32, capacity: u32) !BufferPool {
+        const page_buf = try allocator.alignedAlloc(u8, .fromByteUnits(4096), @as(usize, capacity) * @as(usize, page_size));
+        @memset(page_buf, 0);
+
+        const frames = try allocator.alloc(PageFrame, capacity);
+        for (frames, 0..) |*frame, i| {
+            frame.* = PageFrame{
+                .file_id = .nodes, // placeholder, overwritten on use
+                .page_id = 0,
+                .data = page_buf.ptr + (i * @as(usize, page_size)),
+                .page_size = page_size,
+                .pin_count = 0,
+                .dirty = false,
+                .valid = false,
+                .lsn = 0,
+                .lru_prev = null,
+                .lru_next = null,
+            };
+        }
+
+        var free_list = try std.ArrayList(u32).initCapacity(allocator, capacity);
+        // Add all frame indices to free list (reverse order so pop gives 0, 1, 2, ...)
+        var i: u32 = capacity;
+        while (i > 0) {
+            i -= 1;
+            free_list.appendAssumeCapacity(i);
+        }
+
+        return BufferPool{
+            .allocator = allocator,
+            .page_size = page_size,
+            .capacity = capacity,
+            .frames = frames,
+            .page_buf = page_buf,
+            .page_table = std.AutoHashMap(PageKey, u32).init(allocator),
+            .lru_head = null,
+            .lru_tail = null,
+            .free_list = free_list,
+            .pagers = .{ null, null, null, null, null, null, null, null },
+        };
+    }
+
+    /// Free all resources owned by the buffer pool.
+    pub fn deinit(self: *BufferPool) void {
+        self.page_table.deinit();
+        self.free_list.deinit(self.allocator);
+        self.allocator.free(self.frames);
+        self.allocator.free(self.page_buf);
+    }
+
+    /// Register a pager for the given file_id.
+    pub fn registerPager(self: *BufferPool, file_id: FileId, p: *Pager) void {
+        self.pagers[@intFromEnum(file_id)] = p;
+    }
+
+    /// Pin a page: return it from cache or read it from disk.
+    /// If the page is already cached, increments pin_count and moves to LRU head.
+    /// Otherwise, allocates a frame (evicting LRU if necessary) and reads from disk.
+    pub fn pin(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
+        const key = PageKey{ .file_id = file_id, .page_id = page_id };
+
+        // Cache hit
+        if (self.page_table.get(key)) |frame_idx| {
+            const frame = &self.frames[frame_idx];
+            frame.pin_count += 1;
+            self.moveToHead(frame_idx);
+            return frame;
+        }
+
+        // Cache miss: get a free frame
+        const frame_idx = try self.getFrame();
+        const frame = &self.frames[frame_idx];
+
+        // Read page from disk
+        const p = self.pagers[@intFromEnum(file_id)] orelse return error.NoPagerRegistered;
+        p.readPage(page_id, frame.dataSlice()) catch |err| switch (err) {
+            error.PageNotFound => {
+                // Page doesn't exist on disk yet - zero it out
+                @memset(frame.dataSlice(), 0);
+            },
+            else => return err,
+        };
+
+        frame.file_id = file_id;
+        frame.page_id = page_id;
+        frame.pin_count = 1;
+        frame.dirty = false;
+        frame.valid = true;
+        frame.lsn = 0;
+
+        try self.page_table.put(key, frame_idx);
+        self.moveToHead(frame_idx);
+
+        return frame;
+    }
+
+    /// Pin a new page without reading from disk. Used when creating a new page.
+    /// Zeros the data buffer and inserts into cache.
+    pub fn pinNew(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
+        const key = PageKey{ .file_id = file_id, .page_id = page_id };
+
+        // If already in cache, just pin it
+        if (self.page_table.get(key)) |frame_idx| {
+            const frame = &self.frames[frame_idx];
+            frame.pin_count += 1;
+            self.moveToHead(frame_idx);
+            return frame;
+        }
+
+        const frame_idx = try self.getFrame();
+        const frame = &self.frames[frame_idx];
+
+        // Zero the data (new page)
+        @memset(frame.dataSlice(), 0);
+
+        frame.file_id = file_id;
+        frame.page_id = page_id;
+        frame.pin_count = 1;
+        frame.dirty = false;
+        frame.valid = true;
+        frame.lsn = 0;
+
+        try self.page_table.put(key, frame_idx);
+        self.moveToHead(frame_idx);
+
+        return frame;
+    }
+
+    /// Unpin a frame. Decrements pin_count and optionally marks dirty.
+    pub fn unpin(self: *BufferPool, frame_idx: u32, dirty: bool) void {
+        const frame = &self.frames[frame_idx];
+        std.debug.assert(frame.pin_count > 0);
+        frame.pin_count -= 1;
+        if (dirty) {
+            frame.dirty = true;
+        }
+    }
+
+    /// Flush all dirty frames with LSN <= up_to_lsn to disk.
+    pub fn flushDirty(self: *BufferPool, up_to_lsn: Lsn) !void {
+        for (self.frames, 0..) |*frame, i| {
+            _ = i;
+            if (frame.dirty and frame.valid and frame.lsn <= up_to_lsn) {
+                try self.flushFrame(frame);
+            }
+        }
+    }
+
+    /// Flush all dirty frames to disk regardless of LSN.
+    pub fn flushAll(self: *BufferPool) !void {
+        for (self.frames) |*frame| {
+            if (frame.dirty and frame.valid) {
+                try self.flushFrame(frame);
+            }
+        }
+    }
+
+    /// Get the frame index for a given frame pointer.
+    pub fn frameIndex(self: *const BufferPool, frame: *const PageFrame) u32 {
+        const base = @intFromPtr(self.frames.ptr);
+        const addr = @intFromPtr(frame);
+        return @intCast((addr - base) / @sizeOf(PageFrame));
+    }
+
+    // ========================================================================
+    // Internal helpers
+    // ========================================================================
+
+    /// Flush a single dirty frame to disk via its pager.
+    fn flushFrame(self: *BufferPool, frame: *PageFrame) !void {
+        const p = self.pagers[@intFromEnum(frame.file_id)] orelse return error.NoPagerRegistered;
+        try p.writePage(frame.page_id, frame.dataSlice());
+        frame.dirty = false;
+    }
+
+    /// Get a free frame index, evicting if necessary.
+    fn getFrame(self: *BufferPool) !u32 {
+        // Try free list first
+        if (self.free_list.pop()) |idx| {
+            return idx;
+        }
+
+        // Evict from LRU tail
+        return try self.evict();
+    }
+
+    /// Evict the least recently used unpinned frame.
+    /// Walks from LRU tail towards head to find first evictable frame.
+    fn evict(self: *BufferPool) !u32 {
+        var current = self.lru_tail;
+        while (current) |idx| {
+            const frame = &self.frames[idx];
+            if (frame.isEvictable()) {
+                // Flush if dirty
+                if (frame.dirty) {
+                    try self.flushFrame(frame);
+                }
+
+                // Remove from page table
+                const key = PageKey{ .file_id = frame.file_id, .page_id = frame.page_id };
+                _ = self.page_table.remove(key);
+
+                // Remove from LRU list
+                self.removeFromLru(idx);
+
+                // Reset frame
+                frame.valid = false;
+                frame.pin_count = 0;
+                frame.dirty = false;
+                frame.lsn = 0;
+
+                return idx;
+            }
+            current = frame.lru_prev;
+        }
+
+        return error.BufferPoolFull;
+    }
+
+    /// Move a frame to the head of the LRU list (most recently used).
+    fn moveToHead(self: *BufferPool, idx: u32) void {
+        // If already head, nothing to do
+        if (self.lru_head) |head| {
+            if (head == idx) return;
+        }
+
+        // Remove from current position if actually in the LRU list.
+        // A frame is in the list if it has prev/next pointers, or is head/tail.
+        const in_list = self.frames[idx].lru_prev != null or
+            self.frames[idx].lru_next != null or
+            (self.lru_head != null and self.lru_head.? == idx) or
+            (self.lru_tail != null and self.lru_tail.? == idx);
+        if (in_list) {
+            self.removeFromLru(idx);
+        }
+
+        // Insert at head
+        self.frames[idx].lru_prev = null;
+        self.frames[idx].lru_next = self.lru_head;
+
+        if (self.lru_head) |old_head| {
+            self.frames[old_head].lru_prev = idx;
+        }
+
+        self.lru_head = idx;
+
+        if (self.lru_tail == null) {
+            self.lru_tail = idx;
+        }
+    }
+
+    /// Remove a frame from the LRU list.
+    fn removeFromLru(self: *BufferPool, idx: u32) void {
+        const frame = &self.frames[idx];
+
+        if (frame.lru_prev) |prev| {
+            self.frames[prev].lru_next = frame.lru_next;
+        } else {
+            // This was the head
+            self.lru_head = frame.lru_next;
+        }
+
+        if (frame.lru_next) |next| {
+            self.frames[next].lru_prev = frame.lru_prev;
+        } else {
+            // This was the tail
+            self.lru_tail = frame.lru_prev;
+        }
+
+        frame.lru_prev = null;
+        frame.lru_next = null;
+    }
+};
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+const testing = std.testing;
+
+fn createTempFile(name: []const u8) !std.fs.File {
+    return std.fs.cwd().createFile(name, .{
+        .read = true,
+        .truncate = true,
+    });
+}
+
+fn cleanupTempFile(file: std.fs.File, name: []const u8) void {
+    file.close();
+    std.fs.cwd().deleteFile(name) catch {};
+}
+
+/// Write a page with known data pattern to a file via a pager.
+fn writeTestPage(p: *Pager, page_id: PageId, pattern: u8) !void {
+    const page_mod = @import("page.zig");
+    const page_size = p.page_size;
+    const allocator = testing.allocator;
+    const buf = try allocator.alloc(u8, page_size);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+
+    // Set up header
+    const header = page_mod.initHeader(page_id, .node_data, page_size);
+    const header_bytes = page_mod.headerToBytes(&header);
+    @memcpy(buf[0..page_mod.PAGE_HEADER_SIZE], header_bytes);
+
+    // Fill body with pattern
+    @memset(buf[page_mod.PAGE_HEADER_SIZE..], pattern);
+
+    try p.writePage(page_id, buf);
+}
+
+test "pin and read: data matches what was written to disk" {
+    const file = try createTempFile(".test_bp_pin_read");
+    defer cleanupTempFile(file, ".test_bp_pin_read");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    // Write a page with known pattern 0xAB
+    try writeTestPage(&p, 0, 0xAB);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    const frame = try pool.pin(.nodes, 0);
+    const page_mod = @import("page.zig");
+
+    // Verify body data matches the pattern we wrote
+    const body = frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..];
+    for (body) |byte| {
+        try testing.expectEqual(@as(u8, 0xAB), byte);
+    }
+
+    try testing.expectEqual(@as(u32, 1), frame.pin_count);
+    try testing.expect(frame.valid);
+}
+
+test "pin cache hit: same frame returned, pin_count incremented" {
+    const file = try createTempFile(".test_bp_cache_hit");
+    defer cleanupTempFile(file, ".test_bp_cache_hit");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+    try writeTestPage(&p, 0, 0xCD);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    const frame1 = try pool.pin(.nodes, 0);
+    const frame2 = try pool.pin(.nodes, 0);
+
+    // Same frame pointer
+    try testing.expectEqual(@intFromPtr(frame1), @intFromPtr(frame2));
+    try testing.expectEqual(@as(u32, 2), frame1.pin_count);
+}
+
+test "unpin dirty: flush writes data to disk" {
+    const file = try createTempFile(".test_bp_unpin_dirty");
+    defer cleanupTempFile(file, ".test_bp_unpin_dirty");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+    try writeTestPage(&p, 0, 0x00);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    const frame = try pool.pin(.nodes, 0);
+    const frame_idx = pool.frameIndex(frame);
+
+    // Modify data in the frame
+    const page_mod = @import("page.zig");
+    @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0xFF);
+
+    pool.unpin(frame_idx, true);
+    try testing.expect(pool.frames[frame_idx].dirty);
+
+    try pool.flushAll();
+    try testing.expect(!pool.frames[frame_idx].dirty);
+
+    // Read file directly to verify written data
+    var read_buf: [4096]u8 = undefined;
+    try p.readPage(0, &read_buf);
+    const body = read_buf[page_mod.PAGE_HEADER_SIZE..];
+    for (body) |byte| {
+        try testing.expectEqual(@as(u8, 0xFF), byte);
+    }
+}
+
+test "eviction: LRU tail is evicted when pool is full" {
+    const file = try createTempFile(".test_bp_eviction");
+    defer cleanupTempFile(file, ".test_bp_eviction");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    // Write 3 pages with distinct patterns
+    try writeTestPage(&p, 0, 0xAA);
+    try writeTestPage(&p, 1, 0xBB);
+    try writeTestPage(&p, 2, 0xCC);
+
+    // Pool with capacity 2
+    var pool = try BufferPool.init(testing.allocator, page_size, 2);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Pin page 0, then unpin
+    const f0 = try pool.pin(.nodes, 0);
+    const f0_idx = pool.frameIndex(f0);
+    pool.unpin(f0_idx, false);
+
+    // Pin page 1, then unpin
+    const f1 = try pool.pin(.nodes, 1);
+    const f1_idx = pool.frameIndex(f1);
+    pool.unpin(f1_idx, false);
+
+    // Pin page 2 — should evict page 0 (LRU tail, since page 1 was pinned more recently)
+    const f2 = try pool.pin(.nodes, 2);
+    try testing.expect(f2.valid);
+
+    const page_mod = @import("page.zig");
+    const body = f2.dataSlice()[page_mod.PAGE_HEADER_SIZE..];
+    for (body) |byte| {
+        try testing.expectEqual(@as(u8, 0xCC), byte);
+    }
+
+    // Page 0 should no longer be in page table
+    const key0 = PageKey{ .file_id = .nodes, .page_id = 0 };
+    try testing.expect(pool.page_table.get(key0) == null);
+
+    // Page 1 should still be in page table
+    const key1 = PageKey{ .file_id = .nodes, .page_id = 1 };
+    try testing.expect(pool.page_table.get(key1) != null);
+}
+
+test "pinned pages are not evicted" {
+    const file = try createTempFile(".test_bp_no_evict_pinned");
+    defer cleanupTempFile(file, ".test_bp_no_evict_pinned");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    try writeTestPage(&p, 0, 0xAA);
+    try writeTestPage(&p, 1, 0xBB);
+    try writeTestPage(&p, 2, 0xCC);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 2);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Pin page 0 and KEEP IT PINNED
+    _ = try pool.pin(.nodes, 0);
+
+    // Pin page 1, then unpin
+    const f1 = try pool.pin(.nodes, 1);
+    const f1_idx = pool.frameIndex(f1);
+    pool.unpin(f1_idx, false);
+
+    // Pin page 2 — should evict page 1 (page 0 is pinned)
+    _ = try pool.pin(.nodes, 2);
+
+    // Page 0 should still be cached (was pinned)
+    const key0 = PageKey{ .file_id = .nodes, .page_id = 0 };
+    try testing.expect(pool.page_table.get(key0) != null);
+
+    // Page 1 should have been evicted
+    const key1 = PageKey{ .file_id = .nodes, .page_id = 1 };
+    try testing.expect(pool.page_table.get(key1) == null);
+}
+
+test "BufferPoolFull when all frames are pinned" {
+    const file = try createTempFile(".test_bp_full");
+    defer cleanupTempFile(file, ".test_bp_full");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+    try writeTestPage(&p, 0, 0xAA);
+    try writeTestPage(&p, 1, 0xBB);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 1);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Pin page 0 and keep it pinned
+    _ = try pool.pin(.nodes, 0);
+
+    // Try to pin page 1 — should fail
+    const result = pool.pin(.nodes, 1);
+    try testing.expectError(error.BufferPoolFull, result);
+}
+
+test "pinNew: data is zeroed" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    // pinNew doesn't need a pager (no disk read)
+    const frame = try pool.pinNew(.nodes, 0);
+
+    // Verify all data is zero
+    const slice = frame.dataSlice();
+    for (slice) |byte| {
+        try testing.expectEqual(@as(u8, 0), byte);
+    }
+
+    try testing.expectEqual(@as(u32, 1), frame.pin_count);
+    try testing.expect(frame.valid);
+}
+
+test "flushDirty respects LSN threshold" {
+    const file = try createTempFile(".test_bp_flush_lsn");
+    defer cleanupTempFile(file, ".test_bp_flush_lsn");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Create two new pages with different LSNs
+    const f0 = try pool.pinNew(.nodes, 0);
+    const f0_idx = pool.frameIndex(f0);
+    f0.lsn = 5;
+    pool.unpin(f0_idx, true);
+
+    const f1 = try pool.pinNew(.nodes, 1);
+    const f1_idx = pool.frameIndex(f1);
+    f1.lsn = 10;
+    pool.unpin(f1_idx, true);
+
+    // Flush only up to LSN 7 — should flush f0 (lsn=5) but not f1 (lsn=10)
+    try pool.flushDirty(7);
+
+    try testing.expect(!pool.frames[f0_idx].dirty); // flushed
+    try testing.expect(pool.frames[f1_idx].dirty); // still dirty
+}
+
+test "LRU ordering: head is most recent, tail is least recent" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    const f0 = try pool.pinNew(.nodes, 0);
+    const f0_idx = pool.frameIndex(f0);
+    pool.unpin(f0_idx, false);
+
+    const f1 = try pool.pinNew(.nodes, 1);
+    const f1_idx = pool.frameIndex(f1);
+    pool.unpin(f1_idx, false);
+
+    const f2 = try pool.pinNew(.nodes, 2);
+    const f2_idx = pool.frameIndex(f2);
+    pool.unpin(f2_idx, false);
+
+    // Head should be most recently pinned (f2), tail should be f0
+    try testing.expectEqual(@as(?u32, f2_idx), pool.lru_head);
+    try testing.expectEqual(@as(?u32, f0_idx), pool.lru_tail);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
