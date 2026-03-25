@@ -29,7 +29,6 @@ pub const adj_store = @import("adj_store.zig");
 pub const prop_store = @import("prop_store.zig");
 pub const var_store = @import("var_store.zig");
 pub const wal_record = @import("wal_record.zig");
-pub const wal_segment = @import("wal_segment.zig");
 pub const wal = @import("wal.zig");
 pub const txn = @import("txn.zig");
 

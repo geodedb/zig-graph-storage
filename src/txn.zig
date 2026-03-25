@@ -74,7 +74,7 @@ pub const TxnManager = struct {
             .checksum = 0,
         };
         _ = try self.wal.appendRecord(&rec);
-        try self.wal.syncCurrentSegment();
+        try self.wal.sync();
 
         try self.active_txns.put(txn_id, .committed);
     }
@@ -136,7 +136,7 @@ pub const TxnManager = struct {
 
 fn setupTestWal(allocator: Allocator, tmp_dir: *std.testing.TmpDir) !WalManager {
     const uuid = [_]u8{0xEE} ** 16;
-    return try WalManager.init(allocator, tmp_dir.dir, "wal", uuid, 0, 1024 * 1024);
+    return try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
 }
 
 test "begin returns incrementing IDs" {
