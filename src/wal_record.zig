@@ -33,48 +33,81 @@ pub const WalRecord = struct {
     payload: []const u8,
     checksum: u32,
 
-    /// Serialize the record to a newly allocated byte buffer.
-    pub fn serialize(self: *const WalRecord, allocator: Allocator) ![]u8 {
-        const total_size = HEADER_SIZE + self.payload.len + CHECKSUM_SIZE;
-        const buf = try allocator.alloc(u8, total_size);
-        errdefer allocator.free(buf);
+    /// Total serialized size for this record.
+    pub fn serializedSize(self: *const WalRecord) usize {
+        return HEADER_SIZE + self.payload.len + CHECKSUM_SIZE;
+    }
 
+    /// Serialize the record into a caller-provided buffer, computing the
+    /// CRC32C checksum inline in a single pass over the data.
+    ///
+    /// Returns the number of bytes written and updates `self.checksum`
+    /// with the computed value. The buffer must be at least
+    /// `serializedSize()` bytes long.
+    pub fn serializeInto(self: *WalRecord, buf: []u8) error{BufferTooSmall}!usize {
+        const total_size = self.serializedSize();
+        if (buf.len < total_size) return error.BufferTooSmall;
+
+        var hasher = std.hash.crc.Crc32Iscsi.init();
         var offset: usize = 0;
 
         // lsn (8 bytes, little-endian)
-        @memcpy(buf[offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, self.lsn)));
+        const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, self.lsn));
+        @memcpy(buf[offset..][0..8], &lsn_bytes);
+        hasher.update(&lsn_bytes);
         offset += 8;
 
         // txn_id (8 bytes)
-        @memcpy(buf[offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, self.txn_id)));
+        const txn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, self.txn_id));
+        @memcpy(buf[offset..][0..8], &txn_bytes);
+        hasher.update(&txn_bytes);
         offset += 8;
 
         // record_type (1 byte)
         buf[offset] = @intFromEnum(self.record_type);
+        hasher.update(&[_]u8{buf[offset]});
         offset += 1;
 
         // file_id (1 byte)
         buf[offset] = self.file_id;
+        hasher.update(&[_]u8{buf[offset]});
         offset += 1;
 
         // page_id (8 bytes)
-        @memcpy(buf[offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, self.page_id)));
+        const page_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, self.page_id));
+        @memcpy(buf[offset..][0..8], &page_bytes);
+        hasher.update(&page_bytes);
         offset += 8;
 
         // payload_len (4 bytes)
         const payload_len: u32 = @intCast(self.payload.len);
-        @memcpy(buf[offset..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, payload_len)));
+        const plen_bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, payload_len));
+        @memcpy(buf[offset..][0..4], &plen_bytes);
+        hasher.update(&plen_bytes);
         offset += 4;
 
         // payload
         if (self.payload.len > 0) {
             @memcpy(buf[offset..][0..self.payload.len], self.payload);
+            hasher.update(self.payload);
             offset += self.payload.len;
         }
 
-        // checksum (4 bytes)
+        // Finalize checksum and write it
+        self.checksum = hasher.final();
         @memcpy(buf[offset..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, self.checksum)));
+        offset += CHECKSUM_SIZE;
 
+        return offset;
+    }
+
+    /// Serialize the record to a newly allocated byte buffer.
+    /// Convenience wrapper around `serializeInto` that allocates the buffer.
+    pub fn serialize(self: *WalRecord, allocator: Allocator) ![]u8 {
+        const total_size = self.serializedSize();
+        const buf = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(buf);
+        _ = self.serializeInto(buf) catch unreachable;
         return buf;
     }
 
@@ -305,6 +338,89 @@ test "multiple records serialized consecutively can be deserialized back" {
     }
 
     try std.testing.expectEqual(total_len, read_offset);
+}
+
+test "serializeInto writes into caller buffer and computes checksum inline" {
+    const allocator = std.testing.allocator;
+    const payload_data = "inline checksum test";
+
+    var record = WalRecord{
+        .lsn = 99,
+        .txn_id = 12,
+        .record_type = .page_update,
+        .file_id = 5,
+        .page_id = 200,
+        .payload = payload_data,
+        .checksum = 0,
+    };
+
+    // serializeInto should compute checksum as part of serialization
+    var buf: [256]u8 = undefined;
+    const n = try record.serializeInto(&buf);
+
+    // checksum should have been set by serializeInto
+    try std.testing.expect(record.checksum != 0);
+
+    // The checksum should match what computeChecksum produces
+    const expected_checksum = record.computeChecksum();
+    try std.testing.expectEqual(expected_checksum, record.checksum);
+
+    // Deserialize and verify round-trip
+    const result = try WalRecord.deserialize(allocator, buf[0..n]);
+    defer result.record.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 99), result.record.lsn);
+    try std.testing.expectEqual(@as(u64, 12), result.record.txn_id);
+    try std.testing.expectEqual(WalRecordType.page_update, result.record.record_type);
+    try std.testing.expectEqual(@as(u8, 5), result.record.file_id);
+    try std.testing.expectEqual(@as(u64, 200), result.record.page_id);
+    try std.testing.expectEqualStrings(payload_data, result.record.payload);
+    try std.testing.expectEqual(record.checksum, result.record.checksum);
+    try std.testing.expectEqual(n, result.bytes_read);
+}
+
+test "serializeInto returns BufferTooSmall on undersized buffer" {
+    var record = WalRecord{
+        .lsn = 1,
+        .txn_id = 1,
+        .record_type = .begin_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
+    };
+
+    var tiny_buf: [4]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, record.serializeInto(&tiny_buf));
+}
+
+test "serialize convenience wrapper matches serializeInto output" {
+    const allocator = std.testing.allocator;
+    const payload_data = "consistency check";
+
+    var record1 = WalRecord{
+        .lsn = 50,
+        .txn_id = 3,
+        .record_type = .page_update,
+        .file_id = 1,
+        .page_id = 77,
+        .payload = payload_data,
+        .checksum = 0,
+    };
+
+    var record2 = record1;
+
+    // Use serializeInto
+    var buf: [256]u8 = undefined;
+    const n = try record1.serializeInto(&buf);
+
+    // Use serialize (convenience wrapper)
+    const heap_buf = try record2.serialize(allocator);
+    defer allocator.free(heap_buf);
+
+    // Both should produce identical output
+    try std.testing.expectEqualSlices(u8, buf[0..n], heap_buf);
+    try std.testing.expectEqual(record1.checksum, record2.checksum);
 }
 
 test {

@@ -508,10 +508,12 @@ test "recovery skips WAL records with corrupted checksums" {
         .file_id = 0,
         .page_id = 1,
         .payload = &page_data,
-        .checksum = 0xDEADBEEF, // intentionally wrong
+        .checksum = 0,
     };
     const bad_bytes = try bad_update.serialize(allocator);
     defer allocator.free(bad_bytes);
+    // Corrupt the checksum in the serialized bytes (last 4 bytes)
+    @memcpy(bad_bytes[bad_bytes.len - 4 ..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, 0xDEADBEEF))));
     _ = try wal.inner.append(bad_bytes);
     wal.current_lsn = 2;
 

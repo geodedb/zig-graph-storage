@@ -55,18 +55,31 @@ pub const WalManager = struct {
         self.inner.deinit();
     }
 
-    /// Append a WAL record. Assigns LSN, computes checksum, serializes,
-    /// and delegates to the external library for persistence.
-    /// Returns the assigned LSN.
+    /// Maximum record size that can be serialized on the stack.
+    /// Records larger than this fall back to heap allocation.
+    const STACK_BUF_SIZE: usize = 16 * 1024; // 16 KiB
+
+    /// Append a WAL record. Assigns LSN, serializes with inline checksum
+    /// computation (single pass), and delegates to the external library
+    /// for persistence. Returns the assigned LSN.
     pub fn appendRecord(self: *WalManager, record: *WalRecord) !u64 {
         self.current_lsn += 1;
         record.lsn = self.current_lsn;
-        record.checksum = record.computeChecksum();
 
-        const bytes = try record.serialize(self.allocator);
-        defer self.allocator.free(bytes);
+        const needed = record.serializedSize();
 
-        return try self.inner.append(bytes);
+        if (needed <= STACK_BUF_SIZE) {
+            // Fast path: use stack buffer, no heap allocation
+            var buf: [STACK_BUF_SIZE]u8 = undefined;
+            const n = record.serializeInto(&buf) catch unreachable;
+            return try self.inner.append(buf[0..n]);
+        } else {
+            // Fallback: heap-allocate for very large payloads
+            const buf = try self.allocator.alloc(u8, needed);
+            defer self.allocator.free(buf);
+            const n = record.serializeInto(buf) catch unreachable;
+            return try self.inner.append(buf[0..n]);
+        }
     }
 
     /// Sync the WAL to disk (fsync).
