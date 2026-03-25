@@ -79,8 +79,38 @@ pub const GraphDir = struct {
     }
 
     /// Delete the graph directory and all contents.
+    ///
+    /// SEC-0008: Security contract -- `data_dir` (provided at create/open time) MUST
+    /// be a trusted, application-controlled path. This method calls `deleteTree` on
+    /// `<data_dir>/graphs/<uuid_hex>`. If `data_dir` is user-influenced without
+    /// validation, an attacker could cause deletion of arbitrary directories.
+    ///
+    /// Callers MUST ensure:
+    ///   - `data_dir` is not derived from untrusted user input, OR
+    ///   - `data_dir` has been validated against an allowlist before use.
+    ///
+    /// The path is further constrained by the `graphs/<uuid_hex>` suffix, which
+    /// limits the blast radius even if `data_dir` is partially user-controlled.
     pub fn delete(self: *const GraphDir) !void {
+        // Validate that the path contains the expected graphs/<uuid> structure
+        // before performing the destructive deleteTree operation.
+        if (!self.hasExpectedPathStructure()) return error.InvalidGraphPath;
         try std.fs.cwd().deleteTree(self.path);
+    }
+
+    /// Verify the path contains the expected /graphs/<32-hex-chars> suffix.
+    fn hasExpectedPathStructure(self: *const GraphDir) bool {
+        const path = self.path;
+        // Find the last occurrence of "/graphs/"
+        const marker = "/graphs/";
+        const idx = std.mem.lastIndexOf(u8, path, marker) orelse return false;
+        const after = path[idx + marker.len ..];
+        // After "/graphs/" we expect exactly 32 hex characters (the UUID)
+        if (after.len != 32) return false;
+        for (after) |c| {
+            if (!std.ascii.isHex(c)) return false;
+        }
+        return true;
     }
 
     pub fn deinit(self: *GraphDir) void {
