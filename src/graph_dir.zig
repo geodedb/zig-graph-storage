@@ -22,15 +22,20 @@ pub const GraphDir = struct {
         const path = try std.fmt.allocPrint(allocator, "{s}/graphs/{s}", .{ data_dir, uuid_hex });
         errdefer allocator.free(path);
 
-        // Create directory (including parents)
+        // Create directory (including parents) and restrict to owner-only access
         try std.fs.cwd().makePath(path);
+        {
+            var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+            defer dir.close();
+            dir.chmod(0o700) catch {};
+        }
 
         // Create empty store files
         for (file_manager.FILE_NAMES) |file_name| {
             const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, file_name });
             defer allocator.free(file_path);
 
-            const file = try std.fs.cwd().createFile(file_path, .{});
+            const file = try std.fs.cwd().createFile(file_path, .{ .mode = 0o600 });
             file.close();
         }
 
@@ -202,6 +207,44 @@ test "formatUuidHex produces correct output" {
     const uuid = [16]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
     const hex = formatUuidHex(uuid);
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &hex);
+}
+
+test "created store files have mode 0o600 and directory has mode 0o700" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var uuid: [16]u8 = undefined;
+    @memset(&uuid, 0xEE);
+
+    var gd = try GraphDir.create(allocator, tmp_path, uuid);
+    defer gd.deinit();
+
+    // Verify directory has 0o700
+    {
+        var dir = try std.fs.cwd().openDir(gd.path, .{});
+        defer dir.close();
+        const stat = try dir.stat();
+        const perm = stat.mode & 0o777;
+        try std.testing.expectEqual(@as(u32, 0o700), perm);
+    }
+
+    // Verify each store file has 0o600
+    for (file_manager.FILE_NAMES) |file_name| {
+        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ gd.path, file_name });
+        defer allocator.free(file_path);
+
+        const stat = try std.fs.cwd().statFile(file_path);
+        const perm = stat.mode & 0o777;
+        try std.testing.expectEqual(@as(u32, 0o600), perm);
+    }
 }
 
 test {

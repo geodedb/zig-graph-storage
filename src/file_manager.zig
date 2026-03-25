@@ -54,10 +54,11 @@ pub const FileManager = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.graph_dir, FILE_NAMES[idx] });
         defer self.allocator.free(path);
 
-        // Open or create
+        // Open or create with restricted permissions (owner-only read/write)
         const file = try std.fs.cwd().createFile(path, .{
             .read = true,
             .truncate = false, // don't truncate existing files!
+            .mode = 0o600,
         });
 
         self.files[idx] = file;
@@ -270,6 +271,28 @@ test "FILE_NAMES has correct count and entries" {
     try testing.expectEqualStrings("free.store", FILE_NAMES[@intFromEnum(FileId.free)]);
     try testing.expectEqualStrings("labels.idx", FILE_NAMES[@intFromEnum(FileId.label_idx)]);
     try testing.expectEqualStrings("props.idx", FILE_NAMES[@intFromEnum(FileId.prop_idx)]);
+}
+
+test "created files have mode 0o600" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+
+    var fm = FileManager.init(testing.allocator, dir_path, 4096);
+    defer fm.deinit();
+
+    _ = try fm.openFile(.nodes);
+
+    // Stat the file and check permissions
+    const stat = try tmp.dir.statFile("nodes.store");
+    // Mask out file type bits, check permission bits
+    const perm = stat.mode & 0o777;
+    try testing.expectEqual(@as(u32, 0o600), perm);
 }
 
 test {
