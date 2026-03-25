@@ -118,15 +118,16 @@
 
 ## SEC-0009: Unsafe @enumFromInt on disk data
 
-- **Status:** Open
+- **Status:** Closed
 - **Severity:** Medium
 - **File:** `src/index_catalog.zig:172-173`, `src/prop_store.zig:308`, `src/recovery.zig:146`
 - **Description:** `@enumFromInt` on bytes from disk is undefined behavior in ReleaseFast for invalid values. `wal_record.zig:96` and `property.zig:90` correctly use `std.meta.intToEnum`.
 - **Acceptance Criteria:**
-  - [ ] All `@enumFromInt` on disk-read data replaced with `std.meta.intToEnum`
-  - [ ] Error returned on invalid enum values
-  - [ ] Test with invalid enum byte verifies error (not UB)
+  - [x] All `@enumFromInt` on disk-read data replaced with `std.meta.intToEnum`
+  - [x] Error returned on invalid enum values
+  - [x] Test with invalid enum byte verifies error (not UB)
 - **Affected Files:** `src/index_catalog.zig`, `src/prop_store.zig`, `src/recovery.zig`
+- **Resolution:** Replaced all three `@enumFromInt` calls with `std.meta.intToEnum` + error propagation. Added tests for invalid IndexType, IndexState, and property Tag bytes.
 
 ## SEC-0010: No page_size validation on engine open
 
@@ -142,25 +143,27 @@
 
 ## SEC-0011: No file permissions set on created files
 
-- **Status:** Open
+- **Status:** Closed
 - **Severity:** Medium
 - **File:** `src/file_manager.zig:58-61`, `src/graph_dir.zig:33-34`
 - **Description:** All files created with default umask. On shared systems, store files may be world-readable.
 - **Acceptance Criteria:**
-  - [ ] Store files created with mode 0o600 (owner read/write only)
-  - [ ] Directory created with mode 0o700
+  - [x] Store files created with mode 0o600 (owner read/write only)
+  - [x] Directory created with mode 0o700
 - **Affected Files:** `src/file_manager.zig`, `src/graph_dir.zig`
+- **Resolution:** Set `.mode = 0o600` in all `createFile` calls. Added `dir.chmod(0o700)` after `makePath` for graph directories. Added permission verification tests.
 
 ## SEC-0012: Unsafe @ptrCast/@alignCast on page data
 
-- **Status:** Open
+- **Status:** Closed
 - **Severity:** Medium
 - **File:** `src/node_store.zig:50,92`, `src/page.zig:78`, `src/adj_store.zig:227,239`
 - **Description:** `@ptrCast(@alignCast(...))` on page buffer data. Buffer pool uses 4096-aligned allocation so in-pool casts are safe, but `page.zig:78` (`headerFromBytes`) could fail alignment if called with stack-allocated `[32]u8`.
 - **Acceptance Criteria:**
-  - [ ] `headerFromBytes` uses `std.mem.bytesToValue` instead of pointer cast
-  - [ ] OR document alignment requirement in function doc comment
+  - [x] `headerFromBytes` uses `std.mem.bytesToValue` instead of pointer cast
+  - [x] OR document alignment requirement in function doc comment
 - **Affected Files:** `src/page.zig`, `src/node_store.zig`
+- **Resolution:** Replaced `headerFromBytes` with `std.mem.bytesToValue` returning a value instead of a pointer. Replaced `@ptrCast/@alignCast` in `node_store.zig` getNode and deleteNode with `bytesToValue` for alignment-safe access. Added test for unaligned input.
 
 ## SEC-0013: Integer truncation in backup on 32-bit
 
