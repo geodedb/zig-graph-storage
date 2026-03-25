@@ -62,7 +62,7 @@ pub const PropStore = struct {
             const next_page = readNextPage(data);
             const entry_count = readEntryCount(data);
 
-            // Scan entries
+            // Scan entries — only decode the value when the key matches
             var offset: u32 = PROP_DATA_OFFSET;
             var i: u32 = 0;
             while (i < entry_count) : (i += 1) {
@@ -71,18 +71,16 @@ pub const PropStore = struct {
                 const entry_key = data[offset..][0..key_len];
                 offset += key_len;
 
-                // Decode value to get its size
-                const decode_result = try property_mod.decode(allocator, data[offset..]);
-
                 if (std.mem.eql(u8, entry_key, key)) {
-                    // Found it
+                    // Found it — decode the value
+                    const decode_result = try property_mod.decode(allocator, data[offset..]);
                     self.buffer_pool.unpin(frame_idx, false);
                     return decode_result.value;
                 }
 
-                // Not the key we want: free decoded value if it owns memory
-                property_mod.freeDecoded(allocator, decode_result.value);
-                offset += @intCast(decode_result.bytes_read);
+                // Not the key we want: skip value by encoded size (no heap alloc)
+                const val_size = try encodedSizeFromBytes(data[offset..]);
+                offset += @intCast(val_size);
             }
 
             self.buffer_pool.unpin(frame_idx, false);
@@ -244,13 +242,12 @@ pub const PropStore = struct {
                 const entry_key = data[offset..][0..key_len];
                 offset += key_len;
 
-                // Skip value bytes
-                const val_size = property_mod.decode(self.buffer_pool.allocator, data[offset..]) catch {
+                // Skip value bytes by encoded size (no heap alloc)
+                const val_size = encodedSizeFromBytes(data[offset..]) catch {
                     self.buffer_pool.unpin(frame_idx, false);
                     return;
                 };
-                property_mod.freeDecoded(self.buffer_pool.allocator, val_size.value);
-                offset += @intCast(val_size.bytes_read);
+                offset += @intCast(val_size);
 
                 if (std.mem.eql(u8, entry_key, key)) {
                     // Found: shift remaining entries
