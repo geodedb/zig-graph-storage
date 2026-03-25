@@ -7,7 +7,7 @@ A Zig library for graph-storage
 
 ## Features
 
-- **Zero Dependencies**: Pure Zig standard library only
+- **Minimal Dependencies**: Only [wal](https://gitlab.com/devnw/zig/wal) and [uuid](https://gitlab.com/devnw/zig/uuid) from the devnw/zig ecosystem
 - **Memory Safe**: Proper allocation patterns with no leaks
 - **Cross-Platform**: Linux, macOS, Windows support
 - **Well Tested**: Comprehensive unit and integration tests
@@ -41,12 +41,19 @@ exe.root_module.addImport("graph_storage", graph_storage.module("graph_storage")
 
 ```zig
 const std = @import("std");
-const graph_storage = @import("graph_storage");
+const gs = @import("graph_storage");
 
 pub fn main() !void {
-    try graph_storage.init(.{
-        .debug = true,
-    });
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const graph_uuid = [_]u8{0} ** 16; // use a real UUID in production
+    const cfg = gs.GraphConfig{};
+
+    // Create a new graph (or use GraphEngine.open() for an existing one)
+    const engine = try gs.GraphEngine.create(allocator, "data", graph_uuid, cfg);
+    defer engine.close();
 }
 ```
 
