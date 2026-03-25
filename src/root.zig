@@ -10,6 +10,7 @@ const std = @import("std");
 pub const types = @import("types.zig");
 pub const errors = @import("errors.zig");
 pub const config = @import("config.zig");
+pub const page = @import("page.zig");
 
 // Re-export key types for convenience
 pub const NodeId = types.NodeId;
