@@ -1,0 +1,560 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2025 CodePros
+
+const std = @import("std");
+const types = @import("types.zig");
+const page_mod = @import("page.zig");
+const property_mod = @import("property.zig");
+const buffer_pool_mod = @import("buffer_pool.zig");
+const free_space_mod = @import("free_space.zig");
+const var_store_mod = @import("var_store.zig");
+const interface_mod = @import("interface.zig");
+
+const Allocator = std.mem.Allocator;
+const BufferPool = buffer_pool_mod.BufferPool;
+const FreeSpaceManager = free_space_mod.FreeSpaceManager;
+const VarStore = var_store_mod.VarStore;
+const PropertyValue = types.PropertyValue;
+const PropertyEntry = interface_mod.PropertyEntry;
+const PageId = types.PageId;
+const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
+
+/// Property page metadata offsets (after PAGE_HEADER_SIZE):
+/// - [0..8): next_page (u64), pointer to overflow property page
+/// - [8..12): entry_count (u32), number of property entries on this page
+/// - [12..): entries, each: key_len(2) + key_bytes + encoded_value_bytes
+const PROP_META_SIZE: u32 = 12; // next_page(8) + entry_count(4)
+const PROP_DATA_OFFSET: u32 = PAGE_HEADER_SIZE + PROP_META_SIZE;
+
+/// Slotted-page property storage with overflow.
+/// For v1, uses a simple sequential layout within each property page.
+pub const PropStore = struct {
+    buffer_pool: *BufferPool,
+    free_space: *FreeSpaceManager,
+    var_store: *VarStore,
+    page_size: u32,
+
+    pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, var_store: *VarStore, page_size: u32) PropStore {
+        return .{
+            .buffer_pool = buffer_pool,
+            .free_space = free_space,
+            .var_store = var_store,
+            .page_size = page_size,
+        };
+    }
+
+    /// Usable data bytes per property page.
+    fn dataCapacity(self: *const PropStore) u32 {
+        return self.page_size - PROP_DATA_OFFSET;
+    }
+
+    /// Get a property value by key from a property page chain.
+    /// Returns null if not found.
+    pub fn getProperty(self: *PropStore, prop_head: u64, key: []const u8, allocator: Allocator) !?PropertyValue {
+        if (prop_head == 0) return null;
+
+        var current_page: PageId = prop_head;
+        while (current_page != 0) {
+            const frame = try self.buffer_pool.pin(.props, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+
+            const next_page = readNextPage(data);
+            const entry_count = readEntryCount(data);
+
+            // Scan entries
+            var offset: u32 = PROP_DATA_OFFSET;
+            var i: u32 = 0;
+            while (i < entry_count) : (i += 1) {
+                const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
+                offset += 2;
+                const entry_key = data[offset..][0..key_len];
+                offset += key_len;
+
+                // Decode value to get its size
+                const decode_result = try property_mod.decode(allocator, data[offset..]);
+
+                if (std.mem.eql(u8, entry_key, key)) {
+                    // Found it
+                    self.buffer_pool.unpin(frame_idx, false);
+                    return decode_result.value;
+                }
+
+                // Not the key we want: free decoded value if it owns memory
+                property_mod.freeDecoded(allocator, decode_result.value);
+                offset += @intCast(decode_result.bytes_read);
+            }
+
+            self.buffer_pool.unpin(frame_idx, false);
+            current_page = next_page;
+        }
+
+        return null;
+    }
+
+    /// Get all properties from a property page chain.
+    /// Caller owns the returned slice and must free keys, values, and the slice.
+    pub fn getAllProperties(self: *PropStore, prop_head: u64, allocator: Allocator) ![]PropertyEntry {
+        if (prop_head == 0) return try allocator.alloc(PropertyEntry, 0);
+
+        var result: std.ArrayList(PropertyEntry) = .{};
+        errdefer {
+            for (result.items) |entry| {
+                allocator.free(entry.key);
+                property_mod.freeDecoded(allocator, entry.value);
+            }
+            result.deinit(allocator);
+        }
+
+        var current_page: PageId = prop_head;
+        while (current_page != 0) {
+            const frame = try self.buffer_pool.pin(.props, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+
+            const next_page = readNextPage(data);
+            const entry_count = readEntryCount(data);
+
+            var offset: u32 = PROP_DATA_OFFSET;
+            var i: u32 = 0;
+            while (i < entry_count) : (i += 1) {
+                const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
+                offset += 2;
+                const entry_key = try allocator.dupe(u8, data[offset..][0..key_len]);
+                offset += key_len;
+
+                const decode_result = try property_mod.decode(allocator, data[offset..]);
+                offset += @intCast(decode_result.bytes_read);
+
+                try result.append(allocator, .{
+                    .key = entry_key,
+                    .value = decode_result.value,
+                });
+            }
+
+            self.buffer_pool.unpin(frame_idx, false);
+            current_page = next_page;
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Put a property. Returns the (possibly new) prop_head.
+    /// If the key already exists, it is replaced (remove + re-add).
+    pub fn putProperty(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
+        // If key already exists, remove it first
+        const current_head = prop_head;
+        if (current_head != 0) {
+            const exists = try self.getProperty(current_head, key, self.buffer_pool.allocator);
+            if (exists) |v| {
+                property_mod.freeDecoded(self.buffer_pool.allocator, v);
+                try self.removeProperty(current_head, key);
+            }
+        }
+
+        // Encode value
+        const encoded_val = try property_mod.encode(self.buffer_pool.allocator, val);
+        defer self.buffer_pool.allocator.free(encoded_val);
+
+        const entry_size: u32 = 2 + @as(u32, @intCast(key.len)) + @as(u32, @intCast(encoded_val.len));
+
+        if (current_head == 0) {
+            // Allocate new property page
+            const new_page = try self.free_space.allocPage();
+            const frame = try self.buffer_pool.pinNew(.props, new_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+
+            writeNextPage(data, 0);
+            writeEntryCount(data, 1);
+            self.writePropertyEntry(data, PROP_DATA_OFFSET, key, encoded_val);
+
+            self.buffer_pool.unpin(frame_idx, true);
+            return new_page;
+        }
+
+        // Try to find space in existing pages
+        var current_page: PageId = current_head;
+        while (current_page != 0) {
+            const frame = try self.buffer_pool.pin(.props, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+
+            const next_page = readNextPage(data);
+            const entry_count = readEntryCount(data);
+
+            // Calculate used space
+            const used = self.usedBytes(data, entry_count);
+            const available = self.dataCapacity() - used;
+
+            if (available >= entry_size) {
+                // Append here
+                const write_offset = PROP_DATA_OFFSET + used;
+                self.writePropertyEntry(data, write_offset, key, encoded_val);
+                writeEntryCount(data, entry_count + 1);
+                self.buffer_pool.unpin(frame_idx, true);
+                return current_head;
+            }
+
+            if (next_page == 0) {
+                // Allocate overflow page
+                const new_page = try self.free_space.allocPage();
+                const new_frame = try self.buffer_pool.pinNew(.props, new_page);
+                const new_frame_idx = self.buffer_pool.frameIndex(new_frame);
+                const new_data = new_frame.dataSlice();
+
+                writeNextPage(new_data, 0);
+                writeEntryCount(new_data, 1);
+                self.writePropertyEntry(new_data, PROP_DATA_OFFSET, key, encoded_val);
+                self.buffer_pool.unpin(new_frame_idx, true);
+
+                // Link from current page
+                writeNextPage(data, new_page);
+                self.buffer_pool.unpin(frame_idx, true);
+                return current_head;
+            }
+
+            self.buffer_pool.unpin(frame_idx, false);
+            current_page = next_page;
+        }
+
+        unreachable;
+    }
+
+    /// Remove a property by key. Scans all pages in the chain.
+    /// Compacts the page by shifting remaining entries forward.
+    pub fn removeProperty(self: *PropStore, prop_head: u64, key: []const u8) !void {
+        if (prop_head == 0) return;
+
+        var current_page: PageId = prop_head;
+        while (current_page != 0) {
+            const frame = try self.buffer_pool.pin(.props, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+
+            const next_page = readNextPage(data);
+            var entry_count = readEntryCount(data);
+
+            var offset: u32 = PROP_DATA_OFFSET;
+            var i: u32 = 0;
+            while (i < entry_count) : (i += 1) {
+                const entry_start = offset;
+                const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
+                offset += 2;
+                const entry_key = data[offset..][0..key_len];
+                offset += key_len;
+
+                // Skip value bytes
+                const val_size = property_mod.decode(self.buffer_pool.allocator, data[offset..]) catch {
+                    self.buffer_pool.unpin(frame_idx, false);
+                    return;
+                };
+                property_mod.freeDecoded(self.buffer_pool.allocator, val_size.value);
+                offset += @intCast(val_size.bytes_read);
+
+                if (std.mem.eql(u8, entry_key, key)) {
+                    // Found: shift remaining entries
+                    const total_used = PROP_DATA_OFFSET + self.usedBytes(data, entry_count);
+                    const remaining = total_used - offset;
+                    if (remaining > 0) {
+                        std.mem.copyForwards(u8, data[entry_start..], data[offset..][0..remaining]);
+                    }
+                    // Zero out the freed space
+                    const new_end = entry_start + remaining;
+                    @memset(data[new_end..total_used], 0);
+
+                    entry_count -= 1;
+                    writeEntryCount(data, entry_count);
+                    self.buffer_pool.unpin(frame_idx, true);
+                    return;
+                }
+            }
+
+            self.buffer_pool.unpin(frame_idx, false);
+            current_page = next_page;
+        }
+    }
+
+    // Internal helpers
+
+    fn writePropertyEntry(_: *const PropStore, data: []u8, offset: u32, key: []const u8, encoded_val: []const u8) void {
+        var off = offset;
+        const key_len: u16 = @intCast(key.len);
+        @memcpy(data[off..][0..2], &std.mem.toBytes(key_len));
+        off += 2;
+        @memcpy(data[off..][0..key.len], key);
+        off += @intCast(key.len);
+        @memcpy(data[off..][0..encoded_val.len], encoded_val);
+    }
+
+    fn usedBytes(_: *const PropStore, data: []const u8, entry_count: u32) u32 {
+        var i: u32 = 0;
+        var off: u32 = PROP_DATA_OFFSET;
+        while (i < entry_count) : (i += 1) {
+            const key_len = std.mem.bytesToValue(u16, data[off..][0..2]);
+            off += 2;
+            off += key_len;
+            const esize = encodedSizeFromBytes(data[off..]);
+            off += @intCast(esize);
+        }
+        return off - PROP_DATA_OFFSET;
+    }
+};
+
+/// Determine the encoded size of a property value from its raw bytes.
+/// This avoids needing to fully decode the value.
+fn encodedSizeFromBytes(bytes: []const u8) usize {
+    if (bytes.len < 1) return 0;
+    const tag: property_mod.Tag = @enumFromInt(bytes[0]);
+    return switch (tag) {
+        .null => 1,
+        .bool => 2,
+        .int => 9,
+        .float => 9,
+        .string => blk: {
+            if (bytes.len < 5) break :blk 1;
+            const len = std.mem.bytesToValue(u32, bytes[1..5]);
+            break :blk 5 + @as(usize, len);
+        },
+        .decimal => 18,
+        .ext => blk: {
+            if (bytes.len < 7) break :blk 1;
+            const data_len = std.mem.bytesToValue(u32, bytes[3..7]);
+            break :blk 7 + @as(usize, data_len);
+        },
+    };
+}
+
+fn readNextPage(data: []const u8) PageId {
+    return std.mem.bytesToValue(u64, data[PAGE_HEADER_SIZE..][0..8]);
+}
+
+fn readEntryCount(data: []const u8) u32 {
+    return std.mem.bytesToValue(u32, data[PAGE_HEADER_SIZE + 8 ..][0..4]);
+}
+
+fn writeNextPage(data: []u8, page_id: PageId) void {
+    @memcpy(data[PAGE_HEADER_SIZE..][0..8], &std.mem.toBytes(page_id));
+}
+
+fn writeEntryCount(data: []u8, count: u32) void {
+    @memcpy(data[PAGE_HEADER_SIZE + 8 ..][0..4], &std.mem.toBytes(count));
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+const testing = std.testing;
+const pager_mod = @import("pager.zig");
+const Pager = pager_mod.Pager;
+
+const TestEnv = struct {
+    pool: BufferPool,
+    fsm: FreeSpaceManager,
+    vs: VarStore,
+    tmp_dir: testing.TmpDir,
+    prop_file: std.fs.File,
+    prop_pager: Pager,
+    var_file: std.fs.File,
+    var_pager: Pager,
+
+    fn init() !TestEnv {
+        var tmp_dir = testing.tmpDir(.{});
+        const prop_file = tmp_dir.dir.createFile("props.store", .{ .read = true, .truncate = true }) catch unreachable;
+        const var_file = tmp_dir.dir.createFile("var.store", .{ .read = true, .truncate = true }) catch unreachable;
+
+        var pool = try BufferPool.init(testing.allocator, 4096, 32);
+        const fsm = try FreeSpaceManager.init(testing.allocator, &pool, .props);
+
+        return .{
+            .pool = pool,
+            .fsm = fsm,
+            .vs = undefined, // set in fixup
+            .tmp_dir = tmp_dir,
+            .prop_file = prop_file,
+            .prop_pager = Pager.init(prop_file, 4096),
+            .var_file = var_file,
+            .var_pager = Pager.init(var_file, 4096),
+        };
+    }
+
+    fn fixup(self: *TestEnv) void {
+        self.pool.registerPager(.props, &self.prop_pager);
+        self.pool.registerPager(.var_store, &self.var_pager);
+        self.fsm.buffer_pool = &self.pool;
+        self.vs = VarStore.init(&self.pool, &self.fsm, 4096);
+    }
+
+    fn deinit(self: *TestEnv) void {
+        self.fsm.deinit();
+        self.pool.deinit();
+        self.prop_file.close();
+        self.var_file.close();
+        self.tmp_dir.cleanup();
+    }
+};
+
+test "putProperty + getProperty round-trip: int" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    const head = try store.putProperty(0, "age", .{ .int = 30 });
+    try testing.expect(head != 0);
+
+    const val = try store.getProperty(head, "age", testing.allocator);
+    try testing.expect(val != null);
+    try testing.expectEqual(@as(i64, 30), val.?.int);
+}
+
+test "putProperty + getProperty round-trip: string" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    const head = try store.putProperty(0, "name", .{ .string = "Alice" });
+
+    const val = try store.getProperty(head, "name", testing.allocator);
+    try testing.expect(val != null);
+    defer property_mod.freeDecoded(testing.allocator, val.?);
+    try testing.expectEqualStrings("Alice", val.?.string);
+}
+
+test "putProperty + getProperty round-trip: bool" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    const head = try store.putProperty(0, "active", .{ .bool = true });
+    const val = try store.getProperty(head, "active", testing.allocator);
+    try testing.expect(val != null);
+    try testing.expect(val.?.bool);
+}
+
+test "putProperty + getProperty round-trip: float" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    const head = try store.putProperty(0, "score", .{ .float = 3.14 });
+    const val = try store.getProperty(head, "score", testing.allocator);
+    try testing.expect(val != null);
+    try testing.expectApproxEqAbs(@as(f64, 3.14), val.?.float, 0.001);
+}
+
+test "putProperty + getProperty round-trip: null" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    const head = try store.putProperty(0, "nothing", PropertyValue.null);
+    const val = try store.getProperty(head, "nothing", testing.allocator);
+    try testing.expect(val != null);
+    try testing.expectEqual(PropertyValue.null, val.?);
+}
+
+test "getAllProperties returns all stored properties" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    var head = try store.putProperty(0, "name", .{ .string = "Bob" });
+    head = try store.putProperty(head, "age", .{ .int = 25 });
+    head = try store.putProperty(head, "active", .{ .bool = false });
+
+    const props = try store.getAllProperties(head, testing.allocator);
+    defer {
+        for (props) |entry| {
+            testing.allocator.free(entry.key);
+            property_mod.freeDecoded(testing.allocator, entry.value);
+        }
+        testing.allocator.free(props);
+    }
+
+    try testing.expectEqual(@as(usize, 3), props.len);
+}
+
+test "removeProperty removes the property" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    var head = try store.putProperty(0, "x", .{ .int = 1 });
+    head = try store.putProperty(head, "y", .{ .int = 2 });
+    head = try store.putProperty(head, "z", .{ .int = 3 });
+
+    try store.removeProperty(head, "y");
+
+    const val = try store.getProperty(head, "y", testing.allocator);
+    try testing.expect(val == null);
+
+    // x and z should still be there
+    const vx = try store.getProperty(head, "x", testing.allocator);
+    try testing.expect(vx != null);
+    try testing.expectEqual(@as(i64, 1), vx.?.int);
+
+    const vz = try store.getProperty(head, "z", testing.allocator);
+    try testing.expect(vz != null);
+    try testing.expectEqual(@as(i64, 3), vz.?.int);
+}
+
+test "multiple properties on same entity" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    var head = try store.putProperty(0, "a", .{ .int = 1 });
+    head = try store.putProperty(head, "b", .{ .int = 2 });
+    head = try store.putProperty(head, "c", .{ .int = 3 });
+    head = try store.putProperty(head, "d", .{ .int = 4 });
+
+    const va = try store.getProperty(head, "a", testing.allocator);
+    try testing.expectEqual(@as(i64, 1), va.?.int);
+
+    const vd = try store.getProperty(head, "d", testing.allocator);
+    try testing.expectEqual(@as(i64, 4), vd.?.int);
+}
+
+test "getProperty returns null for nonexistent key" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    const head = try store.putProperty(0, "x", .{ .int = 1 });
+    const val = try store.getProperty(head, "nope", testing.allocator);
+    try testing.expect(val == null);
+}
+
+test "getProperty returns null for empty prop_head" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    const val = try store.getProperty(0, "anything", testing.allocator);
+    try testing.expect(val == null);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}

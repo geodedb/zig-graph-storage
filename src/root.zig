@@ -23,6 +23,11 @@ pub const manifest = @import("manifest.zig");
 pub const graph_dir = @import("graph_dir.zig");
 pub const registry = @import("registry.zig");
 pub const label_dict = @import("label_dict.zig");
+pub const free_space = @import("free_space.zig");
+pub const node_store = @import("node_store.zig");
+pub const adj_store = @import("adj_store.zig");
+pub const prop_store = @import("prop_store.zig");
+pub const var_store = @import("var_store.zig");
 
 // Re-export key types for convenience
 pub const GraphStorage = interface.GraphStorage;
