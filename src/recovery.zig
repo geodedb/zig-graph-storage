@@ -609,8 +609,13 @@ test "GAP-0005a: torn/truncated WAL record is safely skipped during recovery" {
 
     // BEGIN txn 1
     var begin_rec = WalRecord{
-        .lsn = 0, .txn_id = 1, .record_type = .begin_txn,
-        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+        .lsn = 0,
+        .txn_id = 1,
+        .record_type = .begin_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
     };
     _ = try wal.appendRecord(&begin_rec);
 
@@ -618,15 +623,25 @@ test "GAP-0005a: torn/truncated WAL record is safely skipped during recovery" {
     var page_data: [4096]u8 = undefined;
     @memset(&page_data, 0xF1);
     var update_rec = WalRecord{
-        .lsn = 0, .txn_id = 1, .record_type = .page_update,
-        .file_id = 0, .page_id = 1, .payload = &page_data, .checksum = 0,
+        .lsn = 0,
+        .txn_id = 1,
+        .record_type = .page_update,
+        .file_id = 0,
+        .page_id = 1,
+        .payload = &page_data,
+        .checksum = 0,
     };
     _ = try wal.appendRecord(&update_rec);
 
     // COMMIT txn 1
     var commit_rec = WalRecord{
-        .lsn = 0, .txn_id = 1, .record_type = .commit_txn,
-        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+        .lsn = 0,
+        .txn_id = 1,
+        .record_type = .commit_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
     };
     _ = try wal.appendRecord(&commit_rec);
 
@@ -789,7 +804,10 @@ test "GAP-0005c: multiple concurrent transactions -- only committed data survive
     // Check committed data is present
     var committed_ok = true;
     for (read_buf1[page_mod.PAGE_HEADER_SIZE..]) |byte| {
-        if (byte != 0xAA) { committed_ok = false; break; }
+        if (byte != 0xAA) {
+            committed_ok = false;
+            break;
+        }
     }
     try testing.expect(committed_ok);
 
@@ -801,7 +819,10 @@ test "GAP-0005c: multiple concurrent transactions -- only committed data survive
     };
     var uncommitted_present = true;
     for (read_buf2[page_mod.PAGE_HEADER_SIZE..]) |byte| {
-        if (byte != 0xBB) { uncommitted_present = false; break; }
+        if (byte != 0xBB) {
+            uncommitted_present = false;
+            break;
+        }
     }
     try testing.expect(!uncommitted_present);
 
@@ -813,7 +834,10 @@ test "GAP-0005c: multiple concurrent transactions -- only committed data survive
     };
     var aborted_present = true;
     for (read_buf3[page_mod.PAGE_HEADER_SIZE..]) |byte| {
-        if (byte != 0xCC) { aborted_present = false; break; }
+        if (byte != 0xCC) {
+            aborted_present = false;
+            break;
+        }
     }
     try testing.expect(!aborted_present);
 }
@@ -846,8 +870,13 @@ test "GAP-0005d: recovery with many pages (>100 page updates in WAL)" {
 
     // BEGIN txn 1
     var begin_rec = WalRecord{
-        .lsn = 0, .txn_id = 1, .record_type = .begin_txn,
-        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+        .lsn = 0,
+        .txn_id = 1,
+        .record_type = .begin_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
     };
     _ = try wal.appendRecord(&begin_rec);
 
@@ -871,8 +900,13 @@ test "GAP-0005d: recovery with many pages (>100 page updates in WAL)" {
 
     // COMMIT txn 1
     var commit_rec = WalRecord{
-        .lsn = 0, .txn_id = 1, .record_type = .commit_txn,
-        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+        .lsn = 0,
+        .txn_id = 1,
+        .record_type = .commit_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
     };
     _ = try wal.appendRecord(&commit_rec);
 
@@ -905,7 +939,10 @@ test "GAP-0005d: recovery with many pages (>100 page updates in WAL)" {
         const expected_byte: u8 = @intCast((pg - 1) % 256);
         var match = true;
         for (read_buf[page_mod.PAGE_HEADER_SIZE..]) |byte| {
-            if (byte != expected_byte) { match = false; break; }
+            if (byte != expected_byte) {
+                match = false;
+                break;
+            }
         }
         try testing.expect(match);
     }
