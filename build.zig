@@ -134,6 +134,44 @@ pub fn build(b: *std.Build) void {
     }
     load_bench_step.dependOn(&run_load_bench.step);
 
+    // Incremental scale benchmark executable
+    const scale_bench_step = b.step("scale-bench", "Run incremental scale benchmarks with JSON output");
+    const scale_bench_exe = b.addExecutable(.{
+        .name = "scale-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/scale_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "graph_storage", .module = module },
+                .{ .name = "seed", .module = seed_mod },
+                .{ .name = "wal", .module = wal_mod },
+                .{ .name = "uuid", .module = uuid_mod },
+            },
+        }),
+    });
+    const run_scale_bench = b.addRunArtifact(scale_bench_exe);
+    if (b.args) |args| {
+        run_scale_bench.addArgs(args);
+    }
+    scale_bench_step.dependOn(&run_scale_bench.step);
+
+    // Benchmark comparison tool
+    const compare_bench_step = b.step("compare-bench", "Compare benchmark results against a baseline");
+    const compare_bench_exe = b.addExecutable(.{
+        .name = "compare-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/compare.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_compare_bench = b.addRunArtifact(compare_bench_exe);
+    if (b.args) |args| {
+        run_compare_bench.addArgs(args);
+    }
+    compare_bench_step.dependOn(&run_compare_bench.step);
+
     // Check step for IDE integration (fast syntax validation)
     const check_step = b.step("check", "Check for compilation errors");
     const check = b.addTest(.{
