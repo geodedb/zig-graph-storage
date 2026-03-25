@@ -181,8 +181,20 @@ pub const PropStore = struct {
             const next_page = readNextPage(data);
             const entry_count = readEntryCount(data);
 
-            // Calculate used space
-            const used = try self.usedBytes(data, entry_count);
+            // Compute used space inline (avoids separate usedBytes rescan)
+            var used: u32 = 0;
+            {
+                var scan_off: u32 = PROP_DATA_OFFSET;
+                var ei: u32 = 0;
+                while (ei < entry_count) : (ei += 1) {
+                    const kl = std.mem.bytesToValue(u16, data[scan_off..][0..2]);
+                    scan_off += 2;
+                    scan_off += kl;
+                    const esize = try encodedSizeFromBytes(data[scan_off..]);
+                    scan_off += @intCast(esize);
+                }
+                used = scan_off - PROP_DATA_OFFSET;
+            }
             const available = self.dataCapacity() - used;
 
             if (available >= entry_size) {
