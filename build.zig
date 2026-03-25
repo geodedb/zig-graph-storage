@@ -64,6 +64,43 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     integration_step.dependOn(&run_integration_tests.step);
 
+    // Example executable
+    const example = b.addExecutable(.{
+        .name = "basic-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/basic.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "graph_storage", .module = module },
+            },
+        }),
+    });
+    b.installArtifact(example);
+
+    const run_example = b.addRunArtifact(example);
+    run_example.step.dependOn(b.getInstallStep());
+    const run_step = b.step("run-example", "Run the basic usage example");
+    run_step.dependOn(&run_example.step);
+
+    // Benchmark executable
+    const bench_step = b.step("bench", "Run performance benchmarks");
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "graph_storage", .module = module },
+                .{ .name = "wal", .module = wal_mod },
+                .{ .name = "uuid", .module = uuid_mod },
+            },
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&run_bench.step);
+
     // Check step for IDE integration (fast syntax validation)
     const check_step = b.step("check", "Check for compilation errors");
     const check = b.addTest(.{
