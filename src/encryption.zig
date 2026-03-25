@@ -19,12 +19,21 @@ pub const PageEncryption = struct {
         return .{ .key = key };
     }
 
-    /// Build a nonce from page_id and file_id.
-    /// Nonce = page_id(8 bytes LE) + file_id(1 byte) + 3 zero bytes = 12 bytes
-    pub fn buildNonce(page_id: u64, file_id: u8) [NONCE_SIZE]u8 {
+    /// Build a nonce from page_id, file_id, and write_count.
+    /// Nonce = page_id(8 bytes LE) + file_id(1 byte) + write_count(3 bytes LE) = 12 bytes
+    ///
+    /// The write_count MUST be monotonically increasing per (page_id, file_id, key)
+    /// tuple to prevent AES-GCM nonce reuse. Callers should persist the counter in the
+    /// page header's reserved bytes and increment it on every write.
+    pub fn buildNonce(page_id: u64, file_id: u8, write_count: u24) [NONCE_SIZE]u8 {
         var nonce: [NONCE_SIZE]u8 = [_]u8{0} ** NONCE_SIZE;
         std.mem.writeInt(u64, nonce[0..8], page_id, .little);
         nonce[8] = file_id;
+        // Write the 24-bit write counter into bytes 9..12 (little-endian)
+        const wc_bytes = std.mem.toBytes(write_count);
+        nonce[9] = wc_bytes[0];
+        nonce[10] = wc_bytes[1];
+        nonce[11] = wc_bytes[2];
         return nonce;
     }
 
@@ -33,12 +42,12 @@ pub const PageEncryption = struct {
     /// last TAG_SIZE bytes of the body region, so usable body space is reduced
     /// by TAG_SIZE when encryption is enabled. The header is included as
     /// additional authenticated data, binding the ciphertext to its header.
-    pub fn encryptPage(self: *const PageEncryption, page_buf: []u8, page_id: u64, file_id: u8) void {
+    pub fn encryptPage(self: *const PageEncryption, page_buf: []u8, page_id: u64, file_id: u8, write_count: u24) void {
         std.debug.assert(page_buf.len > PAGE_HEADER_SIZE + TAG_SIZE);
 
         const header_slice = page_buf[0..PAGE_HEADER_SIZE];
         const body = page_buf[PAGE_HEADER_SIZE..];
-        const nonce = buildNonce(page_id, file_id);
+        const nonce = buildNonce(page_id, file_id, write_count);
 
         const plaintext_len = body.len - TAG_SIZE;
         const plaintext = body[0..plaintext_len];
@@ -62,12 +71,12 @@ pub const PageEncryption = struct {
     /// covers both the header (as AD) and the body ciphertext. Returns
     /// error.DecryptionFailed if the tag does not match (wrong key, wrong
     /// page_id/file_id, or data corruption).
-    pub fn decryptPage(self: *const PageEncryption, page_buf: []u8, page_id: u64, file_id: u8) !void {
+    pub fn decryptPage(self: *const PageEncryption, page_buf: []u8, page_id: u64, file_id: u8, write_count: u24) !void {
         std.debug.assert(page_buf.len > PAGE_HEADER_SIZE + TAG_SIZE);
 
         const header_slice = page_buf[0..PAGE_HEADER_SIZE];
         const body = page_buf[PAGE_HEADER_SIZE..];
-        const nonce = buildNonce(page_id, file_id);
+        const nonce = buildNonce(page_id, file_id, write_count);
 
         const ciphertext_len = body.len - TAG_SIZE;
         const ciphertext = body[0..ciphertext_len];
@@ -125,13 +134,13 @@ test "encrypt + decrypt round-trip — body matches original" {
     @memcpy(original_body, buf[PAGE_HEADER_SIZE .. page_size - TAG_SIZE]);
 
     // Encrypt then decrypt
-    enc.encryptPage(buf, page_id, file_id);
+    enc.encryptPage(buf, page_id, file_id, 0);
 
     // After encryption, body should differ from original
     const encrypted_body = buf[PAGE_HEADER_SIZE .. page_size - TAG_SIZE];
     try testing.expect(!std.mem.eql(u8, original_body, encrypted_body));
 
-    try enc.decryptPage(buf, page_id, file_id);
+    try enc.decryptPage(buf, page_id, file_id, 0);
 
     // After decryption, body should match original
     const decrypted_body = buf[PAGE_HEADER_SIZE .. page_size - TAG_SIZE];
@@ -149,10 +158,10 @@ test "page-swap detection — wrong page_id fails decryption" {
     defer testing.allocator.free(buf);
 
     // Encrypt as page 1
-    enc.encryptPage(buf, 1, file_id);
+    enc.encryptPage(buf, 1, file_id, 0);
 
     // Attempt to decrypt as page 2 — must fail
-    const result = enc.decryptPage(buf, 2, file_id);
+    const result = enc.decryptPage(buf, 2, file_id, 0);
     try testing.expectError(error.DecryptionFailed, result);
 }
 
@@ -169,10 +178,10 @@ test "wrong key fails decryption" {
     const buf = makeTestPage(page_id, 0xDD, page_size);
     defer testing.allocator.free(buf);
 
-    enc1.encryptPage(buf, page_id, file_id);
+    enc1.encryptPage(buf, page_id, file_id, 0);
 
     // Decrypt with wrong key — must fail
-    const result = enc2.decryptPage(buf, page_id, file_id);
+    const result = enc2.decryptPage(buf, page_id, file_id, 0);
     try testing.expectError(error.DecryptionFailed, result);
 }
 
@@ -191,28 +200,82 @@ test "header preserved — encryption does not modify header bytes" {
     var original_header: [PAGE_HEADER_SIZE]u8 = undefined;
     @memcpy(&original_header, buf[0..PAGE_HEADER_SIZE]);
 
-    enc.encryptPage(buf, page_id, file_id);
+    enc.encryptPage(buf, page_id, file_id, 0);
 
     // Header must be unchanged
     try testing.expectEqualSlices(u8, &original_header, buf[0..PAGE_HEADER_SIZE]);
 }
 
 test "buildNonce produces deterministic output" {
-    const n1 = PageEncryption.buildNonce(42, 3);
-    const n2 = PageEncryption.buildNonce(42, 3);
+    const n1 = PageEncryption.buildNonce(42, 3, 0);
+    const n2 = PageEncryption.buildNonce(42, 3, 0);
     try testing.expectEqualSlices(u8, &n1, &n2);
 }
 
 test "buildNonce differs for different page_id" {
-    const n1 = PageEncryption.buildNonce(1, 0);
-    const n2 = PageEncryption.buildNonce(2, 0);
+    const n1 = PageEncryption.buildNonce(1, 0, 0);
+    const n2 = PageEncryption.buildNonce(2, 0, 0);
     try testing.expect(!std.mem.eql(u8, &n1, &n2));
 }
 
 test "buildNonce differs for different file_id" {
-    const n1 = PageEncryption.buildNonce(1, 0);
-    const n2 = PageEncryption.buildNonce(1, 1);
+    const n1 = PageEncryption.buildNonce(1, 0, 0);
+    const n2 = PageEncryption.buildNonce(1, 1, 0);
     try testing.expect(!std.mem.eql(u8, &n1, &n2));
+}
+
+test "buildNonce differs for different write_count" {
+    const n1 = PageEncryption.buildNonce(1, 0, 0);
+    const n2 = PageEncryption.buildNonce(1, 0, 1);
+    try testing.expect(!std.mem.eql(u8, &n1, &n2));
+}
+
+test "different write_count produces different ciphertext for same content" {
+    const page_size: u32 = 4096;
+    const page_id: u64 = 42;
+    const file_id: u8 = 1;
+    const fill: u8 = 0xAB;
+
+    const key = [_]u8{0x01} ** KEY_SIZE;
+    const enc = PageEncryption.init(key);
+
+    // Encrypt same page content at write_count=0
+    const buf1 = makeTestPage(page_id, fill, page_size);
+    defer testing.allocator.free(buf1);
+    enc.encryptPage(buf1, page_id, file_id, 0);
+
+    // Encrypt same page content at write_count=1
+    const buf2 = makeTestPage(page_id, fill, page_size);
+    defer testing.allocator.free(buf2);
+    enc.encryptPage(buf2, page_id, file_id, 1);
+
+    // Ciphertext bodies must differ (different nonce)
+    const ct1 = buf1[PAGE_HEADER_SIZE..];
+    const ct2 = buf2[PAGE_HEADER_SIZE..];
+    try testing.expect(!std.mem.eql(u8, ct1, ct2));
+
+    // Both must still decrypt correctly with matching write_count
+    try enc.decryptPage(buf1, page_id, file_id, 0);
+    try enc.decryptPage(buf2, page_id, file_id, 1);
+}
+
+test "wrong write_count fails decryption" {
+    const page_size: u32 = 4096;
+    const page_id: u64 = 5;
+    const file_id: u8 = 0;
+
+    const key = [_]u8{0x05} ** KEY_SIZE;
+    const enc = PageEncryption.init(key);
+
+    const buf = makeTestPage(page_id, 0xFF, page_size);
+    defer testing.allocator.free(buf);
+
+    // Encrypt with write_count=3
+    enc.encryptPage(buf, page_id, file_id, 3);
+
+    // Decrypt with write_count=4 — must fail
+    const result = enc.decryptPage(buf, page_id, file_id, 4);
+    try testing.expectError(error.DecryptionFailed, result);
 }
 
 test {
