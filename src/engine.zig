@@ -623,18 +623,15 @@ test "create engine, checkpoint, close, open again, data persists" {
         try engine.close();
     }
 
-    // Re-open and verify
+    // Re-open and verify data survived checkpoint+close+reopen
     {
         const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
         defer engine.close() catch {};
 
-        // The node should be readable if it was flushed to disk
+        // The node MUST be present after checkpoint+close+reopen
         const got = try engine.getNode(1);
-        // After recovery the node may or may not be visible depending on whether
-        // the checkpoint properly flushed. We verify the engine opened successfully.
-        if (got) |rec| {
-            try testing.expectEqual(@as(u32, 77), rec.label_set);
-        }
+        try testing.expect(got != null);
+        try testing.expectEqual(@as(u32, 77), got.?.label_set);
     }
 }
 

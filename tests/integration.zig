@@ -95,34 +95,43 @@ test "integration: full lifecycle — create graph, add data, checkpoint, close,
 
         // Checkpoint and close
         try eng.checkpoint();
-        eng.close();
+        try eng.close();
     }
 
-    // Phase 2: Reopen and verify
+    // Phase 2: Reopen and verify ALL data survives the round-trip
     {
         const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
-        defer eng.close();
+        defer eng.close() catch {};
 
-        // Verify nodes are retrievable (at least node 1, the first allocated)
-        const node1 = try eng.getNode(1);
-        if (node1) |rec| {
-            // Label should be one of our assigned labels (1, 2, or 3)
-            try std.testing.expect(rec.label_set >= 1 and rec.label_set <= 3);
+        // Verify all 10 nodes are present with correct labels
+        for (0..10) |i| {
+            const nid: NodeId = @intCast(i + 1);
+            const got = try eng.getNode(nid);
+            try std.testing.expect(got != null);
+            const expected_label: u32 = @intCast(i % 3 + 1);
+            try std.testing.expectEqual(expected_label, got.?.label_set);
         }
 
-        // Verify edges via expandOut — node_ids[0] = 1 should have outgoing edges
+        // Verify node count
+        const nc = try eng.nodeCount();
+        try std.testing.expectEqual(@as(u64, 10), nc);
+
+        // Verify edge count
+        const ec = try eng.edgeCount();
+        try std.testing.expectEqual(@as(u64, 15), ec);
+
+        // Verify specific edge relationships via expandOut
+        // node_ids[0] (=1): edges at index 0 (->2, rel 0) and index 10 (->2, rel 2)
         const edges_out = try eng.expandOut(1, null, allocator);
         defer allocator.free(edges_out);
+        try std.testing.expect(edges_out.len >= 1);
 
-        // We added edges from node_ids[0] (=1) to node_ids[1] (=2) at index 0,
-        // and from node_ids[10%10=0] (=1) to node_ids[1] (=2) at index 10.
-        // The exact count depends on the modular arithmetic.
-        // At minimum, some edges should exist if data persisted.
-        if (node1 != null) {
-            // If the node persisted, edges may or may not depending on flush.
-            // We just verify the engine opened successfully and the API works.
-            try std.testing.expect(true);
+        // Verify edges_out contain expected neighbors
+        var found_neighbor_2 = false;
+        for (edges_out) |e| {
+            if (e.neighbor == 2) found_neighbor_2 = true;
         }
+        try std.testing.expect(found_neighbor_2);
     }
 }
 
@@ -137,7 +146,7 @@ test "integration: GraphStorage vtable round-trip" {
     }
 
     const eng = try GraphEngine.create(allocator, td.path, uuid, testConfig());
-    defer eng.close();
+    defer eng.close() catch {};
 
     const gs = eng.storage();
 
@@ -221,6 +230,111 @@ test "integration: backup and restore round-trip" {
     var buf: [64]u8 = undefined;
     const n = try file.readAll(&buf);
     try std.testing.expectEqualStrings("integration test data", buf[0..n]);
+}
+
+test "QUAL-0002: full durability round-trip -- nodes, edges, properties survive checkpoint+close+reopen" {
+    const allocator = std.testing.allocator;
+    const cfg = testConfig();
+    const uuid = [_]u8{0x50} ** 16;
+
+    var td = try testDataDir();
+    defer {
+        allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    // Phase 1: Create engine, add nodes with specific labels, add edges, add a property
+    {
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        // Create 3 nodes with distinctive label values
+        const n1 = try eng.allocNode();
+        try eng.putNode(n1, makeNode(101));
+        const n2 = try eng.allocNode();
+        try eng.putNode(n2, makeNode(202));
+        const n3 = try eng.allocNode();
+        try eng.putNode(n3, makeNode(303));
+
+        // Add edges: n1->n2 (rel_type=10), n2->n3 (rel_type=20), n1->n3 (rel_type=30)
+        const e1 = try eng.addEdge(n1, n2, 10);
+        const e2 = try eng.addEdge(n2, n3, 20);
+        const e3 = try eng.addEdge(n1, n3, 30);
+        _ = e1;
+        _ = e2;
+        _ = e3;
+
+        // Add a label to n1
+        try eng.addLabel(n1, 0); // label bit 0
+
+        // Verify pre-checkpoint state
+        try std.testing.expectEqual(@as(u64, 3), try eng.nodeCount());
+        try std.testing.expectEqual(@as(u64, 3), try eng.edgeCount());
+
+        // Checkpoint and close
+        try eng.checkpoint();
+        try eng.close();
+    }
+
+    // Phase 2: Reopen and verify ALL data
+    {
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Verify node count
+        try std.testing.expectEqual(@as(u64, 3), try eng.nodeCount());
+
+        // Verify each node's label_set
+        const got1 = try eng.getNode(1);
+        try std.testing.expect(got1 != null);
+        // n1 had label 101, then addLabel(0) sets bit 0, so label_set = 101 | 1 = 101
+        // Actually, addLabel does `label_set |= (1 << (label % 32))`, label=0 -> bit 0 -> OR 1
+        // 101 in binary = 1100101, OR 1 = 1100101 (bit 0 already set since 101 is odd). Still 101.
+        try std.testing.expectEqual(@as(u32, 101), got1.?.label_set);
+
+        const got2 = try eng.getNode(2);
+        try std.testing.expect(got2 != null);
+        try std.testing.expectEqual(@as(u32, 202), got2.?.label_set);
+
+        const got3 = try eng.getNode(3);
+        try std.testing.expect(got3 != null);
+        try std.testing.expectEqual(@as(u32, 303), got3.?.label_set);
+
+        // Verify edge count
+        try std.testing.expectEqual(@as(u64, 3), try eng.edgeCount());
+
+        // Verify n1 outgoing edges
+        const n1_out = try eng.expandOut(1, null, allocator);
+        defer allocator.free(n1_out);
+        try std.testing.expectEqual(@as(usize, 2), n1_out.len);
+
+        // Verify n1->n2 and n1->n3 edges exist
+        var found_to_2 = false;
+        var found_to_3 = false;
+        for (n1_out) |e| {
+            if (e.neighbor == 2 and e.rel_type == 10) found_to_2 = true;
+            if (e.neighbor == 3 and e.rel_type == 30) found_to_3 = true;
+        }
+        try std.testing.expect(found_to_2);
+        try std.testing.expect(found_to_3);
+
+        // Verify n2 outgoing edge
+        const n2_out = try eng.expandOut(2, null, allocator);
+        defer allocator.free(n2_out);
+        try std.testing.expectEqual(@as(usize, 1), n2_out.len);
+        try std.testing.expectEqual(@as(u64, 3), n2_out[0].neighbor);
+        try std.testing.expectEqual(@as(u32, 20), n2_out[0].rel_type);
+
+        // Verify n2 incoming edge from n1
+        const n2_in = try eng.expandIn(2, null, allocator);
+        defer allocator.free(n2_in);
+        try std.testing.expectEqual(@as(usize, 1), n2_in.len);
+        try std.testing.expectEqual(@as(u64, 1), n2_in[0].neighbor);
+
+        // Verify n3 incoming edges from n1 and n2
+        const n3_in = try eng.expandIn(3, null, allocator);
+        defer allocator.free(n3_in);
+        try std.testing.expectEqual(@as(usize, 2), n3_in.len);
+    }
 }
 
 test "integration: maintenance getStats" {
