@@ -77,6 +77,11 @@ pub const Recovery = struct {
 
         var m = try Manifest.selectManifest(manifest_a, manifest_b);
 
+        // Validate manifest format version compatibility
+        if (m.format_version != manifest_mod.MANIFEST_VERSION) {
+            return error.IncompatibleVersion;
+        }
+
         // 2. Open store files
         _ = try file_manager.openFile(.nodes);
         _ = try file_manager.openFile(.adj_out);
@@ -537,6 +542,39 @@ test "recovery skips WAL records with corrupted checksums" {
 
     // The corrupted page_update record should have been skipped
     try testing.expect(recovery.skipped_checksum_failures >= 1);
+}
+
+test "recovery rejects manifest with incompatible format_version" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write a manifest with a future/incompatible format_version
+    var bad_manifest = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    bad_manifest.format_version = 999; // incompatible version
+
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try bad_manifest.writeToFile(allocator, path_a);
+
+    // Run recovery -- should fail with IncompatibleVersion
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    const result = recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectError(error.IncompatibleVersion, result);
 }
 
 test {

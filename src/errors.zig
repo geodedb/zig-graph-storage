@@ -38,6 +38,7 @@ pub const StorageError = error{
     IndexNotFound,
     IndexBuildFailed,
     IndexCorrupted,
+    IncompatibleVersion,
 };
 
 // ============================================================================
