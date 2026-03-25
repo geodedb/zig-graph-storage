@@ -39,9 +39,15 @@ pub const Recovery = struct {
     allocator: Allocator,
     /// Count of WAL records skipped due to checksum mismatch during recovery.
     skipped_checksum_failures: u64 = 0,
+    /// Encryption key for WAL access. Must match the key used when writing.
+    encryption_key: ?[32]u8 = null,
 
-    pub fn init(allocator: Allocator) Recovery {
-        return .{ .allocator = allocator, .skipped_checksum_failures = 0 };
+    pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
+        return .{
+            .allocator = allocator,
+            .skipped_checksum_failures = 0,
+            .encryption_key = encryption_key,
+        };
     }
 
     /// Recover a graph from its directory.
@@ -102,7 +108,7 @@ pub const Recovery = struct {
             wal_dir,
             graph_dir.graph_uuid,
             m.last_checkpoint_lsn,
-            .{},
+            .{ .encryption_key = self.encryption_key },
         );
         defer wal.deinit();
 
@@ -244,7 +250,7 @@ test "clean recovery: no WAL records, manifest loaded correctly" {
     var pool = try BufferPool.init(allocator, 4096, 16);
     defer pool.deinit();
 
-    var recovery = Recovery.init(allocator);
+    var recovery = Recovery.init(allocator, null);
     const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
 
     // Manifest should match what was written (clean recovery doesn't increment counter
@@ -328,7 +334,7 @@ test "recovery with committed transaction: changes visible after recovery" {
     var pool = try BufferPool.init(allocator, 4096, 32);
     defer pool.deinit();
 
-    var recovery = Recovery.init(allocator);
+    var recovery = Recovery.init(allocator, null);
     const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
 
     // The recovered manifest should have a bumped counter
@@ -421,7 +427,7 @@ test "recovery with uncommitted transaction: changes discarded" {
     var pool = try BufferPool.init(allocator, 4096, 32);
     defer pool.deinit();
 
-    var recovery = Recovery.init(allocator);
+    var recovery = Recovery.init(allocator, null);
     const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
     _ = recovered;
 
@@ -526,7 +532,7 @@ test "recovery skips WAL records with corrupted checksums" {
     var pool = try BufferPool.init(allocator, 4096, 32);
     defer pool.deinit();
 
-    var recovery = Recovery.init(allocator);
+    var recovery = Recovery.init(allocator, null);
     _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
 
     // The corrupted page_update record should have been skipped

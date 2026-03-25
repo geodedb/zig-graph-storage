@@ -189,7 +189,7 @@ pub const GraphEngine = struct {
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
 
         // 4. Run recovery (loads manifest, replays WAL)
-        var recovery = Recovery.init(allocator);
+        var recovery = Recovery.init(allocator, cfg.encryption_key);
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
 
         // 5. Create free space managers
