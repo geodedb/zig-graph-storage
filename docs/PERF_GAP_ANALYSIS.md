@@ -8,9 +8,9 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 6 |
+| Closed | 11 |
 | Won't Do | 2 |
-| Deferred | 7 |
+| Deferred | 2 |
 
 ---
 
@@ -23,9 +23,10 @@
 
 ## PERF-0002: PropStore.putProperty 3-pass chain traversal
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** P0
-- **Description:** Significant refactor of prop_store internals. Should be paired with a dedicated benchmark to validate improvement. Deferred to post-v1.
+- **Resolution:** Replaced getProperty+removeProperty+insert (3 scans) with combined find-and-remove pass + insert pass (2 scans). Preserves PERF-0001 skip-by-size and PERF-0015 inline usedBytes.
+- **Commit:** `d0d6ad6`
 
 ## PERF-0003: AdjStore.addEdge O(blocks) linked-list walk
 
@@ -69,27 +70,30 @@
 
 ## PERF-0009: WalRecord.serialize per-record heap allocation
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** P1
-- **Description:** Requires WAL interface change (caller-provided buffer). Deferred to post-v1.
+- **Resolution:** Added `serializeInto(buf)` and `serializedSize()`. Uses 16KB stack buffer with heap fallback for large payloads. Eliminates per-record allocation.
+- **Commit:** `09bd2f4`
 
 ## PERF-0010: Double CRC in WAL append
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** P1
-- **Description:** Coupled with PERF-0009; serialize/checksum refactor. Deferred to post-v1.
+- **Resolution:** Checksum computed inline during `serializeInto` in single pass. `appendRecord` no longer calls `computeChecksum()` separately.
+- **Commit:** `09bd2f4`
 
 ## PERF-0011: LabelIndex.addNode O(n) sorted insert
 
 - **Status:** Deferred
 - **Severity:** P1
-- **Description:** Requires switching to B+tree for posting lists. Significant refactor. Deferred to post-v1.
+- **Description:** Audit showed label_scan_ns actually improves at scale (75ns to 4ns per result). Insert cost absorbed during seeding. Low priority.
 
 ## PERF-0012: getNode pin/unpin per call in scan loops
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** P2
-- **Description:** Requires new scanPage API and updating all call sites. Deferred to post-v1.
+- **Resolution:** Added `scanNodes` page-scan method to NodeStore. Pins once per page, visits all node slots. Used by `LabelIndex.rebuild`. Reduces pin/unpin cycles ~100-200x.
+- **Commit:** `b91861b`
 
 ## PERF-0013: B+tree delete doesn't rebalance
 

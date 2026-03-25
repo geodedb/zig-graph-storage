@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "timestamp": "2026-03-25T22:54:51Z",
+  "git_commit": "unknown",
+  "system": {
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "page_size": 8192,
+  "buffer_pool_pages": 4096,
+  "tiers": [
+    {
+      "name": "1K",
+      "node_count": 1000,
+      "edge_count": 1500,
+      "seed_ops_sec": 90293,
+      "point_lookup_ns": 32,
+      "prop_read_ns": 6656,
+      "expand_out_ns": 6535,
+      "label_scan_ns": 61,
+      "checkpoint_ms": 78.8,
+      "open_ms": 49.3,
+      "mixed_ops_sec": 16994664
+    },
+    {
+      "name": "1K",
+      "node_count": 1000,
+      "edge_count": 1500,
+      "seed_ops_sec": 84969,
+      "point_lookup_ns": 31,
+      "prop_read_ns": 7879,
+      "expand_out_ns": 8557,
+      "label_scan_ns": 63,
+      "checkpoint_ms": 77.9,
+      "open_ms": 49.1,
+      "mixed_ops_sec": 22960531
+    },
+    {
+      "name": "1K",
+      "node_count": 1000,
+      "edge_count": 1500,
+      "seed_ops_sec": 87122,
+      "point_lookup_ns": 32,
+      "prop_read_ns": 6342,
+      "expand_out_ns": 6566,
+      "label_scan_ns": 65,
+      "checkpoint_ms": 77.8,
+      "open_ms": 48.7,
+      "mixed_ops_sec": 22077005
+    },
+    {
+      "name": "1K",
+      "node_count": 1000,
+      "edge_count": 1500,
+      "seed_ops_sec": 90640,
+      "point_lookup_ns": 31,
+      "prop_read_ns": 6366,
+      "expand_out_ns": 11779,
+      "label_scan_ns": 64,
+      "checkpoint_ms": 82.6,
+      "open_ms": 47.1,
+      "mixed_ops_sec": 16316940
+    }
+  ]
+}

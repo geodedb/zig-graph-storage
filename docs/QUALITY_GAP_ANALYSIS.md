@@ -8,9 +8,9 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 4 |
+| Closed | 6 |
 | Won't Do | 1 |
-| Deferred | 3 |
+| Deferred | 1 |
 
 ---
 
@@ -37,15 +37,17 @@
 
 ## QUAL-0004: Duplicated init sequence in create() and open()
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** Medium
-- **Description:** Refactoring only; no correctness or security impact. Deferred to post-v1.
+- **Resolution:** Extracted `initSubsystems()` private helper covering free space, WAL, TxnManager, stores, labels, and checkpointer. Net reduction ~29 lines.
+- **Commit:** `674f367`
 
 ## QUAL-0005: Deep nesting in B+tree operations
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** Medium
-- **Description:** Style only; no correctness or security impact. Deferred to post-v1.
+- **Resolution:** Extracted `deinitChildren`, `findLeaf`, `collectRange` helpers. `search` refactored to use `findLeaf`. Max nesting reduced from 7 to 4.
+- **Commit:** `524786e`
 
 ## QUAL-0006: getEdge() stub returns null unconditionally
 
