@@ -130,46 +130,8 @@ pub const GraphEngine = struct {
         if (self.file_manager.getPager(.var_store)) |p| self.buffer_pool.registerPager(.var_store, p);
         if (self.file_manager.getPager(.free)) |p| self.buffer_pool.registerPager(.free, p);
 
-        // 6. Create free space managers for each store
-        self.free_space_nodes = try FreeSpaceManager.init(allocator, &self.buffer_pool, .nodes);
-        self.free_space_adj_out = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_out);
-        self.free_space_adj_in = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_in);
-        self.free_space_props = try FreeSpaceManager.init(allocator, &self.buffer_pool, .props);
-        self.free_space_var = try FreeSpaceManager.init(allocator, &self.buffer_pool, .var_store);
-
-        // 7. Open WAL directory, init WalManager
-        const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{self.graph_dir.path});
-        defer allocator.free(wal_dir_path);
-        try std.fs.cwd().makePath(wal_dir_path);
-        self.wal_dir_handle = try std.fs.cwd().openDir(wal_dir_path, .{});
-
-        self.wal = try WalManager.init(allocator, self.wal_dir_handle, graph_uuid, 0, .{
-            .encryption_key = cfg.encryption_key,
-        });
-
-        // 8. Init TxnManager
-        self.txn_manager = TxnManager.init(allocator, &self.wal, self.manifest.next_txn_id);
-
-        // 9. Init all stores
-        self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);
-        self.adj_out = AdjStore.init(&self.buffer_pool, &self.free_space_adj_out, .adj_out, cfg.page_size);
-        self.adj_in = AdjStore.init(&self.buffer_pool, &self.free_space_adj_in, .adj_in, cfg.page_size);
-        self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
-        self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
-
-        // 10. Init label dictionary and label index
-        self.label_dict = LabelDictionary.init(allocator);
-        self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
-
-        // 11. Init checkpointer
-        self.checkpointer = Checkpointer.init(
-            allocator,
-            &self.buffer_pool,
-            &self.wal,
-            &self.manifest,
-            &self.file_manager,
-            &self.graph_dir,
-        );
+        // 6. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
+        try self.initSubsystems(allocator, graph_uuid, cfg, 0);
 
         return self;
     }
@@ -203,38 +165,10 @@ pub const GraphEngine = struct {
             return error.PageSizeMismatch;
         }
 
-        // 5. Create free space managers
-        self.free_space_nodes = try FreeSpaceManager.init(allocator, &self.buffer_pool, .nodes);
-        self.free_space_adj_out = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_out);
-        self.free_space_adj_in = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_in);
-        self.free_space_props = try FreeSpaceManager.init(allocator, &self.buffer_pool, .props);
-        self.free_space_var = try FreeSpaceManager.init(allocator, &self.buffer_pool, .var_store);
+        // 5. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
+        try self.initSubsystems(allocator, graph_uuid, cfg, self.manifest.last_checkpoint_lsn);
 
-        // 6. Open WAL directory, init WalManager
-        const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{self.graph_dir.path});
-        defer allocator.free(wal_dir_path);
-        try std.fs.cwd().makePath(wal_dir_path);
-        self.wal_dir_handle = try std.fs.cwd().openDir(wal_dir_path, .{});
-
-        self.wal = try WalManager.init(allocator, self.wal_dir_handle, graph_uuid, self.manifest.last_checkpoint_lsn, .{
-            .encryption_key = cfg.encryption_key,
-        });
-
-        // 7. Init TxnManager
-        self.txn_manager = TxnManager.init(allocator, &self.wal, self.manifest.next_txn_id);
-
-        // 8. Init all stores
-        self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);
-        self.adj_out = AdjStore.init(&self.buffer_pool, &self.free_space_adj_out, .adj_out, cfg.page_size);
-        self.adj_in = AdjStore.init(&self.buffer_pool, &self.free_space_adj_in, .adj_in, cfg.page_size);
-        self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
-        self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
-
-        // 9. Init label dictionary and label index
-        self.label_dict = LabelDictionary.init(allocator);
-        self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
-
-        // Try to load label dictionary if it exists
+        // 6. Load persisted label dictionary if it exists
         const labels_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path});
         defer allocator.free(labels_path);
         self.label_dict.loadFromFile(labels_path) catch |err| switch (err) {
@@ -242,10 +176,49 @@ pub const GraphEngine = struct {
             else => return err,
         };
 
-        // Rebuild label index from node store
+        // 7. Rebuild label index from node store
         try self.label_index.rebuild(&self.node_store, self.manifest.next_node_id);
 
-        // 10. Init checkpointer
+        return self;
+    }
+
+    /// Initialize all subsystems shared between create() and open().
+    ///
+    /// This covers: free space managers, WAL, transaction manager, data stores,
+    /// label dictionary, label index, and the checkpointer.
+    fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]u8, cfg: GraphConfig, wal_start_lsn: u64) !void {
+        // Free space managers for each store
+        self.free_space_nodes = try FreeSpaceManager.init(allocator, &self.buffer_pool, .nodes);
+        self.free_space_adj_out = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_out);
+        self.free_space_adj_in = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_in);
+        self.free_space_props = try FreeSpaceManager.init(allocator, &self.buffer_pool, .props);
+        self.free_space_var = try FreeSpaceManager.init(allocator, &self.buffer_pool, .var_store);
+
+        // WAL directory + WalManager
+        const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{self.graph_dir.path});
+        defer allocator.free(wal_dir_path);
+        try std.fs.cwd().makePath(wal_dir_path);
+        self.wal_dir_handle = try std.fs.cwd().openDir(wal_dir_path, .{});
+
+        self.wal = try WalManager.init(allocator, self.wal_dir_handle, graph_uuid, wal_start_lsn, .{
+            .encryption_key = cfg.encryption_key,
+        });
+
+        // Transaction manager
+        self.txn_manager = TxnManager.init(allocator, &self.wal, self.manifest.next_txn_id);
+
+        // Data stores
+        self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);
+        self.adj_out = AdjStore.init(&self.buffer_pool, &self.free_space_adj_out, .adj_out, cfg.page_size);
+        self.adj_in = AdjStore.init(&self.buffer_pool, &self.free_space_adj_in, .adj_in, cfg.page_size);
+        self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
+        self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
+
+        // Label dictionary and label index
+        self.label_dict = LabelDictionary.init(allocator);
+        self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
+
+        // Checkpointer
         self.checkpointer = Checkpointer.init(
             allocator,
             &self.buffer_pool,
@@ -254,8 +227,6 @@ pub const GraphEngine = struct {
             &self.file_manager,
             &self.graph_dir,
         );
-
-        return self;
     }
 
     /// Close the engine (flush, checkpoint, close files).
