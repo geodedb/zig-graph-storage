@@ -14,8 +14,11 @@ pub const page = @import("page.zig");
 pub const node = @import("node.zig");
 pub const edge = @import("edge.zig");
 pub const property = @import("property.zig");
+pub const interface = @import("interface.zig");
 
 // Re-export key types for convenience
+pub const GraphStorage = interface.GraphStorage;
+pub const PropertyEntry = interface.PropertyEntry;
 pub const NodeId = types.NodeId;
 pub const EdgeId = types.EdgeId;
 pub const PageId = types.PageId;
