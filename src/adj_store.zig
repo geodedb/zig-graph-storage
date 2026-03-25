@@ -41,9 +41,10 @@ pub const AdjStore = struct {
         };
     }
 
-    /// Add an edge entry to a node's adjacency list.
+    /// Add an edge entry to a node's adjacency list (O(1) head-insert).
     /// If head_page is 0 (no existing list), allocates a new block and returns its page_id as the new head.
-    /// If the current block is full, allocates an overflow block.
+    /// If the head block has space, inserts there. If the head block is full, allocates a new head
+    /// block whose overflow points to the old head.
     /// Returns the head page_id (may be unchanged or new).
     pub fn addEdge(self: *AdjStore, head_page: PageId, entry: EdgeEntry) !PageId {
         if (head_page == 0) {
@@ -70,54 +71,44 @@ pub const AdjStore = struct {
             return new_page;
         }
 
-        // Walk the chain to find a block with space, or the last block
-        var current_page = head_page;
-        while (true) {
-            const frame = try self.buffer_pool.pin(self.file_id, current_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
-            var bh = self.readBlockHeader(data);
+        // Head-insert: only check the head block. If it has space, insert
+        // there (O(1)). If full, allocate a new block as the new head and
+        // chain the old head as its overflow (O(1)). This avoids the O(blocks)
+        // walk that the previous tail-append strategy required.
+        const frame = try self.buffer_pool.pin(self.file_id, head_page);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        var bh = self.readBlockHeader(data);
 
-            if (bh.count < @as(u16, @intCast(self.entries_per_block))) {
-                // Space in this block
-                self.writeEntry(data, bh.count, entry);
-                bh.count += 1;
-                bh.payload_size = @intCast(@as(u32, bh.count) * ENTRY_SIZE);
-                self.writeBlockHeader(data, bh);
-                self.buffer_pool.unpin(frame_idx, true);
-                return head_page;
-            }
-
-            // Block is full
-            if (bh.next_block == 0) {
-                // Allocate overflow block
-                const new_page = try self.free_space.allocPage();
-                const new_frame = try self.buffer_pool.pinNew(self.file_id, new_page);
-                const new_frame_idx = self.buffer_pool.frameIndex(new_frame);
-
-                const new_data = new_frame.dataSlice();
-                self.writeBlockHeader(new_data, .{
-                    .next_block = 0,
-                    .count = 1,
-                    .kind = 0,
-                    ._reserved = 0,
-                    .payload_size = ENTRY_SIZE,
-                    .checksum = 0,
-                });
-                self.writeEntry(new_data, 0, entry);
-                self.buffer_pool.unpin(new_frame_idx, true);
-
-                // Link from current block
-                bh.next_block = new_page;
-                self.writeBlockHeader(data, bh);
-                self.buffer_pool.unpin(frame_idx, true);
-                return head_page;
-            }
-
-            const next = bh.next_block;
-            self.buffer_pool.unpin(frame_idx, false);
-            current_page = next;
+        if (bh.count < @as(u16, @intCast(self.entries_per_block))) {
+            // Space in the head block -- insert here
+            self.writeEntry(data, bh.count, entry);
+            bh.count += 1;
+            bh.payload_size = @intCast(@as(u32, bh.count) * ENTRY_SIZE);
+            self.writeBlockHeader(data, bh);
+            self.buffer_pool.unpin(frame_idx, true);
+            return head_page;
         }
+
+        // Head block is full -- allocate a new head that points to the old head
+        self.buffer_pool.unpin(frame_idx, false);
+
+        const new_page = try self.free_space.allocPage();
+        const new_frame = try self.buffer_pool.pinNew(self.file_id, new_page);
+        const new_frame_idx = self.buffer_pool.frameIndex(new_frame);
+
+        const new_data = new_frame.dataSlice();
+        self.writeBlockHeader(new_data, .{
+            .next_block = head_page,
+            .count = 1,
+            .kind = 0,
+            ._reserved = 0,
+            .payload_size = ENTRY_SIZE,
+            .checksum = 0,
+        });
+        self.writeEntry(new_data, 0, entry);
+        self.buffer_pool.unpin(new_frame_idx, true);
+        return new_page;
     }
 
     /// Remove an edge entry from a node's adjacency list.
@@ -376,8 +367,9 @@ test "overflow to second block when first is full" {
     defer testing.allocator.free(edges);
     try testing.expectEqual(@as(usize, @intCast(epb + 1)), edges.len);
 
-    // Last edge should be the overflow one
-    try testing.expectEqual(@as(u64, 999), edges[edges.len - 1].neighbor);
+    // With head-insert, the overflow entry is in the new head block,
+    // so expand reads it first.
+    try testing.expectEqual(@as(u64, 999), edges[0].neighbor);
 }
 
 test "removeEdge removes correct entry" {

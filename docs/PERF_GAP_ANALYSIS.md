@@ -29,9 +29,9 @@
 
 ## PERF-0003: AdjStore.addEdge O(blocks) linked-list walk
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** P0
-- **Description:** Requires structural change to adjacency store (tail pointer tracking). Significant complexity. Deferred to post-v1.
+- **Resolution:** Replaced tail-append strategy (O(blocks) chain walk) with O(1) head-insert. When the head block is full, a new block is allocated as the new head with its overflow pointer to the old head. The caller already stores the returned head page, so no additional bookkeeping is needed. `expand`, `removeEdge`, and `edgeCount` are unaffected since they traverse forward through overflow pointers regardless of insertion order.
 
 ## PERF-0004: Engine.scanLabel ignores LabelIndex
 
