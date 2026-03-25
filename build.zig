@@ -7,11 +7,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Dependencies
+    const wal_dep = b.dependency("wal", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const uuid_dep = b.dependency("uuid", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const wal_mod = wal_dep.module("wal");
+    const uuid_mod = uuid_dep.module("uuid");
+
     // Main library module
     const module = b.addModule("graph_storage", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wal", .module = wal_mod },
+            .{ .name = "uuid", .module = uuid_mod },
+        },
     });
 
     // Unit tests (run tests defined in the module itself)
@@ -21,6 +38,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wal", .module = wal_mod },
+                .{ .name = "uuid", .module = uuid_mod },
+            },
         }),
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -35,6 +56,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "graph_storage", .module = module },
+                .{ .name = "wal", .module = wal_mod },
+                .{ .name = "uuid", .module = uuid_mod },
             },
         }),
     });
@@ -48,6 +71,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wal", .module = wal_mod },
+                .{ .name = "uuid", .module = uuid_mod },
+            },
         }),
     });
     check_step.dependOn(&check.step);
