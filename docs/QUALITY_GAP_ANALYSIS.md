@@ -62,6 +62,6 @@
 
 ## QUAL-0008: No binary format specification document
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** Medium
-- **Description:** Documentation only; large effort, no code impact. Deferred to post-v1.
+- **Description:** Comprehensive binary format specification added in `docs/format-spec.md`, covering all on-disk structures: page headers, node records, edge entries, property encoding, manifest, backup, WAL records, registry, index catalog, and free space bitmap.

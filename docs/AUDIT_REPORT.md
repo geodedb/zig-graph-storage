@@ -196,4 +196,4 @@ All 4 verification agents confirmed fixes are correct:
 | PERF-0014: WAL full load | Deferred | Streaming replay |
 | QUAL-0004/5: Code style | Deferred | Refactoring only |
 | QUAL-0007: anyerror vtable | Won't Do | Zig language limitation |
-| QUAL-0008: Format spec doc | Deferred | Documentation only |
+| QUAL-0008: Format spec doc | Closed | See docs/format-spec.md |
