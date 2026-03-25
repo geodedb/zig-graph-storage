@@ -19,6 +19,10 @@ pub const edge = @import("edge.zig");
 pub const property = @import("property.zig");
 pub const file_manager = @import("file_manager.zig");
 pub const interface = @import("interface.zig");
+pub const manifest = @import("manifest.zig");
+pub const graph_dir = @import("graph_dir.zig");
+pub const registry = @import("registry.zig");
+pub const label_dict = @import("label_dict.zig");
 
 // Re-export key types for convenience
 pub const GraphStorage = interface.GraphStorage;
