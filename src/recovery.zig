@@ -577,6 +577,340 @@ test "recovery rejects manifest with incompatible format_version" {
     try testing.expectError(error.IncompatibleVersion, result);
 }
 
+test "GAP-0005a: torn/truncated WAL record is safely skipped during recovery" {
+    // A truncated record at the end of the WAL should not prevent recovery.
+    // The WAL reader (wal.readFrom) skips unparseable entries via `catch continue`
+    // in the deserialize path, and recovery further skips records with bad checksums.
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write initial manifest
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    // Create WAL with a valid committed txn followed by a truncated record
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+    defer wal_dir.close();
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+
+    // BEGIN txn 1
+    var begin_rec = WalRecord{
+        .lsn = 0, .txn_id = 1, .record_type = .begin_txn,
+        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+    };
+    _ = try wal.appendRecord(&begin_rec);
+
+    // PAGE_UPDATE for txn 1 with recognizable data
+    var page_data: [4096]u8 = undefined;
+    @memset(&page_data, 0xF1);
+    var update_rec = WalRecord{
+        .lsn = 0, .txn_id = 1, .record_type = .page_update,
+        .file_id = 0, .page_id = 1, .payload = &page_data, .checksum = 0,
+    };
+    _ = try wal.appendRecord(&update_rec);
+
+    // COMMIT txn 1
+    var commit_rec = WalRecord{
+        .lsn = 0, .txn_id = 1, .record_type = .commit_txn,
+        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+    };
+    _ = try wal.appendRecord(&commit_rec);
+
+    // Write a truncated/garbage record directly into the WAL log.
+    // This simulates a torn write (crash mid-write).
+    const truncated_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05 }; // too short to be valid
+    _ = try wal.inner.append(&truncated_bytes);
+
+    try wal.sync();
+    wal.deinit();
+
+    // Run recovery -- should succeed despite the truncated record
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery_inst = Recovery.init(allocator, null);
+    const recovered = try recovery_inst.recover(&setup.graph_dir, &pool, &fm);
+
+    // Recovery succeeded: counter was incremented (WAL had committed records)
+    try testing.expectEqual(@as(u64, 2), recovered.counter);
+}
+
+test "GAP-0005b: manifest A corrupt, B valid -- recovery uses B" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write a VALID manifest to slot B with distinctive values
+    const valid_manifest = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 5,
+        .next_node_id = 42,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_b = try setup.graph_dir.manifestPath(allocator, .b);
+    defer allocator.free(path_b);
+    try valid_manifest.writeToFile(allocator, path_b);
+
+    // Write CORRUPT data to slot A (invalid magic/CRC)
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    {
+        const corrupt_file = try std.fs.cwd().createFile(path_a, .{});
+        defer corrupt_file.close();
+        var garbage: [148]u8 = undefined;
+        @memset(&garbage, 0xFF); // total garbage, invalid magic + CRC
+        try corrupt_file.writeAll(&garbage);
+    }
+
+    // Run recovery -- should use manifest B
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery_inst = Recovery.init(allocator, null);
+    const recovered = try recovery_inst.recover(&setup.graph_dir, &pool, &fm);
+
+    // Recovered manifest should be from slot B
+    try testing.expectEqual(@as(u64, 42), recovered.next_node_id);
+    // Counter should be >= 5 (the value from B; recovery may increment it)
+    try testing.expect(recovered.counter >= 5);
+}
+
+test "GAP-0005c: multiple concurrent transactions -- only committed data survives" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write initial manifest
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    // Create WAL with 3 interleaved transactions:
+    //   txn 1 = committed (page 1, data 0xAA)
+    //   txn 2 = uncommitted / still active (page 2, data 0xBB)
+    //   txn 3 = aborted (page 3, data 0xCC)
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+    defer wal_dir.close();
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+
+    // BEGIN all three
+    var begin1 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin1);
+    var begin2 = WalRecord{ .lsn = 0, .txn_id = 2, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin2);
+    var begin3 = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin3);
+
+    // PAGE_UPDATE for txn 1 (committed data)
+    var data1: [4096]u8 = undefined;
+    @memset(&data1, 0xAA);
+    var upd1 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = 0, .page_id = 1, .payload = &data1, .checksum = 0 };
+    _ = try wal.appendRecord(&upd1);
+
+    // PAGE_UPDATE for txn 2 (uncommitted data)
+    var data2: [4096]u8 = undefined;
+    @memset(&data2, 0xBB);
+    var upd2 = WalRecord{ .lsn = 0, .txn_id = 2, .record_type = .page_update, .file_id = 0, .page_id = 2, .payload = &data2, .checksum = 0 };
+    _ = try wal.appendRecord(&upd2);
+
+    // PAGE_UPDATE for txn 3 (aborted data)
+    var data3: [4096]u8 = undefined;
+    @memset(&data3, 0xCC);
+    var upd3 = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .page_update, .file_id = 0, .page_id = 3, .payload = &data3, .checksum = 0 };
+    _ = try wal.appendRecord(&upd3);
+
+    // COMMIT txn 1
+    var commit1 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&commit1);
+
+    // ABORT txn 3
+    var abort3 = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .abort_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&abort3);
+
+    // txn 2 has no commit or abort -- simulates in-flight crash
+
+    try wal.sync();
+    wal.deinit();
+
+    // Run recovery
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 64);
+    defer pool.deinit();
+
+    var recovery_inst = Recovery.init(allocator, null);
+    _ = try recovery_inst.recover(&setup.graph_dir, &pool, &fm);
+
+    // Verify: committed txn 1 page data (page 1) was applied
+    const pager_ptr = fm.getPager(.nodes).?;
+    const page_mod = @import("page.zig");
+
+    var read_buf1: [4096]u8 = undefined;
+    pager_ptr.readPage(1, &read_buf1) catch {
+        return error.TestUnexpectedResult;
+    };
+    // Check committed data is present
+    var committed_ok = true;
+    for (read_buf1[page_mod.PAGE_HEADER_SIZE..]) |byte| {
+        if (byte != 0xAA) { committed_ok = false; break; }
+    }
+    try testing.expect(committed_ok);
+
+    // Verify: uncommitted txn 2 page data (page 2) was NOT applied
+    var read_buf2: [4096]u8 = undefined;
+    pager_ptr.readPage(2, &read_buf2) catch {
+        // Page doesn't exist = correct, uncommitted data discarded
+        return;
+    };
+    var uncommitted_present = true;
+    for (read_buf2[page_mod.PAGE_HEADER_SIZE..]) |byte| {
+        if (byte != 0xBB) { uncommitted_present = false; break; }
+    }
+    try testing.expect(!uncommitted_present);
+
+    // Verify: aborted txn 3 page data (page 3) was NOT applied
+    var read_buf3: [4096]u8 = undefined;
+    pager_ptr.readPage(3, &read_buf3) catch {
+        // Page doesn't exist = correct, aborted data discarded
+        return;
+    };
+    var aborted_present = true;
+    for (read_buf3[page_mod.PAGE_HEADER_SIZE..]) |byte| {
+        if (byte != 0xCC) { aborted_present = false; break; }
+    }
+    try testing.expect(!aborted_present);
+}
+
+test "GAP-0005d: recovery with many pages (>100 page updates in WAL)" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write initial manifest
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+    defer wal_dir.close();
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+
+    // BEGIN txn 1
+    var begin_rec = WalRecord{
+        .lsn = 0, .txn_id = 1, .record_type = .begin_txn,
+        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+    };
+    _ = try wal.appendRecord(&begin_rec);
+
+    // Write 120 page_update records, each to a distinct page.
+    // Each page gets a unique byte pattern based on its page index.
+    const num_pages: u64 = 120;
+    for (0..num_pages) |i| {
+        var page_data: [4096]u8 = undefined;
+        @memset(&page_data, @as(u8, @intCast(i % 256)));
+        var upd = WalRecord{
+            .lsn = 0,
+            .txn_id = 1,
+            .record_type = .page_update,
+            .file_id = 0, // nodes
+            .page_id = @intCast(i + 1), // pages 1..120
+            .payload = &page_data,
+            .checksum = 0,
+        };
+        _ = try wal.appendRecord(&upd);
+    }
+
+    // COMMIT txn 1
+    var commit_rec = WalRecord{
+        .lsn = 0, .txn_id = 1, .record_type = .commit_txn,
+        .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0,
+    };
+    _ = try wal.appendRecord(&commit_rec);
+
+    try wal.sync();
+    wal.deinit();
+
+    // Run recovery with enough buffer pool frames for all 120 pages
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 256);
+    defer pool.deinit();
+
+    var recovery_inst = Recovery.init(allocator, null);
+    const recovered = try recovery_inst.recover(&setup.graph_dir, &pool, &fm);
+
+    // Recovery should succeed and increment counter
+    try testing.expectEqual(@as(u64, 2), recovered.counter);
+
+    // Spot-check a sample of the 120 pages to verify data was applied correctly
+    const pager_ptr = fm.getPager(.nodes).?;
+    const page_mod = @import("page.zig");
+
+    const check_pages = [_]u64{ 1, 50, 100, 119, 120 };
+    for (check_pages) |pg| {
+        var read_buf: [4096]u8 = undefined;
+        pager_ptr.readPage(pg, &read_buf) catch {
+            return error.TestUnexpectedResult;
+        };
+        const expected_byte: u8 = @intCast((pg - 1) % 256);
+        var match = true;
+        for (read_buf[page_mod.PAGE_HEADER_SIZE..]) |byte| {
+            if (byte != expected_byte) { match = false; break; }
+        }
+        try testing.expect(match);
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
