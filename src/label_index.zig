@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
 const free_space_mod = @import("free_space.zig");
 const node_store_mod = @import("node_store.zig");
+const node_mod = @import("node.zig");
 
 const Allocator = std.mem.Allocator;
 const BufferPool = buffer_pool_mod.BufferPool;
@@ -108,6 +109,8 @@ pub const LabelIndex = struct {
     }
 
     /// Rebuild the index from a node store by scanning all nodes.
+    /// Uses page-level scanning to pin each page once instead of
+    /// per-ID pin/unpin cycles (PERF-0012).
     pub fn rebuild(self: *LabelIndex, node_store: *NodeStore, max_node_id: NodeId) !void {
         // Clear existing data.
         var it = self.index.valueIterator();
@@ -116,13 +119,13 @@ pub const LabelIndex = struct {
         }
         self.index.clearAndFree();
 
-        // Scan all possible node IDs.
-        var nid: NodeId = 0;
-        while (nid < max_node_id) : (nid += 1) {
-            const rec = try node_store.getNode(nid) orelse continue;
-            if (rec.label_set != 0) {
-                try self.addNode(rec.label_set, nid);
-            }
+        // Use page-scan to iterate all live nodes efficiently.
+        try node_store.scanNodes(max_node_id, self, &rebuildCallback);
+    }
+
+    fn rebuildCallback(self: *LabelIndex, node_id: NodeId, rec: node_mod.NodeRec) void {
+        if (rec.label_set != 0) {
+            self.addNode(rec.label_set, node_id) catch {};
         }
     }
 };
@@ -286,8 +289,6 @@ test "rebuild from node store" {
     var env = try TestEnv.create();
     env.fixup();
     defer env.deinit();
-
-    const node_mod = @import("node.zig");
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
 

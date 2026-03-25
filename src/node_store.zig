@@ -101,6 +101,60 @@ pub const NodeStore = struct {
         self.buffer_pool.unpin(frame_idx, true);
     }
 
+    /// Page-scan iterator. Pins each page once and visits every non-empty,
+    /// non-deleted node slot, calling `callback(context, node_id, rec)` for
+    /// each live node. This eliminates the per-ID pin/unpin overhead that
+    /// occurs when calling `getNode` in a loop over consecutive IDs.
+    pub fn scanNodes(
+        self: *NodeStore,
+        max_node_id: u64,
+        context: anytype,
+        callback: *const fn (@TypeOf(context), NodeId, NodeRec) void,
+    ) !void {
+        if (max_node_id == 0) return;
+
+        const npp = self.nodes_per_page;
+        // Compute the page range we need to visit.
+        // node_id 0 lives on page 0, node_id npp lives on page 1, etc.
+        const last_node = max_node_id - 1;
+        const last_page = last_node / npp;
+
+        var page_id: u64 = 0;
+        while (page_id <= last_page) : (page_id += 1) {
+            // Skip pages that were never allocated.
+            if (!self.free_space.isAllocated(page_id)) {
+                continue;
+            }
+
+            const frame = try self.buffer_pool.pin(.nodes, page_id);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            defer self.buffer_pool.unpin(frame_idx, false);
+
+            const data = frame.dataSlice();
+
+            // How many slots to inspect on this page.
+            const first_node_on_page = page_id * npp;
+            const remaining = max_node_id - first_node_on_page;
+            const slots_on_page: u32 = if (remaining >= npp) npp else @intCast(remaining);
+
+            var slot: u32 = 0;
+            while (slot < slots_on_page) : (slot += 1) {
+                const offset = PAGE_HEADER_SIZE + slot * @sizeOf(NodeRec);
+                const rec = std.mem.bytesToValue(NodeRec, data[offset..][0..@sizeOf(NodeRec)]);
+
+                if (node_mod.isEmpty(&rec)) {
+                    continue;
+                }
+                if (node_mod.isDeleted(&rec)) {
+                    continue;
+                }
+
+                const node_id: NodeId = first_node_on_page + slot;
+                callback(context, node_id, rec);
+            }
+        }
+    }
+
     // Internal helpers
 
     fn pageForNode(self: *const NodeStore, node_id: NodeId) PageId {
@@ -254,6 +308,101 @@ test "nodes across multiple pages" {
 
     try testing.expectEqual(@as(u32, 100), n0.label_set);
     try testing.expectEqual(@as(u32, 200), n1.label_set);
+}
+
+test "scanNodes visits all live nodes across multiple pages" {
+    // Use a larger buffer pool since we need many pages for 500+ nodes.
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const node_file = tmp_dir.dir.createFile("nodes.store", .{ .read = true, .truncate = true }) catch unreachable;
+    defer node_file.close();
+    var pool = try BufferPool.init(testing.allocator, 4096, 64);
+    defer pool.deinit();
+    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm.deinit();
+    var node_pager = Pager.init(node_file, 4096);
+    pool.registerPager(.nodes, &node_pager);
+    fsm.buffer_pool = &pool;
+
+    var store = NodeStore.init(&pool, &fsm, 4096);
+
+    // nodes_per_page = 101 for 4096-byte pages.
+    // 500 nodes spans 5 pages (pages 0..4).
+    const total_nodes: u64 = 500;
+    var i: u64 = 0;
+    while (i < total_nodes) : (i += 1) {
+        // Use label_set = (i % 10) + 1 so no label is zero.
+        try store.putNode(i, makeTestNode(@intCast((i % 10) + 1)));
+    }
+
+    // Delete a few nodes to verify they are skipped.
+    try store.deleteNode(10);
+    try store.deleteNode(200);
+    try store.deleteNode(499);
+
+    // Scan and collect results.
+    const ScanCtx = struct {
+        count: u64 = 0,
+        id_sum: u64 = 0,
+
+        fn onNode(self: *@This(), node_id: NodeId, _: NodeRec) void {
+            self.count += 1;
+            self.id_sum += node_id;
+        }
+    };
+    var ctx = ScanCtx{};
+    try store.scanNodes(total_nodes, &ctx, &ScanCtx.onNode);
+
+    // 500 - 3 deleted = 497 live nodes.
+    try testing.expectEqual(@as(u64, 497), ctx.count);
+
+    // Sum of 0..499 minus 10, 200, 499 = (499*500/2) - 709 = 124750 - 709 = 124041.
+    try testing.expectEqual(@as(u64, 124041), ctx.id_sum);
+}
+
+test "scanNodes with zero max_node_id is a no-op" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = NodeStore.init(&env.pool, &env.fsm, 4096);
+
+    const Counter = struct {
+        count: u64 = 0,
+        fn onNode(self: *@This(), _: NodeId, _: NodeRec) void {
+            self.count += 1;
+        }
+    };
+    var ctx = Counter{};
+    try store.scanNodes(0, &ctx, &Counter.onNode);
+    try testing.expectEqual(@as(u64, 0), ctx.count);
+}
+
+test "scanNodes skips unallocated pages" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = NodeStore.init(&env.pool, &env.fsm, 4096);
+
+    // Put a node on page 1 (node_id = npp) but not page 0.
+    const npp = store.nodes_per_page;
+    try store.putNode(npp, makeTestNode(42));
+
+    const Counter = struct {
+        count: u64 = 0,
+        last_id: NodeId = 0,
+        fn onNode(self: *@This(), node_id: NodeId, _: NodeRec) void {
+            self.count += 1;
+            self.last_id = node_id;
+        }
+    };
+    var ctx = Counter{};
+    // Scan up to npp+1 so we cover both page 0 and page 1.
+    try store.scanNodes(npp + 1, &ctx, &Counter.onNode);
+
+    try testing.expectEqual(@as(u64, 1), ctx.count);
+    try testing.expectEqual(@as(NodeId, npp), ctx.last_id);
 }
 
 test {
