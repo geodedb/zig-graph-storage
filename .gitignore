@@ -43,6 +43,9 @@ result
 # Nix/direnv
 .direnv/
 
+# Worktrees
+.worktrees/
+
 # Coverage
 coverage/
 *.gcov
