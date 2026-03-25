@@ -15,16 +15,20 @@
 //!   file_data (file_size bytes)
 //!   --- end ---
 //!   CRC32 (4 bytes, over everything above)
+//!   --- when encryption_key is present (version 2) ---
+//!   HMAC-SHA256 (32 bytes, over everything above including CRC32)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 const graph_dir_mod = @import("graph_dir.zig");
 const GraphDir = graph_dir_mod.GraphDir;
 
 pub const BACKUP_MAGIC: [4]u8 = .{ 'G', 'E', 'O', 'B' };
 pub const BACKUP_VERSION: u16 = 1;
+pub const BACKUP_VERSION_HMAC: u16 = 2;
 
 /// Files to include in a backup.
 const BACKUP_FILES = [_][]const u8{
@@ -54,18 +58,31 @@ pub const BackupResult = struct {
 /// Per-graph backup and restore.
 pub const Backup = struct {
     allocator: Allocator,
+    /// Optional encryption key. When present, backups include an HMAC-SHA256
+    /// tag for integrity verification that cannot be forged without the key.
+    encryption_key: ?[32]u8 = null,
 
     pub fn init(allocator: Allocator) Backup {
         return .{ .allocator = allocator };
     }
 
+    /// Create a Backup with an encryption key for HMAC integrity protection.
+    pub fn initWithKey(allocator: Allocator, key: [32]u8) Backup {
+        return .{ .allocator = allocator, .encryption_key = key };
+    }
+
     /// Create a backup of a graph directory.
     /// The backup is a simple archive: header + file entries.
+    /// When encryption_key is set, uses version 2 with HMAC-SHA256 tag.
     pub fn createBackup(self: *Backup, graph_dir: *const GraphDir, output_path: []const u8) !BackupResult {
         const out_file = try std.fs.cwd().createFile(output_path, .{});
         defer out_file.close();
 
+        const version: u16 = if (self.encryption_key != null) BACKUP_VERSION_HMAC else BACKUP_VERSION;
+
         var crc = Crc32.init();
+        // SEC-0005: Initialize HMAC hasher when key is present
+        var hmac_ctx: ?HmacSha256 = if (self.encryption_key) |key| HmacSha256.init(&key) else null;
         var total_bytes: u64 = 0;
         var files_backed_up: u32 = 0;
 
@@ -99,12 +116,13 @@ pub const Backup = struct {
         // Write header: magic(4) + version(2) + uuid(16) + file_count(4)
         var header: [26]u8 = undefined;
         @memcpy(header[0..4], &BACKUP_MAGIC);
-        @memcpy(header[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, BACKUP_VERSION)));
+        @memcpy(header[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, version)));
         @memcpy(header[6..22], &graph_dir.graph_uuid);
         @memcpy(header[22..26], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(entries.items.len)))));
 
         try out_file.writeAll(&header);
         crc.update(&header);
+        if (hmac_ctx) |*h| h.update(&header);
         total_bytes += header.len;
 
         // Write each file entry
@@ -114,11 +132,13 @@ pub const Backup = struct {
             @memcpy(&name_len_buf, &std.mem.toBytes(std.mem.nativeToLittle(u16, @as(u16, @intCast(entry.name.len)))));
             try out_file.writeAll(&name_len_buf);
             crc.update(&name_len_buf);
+            if (hmac_ctx) |*h| h.update(&name_len_buf);
             total_bytes += 2;
 
             // filename
             try out_file.writeAll(entry.name);
             crc.update(entry.name);
+            if (hmac_ctx) |*h| h.update(entry.name);
             total_bytes += entry.name.len;
 
             // file_size (8 bytes)
@@ -126,11 +146,13 @@ pub const Backup = struct {
             @memcpy(&size_buf, &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, @intCast(entry.data.len)))));
             try out_file.writeAll(&size_buf);
             crc.update(&size_buf);
+            if (hmac_ctx) |*h| h.update(&size_buf);
             total_bytes += 8;
 
             // file_data
             try out_file.writeAll(entry.data);
             crc.update(entry.data);
+            if (hmac_ctx) |*h| h.update(entry.data);
             total_bytes += entry.data.len;
 
             files_backed_up += 1;
@@ -140,7 +162,16 @@ pub const Backup = struct {
         var crc_buf: [4]u8 = undefined;
         @memcpy(&crc_buf, &std.mem.toBytes(std.mem.nativeToLittle(u32, crc.final())));
         try out_file.writeAll(&crc_buf);
+        if (hmac_ctx) |*h| h.update(&crc_buf);
         total_bytes += 4;
+
+        // SEC-0005: When encryption key is present, finalize and append HMAC-SHA256 tag
+        if (hmac_ctx) |*h| {
+            var hmac_tag: [HmacSha256.mac_length]u8 = undefined;
+            h.final(&hmac_tag);
+            try out_file.writeAll(&hmac_tag);
+            total_bytes += HmacSha256.mac_length;
+        }
 
         return .{
             .graph_uuid = graph_dir.graph_uuid,
@@ -159,10 +190,41 @@ pub const Backup = struct {
         // Validate magic
         if (!std.mem.eql(u8, data[0..4], &BACKUP_MAGIC)) return error.InvalidMagic;
 
-        // Validate CRC
-        const stored_crc = std.mem.littleToNative(u32, @bitCast(data[data.len - 4 ..][0..4].*));
-        const computed_crc = Crc32.hash(data[0 .. data.len - 4]);
+        // Parse version
+        const version = readU16(data, 4);
+
+        // SEC-0005: Determine integrity region based on version
+        const integrity_end: usize = if (version >= BACKUP_VERSION_HMAC)
+            data.len - HmacSha256.mac_length
+        else
+            data.len;
+
+        // Validate CRC over data before CRC field
+        const crc_offset = if (version >= BACKUP_VERSION_HMAC)
+            integrity_end - 4
+        else
+            data.len - 4;
+
+        const stored_crc = std.mem.littleToNative(u32, @bitCast(data[crc_offset..][0..4].*));
+        const computed_crc = Crc32.hash(data[0..crc_offset]);
         if (stored_crc != computed_crc) return error.ChecksumMismatch;
+
+        // SEC-0005: Verify HMAC when version >= 2 and encryption key is available
+        if (version >= BACKUP_VERSION_HMAC) {
+            if (self.encryption_key) |key| {
+                if (data.len < integrity_end + HmacSha256.mac_length) return error.InvalidData;
+                const stored_hmac = data[integrity_end..][0..HmacSha256.mac_length];
+                const hmac_input = data[0..integrity_end];
+                var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
+                HmacSha256.create(&computed_hmac, hmac_input, &key);
+                if (!std.mem.eql(u8, stored_hmac, &computed_hmac)) {
+                    return error.HmacMismatch;
+                }
+            } else {
+                // Version 2 backup but no key provided -- HMAC cannot be verified.
+                // Allow restore (CRC already verified) but this is a reduced security mode.
+            }
+        }
 
         // Parse header
         var pos: usize = 4; // skip magic
@@ -179,11 +241,11 @@ pub const Backup = struct {
         // Extract files
         var i: u32 = 0;
         while (i < file_count) : (i += 1) {
-            if (pos + 2 > data.len - 4) return error.InvalidData;
+            if (pos + 2 > crc_offset) return error.InvalidData;
             const name_len = readU16(data, pos);
             pos += 2;
 
-            if (pos + name_len > data.len - 4) return error.InvalidData;
+            if (pos + name_len > crc_offset) return error.InvalidData;
             const name = data[pos..][0..name_len];
             pos += name_len;
 
@@ -191,14 +253,14 @@ pub const Backup = struct {
             // Reject absolute paths, null bytes, backslashes, and ".." components.
             if (!isValidBackupFilename(name)) return error.InvalidBackupFilename;
 
-            if (pos + 8 > data.len - 4) return error.InvalidData;
+            if (pos + 8 > crc_offset) return error.InvalidData;
             const file_size = readU64(data, pos);
             pos += 8;
 
             // SEC-0013: Guard against integer truncation on 32-bit targets.
             const file_size_usize = std.math.cast(usize, file_size) orelse return error.BackupTooLarge;
 
-            if (pos + file_size_usize > data.len - 4) return error.InvalidData;
+            if (pos + file_size_usize > crc_offset) return error.InvalidData;
             const file_data = data[pos..][0..file_size_usize];
             pos += file_size_usize;
 
@@ -218,7 +280,7 @@ pub const Backup = struct {
         }
     }
 
-    /// Validate a backup file's integrity (check header and CRC, don't extract).
+    /// Validate a backup file's integrity (check header, CRC, and HMAC if applicable).
     pub fn validateBackup(self: *Backup, backup_path: []const u8) !bool {
         const data = self.readFileAlloc(backup_path) catch return false;
         defer self.allocator.free(data);
@@ -230,12 +292,32 @@ pub const Backup = struct {
 
         // Check version
         const version = readU16(data, 4);
-        if (version != BACKUP_VERSION) return false;
+        if (version != BACKUP_VERSION and version != BACKUP_VERSION_HMAC) return false;
+
+        // Determine CRC position based on version
+        const crc_offset: usize = if (version >= BACKUP_VERSION_HMAC)
+            data.len - HmacSha256.mac_length - 4
+        else
+            data.len - 4;
+
+        if (crc_offset > data.len - 4) return false;
 
         // Check CRC
-        const stored_crc = std.mem.littleToNative(u32, @bitCast(data[data.len - 4 ..][0..4].*));
-        const computed_crc = Crc32.hash(data[0 .. data.len - 4]);
-        return stored_crc == computed_crc;
+        const stored_crc = std.mem.littleToNative(u32, @bitCast(data[crc_offset..][0..4].*));
+        const computed_crc = Crc32.hash(data[0..crc_offset]);
+        if (stored_crc != computed_crc) return false;
+
+        // SEC-0005: Verify HMAC when version >= 2 and key is available
+        if (version >= BACKUP_VERSION_HMAC and self.encryption_key != null) {
+            const integrity_end = data.len - HmacSha256.mac_length;
+            const stored_hmac = data[integrity_end..][0..HmacSha256.mac_length];
+            const hmac_input = data[0..integrity_end];
+            var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
+            HmacSha256.create(&computed_hmac, hmac_input, &self.encryption_key.?);
+            if (!std.mem.eql(u8, stored_hmac, &computed_hmac)) return false;
+        }
+
+        return true;
     }
 
     // ========================================================================
@@ -633,6 +715,133 @@ test "SEC-0013: integer truncation guard in restoreBackup" {
     // On 64-bit: file_size is valid usize but exceeds data.len => InvalidData
     // On 32-bit: cast fails => BackupTooLarge
     try testing.expect(result == error.InvalidData or result == error.BackupTooLarge);
+}
+
+test "SEC-0005: HMAC backup creates version 2 with tag" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_hmac.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    const key = [_]u8{0xAA} ** 32;
+    var backup = Backup.initWithKey(allocator, key);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+
+    // Verify version is 2
+    const file = try std.fs.cwd().openFile(backup_path, .{});
+    defer file.close();
+    var header: [6]u8 = undefined;
+    _ = try file.readAll(&header);
+    const version = std.mem.littleToNative(u16, @bitCast(header[4..6].*));
+    try testing.expectEqual(@as(u16, BACKUP_VERSION_HMAC), version);
+
+    // Validate with correct key succeeds
+    const valid = try backup.validateBackup(backup_path);
+    try testing.expect(valid);
+}
+
+test "SEC-0005: HMAC backup rejects tampered data with recalculated CRC" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    // Write some data to a store file so there is content to tamper
+    const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
+    defer allocator.free(nodes_path);
+    {
+        const f = try std.fs.cwd().openFile(nodes_path, .{ .mode = .write_only });
+        defer f.close();
+        try f.writeAll("original data");
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_tamper.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    const key = [_]u8{0xBB} ** 32;
+    var backup = Backup.initWithKey(allocator, key);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+
+    // Tamper with the file data and recalculate the CRC (but not HMAC)
+    {
+        const data = try Backup.readFileAlloc(&backup, backup_path);
+        defer allocator.free(data);
+
+        // Tamper: change a byte in the file data area (after header)
+        if (data.len > 30 + HmacSha256.mac_length) {
+            const tampered = try allocator.alloc(u8, data.len);
+            defer allocator.free(tampered);
+            @memcpy(tampered, data);
+
+            // Flip a byte in the file data area
+            tampered[28] ^= 0xFF;
+
+            // Recalculate CRC32 over data[0..crc_offset]
+            const crc_offset = data.len - HmacSha256.mac_length - 4;
+            const new_crc = Crc32.hash(tampered[0..crc_offset]);
+            @memcpy(tampered[crc_offset..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+
+            // Write tampered data (HMAC is now invalid)
+            const f = try std.fs.cwd().createFile(backup_path, .{});
+            defer f.close();
+            try f.writeAll(tampered);
+        }
+    }
+
+    // Validation with the correct key should fail due to HMAC mismatch
+    const valid = try backup.validateBackup(backup_path);
+    try testing.expect(!valid);
+}
+
+test "SEC-0005: no-key backup still works as version 1" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v1.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    var backup = Backup.init(allocator);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+
+    // Check version is 1
+    const file = try std.fs.cwd().openFile(backup_path, .{});
+    defer file.close();
+    var header: [6]u8 = undefined;
+    _ = try file.readAll(&header);
+    const version = std.mem.littleToNative(u16, @bitCast(header[4..6].*));
+    try testing.expectEqual(@as(u16, BACKUP_VERSION), version);
+
+    const valid = try backup.validateBackup(backup_path);
+    try testing.expect(valid);
 }
 
 test {
