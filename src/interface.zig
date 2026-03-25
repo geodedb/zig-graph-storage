@@ -56,7 +56,7 @@ pub const GraphStorage = struct {
         edgeCount: *const fn (ptr: *anyopaque) anyerror!u64,
         // Lifecycle
         checkpoint: *const fn (ptr: *anyopaque) anyerror!void,
-        close: *const fn (ptr: *anyopaque) void,
+        close: *const fn (ptr: *anyopaque) anyerror!void,
     };
 
     // Convenience methods that delegate to vtable
@@ -126,7 +126,7 @@ pub const GraphStorage = struct {
     pub fn doCheckpoint(self: GraphStorage) anyerror!void {
         return self.vtable.checkpoint(self.ptr);
     }
-    pub fn close(self: GraphStorage) void {
+    pub fn close(self: GraphStorage) anyerror!void {
         return self.vtable.close(self.ptr);
     }
 
@@ -263,7 +263,7 @@ pub const GraphStorage = struct {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{self});
             }
-            fn closeFn(ptr: *anyopaque) void {
+            fn closeFn(ptr: *anyopaque) anyerror!void {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{self});
             }
@@ -327,14 +327,12 @@ test "GraphStorage with mock vtable dispatches close" {
     const Mock = struct {
         closed: bool = false,
 
-        fn closeFn(ptr: *anyopaque) void {
+        fn closeFn(ptr: *anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.closed = true;
         }
     };
 
-    // We only need to fill in the close method for this test;
-    // the rest can use stubs that will never be called.
     const stub_vtable = GraphStorage.VTable{
         .getNode = undefined,
         .putNode = undefined,
@@ -367,7 +365,7 @@ test "GraphStorage with mock vtable dispatches close" {
         .vtable = &stub_vtable,
     };
 
-    gs.close();
+    try gs.close();
     try std.testing.expect(mock.closed);
 }
 

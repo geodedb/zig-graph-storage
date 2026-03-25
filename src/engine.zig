@@ -19,7 +19,6 @@ const prop_store_mod = @import("prop_store.zig");
 const var_store_mod = @import("var_store.zig");
 const free_space_mod = @import("free_space.zig");
 const label_dict_mod = @import("label_dict.zig");
-const label_index_mod = @import("label_index.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const recovery_mod = @import("recovery.zig");
 const node_mod = @import("node.zig");
@@ -46,7 +45,6 @@ const PropStore = prop_store_mod.PropStore;
 const VarStore = var_store_mod.VarStore;
 const FreeSpaceManager = free_space_mod.FreeSpaceManager;
 const LabelDictionary = label_dict_mod.LabelDictionary;
-const LabelIndex = label_index_mod.LabelIndex;
 const Checkpointer = checkpoint_mod.Checkpointer;
 const Recovery = recovery_mod.Recovery;
 const NodeRec = node_mod.NodeRec;
@@ -77,7 +75,6 @@ pub const GraphEngine = struct {
     free_space_props: FreeSpaceManager,
     free_space_var: FreeSpaceManager,
     label_dict: LabelDictionary,
-    label_index: LabelIndex,
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.fs.Dir,
@@ -122,6 +119,7 @@ pub const GraphEngine = struct {
 
         // 5. Create buffer pool, register pagers
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
+        errdefer self.buffer_pool.deinit();
         if (self.file_manager.getPager(.nodes)) |p| self.buffer_pool.registerPager(.nodes, p);
         if (self.file_manager.getPager(.adj_out)) |p| self.buffer_pool.registerPager(.adj_out, p);
         if (self.file_manager.getPager(.adj_in)) |p| self.buffer_pool.registerPager(.adj_in, p);
@@ -156,9 +154,8 @@ pub const GraphEngine = struct {
         self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
         self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
 
-        // 10. Init label dictionary and label index
+        // 10. Init label dictionary
         self.label_dict = LabelDictionary.init(allocator);
-        self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
 
         // 11. Init checkpointer
         self.checkpointer = Checkpointer.init(
@@ -191,10 +188,16 @@ pub const GraphEngine = struct {
 
         // 3. Create buffer pool
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
+        errdefer self.buffer_pool.deinit();
 
         // 4. Run recovery (loads manifest, replays WAL)
         var recovery = Recovery.init(allocator, cfg.encryption_key);
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
+
+        // SEC-0010: Validate page_size matches manifest after recovery
+        if (cfg.page_size != self.manifest.page_size) {
+            return error.PageSizeMismatch;
+        }
 
         // 5. Create free space managers
         self.free_space_nodes = try FreeSpaceManager.init(allocator, &self.buffer_pool, .nodes);
@@ -223,17 +226,13 @@ pub const GraphEngine = struct {
         self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
         self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
 
-        // 9. Init label dictionary and label index
+        // 9. Init label dictionary
         self.label_dict = LabelDictionary.init(allocator);
-        self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
 
         // Try to load label dictionary if it exists
         const labels_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path});
         defer allocator.free(labels_path);
         self.label_dict.loadFromFile(labels_path) catch {};
-
-        // Rebuild label index from node store
-        self.label_index.rebuild(&self.node_store, self.manifest.next_node_id) catch {};
 
         // 10. Init checkpointer
         self.checkpointer = Checkpointer.init(
@@ -249,23 +248,47 @@ pub const GraphEngine = struct {
     }
 
     /// Close the engine (flush, checkpoint, close files).
-    pub fn close(self: *GraphEngine) void {
+    ///
+    /// Returns an error if the final checkpoint or label dictionary save fails.
+    /// Resources are always cleaned up regardless of errors.
+    pub fn close(self: *GraphEngine) !void {
         const allocator = self.allocator;
 
         // Persist current state
         self.manifest.next_txn_id = self.txn_manager.next_txn_id.load(.monotonic);
         self.manifest.label_count = self.label_dict.count();
 
-        // Try to run a final checkpoint
-        self.checkpointer.run() catch {};
+        // Track the first error encountered during close
+        var close_err: ?anyerror = null;
 
-        // Save label dictionary
-        if (std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path})) |labels_path| {
-            defer allocator.free(labels_path);
-            self.label_dict.saveToFile(labels_path) catch {};
-        } else |_| {}
+        // Run a final checkpoint -- propagate errors
+        self.checkpointer.run() catch |err| {
+            close_err = err;
+        };
 
-        // Cleanup all resources
+        // Save label dictionary -- propagate errors
+        const labels_path = std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path}) catch |err| {
+            if (close_err == null) close_err = err;
+            self.cleanupResources(allocator);
+            if (close_err) |e| return e;
+            return;
+        };
+        defer allocator.free(labels_path);
+
+        self.label_dict.saveToFile(labels_path) catch |err| {
+            if (close_err == null) close_err = err;
+        };
+
+        // Cleanup all resources (always runs)
+        self.cleanupResources(allocator);
+
+        // Return the first error encountered
+        if (close_err) |err| return err;
+    }
+
+    /// Internal cleanup of all engine resources. Always runs on close,
+    /// even when errors have occurred.
+    fn cleanupResources(self: *GraphEngine, allocator: Allocator) void {
         self.txn_manager.deinit();
         self.wal.deinit();
         self.wal_dir_handle.close();
@@ -275,7 +298,6 @@ pub const GraphEngine = struct {
         self.free_space_props.deinit();
         self.free_space_var.deinit();
         self.label_dict.deinit();
-        self.label_index.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
@@ -313,12 +335,15 @@ pub const GraphEngine = struct {
         return self.node_store.deleteNode(id);
     }
 
+    /// Look up an edge by its ID.
+    ///
+    /// QUAL-0006: Returns error.EdgeIndexNotImplemented instead of silently
+    /// returning null. A dedicated edge-ID index is required for efficient
+    /// lookup; the current storage layout does not maintain one.
     pub fn getEdge(self: *GraphEngine, edge_id: EdgeId) anyerror!?EdgeEntry {
-        // Scan all nodes' adjacency lists to find the edge
-        // For v1, this is a linear scan. A future index would improve this.
         _ = self;
         _ = edge_id;
-        return null; // Stub: full implementation would require an edge index
+        return error.EdgeIndexNotImplemented;
     }
 
     pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, alloc: Allocator) anyerror![]EdgeEntry {
@@ -393,19 +418,29 @@ pub const GraphEngine = struct {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         rec.label_set |= (@as(u32, 1) << @intCast(label % 32));
         try self.node_store.putNode(node_id, rec);
-        try self.label_index.addNode(label, node_id);
     }
 
     pub fn removeLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         rec.label_set &= ~(@as(u32, 1) << @intCast(label % 32));
         try self.node_store.putNode(node_id, rec);
-        self.label_index.removeNode(label, node_id);
     }
 
     pub fn scanLabel(self: *GraphEngine, label: LabelId, alloc: Allocator) anyerror![]NodeId {
-        // Delegate to the in-memory label index (sorted posting lists).
-        return self.label_index.scan(label, alloc);
+        // Linear scan of all nodes for the label bit
+        const mask = @as(u32, 1) << @intCast(label % 32);
+        var result: std.ArrayList(NodeId) = .{};
+        errdefer result.deinit(alloc);
+
+        var id: NodeId = 0;
+        while (id < self.manifest.next_node_id) : (id += 1) {
+            const rec = try self.node_store.getNode(id) orelse continue;
+            if ((rec.label_set & mask) != 0) {
+                try result.append(alloc, id);
+            }
+        }
+
+        return result.toOwnedSlice(alloc);
     }
 
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {
@@ -479,7 +514,7 @@ test "create engine, allocNode, putNode, getNode round-trip" {
 
     const uuid = [_]u8{0x01} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
-    defer engine.close();
+    defer engine.close() catch {};
 
     // Allocate and write a node
     const node_id = try engine.allocNode();
@@ -511,7 +546,7 @@ test "create engine, addEdge, expandOut returns edge" {
 
     const uuid = [_]u8{0x02} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
-    defer engine.close();
+    defer engine.close() catch {};
 
     // Create two nodes
     const n1 = try engine.allocNode();
@@ -585,13 +620,13 @@ test "create engine, checkpoint, close, open again, data persists" {
         // Checkpoint to persist
         try engine.checkpoint();
 
-        engine.close();
+        try engine.close();
     }
 
     // Re-open and verify
     {
         const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
-        defer engine.close();
+        defer engine.close() catch {};
 
         // The node should be readable if it was flushed to disk
         const got = try engine.getNode(1);
@@ -612,7 +647,7 @@ test "GraphStorage vtable interface works" {
 
     const uuid = [_]u8{0x04} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
-    defer engine.close();
+    defer engine.close() catch {};
 
     // Get the vtable interface
     const gs = engine.storage();
@@ -635,6 +670,63 @@ test "GraphStorage vtable interface works" {
 
     const count = try gs.nodeCount();
     try testing.expectEqual(@as(u64, 1), count);
+}
+
+test "GAP-0006: close returns error union, not void" {
+    // Verify that close() returns !void by calling try on it
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x06} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+
+    // This call would fail to compile if close() returned void
+    try engine.close();
+}
+
+test "SEC-0010: open rejects page_size mismatch" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x10} ** 16;
+    const cfg = testConfig(); // page_size = 4096
+
+    // Create with page_size 4096
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Try to open with different page_size -- should fail
+    {
+        var bad_cfg = testConfig();
+        bad_cfg.page_size = 8192;
+        const result = GraphEngine.open(testing.allocator, td.path, uuid, bad_cfg);
+        try testing.expectError(error.PageSizeMismatch, result);
+    }
+}
+
+test "QUAL-0006: getEdge returns EdgeIndexNotImplemented error" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x07} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // getEdge should return an explicit error, not silent null
+    const result = engine.getEdge(1);
+    try testing.expectError(error.EdgeIndexNotImplemented, result);
 }
 
 test {
