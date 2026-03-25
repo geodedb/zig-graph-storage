@@ -31,6 +31,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Seed module (reusable test data generator)
+    const seed_mod = b.addModule("seed", .{
+        .root_source_file = b.path("tests/seed.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "graph_storage", .module = module },
+        },
+    });
+
     // Unit tests (run tests defined in the module itself)
     const test_step = b.step("test", "Run unit tests");
     const unit_tests = b.addTest(.{
@@ -56,6 +66,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "graph_storage", .module = module },
+                .{ .name = "seed", .module = seed_mod },
                 .{ .name = "wal", .module = wal_mod },
                 .{ .name = "uuid", .module = uuid_mod },
             },
@@ -100,6 +111,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_bench = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&run_bench.step);
+
+    // Heavy-load benchmark executable (uses seed module)
+    const load_bench_step = b.step("load-bench", "Run heavy-load benchmarks with Geode-model seeder");
+    const load_bench_exe = b.addExecutable(.{
+        .name = "load-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/load_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "graph_storage", .module = module },
+                .{ .name = "seed", .module = seed_mod },
+                .{ .name = "wal", .module = wal_mod },
+                .{ .name = "uuid", .module = uuid_mod },
+            },
+        }),
+    });
+    const run_load_bench = b.addRunArtifact(load_bench_exe);
+    if (b.args) |args| {
+        run_load_bench.addArgs(args);
+    }
+    load_bench_step.dependOn(&run_load_bench.step);
 
     // Check step for IDE integration (fast syntax validation)
     const check_step = b.step("check", "Check for compilation errors");

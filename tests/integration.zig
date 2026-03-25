@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const lib = @import("graph_storage");
+const seed = @import("seed");
 
 const GraphEngine = lib.GraphEngine;
 const GraphConfig = lib.GraphConfig;
@@ -334,6 +335,89 @@ test "QUAL-0002: full durability round-trip -- nodes, edges, properties survive 
         const n3_in = try eng.expandIn(3, null, allocator);
         defer allocator.free(n3_in);
         try std.testing.expectEqual(@as(usize, 2), n3_in.len);
+    }
+}
+
+test "seed: small graph round-trip" {
+    const allocator = std.testing.allocator;
+    const cfg = testConfig();
+    const uuid = [_]u8{0xAA} ** 16;
+
+    var td = try testDataDir();
+    defer {
+        allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    // Phase 1: Seed, verify counts, checkpoint, close
+    const seed_cfg = seed.SeedConfig.tiny();
+    var sr: seed.SeedResult = undefined;
+    {
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        sr = try seed.populate(eng, seed_cfg);
+
+        // Verify node count matches config
+        try std.testing.expectEqual(seed_cfg.totalNodes(), sr.node_count);
+        try std.testing.expectEqual(seed_cfg.totalNodes(), try eng.nodeCount());
+
+        // Verify edge count is reasonable (at least the estimated count)
+        try std.testing.expect(sr.edge_count > 0);
+        try std.testing.expectEqual(sr.edge_count, try eng.edgeCount());
+
+        // Verify properties were set
+        try std.testing.expect(sr.property_count > 0);
+
+        // Verify node ranges make sense
+        try std.testing.expectEqual(@as(u64, seed_cfg.users), sr.users.count());
+        try std.testing.expectEqual(@as(u64, seed_cfg.devices), sr.devices.count());
+        try std.testing.expectEqual(@as(u64, seed_cfg.drive_items), sr.drive_items.count());
+
+        // Verify a user node has the expected label and properties
+        const user_rec = try eng.getNode(sr.users.start);
+        try std.testing.expect(user_rec != null);
+        try std.testing.expect(user_rec.?.prop_head != 0);
+
+        // Read display_name property from first user
+        const val = try eng.getProperty(user_rec.?.prop_head, "display_name", allocator);
+        try std.testing.expect(val != null);
+        switch (val.?) {
+            .string => |s| {
+                // Should start with "user_"
+                try std.testing.expect(std.mem.startsWith(u8, s, "user_"));
+                allocator.free(s);
+            },
+            else => return error.UnexpectedPropertyType,
+        }
+
+        // Verify label scan returns the right count of users
+        const user_nodes = try eng.scanLabel(sr.labels.user, allocator);
+        defer allocator.free(user_nodes);
+        try std.testing.expectEqual(@as(usize, seed_cfg.users), user_nodes.len);
+
+        // Verify a user has outgoing edges (MEMBER_OF, LOGGED_INTO, SIGNED_IN_*)
+        const user_edges = try eng.expandOut(sr.users.start, null, allocator);
+        defer allocator.free(user_edges);
+        try std.testing.expect(user_edges.len > 0);
+
+        // Checkpoint and close
+        try eng.checkpoint();
+        try eng.close();
+    }
+
+    // Phase 2: Reopen and verify data survived
+    {
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Verify node and edge counts persisted
+        try std.testing.expectEqual(seed_cfg.totalNodes(), try eng.nodeCount());
+        try std.testing.expectEqual(sr.edge_count, try eng.edgeCount());
+
+        // Verify a user node is still readable
+        const got = try eng.getNode(sr.users.start);
+        try std.testing.expect(got != null);
+        try std.testing.expect(got.?.txn_stamp >= 1);
     }
 }
 
