@@ -1,7 +1,8 @@
 # Full Codebase Audit Summary
 
 **Date:** 2026-03-25
-**Auditors:** Automated multi-agent pipeline (8 agents, 4 phases)
+**Auditors:** Automated multi-agent pipeline (20+ agents across audit + closure + verification)
+**Status:** Audit complete. Gap closure complete. Post-closure verification passed.
 
 ## Repository
 
@@ -168,33 +169,31 @@ Note: Platform issue creation skipped (no GitLab API access). All findings docum
 
 ---
 
-## Recommended Priority Actions
+## Post-Closure Verification (2026-03-25)
 
-### Immediate (before any release)
+All 4 verification agents confirmed fixes are correct:
 
-1. **Fix AES-GCM nonce reuse** -- include write counter/LSN in nonce, or switch to AES-GCM-SIV
-2. **Fix path traversal in backup restore** -- validate filenames, reject `..` components
-3. **Add key zeroization** -- `std.crypto.utils.secureZero` on all key copies in deinit
-4. **Add WAL checksum verification in recovery** -- `rec.checksum == rec.computeChecksum()`
-5. **Pass encryption key to recovery** -- recovery must use same key as write path
-6. **Add CI build+test jobs** -- add `zig build test` and `zig build test-integration` to pipeline
+- **Security:** 13/13 fixes VERIFIED (semgrep 0 findings, gitleaks 0 real findings)
+- **Quality:** 4/4 fixes VERIFIED
+- **Performance:** 5/5 fixes VERIFIED (PERF-0004 fixed in verification pass)
+- **Gap Analysis:** 5/5 closed gaps VERIFIED
 
-### Short-term (next sprint)
+### Remaining items (not addressable in this pass)
 
-7. Make `close()` return `!void` to propagate checkpoint/save errors
-8. Assert `page_size` matches manifest on open
-9. Replace `@enumFromInt` with `std.meta.intToEnum` on all disk-read paths
-10. Add backup file size limit and MAC (HMAC-SHA256)
-11. Validate `data_dir` path before `deleteTree`
-12. Set explicit file permissions (0o600) on created files
-
-### Medium-term
-
-13. Add `next_free_hint` to FreeSpaceManager for O(1) amortized allocation
-14. Wire LabelIndex into Engine.scanLabel instead of linear scan
-15. Add maintained counters for nodeCount/edgeCount in manifest
-16. Optimize PropStore to skip-by-size instead of decode-and-discard
-17. Add page-scan method to NodeStore for batch operations
-18. Implement crash recovery test suite (torn writes, manifest corruption, multi-txn)
-19. Complete migration bulk-load implementation
-20. Add benchmark harness
+| Item | Status | Reason |
+|------|--------|--------|
+| GAP-0001: CI build/test jobs | Won't Do | Requires GitLab project-level changes |
+| GAP-0002: Migration bulk-load | Blocked | Needs Geode binary format reader |
+| GAP-0004: Metrics module | Won't Do | Post-v1 scope |
+| PERF-0002: PropStore 3-pass update | Deferred | Major refactor, needs benchmarks |
+| PERF-0003: AdjStore O(blocks) walk | Deferred | Structural change |
+| PERF-0005: nodeCount/edgeCount O(N) | Deferred | Manifest schema change |
+| PERF-0008: Sync eviction | Won't Do | v1 limitation |
+| PERF-0009/10: WAL alloc + double CRC | Deferred | WAL interface change |
+| PERF-0011: LabelIndex O(n) insert | Deferred | B+tree migration |
+| PERF-0012: Pin/unpin per node | Deferred | New scanPage API |
+| PERF-0013: B+tree rebalance | Won't Do | v1 limitation |
+| PERF-0014: WAL full load | Deferred | Streaming replay |
+| QUAL-0004/5: Code style | Deferred | Refactoring only |
+| QUAL-0007: anyerror vtable | Won't Do | Zig language limitation |
+| QUAL-0008: Format spec doc | Deferred | Documentation only |
