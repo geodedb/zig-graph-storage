@@ -46,13 +46,15 @@ pub const NodeStore = struct {
         defer self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
 
         const data = frame.dataSlice();
-        const rec_bytes = data[slot_offset..][0..@sizeOf(NodeRec)];
-        const rec: *const NodeRec = @ptrCast(@alignCast(rec_bytes.ptr));
+        // Use bytesToValue for alignment-safe reading from buffer pool pages.
+        // Buffer pool pages are page-aligned, but slot offsets within a page
+        // may not satisfy NodeRec's alignment requirement.
+        const rec = std.mem.bytesToValue(NodeRec, data[slot_offset..][0..@sizeOf(NodeRec)]);
 
-        if (node_mod.isEmpty(rec)) return null;
-        if (node_mod.isDeleted(rec)) return null;
+        if (node_mod.isEmpty(&rec)) return null;
+        if (node_mod.isDeleted(&rec)) return null;
 
-        return rec.*;
+        return rec;
     }
 
     /// Write a node record at the given ID.
@@ -89,8 +91,12 @@ pub const NodeStore = struct {
         const frame_idx = self.buffer_pool.frameIndex(frame);
 
         const data = frame.dataSlice();
-        const rec: *NodeRec = @ptrCast(@alignCast(data[slot_offset..][0..@sizeOf(NodeRec)].ptr));
+        // Use bytesToValue/bytesAsSlice for alignment-safe read-modify-write.
+        // Read the record, set the deleted flag, and write it back.
+        var rec = std.mem.bytesToValue(NodeRec, data[slot_offset..][0..@sizeOf(NodeRec)]);
         rec.flags |= node_mod.NODE_FLAG_DELETED;
+        const rec_bytes: *const [@sizeOf(NodeRec)]u8 = @ptrCast(&rec);
+        @memcpy(data[slot_offset..][0..@sizeOf(NodeRec)], rec_bytes);
 
         self.buffer_pool.unpin(frame_idx, true);
     }

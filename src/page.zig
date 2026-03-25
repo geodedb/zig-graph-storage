@@ -73,9 +73,11 @@ pub fn headerToBytes(header: *const PageHeader) *const [32]u8 {
     return @ptrCast(header);
 }
 
-/// Cast a byte array pointer to a PageHeader pointer for reading.
-pub fn headerFromBytes(bytes: *const [32]u8) *const PageHeader {
-    return @ptrCast(@alignCast(bytes));
+/// Decode a PageHeader from a 32-byte array.
+/// Uses bytesToValue for alignment-safe reading -- the input bytes
+/// do not need to satisfy PageHeader's alignment requirement.
+pub fn headerFromBytes(bytes: *const [32]u8) PageHeader {
+    return std.mem.bytesToValue(PageHeader, bytes);
 }
 
 // ============================================================================
@@ -139,6 +141,22 @@ test "corruption detection: checksum mismatch after body modification" {
     const checksum_after = computeChecksum(&body);
 
     try std.testing.expect(checksum_before != checksum_after);
+}
+
+test "headerFromBytes works with unaligned byte array" {
+    // Create a buffer at an odd offset to force misalignment
+    var buf: [33]u8 = undefined;
+    @memset(&buf, 0);
+    // Write a header starting at offset 1 (guaranteed unaligned for any >1 alignment)
+    const original = initHeader(7, .prop_slotted, 4096);
+    const header_bytes = headerToBytes(&original);
+    @memcpy(buf[1..][0..32], header_bytes);
+
+    // headerFromBytes should handle this without a crash
+    const restored = headerFromBytes(buf[1..][0..32]);
+    try std.testing.expectEqual(original.page_id, restored.page_id);
+    try std.testing.expectEqual(original.page_type, restored.page_type);
+    try std.testing.expectEqual(original.free_end, restored.free_end);
 }
 
 test {
