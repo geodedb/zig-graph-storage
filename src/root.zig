@@ -11,6 +11,7 @@ pub const types = @import("types.zig");
 pub const errors = @import("errors.zig");
 pub const config = @import("config.zig");
 pub const page = @import("page.zig");
+pub const pager = @import("pager.zig");
 pub const node = @import("node.zig");
 pub const edge = @import("edge.zig");
 pub const property = @import("property.zig");
