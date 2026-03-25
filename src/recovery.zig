@@ -97,8 +97,8 @@ pub const Recovery = struct {
         const wal_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/wal", .{graph_dir.path});
         defer self.allocator.free(wal_dir_path);
 
-        // Ensure WAL directory exists
-        std.fs.cwd().makePath(wal_dir_path) catch {};
+        // Ensure WAL directory exists (propagate errors instead of swallowing)
+        try std.fs.cwd().makePath(wal_dir_path);
 
         var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
         defer wal_dir.close();
