@@ -10,8 +10,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields (see below) + CRC32(4)
-const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8; // = 136
-const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4; // magic + fields + crc = 148
+const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 152
+const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4; // magic + fields + crc = 164
 
 pub const Manifest = struct {
     format_version: u32 = MANIFEST_VERSION,
@@ -31,6 +31,8 @@ pub const Manifest = struct {
     props_pages: u64 = 0,
     var_pages: u64 = 0,
     free_pages: u64 = 0,
+    node_count: u64 = 0,
+    edge_count: u64 = 0,
 
     /// Serialize to bytes: magic(8) + all fields in little-endian + CRC32(4).
     pub fn serialize(self: *const Manifest, allocator: Allocator) ![]u8 {
@@ -62,6 +64,8 @@ pub const Manifest = struct {
         writeU64(buf, &pos, self.props_pages);
         writeU64(buf, &pos, self.var_pages);
         writeU64(buf, &pos, self.free_pages);
+        writeU64(buf, &pos, self.node_count);
+        writeU64(buf, &pos, self.edge_count);
 
         // CRC32 over everything before the checksum
         const crc = Crc32.hash(buf[0..pos]);
@@ -120,6 +124,10 @@ pub const Manifest = struct {
         m.var_pages = readU64(data, pos);
         pos += 8;
         m.free_pages = readU64(data, pos);
+        pos += 8;
+        m.node_count = readU64(data, pos);
+        pos += 8;
+        m.edge_count = readU64(data, pos);
 
         return m;
     }
@@ -209,6 +217,8 @@ test "serialize/deserialize round-trip" {
         .props_pages = 40,
         .var_pages = 50,
         .free_pages = 60,
+        .node_count = 70,
+        .edge_count = 80,
     };
 
     const data = try m.serialize(allocator);
@@ -230,6 +240,8 @@ test "serialize/deserialize round-trip" {
     try std.testing.expectEqual(m.props_pages, m2.props_pages);
     try std.testing.expectEqual(m.var_pages, m2.var_pages);
     try std.testing.expectEqual(m.free_pages, m2.free_pages);
+    try std.testing.expectEqual(m.node_count, m2.node_count);
+    try std.testing.expectEqual(m.edge_count, m2.edge_count);
 }
 
 test "corrupt data detected (bad CRC)" {

@@ -337,11 +337,15 @@ pub const GraphEngine = struct {
     pub fn allocNode(self: *GraphEngine) anyerror!NodeId {
         const id = self.manifest.next_node_id;
         self.manifest.next_node_id += 1;
+        self.manifest.node_count += 1;
         return id;
     }
 
     pub fn deleteNode(self: *GraphEngine, id: NodeId) anyerror!void {
-        return self.node_store.deleteNode(id);
+        try self.node_store.deleteNode(id);
+        if (self.manifest.node_count > 0) {
+            self.manifest.node_count -= 1;
+        }
     }
 
     /// Look up an edge by its ID.
@@ -394,6 +398,8 @@ pub const GraphEngine = struct {
         to_rec.in_head = new_in_head;
         try self.node_store.putNode(to, to_rec);
 
+        self.manifest.edge_count += 1;
+
         return edge_id;
     }
 
@@ -405,6 +411,10 @@ pub const GraphEngine = struct {
         // Remove from target node's in adjacency list
         const to_rec = try self.node_store.getNode(to) orelse return error.NodeNotFound;
         try self.adj_in.removeEdge(to_rec.in_head, edge_id);
+
+        if (self.manifest.edge_count > 0) {
+            self.manifest.edge_count -= 1;
+        }
     }
 
     pub fn getProperty(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
@@ -455,25 +465,11 @@ pub const GraphEngine = struct {
     }
 
     pub fn nodeCount(self: *GraphEngine) anyerror!u64 {
-        // Count non-null, non-deleted nodes
-        var count: u64 = 0;
-        var id: NodeId = 0;
-        while (id < self.manifest.next_node_id) : (id += 1) {
-            const rec = try self.node_store.getNode(id);
-            if (rec != null) count += 1;
-        }
-        return count;
+        return self.manifest.node_count;
     }
 
     pub fn edgeCount(self: *GraphEngine) anyerror!u64 {
-        // Count edges by scanning all nodes' out adjacency lists
-        var count: u64 = 0;
-        var id: NodeId = 0;
-        while (id < self.manifest.next_node_id) : (id += 1) {
-            const rec = try self.node_store.getNode(id) orelse continue;
-            count += try self.adj_out.edgeCount(rec.out_head);
-        }
-        return count;
+        return self.manifest.edge_count;
     }
 
     pub fn checkpoint(self: *GraphEngine) anyerror!void {
@@ -723,6 +719,56 @@ test "QUAL-0006: getEdge returns EdgeIndexNotImplemented error" {
     // getEdge should return an explicit error, not silent null
     const result = engine.getEdge(1);
     try testing.expectError(error.EdgeIndexNotImplemented, result);
+}
+
+test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x50} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Initially zero
+    try testing.expectEqual(@as(u64, 0), try engine.nodeCount());
+    try testing.expectEqual(@as(u64, 0), try engine.edgeCount());
+
+    // Allocate and write two nodes
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0, .in_head = 0, .prop_head = 0,
+        .label_set = 0, .flags = 0, ._pad = 0, .txn_stamp = 1,
+    });
+    try testing.expectEqual(@as(u64, 1), try engine.nodeCount());
+
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0, .in_head = 0, .prop_head = 0,
+        .label_set = 0, .flags = 0, ._pad = 0, .txn_stamp = 1,
+    });
+    try testing.expectEqual(@as(u64, 2), try engine.nodeCount());
+
+    // Add edges
+    _ = try engine.addEdge(n1, n2, 1);
+    try testing.expectEqual(@as(u64, 1), try engine.edgeCount());
+
+    _ = try engine.addEdge(n2, n1, 2);
+    try testing.expectEqual(@as(u64, 2), try engine.edgeCount());
+
+    // Remove an edge
+    try engine.removeEdge(n1, n2, 1);
+    try testing.expectEqual(@as(u64, 1), try engine.edgeCount());
+
+    // Delete a node
+    try engine.deleteNode(n1);
+    try testing.expectEqual(@as(u64, 1), try engine.nodeCount());
+
+    // Counters are directly from manifest (O(1))
+    try testing.expectEqual(@as(u64, 1), engine.manifest.node_count);
+    try testing.expectEqual(@as(u64, 1), engine.manifest.edge_count);
 }
 
 test {
