@@ -19,6 +19,7 @@ const prop_store_mod = @import("prop_store.zig");
 const var_store_mod = @import("var_store.zig");
 const free_space_mod = @import("free_space.zig");
 const label_dict_mod = @import("label_dict.zig");
+const label_index_mod = @import("label_index.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const recovery_mod = @import("recovery.zig");
 const node_mod = @import("node.zig");
@@ -45,6 +46,7 @@ const PropStore = prop_store_mod.PropStore;
 const VarStore = var_store_mod.VarStore;
 const FreeSpaceManager = free_space_mod.FreeSpaceManager;
 const LabelDictionary = label_dict_mod.LabelDictionary;
+const LabelIndex = label_index_mod.LabelIndex;
 const Checkpointer = checkpoint_mod.Checkpointer;
 const Recovery = recovery_mod.Recovery;
 const NodeRec = node_mod.NodeRec;
@@ -75,6 +77,7 @@ pub const GraphEngine = struct {
     free_space_props: FreeSpaceManager,
     free_space_var: FreeSpaceManager,
     label_dict: LabelDictionary,
+    label_index: LabelIndex,
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.fs.Dir,
@@ -153,8 +156,9 @@ pub const GraphEngine = struct {
         self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
         self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
 
-        // 10. Init label dictionary
+        // 10. Init label dictionary and label index
         self.label_dict = LabelDictionary.init(allocator);
+        self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
 
         // 11. Init checkpointer
         self.checkpointer = Checkpointer.init(
@@ -219,13 +223,17 @@ pub const GraphEngine = struct {
         self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
         self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
 
-        // 9. Init label dictionary
+        // 9. Init label dictionary and label index
         self.label_dict = LabelDictionary.init(allocator);
+        self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
 
         // Try to load label dictionary if it exists
         const labels_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path});
         defer allocator.free(labels_path);
         self.label_dict.loadFromFile(labels_path) catch {};
+
+        // Rebuild label index from node store
+        self.label_index.rebuild(&self.node_store, self.manifest.next_node_id) catch {};
 
         // 10. Init checkpointer
         self.checkpointer = Checkpointer.init(
@@ -267,6 +275,7 @@ pub const GraphEngine = struct {
         self.free_space_props.deinit();
         self.free_space_var.deinit();
         self.label_dict.deinit();
+        self.label_index.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
@@ -384,29 +393,19 @@ pub const GraphEngine = struct {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         rec.label_set |= (@as(u32, 1) << @intCast(label % 32));
         try self.node_store.putNode(node_id, rec);
+        try self.label_index.addNode(label, node_id);
     }
 
     pub fn removeLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         rec.label_set &= ~(@as(u32, 1) << @intCast(label % 32));
         try self.node_store.putNode(node_id, rec);
+        self.label_index.removeNode(label, node_id);
     }
 
     pub fn scanLabel(self: *GraphEngine, label: LabelId, alloc: Allocator) anyerror![]NodeId {
-        // Linear scan of all nodes for the label bit
-        const mask = @as(u32, 1) << @intCast(label % 32);
-        var result: std.ArrayList(NodeId) = .{};
-        errdefer result.deinit(alloc);
-
-        var id: NodeId = 0;
-        while (id < self.manifest.next_node_id) : (id += 1) {
-            const rec = try self.node_store.getNode(id) orelse continue;
-            if ((rec.label_set & mask) != 0) {
-                try result.append(alloc, id);
-            }
-        }
-
-        return result.toOwnedSlice(alloc);
+        // Delegate to the in-memory label index (sorted posting lists).
+        return self.label_index.scan(label, alloc);
     }
 
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {
