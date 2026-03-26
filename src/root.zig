@@ -70,6 +70,9 @@ pub const txn = @import("txn.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const recovery = @import("recovery.zig");
 
+// Metrics / observability
+pub const metrics = @import("metrics.zig");
+
 // Engine
 pub const engine = @import("engine.zig");
 
@@ -105,6 +108,7 @@ pub const FileId = types.FileId;
 pub const PropertyValue = types.PropertyValue;
 pub const StorageError = errors.StorageError;
 pub const GraphConfig = config.GraphConfig;
+pub const Metrics = metrics.Metrics;
 
 pub const version = "0.1.0";
 

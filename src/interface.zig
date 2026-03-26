@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
 
@@ -14,6 +15,7 @@ const Lsn = types.Lsn;
 const TxnId = types.TxnId;
 const LabelId = types.LabelId;
 const PropertyValue = types.PropertyValue;
+const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
 const EdgeEntry = edge_mod.EdgeEntry;
 
@@ -54,6 +56,8 @@ pub const GraphStorage = struct {
         // Stats
         nodeCount: *const fn (ptr: *anyopaque) anyerror!u64,
         edgeCount: *const fn (ptr: *anyopaque) anyerror!u64,
+        // Metrics / observability
+        getMetrics: *const fn (ptr: *anyopaque) *const Metrics,
         // Lifecycle
         checkpoint: *const fn (ptr: *anyopaque) anyerror!void,
         close: *const fn (ptr: *anyopaque) anyerror!void,
@@ -123,6 +127,9 @@ pub const GraphStorage = struct {
     pub fn edgeCount(self: GraphStorage) anyerror!u64 {
         return self.vtable.edgeCount(self.ptr);
     }
+    pub fn getMetrics(self: GraphStorage) *const Metrics {
+        return self.vtable.getMetrics(self.ptr);
+    }
     pub fn doCheckpoint(self: GraphStorage) anyerror!void {
         return self.vtable.checkpoint(self.ptr);
     }
@@ -157,6 +164,7 @@ pub const GraphStorage = struct {
                 .abortTxn = typeErasedFn(T, "abortTxn"),
                 .nodeCount = typeErasedFn(T, "nodeCount"),
                 .edgeCount = typeErasedFn(T, "edgeCount"),
+                .getMetrics = typeErasedFn(T, "getMetrics"),
                 .checkpoint = typeErasedFn(T, "checkpoint"),
                 .close = typeErasedFn(T, "close"),
             },
@@ -259,6 +267,10 @@ pub const GraphStorage = struct {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{self});
             }
+            fn getMetricsFn(ptr: *anyopaque) *const Metrics {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return @call(.auto, @field(T, method_name), .{self});
+            }
             fn checkpointFn(ptr: *anyopaque) anyerror!void {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{self});
@@ -292,6 +304,7 @@ pub const GraphStorage = struct {
             .{ "abortTxn", Wrapper.abortTxnFn },
             .{ "nodeCount", Wrapper.nodeCountFn },
             .{ "edgeCount", Wrapper.edgeCountFn },
+            .{ "getMetrics", Wrapper.getMetricsFn },
             .{ "checkpoint", Wrapper.checkpointFn },
             .{ "close", Wrapper.closeFn },
         };
@@ -309,9 +322,9 @@ pub const GraphStorage = struct {
 // Unit Tests
 // ============================================================================
 
-test "VTable has exactly 23 method fields" {
+test "VTable has exactly 24 method fields" {
     const fields = std.meta.fields(GraphStorage.VTable);
-    try std.testing.expectEqual(@as(usize, 23), fields.len);
+    try std.testing.expectEqual(@as(usize, 24), fields.len);
 }
 
 test "PropertyEntry can be constructed" {
@@ -355,6 +368,7 @@ test "GraphStorage with mock vtable dispatches close" {
         .abortTxn = undefined,
         .nodeCount = undefined,
         .edgeCount = undefined,
+        .getMetrics = undefined,
         .checkpoint = undefined,
         .close = Mock.closeFn,
     };

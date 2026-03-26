@@ -8,12 +8,29 @@ pub const LogLevel = enum { debug, info, warn, err };
 pub const GraphConfig = struct {
     page_size: u32 = 8192,
     buffer_pool_pages: u32 = 1024,
+    /// When true (default), `GraphEngine.open()` will auto-size the buffer pool
+    /// based on the manifest's total page counts. The pool will be at least
+    /// `buffer_pool_pages` but may grow up to 65536 pages (512 MB at 8 KB pages).
+    buffer_pool_auto_size: bool = true,
     wal_segment_size: u64 = 16 * 1024 * 1024,
     checkpoint_byte_threshold: u64 = 16 * 1024 * 1024,
     checkpoint_time_threshold_ms: u64 = 60_000,
     encryption_key: ?[32]u8 = null,
     data_dir: []const u8 = "data",
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
+
+    /// Compute the effective buffer pool size, applying auto-sizing when enabled.
+    ///
+    /// When `buffer_pool_auto_size` is true, the returned value is:
+    ///   max(buffer_pool_pages, clamp(total_manifest_pages, 1024, 65536))
+    /// When false, returns `buffer_pool_pages` unchanged.
+    pub fn effectiveBufferPoolPages(self: *const GraphConfig, manifest_total_pages: u64) u32 {
+        if (!self.buffer_pool_auto_size) {
+            return self.buffer_pool_pages;
+        }
+        const clamped: u32 = @intCast(@min(@max(manifest_total_pages, 1024), 65536));
+        return @max(self.buffer_pool_pages, clamped);
+    }
 
     /// Securely zero the encryption key if present. Should be called during
     /// engine shutdown to prevent key material from lingering in memory.
@@ -77,6 +94,43 @@ test "zeroKey zeros encryption key and sets to null" {
 
     // After zeroKey, encryption_key must be null
     try std.testing.expectEqual(@as(?[32]u8, null), cfg.encryption_key);
+}
+
+test "buffer_pool_auto_size defaults to true" {
+    const cfg = GraphConfig{};
+    try std.testing.expect(cfg.buffer_pool_auto_size);
+}
+
+test "effectiveBufferPoolPages auto-sizes from manifest pages" {
+    const cfg = GraphConfig{
+        .buffer_pool_pages = 1024,
+        .buffer_pool_auto_size = true,
+    };
+
+    // When manifest has fewer pages than minimum (1024), clamp to 1024
+    try std.testing.expectEqual(@as(u32, 1024), cfg.effectiveBufferPoolPages(500));
+
+    // When manifest has more pages than configured, use manifest total
+    try std.testing.expectEqual(@as(u32, 4096), cfg.effectiveBufferPoolPages(4096));
+
+    // When manifest pages exceed max (65536), clamp to 65536
+    try std.testing.expectEqual(@as(u32, 65536), cfg.effectiveBufferPoolPages(100_000));
+
+    // When configured is larger than recommended, use configured
+    const big_cfg = GraphConfig{
+        .buffer_pool_pages = 8192,
+        .buffer_pool_auto_size = true,
+    };
+    try std.testing.expectEqual(@as(u32, 8192), big_cfg.effectiveBufferPoolPages(2000));
+}
+
+test "effectiveBufferPoolPages disabled returns configured value" {
+    const cfg = GraphConfig{
+        .buffer_pool_pages = 512,
+        .buffer_pool_auto_size = false,
+    };
+    // Even with large manifest, returns configured value
+    try std.testing.expectEqual(@as(u32, 512), cfg.effectiveBufferPoolPages(50000));
 }
 
 test "zeroKey is safe to call when no key is set" {

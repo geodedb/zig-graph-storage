@@ -5,10 +5,12 @@ const std = @import("std");
 const types = @import("types.zig");
 const page_frame_mod = @import("page_frame.zig");
 const pager_mod = @import("pager.zig");
+const metrics_mod = @import("metrics.zig");
 
 const Allocator = std.mem.Allocator;
 const PageFrame = page_frame_mod.PageFrame;
 const Pager = pager_mod.Pager;
+const Metrics = metrics_mod.Metrics;
 const PageId = types.PageId;
 const FileId = types.FileId;
 const Lsn = types.Lsn;
@@ -38,6 +40,8 @@ pub const BufferPool = struct {
     free_list: std.ArrayList(u32),
     // Pagers: one per FileId
     pagers: [8]?*Pager, // indexed by @intFromEnum(FileId)
+    // Optional metrics pointer for recording buffer hits/misses and page I/O
+    metrics: ?*Metrics = null,
 
     /// Initialize a buffer pool with the given capacity (number of frames).
     pub fn init(allocator: Allocator, page_size: u32, capacity: u32) !BufferPool {
@@ -95,6 +99,11 @@ pub const BufferPool = struct {
         self.pagers[@intFromEnum(file_id)] = p;
     }
 
+    /// Attach a metrics struct for recording buffer hit/miss and page I/O counters.
+    pub fn setMetrics(self: *BufferPool, m: *Metrics) void {
+        self.metrics = m;
+    }
+
     /// Pin a page: return it from cache or read it from disk.
     /// If the page is already cached, increments pin_count and moves to LRU head.
     /// Otherwise, allocates a frame (evicting LRU if necessary) and reads from disk.
@@ -106,10 +115,12 @@ pub const BufferPool = struct {
             const frame = &self.frames[frame_idx];
             frame.pin_count += 1;
             self.moveToHead(frame_idx);
+            if (self.metrics) |m| m.buffer_hits += 1;
             return frame;
         }
 
         // Cache miss: get a free frame
+        if (self.metrics) |m| m.buffer_misses += 1;
         const frame_idx = try self.getFrame();
         const frame = &self.frames[frame_idx];
 
@@ -122,6 +133,7 @@ pub const BufferPool = struct {
             },
             else => return err,
         };
+        if (self.metrics) |m| m.page_reads += 1;
 
         frame.file_id = file_id;
         frame.page_id = page_id;
@@ -197,6 +209,26 @@ pub const BufferPool = struct {
         }
     }
 
+    /// Flush up to max_count dirty unpinned pages to disk, starting from the LRU tail.
+    /// Returns the number of pages actually flushed. This is intended to be called
+    /// proactively (e.g. during maintenance) to reduce eviction stalls.
+    pub fn flushDirtyPages(self: *BufferPool, max_count: u32) !u32 {
+        var flushed: u32 = 0;
+        var current = self.lru_tail;
+        while (current) |idx| {
+            if (flushed >= max_count) break;
+            const frame = &self.frames[idx];
+            // Walk via lru_prev before we potentially modify the frame
+            const prev = frame.lru_prev;
+            if (frame.dirty and frame.valid and frame.pin_count == 0) {
+                try self.flushFrame(frame);
+                flushed += 1;
+            }
+            current = prev;
+        }
+        return flushed;
+    }
+
     /// Get the frame index for a given frame pointer.
     pub fn frameIndex(self: *const BufferPool, frame: *const PageFrame) u32 {
         const base = @intFromPtr(self.frames.ptr);
@@ -213,6 +245,7 @@ pub const BufferPool = struct {
         const p = self.pagers[@intFromEnum(frame.file_id)] orelse return error.NoPagerRegistered;
         try p.writePage(frame.page_id, frame.dataSlice());
         frame.dirty = false;
+        if (self.metrics) |m| m.page_writes += 1;
     }
 
     /// Get a free frame index, evicting if necessary.
@@ -600,6 +633,84 @@ test "LRU ordering: head is most recent, tail is least recent" {
     // Head should be most recently pinned (f2), tail should be f0
     try testing.expectEqual(@as(?u32, f2_idx), pool.lru_head);
     try testing.expectEqual(@as(?u32, f0_idx), pool.lru_tail);
+}
+
+test "flushDirtyPages flushes dirty unpinned frames from LRU tail" {
+    const file = try createTempFile(".test_bp_flush_dirty_pages");
+    defer cleanupTempFile(file, ".test_bp_flush_dirty_pages");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 8);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Create 4 dirty unpinned pages
+    var indices: [4]u32 = undefined;
+    for (0..4) |i| {
+        const f = try pool.pinNew(.nodes, @intCast(i));
+        indices[i] = pool.frameIndex(f);
+        pool.unpin(indices[i], true); // mark dirty
+    }
+
+    // All 4 should be dirty
+    for (indices) |idx| {
+        try testing.expect(pool.frames[idx].dirty);
+    }
+
+    // Flush at most 2
+    const flushed = try pool.flushDirtyPages(2);
+    try testing.expectEqual(@as(u32, 2), flushed);
+
+    // Count remaining dirty frames
+    var still_dirty: u32 = 0;
+    for (indices) |idx| {
+        if (pool.frames[idx].dirty) still_dirty += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), still_dirty);
+}
+
+test "flushDirtyPages skips pinned frames" {
+    const file = try createTempFile(".test_bp_flush_skip_pinned");
+    defer cleanupTempFile(file, ".test_bp_flush_skip_pinned");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Create page 0: dirty but pinned (should be skipped)
+    const f0 = try pool.pinNew(.nodes, 0);
+    const f0_idx = pool.frameIndex(f0);
+    f0.dirty = true; // mark dirty but don't unpin
+
+    // Create page 1: dirty and unpinned (should be flushed)
+    const f1 = try pool.pinNew(.nodes, 1);
+    const f1_idx = pool.frameIndex(f1);
+    pool.unpin(f1_idx, true);
+
+    const flushed = try pool.flushDirtyPages(10);
+    try testing.expectEqual(@as(u32, 1), flushed);
+
+    // f0 still dirty (was pinned), f1 clean (was flushed)
+    try testing.expect(pool.frames[f0_idx].dirty);
+    try testing.expect(!pool.frames[f1_idx].dirty);
+}
+
+test "flushDirtyPages returns 0 when no dirty pages" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    // Create clean unpinned page
+    const f0 = try pool.pinNew(.nodes, 0);
+    const f0_idx = pool.frameIndex(f0);
+    pool.unpin(f0_idx, false); // not dirty
+
+    const flushed = try pool.flushDirtyPages(10);
+    try testing.expectEqual(@as(u32, 0), flushed);
 }
 
 test {

@@ -22,6 +22,7 @@ const label_dict_mod = @import("label_dict.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const recovery_mod = @import("recovery.zig");
 const label_index_mod = @import("label_index.zig");
+const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
 
@@ -49,6 +50,7 @@ const LabelDictionary = label_dict_mod.LabelDictionary;
 const Checkpointer = checkpoint_mod.Checkpointer;
 const Recovery = recovery_mod.Recovery;
 const LabelIndex = label_index_mod.LabelIndex;
+const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
 const EdgeEntry = edge_mod.EdgeEntry;
 
@@ -81,6 +83,7 @@ pub const GraphEngine = struct {
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.fs.Dir,
+    metrics: Metrics = .{},
 
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
@@ -133,6 +136,10 @@ pub const GraphEngine = struct {
         // 6. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         try self.initSubsystems(allocator, graph_uuid, cfg, 0);
 
+        // 7. Wire metrics into buffer pool
+        self.metrics = .{};
+        self.buffer_pool.setMetrics(&self.metrics);
+
         return self;
     }
 
@@ -165,6 +172,26 @@ pub const GraphEngine = struct {
             return error.PageSizeMismatch;
         }
 
+        // PERF-0008: Auto-size buffer pool based on manifest page counts
+        const total_pages = self.manifest.nodes_pages +
+            self.manifest.adj_out_pages +
+            self.manifest.adj_in_pages +
+            self.manifest.props_pages +
+            self.manifest.var_pages +
+            self.manifest.free_pages;
+        const effective = cfg.effectiveBufferPoolPages(total_pages);
+        if (effective > self.buffer_pool.capacity) {
+            // Re-create buffer pool with larger capacity, re-register pagers
+            self.buffer_pool.deinit();
+            self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, effective);
+            if (self.file_manager.getPager(.nodes)) |p| self.buffer_pool.registerPager(.nodes, p);
+            if (self.file_manager.getPager(.adj_out)) |p| self.buffer_pool.registerPager(.adj_out, p);
+            if (self.file_manager.getPager(.adj_in)) |p| self.buffer_pool.registerPager(.adj_in, p);
+            if (self.file_manager.getPager(.props)) |p| self.buffer_pool.registerPager(.props, p);
+            if (self.file_manager.getPager(.var_store)) |p| self.buffer_pool.registerPager(.var_store, p);
+            if (self.file_manager.getPager(.free)) |p| self.buffer_pool.registerPager(.free, p);
+        }
+
         // 5. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         try self.initSubsystems(allocator, graph_uuid, cfg, self.manifest.last_checkpoint_lsn);
 
@@ -178,6 +205,10 @@ pub const GraphEngine = struct {
 
         // 7. Rebuild label index from node store
         try self.label_index.rebuild(&self.node_store, self.manifest.next_node_id);
+
+        // 8. Wire metrics into buffer pool
+        self.metrics = .{};
+        self.buffer_pool.setMetrics(&self.metrics);
 
         return self;
     }
@@ -296,6 +327,11 @@ pub const GraphEngine = struct {
         return GraphStorage.init(GraphEngine, self);
     }
 
+    /// Return a read-only pointer to the engine's metrics counters.
+    pub fn getMetrics(self: *GraphEngine) *const Metrics {
+        return &self.metrics;
+    }
+
     // ========================================================================
     // VTable implementation methods (called via GraphStorage interface)
     // ========================================================================
@@ -312,6 +348,7 @@ pub const GraphEngine = struct {
         const id = self.manifest.next_node_id;
         self.manifest.next_node_id += 1;
         self.manifest.node_count += 1;
+        self.metrics.nodes_created += 1;
         return id;
     }
 
@@ -320,6 +357,7 @@ pub const GraphEngine = struct {
         if (self.manifest.node_count > 0) {
             self.manifest.node_count -= 1;
         }
+        self.metrics.nodes_deleted += 1;
     }
 
     /// Look up an edge by its ID.
@@ -373,6 +411,7 @@ pub const GraphEngine = struct {
         try self.node_store.putNode(to, to_rec);
 
         self.manifest.edge_count += 1;
+        self.metrics.edges_created += 1;
 
         return edge_id;
     }
@@ -389,9 +428,11 @@ pub const GraphEngine = struct {
         if (self.manifest.edge_count > 0) {
             self.manifest.edge_count -= 1;
         }
+        self.metrics.edges_removed += 1;
     }
 
     pub fn getProperty(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
+        self.metrics.properties_read += 1;
         return self.prop_store.getProperty(prop_head, key, alloc);
     }
 
@@ -400,6 +441,7 @@ pub const GraphEngine = struct {
     }
 
     pub fn putProperty(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        self.metrics.properties_written += 1;
         return self.prop_store.putProperty(owner, key, val);
     }
 
@@ -427,15 +469,19 @@ pub const GraphEngine = struct {
     }
 
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {
-        return self.txn_manager.begin();
+        const txn_id = try self.txn_manager.begin();
+        self.metrics.txn_begun += 1;
+        return txn_id;
     }
 
     pub fn commitTxn(self: *GraphEngine, txn: TxnId) anyerror!void {
-        return self.txn_manager.commit(txn);
+        try self.txn_manager.commit(txn);
+        self.metrics.txn_committed += 1;
     }
 
     pub fn abortTxn(self: *GraphEngine, txn: TxnId) anyerror!void {
-        return self.txn_manager.abort(txn);
+        try self.txn_manager.abort(txn);
+        self.metrics.txn_aborted += 1;
     }
 
     pub fn nodeCount(self: *GraphEngine) anyerror!u64 {
@@ -450,7 +496,13 @@ pub const GraphEngine = struct {
         // Update manifest counters before checkpoint
         self.manifest.next_txn_id = self.txn_manager.next_txn_id.load(.monotonic);
         self.manifest.label_count = self.label_dict.count();
-        return self.checkpointer.run();
+
+        var timer = std.time.Timer.start() catch null;
+        try self.checkpointer.run();
+        if (timer) |*t| {
+            self.metrics.last_checkpoint_duration_ns = t.read();
+        }
+        self.metrics.checkpoints_completed += 1;
     }
 };
 
@@ -753,6 +805,64 @@ test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
     // Counters are directly from manifest (O(1))
     try testing.expectEqual(@as(u64, 1), engine.manifest.node_count);
     try testing.expectEqual(@as(u64, 1), engine.manifest.edge_count);
+}
+
+test "PERF-0008: open auto-sizes buffer pool from manifest" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x08} ** 16;
+
+    // Create with small buffer pool
+    var cfg = testConfig();
+    cfg.buffer_pool_pages = 64;
+    cfg.buffer_pool_auto_size = true;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Re-open: auto-size should kick in (minimum 1024 even for empty graph)
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        // Buffer pool should be at least 1024 (the auto-size minimum)
+        try testing.expect(engine.buffer_pool.capacity >= 1024);
+    }
+}
+
+test "PERF-0008: open respects buffer_pool_auto_size=false" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x09} ** 16;
+
+    var cfg = testConfig();
+    cfg.buffer_pool_pages = 64;
+    cfg.buffer_pool_auto_size = false;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Re-open with auto-size disabled: should keep configured size
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        try testing.expectEqual(@as(u32, 64), engine.buffer_pool.capacity);
+    }
 }
 
 test {

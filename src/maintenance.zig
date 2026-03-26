@@ -12,10 +12,12 @@ const Allocator = std.mem.Allocator;
 const manifest_mod = @import("manifest.zig");
 const label_index_mod = @import("label_index.zig");
 const node_store_mod = @import("node_store.zig");
+const buffer_pool_mod = @import("buffer_pool.zig");
 
 const Manifest = manifest_mod.Manifest;
 const LabelIndex = label_index_mod.LabelIndex;
 const NodeStore = node_store_mod.NodeStore;
+const BufferPool = buffer_pool_mod.BufferPool;
 
 /// Types of maintenance operations.
 pub const MaintenanceOp = enum {
@@ -70,6 +72,15 @@ pub const Maintenance = struct {
     ) !void {
         _ = self;
         try label_index.rebuild(node_store, max_node_id);
+    }
+
+    /// Pre-flush dirty pages to reduce eviction stalls.
+    ///
+    /// Delegates to `BufferPool.flushDirtyPages`, which walks the LRU list
+    /// from the tail and flushes up to `max_count` dirty unpinned frames.
+    /// Returns the number of pages actually flushed.
+    pub fn flushDirtyPages(_: *Maintenance, buffer_pool: *BufferPool, max_count: u32) !u32 {
+        return buffer_pool.flushDirtyPages(max_count);
     }
 
     /// Get storage statistics from a manifest.
@@ -162,7 +173,6 @@ test "forceCheckpoint propagates errors" {
 test "rebuildLabelIndex works" {
     // This test requires a full BufferPool/FreeSpaceManager/NodeStore setup.
     // We verify the function is callable by using the same TestEnv pattern.
-    const buffer_pool_mod = @import("buffer_pool.zig");
     const free_space_mod = @import("free_space.zig");
     const pager_mod = @import("pager.zig");
     const node_mod = @import("node.zig");
@@ -212,6 +222,40 @@ test "rebuildLabelIndex works" {
     try maint.rebuildLabelIndex(&idx, &store, 2);
 
     try testing.expectEqual(@as(u64, 2), idx.count(10));
+}
+
+test "flushDirtyPages delegates to buffer pool" {
+    const pager_mod = @import("pager.zig");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const node_file = tmp_dir.dir.createFile("nodes_flush.store", .{ .read = true, .truncate = true }) catch unreachable;
+    defer node_file.close();
+
+    var pool = try buffer_pool_mod.BufferPool.init(testing.allocator, 4096, 8);
+    defer pool.deinit();
+
+    var node_pager = pager_mod.Pager.init(node_file, 4096);
+    pool.registerPager(.nodes, &node_pager);
+
+    // Create 3 dirty unpinned pages
+    for (0..3) |i| {
+        const f = try pool.pinNew(.nodes, @intCast(i));
+        const fidx = pool.frameIndex(f);
+        pool.unpin(fidx, true);
+    }
+
+    var maint = Maintenance.init(testing.allocator);
+    const flushed = try maint.flushDirtyPages(&pool, 2);
+    try testing.expectEqual(@as(u32, 2), flushed);
+
+    // One page should still be dirty
+    var dirty_count: u32 = 0;
+    for (pool.frames[0..pool.capacity]) |frame| {
+        if (frame.dirty and frame.valid) dirty_count += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), dirty_count);
 }
 
 test {
