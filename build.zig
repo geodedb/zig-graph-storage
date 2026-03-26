@@ -141,7 +141,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("benchmarks/scale_bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
             .imports = &.{
                 .{ .name = "graph_storage", .module = module },
                 .{ .name = "seed", .module = seed_mod },
@@ -150,6 +150,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    b.installArtifact(scale_bench_exe);
     const run_scale_bench = b.addRunArtifact(scale_bench_exe);
     if (b.args) |args| {
         run_scale_bench.addArgs(args);

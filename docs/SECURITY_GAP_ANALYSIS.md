@@ -9,7 +9,7 @@
 |--------|-------|
 | Open | 0 |
 | Closed | 13 |
-| Won't Do | 0 |
+| Won't Do | 1 |
 | Blocked | 0 |
 
 ---
@@ -104,3 +104,9 @@
 - **Severity:** Medium
 - **Resolution:** Replaced direct `u64` use with `std.math.cast(usize, file_size)` returning `error.BackupTooLarge` on overflow. Test with oversized file_size field triggers error.
 - **Commit:** `f013e88`
+
+## SEC-0014: Missing rigid Docker image hash pinning in CI/CD pipeline
+
+- **Status:** Won't Do
+- **Severity:** Low
+- **Resolution:** The user explicitly stated this is out of scope since CI/CD is managed downstream via GitLab orchestration. Image pinning will not be enforced at the repository level. Avoids unnecessary merge conflict overhead for security patches on tags.

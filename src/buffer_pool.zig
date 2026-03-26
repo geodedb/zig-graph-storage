@@ -42,6 +42,8 @@ pub const BufferPool = struct {
     pagers: [8]?*Pager, // indexed by @intFromEnum(FileId)
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
+    // Concurrency protection for multi-threaded access
+    mutex: std.Thread.Mutex = .{},
 
     /// Initialize a buffer pool with the given capacity (number of frames).
     pub fn init(allocator: Allocator, page_size: u32, capacity: u32) !BufferPool {
@@ -83,6 +85,7 @@ pub const BufferPool = struct {
             .lru_tail = null,
             .free_list = free_list,
             .pagers = .{ null, null, null, null, null, null, null, null },
+            .mutex = .{},
         };
     }
 
@@ -108,6 +111,9 @@ pub const BufferPool = struct {
     /// If the page is already cached, increments pin_count and moves to LRU head.
     /// Otherwise, allocates a frame (evicting LRU if necessary) and reads from disk.
     pub fn pin(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
 
         // Cache hit
@@ -151,6 +157,9 @@ pub const BufferPool = struct {
     /// Pin a new page without reading from disk. Used when creating a new page.
     /// Zeros the data buffer and inserts into cache.
     pub fn pinNew(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
 
         // If already in cache, just pin it
@@ -182,6 +191,9 @@ pub const BufferPool = struct {
 
     /// Unpin a frame. Decrements pin_count and optionally marks dirty.
     pub fn unpin(self: *BufferPool, frame_idx: u32, dirty: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const frame = &self.frames[frame_idx];
         std.debug.assert(frame.pin_count > 0);
         frame.pin_count -= 1;
@@ -192,6 +204,8 @@ pub const BufferPool = struct {
 
     /// Flush all dirty frames with LSN <= up_to_lsn to disk.
     pub fn flushDirty(self: *BufferPool, up_to_lsn: Lsn) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.frames, 0..) |*frame, i| {
             _ = i;
             if (frame.dirty and frame.valid and frame.lsn <= up_to_lsn) {
@@ -202,6 +216,8 @@ pub const BufferPool = struct {
 
     /// Flush all dirty frames to disk regardless of LSN.
     pub fn flushAll(self: *BufferPool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.frames) |*frame| {
             if (frame.dirty and frame.valid) {
                 try self.flushFrame(frame);
@@ -213,6 +229,8 @@ pub const BufferPool = struct {
     /// Returns the number of pages actually flushed. This is intended to be called
     /// proactively (e.g. during maintenance) to reduce eviction stalls.
     pub fn flushDirtyPages(self: *BufferPool, max_count: u32) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var flushed: u32 = 0;
         var current = self.lru_tail;
         while (current) |idx| {
@@ -242,9 +260,32 @@ pub const BufferPool = struct {
 
     /// Flush a single dirty frame to disk via its pager.
     fn flushFrame(self: *BufferPool, frame: *PageFrame) !void {
-        const p = self.pagers[@intFromEnum(frame.file_id)] orelse return error.NoPagerRegistered;
-        try p.writePage(frame.page_id, frame.dataSlice());
+        // Called WITH mutex held.
+        const fid = frame.file_id;
+        const pid = frame.page_id;
+        const p = self.pagers[@intFromEnum(fid)] orelse return error.NoPagerRegistered;
+
+        // Prevent eviction during I/O
+        frame.pin_count += 1;
         frame.dirty = false;
+
+        var buf: [16384]u8 = undefined;
+        std.debug.assert(self.page_size <= buf.len);
+        @memcpy(buf[0..self.page_size], frame.dataSlice());
+        
+        self.mutex.unlock();
+        p.writePage(pid, buf[0..self.page_size]) catch |err| {
+            self.mutex.lock();
+            frame.pin_count -= 1;
+            // Restore dirty state if write failed so we can retry later
+            frame.dirty = true;
+            return err;
+        };
+        self.mutex.lock();
+        
+        // Allowed to be evicted again
+        frame.pin_count -= 1;
+
         if (self.metrics) |m| m.page_writes += 1;
     }
 

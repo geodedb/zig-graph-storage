@@ -260,6 +260,33 @@ pub const GraphEngine = struct {
         );
     }
 
+    /// Clean up the graph engine and its storage resources.
+    pub fn deinit(self: *GraphEngine) void {
+        // Wait for any background checkpoint to finish before tearing down allocators
+        while (self.checkpointer.is_running.load(.acquire)) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+
+        self.txn_manager.deinit();
+        self.wal.deinit();
+        self.wal_dir_handle.close();
+        self.free_space_nodes.deinit();
+        self.free_space_adj_out.deinit();
+        self.free_space_adj_in.deinit();
+        self.free_space_props.deinit();
+        self.free_space_var.deinit();
+        self.label_dict.deinit();
+        self.label_index.deinit();
+        self.buffer_pool.deinit();
+        self.file_manager.deinit();
+        self.graph_dir.deinit();
+
+        // SEC-0003: Zero encryption key material before freeing memory
+        self.config.zeroKey();
+
+        self.allocator.destroy(self);
+    }
+
     /// Close the engine (flush, checkpoint, close files).
     ///
     /// Returns an error if the final checkpoint or label dictionary save fails.
@@ -292,6 +319,11 @@ pub const GraphEngine = struct {
             if (close_err == null) close_err = err;
         };
 
+        // Wait for the final background checkpoint to finish before teardown
+        while (self.checkpointer.is_running.load(.acquire)) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+
         // Cleanup all resources (always runs)
         self.cleanupResources(allocator);
 
@@ -302,6 +334,11 @@ pub const GraphEngine = struct {
     /// Internal cleanup of all engine resources. Always runs on close,
     /// even when errors have occurred.
     fn cleanupResources(self: *GraphEngine, allocator: Allocator) void {
+        // Double check there are no lingering background tasks
+        while (self.checkpointer.is_running.load(.acquire)) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+
         self.txn_manager.deinit();
         self.wal.deinit();
         self.wal_dir_handle.close();
@@ -371,14 +408,14 @@ pub const GraphEngine = struct {
         return error.EdgeIndexNotImplemented;
     }
 
-    pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, alloc: Allocator) anyerror![]EdgeEntry {
-        const rec = try self.node_store.getNode(id) orelse return try alloc.alloc(EdgeEntry, 0);
-        return self.adj_out.expand(rec.out_head, rel_type, alloc);
+    pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
+        const rec = try self.node_store.getNode(id) orelse return self.adj_out.expand(0, rel_type);
+        return self.adj_out.expand(rec.out_head, rel_type);
     }
 
-    pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32, alloc: Allocator) anyerror![]EdgeEntry {
-        const rec = try self.node_store.getNode(id) orelse return try alloc.alloc(EdgeEntry, 0);
-        return self.adj_in.expand(rec.in_head, rel_type, alloc);
+    pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
+        const rec = try self.node_store.getNode(id) orelse return self.adj_in.expand(0, rel_type);
+        return self.adj_in.expand(rec.in_head, rel_type);
     }
 
     pub fn addEdge(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
@@ -436,8 +473,8 @@ pub const GraphEngine = struct {
         return self.prop_store.getProperty(prop_head, key, alloc);
     }
 
-    pub fn getAllProperties(self: *GraphEngine, prop_head: u64, alloc: Allocator) anyerror![]PropertyEntry {
-        return self.prop_store.getAllProperties(prop_head, alloc);
+    pub fn getAllProperties(self: *GraphEngine, prop_head: u64) anyerror!PropStore.PropIterator {
+        return self.prop_store.getAllProperties(prop_head);
     }
 
     pub fn putProperty(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
@@ -597,20 +634,28 @@ test "create engine, addEdge, expandOut returns edge" {
     try testing.expectEqual(@as(EdgeId, 1), edge_id);
 
     // Expand outgoing edges from n1
-    const edges = try engine.expandOut(n1, null, testing.allocator);
-    defer testing.allocator.free(edges);
+    var out_iter = try engine.expandOut(n1, null);
+    defer out_iter.deinit();
 
-    try testing.expectEqual(@as(usize, 1), edges.len);
-    try testing.expectEqual(n2, edges[0].neighbor);
-    try testing.expectEqual(edge_id, edges[0].edge_id);
-    try testing.expectEqual(@as(u32, 5), edges[0].rel_type);
+    var out_count: usize = 0;
+    while (try out_iter.next()) |e| {
+        try testing.expectEqual(n2, e.neighbor);
+        try testing.expectEqual(edge_id, e.edge_id);
+        try testing.expectEqual(@as(u32, 5), e.rel_type);
+        out_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), out_count);
 
     // Expand incoming edges at n2
-    const in_edges = try engine.expandIn(n2, null, testing.allocator);
-    defer testing.allocator.free(in_edges);
+    var in_iter = try engine.expandIn(n2, null);
+    defer in_iter.deinit();
 
-    try testing.expectEqual(@as(usize, 1), in_edges.len);
-    try testing.expectEqual(n1, in_edges[0].neighbor);
+    var in_count: usize = 0;
+    while (try in_iter.next()) |e| {
+        try testing.expectEqual(n1, e.neighbor);
+        in_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), in_count);
 }
 
 test "create engine, checkpoint, close, open again, data persists" {

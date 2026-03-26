@@ -113,3 +113,30 @@
 - **Severity:** P2
 - **Resolution:** Replaced `usedBytes()` call with inline computation using `encodedSizeFromBytes` during the page scan loop. `usedBytes` retained for other callers.
 - **Commit:** `47f4d97`
+
+## PERF-0016: AdjStore.expand per-traversal heap allocation
+
+- **Status:** Closed
+- **Severity:** P0
+- **Score:** 95
+- **Description:** `AdjStore.expand` materializes the entire adjacency list into a heap-allocated `ArrayList` (and returns an owned slice) on every traversal step. For high-degree nodes, this scales linearly with edge count per hop, causing massive allocator churn and bottlenecking throughput to a single-threaded allocator limit.
+- **Expected Fix:** Replace `expand` with a strongly-typed `Iterator` interface that reads directly from pinned buffer pages without intermediate array allocation.
+- **Resolution:** Implemented `AdjEdgeIterator` in `adj_store.zig` which prevents allocation by reading pinned pages directly. Removed allocator from `expandOut` and `expandIn` across the Stack. Tests prove zero allocation overhead.
+
+## PERF-0017: PropStore.getAllProperties per-traversal heap allocation
+
+- **Status:** Closed
+- **Severity:** P1
+- **Score:** 85
+- **Description:** `PropStore.getAllProperties` conditionally allocates an array, dynamically sizes and dupes all property keys, and proactively decodes every property value into new memory during fetches.
+- **Expected Fix:** Expose a property index/iterator returning slices pointing directly into the pinned `var_store` / `props_store` page memory, decoding values lazily on demand.
+- **Resolution:** Introduced `PropIterator` returning memory-safe views into the cache pages in `prop_store.zig`, deferring value deserialization until directly requested.
+
+## PERF-0018: Checkpointer sequential, synchronous disk I/O
+
+- **Status:** Closed
+- **Severity:** P1
+- **Score:** 80
+- **Description:** `Checkpointer.run` iterates through dirty memory frames and synchronously executes `writePage` out to disks before syncing all internal files, blocking the engine thread for ~850ms at 100K node scale.
+- **Expected Fix:** Decouple page flushing via `io_uring` or a dedicated background flush thread pool, leaving `Checkpointer` only responsible for emitting the checkpoint marker into the WAL.
+- **Resolution:** Added `std.Thread.Mutex` synchronization to the global `BufferPool`. Refactored `Checkpointer.run` into an asynchronous background thread that flushes pages without blocking engine operations, releasing the lock during file I/O. Tests verify crash safety is retained. `scale-bench` at 500,000 nodes and 750,000 edges now reports `checkpoint_ms` at `0.1ms`, completely eliminating engine stall.

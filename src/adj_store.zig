@@ -146,39 +146,62 @@ pub const AdjStore = struct {
         }
     }
 
-    /// Iterate all edge entries starting from head_page.
-    /// Returns a slice of EdgeEntry (caller owns, must free).
-    pub fn expand(self: *AdjStore, head_page: PageId, rel_type_filter: ?u32, allocator: Allocator) ![]EdgeEntry {
-        if (head_page == 0) return try allocator.alloc(EdgeEntry, 0);
+    pub const AdjEdgeIterator = struct {
+        store: *AdjStore,
+        current_page: u64,
+        current_frame_idx: ?u32 = null,
+        current_index: u16 = 0,
+        rel_type: ?u32,
 
-        var result: std.ArrayList(EdgeEntry) = .{};
-        errdefer result.deinit(allocator);
-
-        var current_page = head_page;
-        while (current_page != 0) {
-            const frame = try self.buffer_pool.pin(self.file_id, current_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
-            const bh = self.readBlockHeader(data);
-
-            var i: u16 = 0;
-            while (i < bh.count) : (i += 1) {
-                const e = self.readEntry(data, i);
-                if (rel_type_filter) |filter| {
-                    if (e.rel_type == filter) {
-                        try result.append(allocator, e);
-                    }
-                } else {
-                    try result.append(allocator, e);
-                }
+        pub fn deinit(self: *AdjEdgeIterator) void {
+            if (self.current_frame_idx) |idx| {
+                self.store.buffer_pool.unpin(idx, false);
+                self.current_frame_idx = null;
             }
-
-            const next = bh.next_block;
-            self.buffer_pool.unpin(frame_idx, false);
-            current_page = next;
         }
 
-        return result.toOwnedSlice(allocator);
+        pub fn next(self: *AdjEdgeIterator) anyerror!?EdgeEntry {
+            while (self.current_page != 0) {
+                if (self.current_frame_idx == null) {
+                    const frame = try self.store.buffer_pool.pin(self.store.file_id, self.current_page);
+                    self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
+                }
+
+                const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
+                const data = frame.dataSlice();
+                const bh = self.store.readBlockHeader(data);
+
+                while (self.current_index < bh.count) {
+                    const entry = self.store.readEntry(data, self.current_index);
+                    self.current_index += 1;
+
+                    if (self.rel_type) |rt| {
+                        if (entry.rel_type == rt) {
+                            return entry;
+                        }
+                    } else {
+                        return entry;
+                    }
+                }
+
+                const next_page = bh.next_block;
+                self.store.buffer_pool.unpin(self.current_frame_idx.?, false);
+                self.current_frame_idx = null;
+                self.current_page = next_page;
+                self.current_index = 0;
+            }
+
+            return null;
+        }
+    };
+
+    /// Return an iterator over edge entries starting from head_page (O(1) allocation path).
+    pub fn expand(self: *AdjStore, head_page: PageId, rel_type_filter: ?u32) AdjEdgeIterator {
+        return .{
+            .store = self,
+            .current_page = head_page,
+            .rel_type = rel_type_filter,
+        };
     }
 
     /// Count edges in the adjacency list.
@@ -311,10 +334,15 @@ test "expand returns added edges" {
     head = try store.addEdge(head, makeEdge(10, 1, 5));
     head = try store.addEdge(head, makeEdge(20, 2, 5));
 
-    const edges = try store.expand(head, null, testing.allocator);
-    defer testing.allocator.free(edges);
+    var iter = store.expand(head, null);
+    defer iter.deinit();
 
-    try testing.expectEqual(@as(usize, 2), edges.len);
+    var count: usize = 0;
+    while (try iter.next()) |_| {
+        count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 2), count);
 }
 
 test "multiple edges in same block" {
@@ -332,13 +360,18 @@ test "multiple edges in same block" {
     const count = try store.edgeCount(head);
     try testing.expectEqual(@as(u64, 3), count);
 
-    const edges = try store.expand(head, null, testing.allocator);
-    defer testing.allocator.free(edges);
+    var iter = store.expand(head, null);
+    defer iter.deinit();
 
-    try testing.expectEqual(@as(usize, 3), edges.len);
-    try testing.expectEqual(@as(u64, 10), edges[0].neighbor);
-    try testing.expectEqual(@as(u64, 20), edges[1].neighbor);
-    try testing.expectEqual(@as(u64, 30), edges[2].neighbor);
+    var edges_found: usize = 0;
+    while (try iter.next()) |e| {
+        if (edges_found == 0) try testing.expectEqual(@as(u64, 10), e.neighbor);
+        if (edges_found == 1) try testing.expectEqual(@as(u64, 20), e.neighbor);
+        if (edges_found == 2) try testing.expectEqual(@as(u64, 30), e.neighbor);
+        edges_found += 1;
+    }
+    
+    try testing.expectEqual(@as(usize, 3), edges_found);
 }
 
 test "overflow to second block when first is full" {
@@ -363,13 +396,20 @@ test "overflow to second block when first is full" {
     const count = try store.edgeCount(head);
     try testing.expectEqual(@as(u64, epb + 1), count);
 
-    const edges = try store.expand(head, null, testing.allocator);
-    defer testing.allocator.free(edges);
-    try testing.expectEqual(@as(usize, @intCast(epb + 1)), edges.len);
+    var iter = store.expand(head, null);
+    defer iter.deinit();
+    
+    var edges_len: usize = 0;
+    var first_neighbor: u64 = 0;
+    while (try iter.next()) |e| {
+        if (edges_len == 0) first_neighbor = e.neighbor;
+        edges_len += 1;
+    }
+    try testing.expectEqual(@as(usize, @intCast(epb + 1)), edges_len);
 
     // With head-insert, the overflow entry is in the new head block,
     // so expand reads it first.
-    try testing.expectEqual(@as(u64, 999), edges[0].neighbor);
+    try testing.expectEqual(@as(u64, 999), first_neighbor);
 }
 
 test "removeEdge removes correct entry" {
@@ -389,11 +429,11 @@ test "removeEdge removes correct entry" {
     const count = try store.edgeCount(head);
     try testing.expectEqual(@as(u64, 2), count);
 
-    const edges = try store.expand(head, null, testing.allocator);
-    defer testing.allocator.free(edges);
+    var iter = store.expand(head, null);
+    defer iter.deinit();
 
     // Edge with edge_id=2 should be gone
-    for (edges) |e| {
+    while (try iter.next()) |e| {
         try testing.expect(e.edge_id != 2);
     }
 }
@@ -411,17 +451,23 @@ test "rel_type_filter in expand" {
     head = try store.addEdge(head, makeEdge(30, 3, 1));
     head = try store.addEdge(head, makeEdge(40, 4, 3));
 
-    const type1_edges = try store.expand(head, 1, testing.allocator);
-    defer testing.allocator.free(type1_edges);
-    try testing.expectEqual(@as(usize, 2), type1_edges.len);
+    var filter1_iter = store.expand(head, 1);
+    defer filter1_iter.deinit();
+    var filter1_len: usize = 0;
+    while (try filter1_iter.next()) |_| filter1_len += 1;
+    try testing.expectEqual(@as(usize, 2), filter1_len);
 
-    const type2_edges = try store.expand(head, 2, testing.allocator);
-    defer testing.allocator.free(type2_edges);
-    try testing.expectEqual(@as(usize, 1), type2_edges.len);
+    var filter2_iter = store.expand(head, 2);
+    defer filter2_iter.deinit();
+    var filter2_len: usize = 0;
+    while (try filter2_iter.next()) |_| filter2_len += 1;
+    try testing.expectEqual(@as(usize, 1), filter2_len);
 
-    const type9_edges = try store.expand(head, 9, testing.allocator);
-    defer testing.allocator.free(type9_edges);
-    try testing.expectEqual(@as(usize, 0), type9_edges.len);
+    var filter9_iter = store.expand(head, 9);
+    defer filter9_iter.deinit();
+    var filter9_len: usize = 0;
+    while (try filter9_iter.next()) |_| filter9_len += 1;
+    try testing.expectEqual(@as(usize, 0), filter9_len);
 }
 
 test "edgeCount on empty list returns 0" {

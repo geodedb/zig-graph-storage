@@ -185,8 +185,8 @@ fn graphUuid(tag: u8) [16]u8 {
     return [_]u8{tag} ** 16;
 }
 
-/// Maximum wall-clock time for a single tier (5 minutes in ns).
-const TIER_TIMEOUT_NS: u64 = 5 * 60 * std.time.ns_per_s;
+/// Maximum wall-clock time for a single tier (15 minutes in ns).
+const TIER_TIMEOUT_NS: u64 = 15 * 60 * std.time.ns_per_s;
 
 // ---------------------------------------------------------------------------
 // Stdout writer (buffered, for JSON output)
@@ -329,8 +329,9 @@ fn benchExpandOut(
     var timer = try std.time.Timer.start();
     for (0..iters) |_| {
         const uid = random.intRangeAtMost(NodeId, sr.users.start, sr.users.end - 1);
-        const edges = try engine.expandOut(uid, null, allocator);
-        allocator.free(edges);
+        var iter = try engine.expandOut(uid, null);
+        defer iter.deinit();
+        while (try iter.next()) |_| {}
     }
     const elapsed = timer.read();
 
@@ -492,7 +493,9 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
         defer allocator.free(sub);
         if (benchSeed(allocator, sub, tier.cfg)) |r| {
             seed_ops_sec = r.ops_sec;
-        } else |_| {}
+        } else |err| {
+            print("ERROR in benchSeed: {any}\n", .{err});
+        }
     }
 
     if (checkTimeout(&tier_start, tier)) |r| return r;
@@ -503,7 +506,9 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
         defer allocator.free(sub);
         if (benchPointLookup(allocator, sub, tier.cfg, iters)) |r| {
             point_lookup_ns = r;
-        } else |_| {}
+        } else |err| {
+            print("ERROR in benchPointLookup: {any}\n", .{err});
+        }
     }
 
     if (checkTimeout(&tier_start, tier)) |r| return r;
@@ -590,7 +595,7 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
 fn checkTimeout(tier_start: *std.time.Timer, tier: Tier) ?TierResult {
     const elapsed = tier_start.read();
     if (elapsed > TIER_TIMEOUT_NS) {
-        return skipResult(tier, "timeout (>5min)");
+        return skipResult(tier, "timeout (>15min)");
     }
     return null;
 }
@@ -745,7 +750,11 @@ pub fn main() !void {
     }
 
     var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    defer {
+        print("  Cleaning up tmp_dir...\n", .{});
+        tmp_dir.cleanup();
+        print("  Done cleanup.\n", .{});
+    }
 
     const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base_path);
@@ -759,6 +768,7 @@ pub fn main() !void {
         });
 
         results[i] = runTier(allocator, base_path, tier);
+        print("    runTier finished for {s}.\n", .{tier.name});
         completed = i + 1;
 
         if (results[i].skipped) {

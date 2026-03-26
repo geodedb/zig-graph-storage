@@ -90,51 +90,76 @@ pub const PropStore = struct {
         return null;
     }
 
-    /// Get all properties from a property page chain.
-    /// Caller owns the returned slice and must free keys, values, and the slice.
-    pub fn getAllProperties(self: *PropStore, prop_head: u64, allocator: Allocator) ![]PropertyEntry {
-        if (prop_head == 0) return try allocator.alloc(PropertyEntry, 0);
+    pub const PropertyEntrySlice = struct {
+        key: []const u8,
+        encoded_value: []const u8,
+    };
 
-        var result: std.ArrayList(PropertyEntry) = .{};
-        errdefer {
-            for (result.items) |entry| {
-                allocator.free(entry.key);
-                property_mod.freeDecoded(allocator, entry.value);
+    pub const PropIterator = struct {
+        store: *PropStore,
+        current_page: u64,
+        current_frame_idx: ?u32 = null,
+        current_index: u32 = 0,
+        current_offset: u32 = PROP_DATA_OFFSET,
+        entry_count_cache: u32 = 0,
+
+        pub fn deinit(self: *PropIterator) void {
+            if (self.current_frame_idx) |idx| {
+                self.store.buffer_pool.unpin(idx, false);
+                self.current_frame_idx = null;
             }
-            result.deinit(allocator);
         }
 
-        var current_page: PageId = prop_head;
-        while (current_page != 0) {
-            const frame = try self.buffer_pool.pin(.props, current_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
+        pub fn next(self: *PropIterator) anyerror!?PropertyEntrySlice {
+            while (self.current_page != 0) {
+                if (self.current_frame_idx == null) {
+                    const frame = try self.store.buffer_pool.pin(.props, self.current_page);
+                    self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
+                    const data = frame.dataSlice();
+                    self.entry_count_cache = readEntryCount(data);
+                    self.current_offset = PROP_DATA_OFFSET;
+                }
 
-            const next_page = readNextPage(data);
-            const entry_count = readEntryCount(data);
+                const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
+                const data = frame.dataSlice();
 
-            var offset: u32 = PROP_DATA_OFFSET;
-            var i: u32 = 0;
-            while (i < entry_count) : (i += 1) {
-                const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
-                offset += 2;
-                const entry_key = try allocator.dupe(u8, data[offset..][0..key_len]);
-                offset += key_len;
+                if (self.current_index < self.entry_count_cache) {
+                    const key_len = std.mem.bytesToValue(u16, data[self.current_offset..][0..2]);
+                    self.current_offset += 2;
+                    
+                    const entry_key = data[self.current_offset..][0..key_len];
+                    self.current_offset += key_len;
 
-                const decode_result = try property_mod.decode(allocator, data[offset..]);
-                offset += @intCast(decode_result.bytes_read);
+                    const val_size = try encodedSizeFromBytes(data[self.current_offset..]);
+                    const encoded_val = data[self.current_offset..][0..val_size];
+                    self.current_offset += @intCast(val_size);
 
-                try result.append(allocator, .{
-                    .key = entry_key,
-                    .value = decode_result.value,
-                });
+                    self.current_index += 1;
+                    
+                    return PropertyEntrySlice{
+                        .key = entry_key,
+                        .encoded_value = encoded_val,
+                    };
+                }
+
+                const next_page = readNextPage(data);
+                self.store.buffer_pool.unpin(self.current_frame_idx.?, false);
+                self.current_frame_idx = null;
+                self.current_page = next_page;
+                self.current_index = 0;
+                self.current_offset = PROP_DATA_OFFSET;
             }
 
-            self.buffer_pool.unpin(frame_idx, false);
-            current_page = next_page;
+            return null;
         }
+    };
 
-        return result.toOwnedSlice(allocator);
+    /// Get an iterator over all properties in a property page chain (zero allocation).
+    pub fn getAllProperties(self: *PropStore, prop_head: u64) PropIterator {
+        return .{
+            .store = self,
+            .current_page = prop_head,
+        };
     }
 
     /// Put a property. Returns the (possibly new) prop_head.
@@ -537,16 +562,15 @@ test "getAllProperties returns all stored properties" {
     head = try store.putProperty(head, "age", .{ .int = 25 });
     head = try store.putProperty(head, "active", .{ .bool = false });
 
-    const props = try store.getAllProperties(head, testing.allocator);
-    defer {
-        for (props) |entry| {
-            testing.allocator.free(entry.key);
-            property_mod.freeDecoded(testing.allocator, entry.value);
-        }
-        testing.allocator.free(props);
+    var iter = store.getAllProperties(head);
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (try iter.next()) |_| {
+        count += 1;
     }
 
-    try testing.expectEqual(@as(usize, 3), props.len);
+    try testing.expectEqual(@as(usize, 3), count);
 }
 
 test "removeProperty removes the property" {
