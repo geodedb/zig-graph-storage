@@ -18,7 +18,8 @@ pub const TxnState = enum {
 
 /// Tracks active transactions and coordinates WAL writes.
 pub const TxnManager = struct {
-    next_txn_id: std.atomic.Value(u64),
+    next_txn_id: u64,
+    txn_id_mutex: std.Thread.Mutex,
     active_txns: std.AutoHashMap(u64, TxnState),
     wal: *WalManager,
     allocator: Allocator,
@@ -26,7 +27,8 @@ pub const TxnManager = struct {
     /// Initialize the transaction manager.
     pub fn init(allocator: Allocator, wal: *WalManager, start_txn_id: u64) TxnManager {
         return TxnManager{
-            .next_txn_id = std.atomic.Value(u64).init(start_txn_id),
+            .next_txn_id = start_txn_id,
+            .txn_id_mutex = .{},
             .active_txns = std.AutoHashMap(u64, TxnState).init(allocator),
             .wal = wal,
             .allocator = allocator,
@@ -41,7 +43,10 @@ pub const TxnManager = struct {
     /// Begin a new transaction. Writes a BEGIN record to the WAL.
     /// Returns the new transaction ID.
     pub fn begin(self: *TxnManager) !u64 {
-        const txn_id = self.next_txn_id.fetchAdd(1, .monotonic);
+        self.txn_id_mutex.lock();
+        const txn_id = self.next_txn_id;
+        self.next_txn_id += 1;
+        self.txn_id_mutex.unlock();
 
         var rec = WalRecord{
             .lsn = 0,

@@ -119,7 +119,7 @@ pub const FreeSpaceManager = struct {
     /// Expand to accommodate at least `min_pages` total pages.
     pub fn ensureCapacity(self: *FreeSpaceManager, min_pages: u64) !void {
         if (min_pages <= self.total_pages) return;
-        try self.bitmap.resize(min_pages, false);
+        try self.bitmap.resize(@intCast(min_pages), false);
         self.total_pages = min_pages;
     }
 };

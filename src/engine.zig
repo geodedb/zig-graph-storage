@@ -268,7 +268,7 @@ pub const GraphEngine = struct {
         const allocator = self.allocator;
 
         // Persist current state
-        self.manifest.next_txn_id = self.txn_manager.next_txn_id.load(.monotonic);
+        self.manifest.next_txn_id = self.txn_manager.next_txn_id;
         self.manifest.label_count = self.label_dict.count();
 
         // Track the first error encountered during close
@@ -494,7 +494,7 @@ pub const GraphEngine = struct {
 
     pub fn checkpoint(self: *GraphEngine) anyerror!void {
         // Update manifest counters before checkpoint
-        self.manifest.next_txn_id = self.txn_manager.next_txn_id.load(.monotonic);
+        self.manifest.next_txn_id = self.txn_manager.next_txn_id;
         self.manifest.label_count = self.label_dict.count();
 
         var timer = std.time.Timer.start() catch null;
