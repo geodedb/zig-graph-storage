@@ -2,8 +2,7 @@
 # GitLab CI/CD Pipeline for zig-template
 # SPDX-License-Identifier: Apache-2.0
 #
-# This is a template project with placeholder values in build.zig.zon.
-# Build/test steps are omitted — only security scans and formatting run.
+# Build, test, security scanning, and release pipeline.
 
 include:
   # Security scanning
@@ -74,6 +73,47 @@ stages:
     fi
   - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
   - zig version
+
+build:
+  stage: build
+  image: debian:bookworm-slim
+  before_script:
+    - *install-zig
+  script:
+    - zig build
+  cache:
+    key: zig-${ZIG_VERSION}
+    paths:
+      - zig-${ZIG_VERSION}/
+      - .zig-cache/
+
+test-unit:
+  stage: test
+  image: debian:bookworm-slim
+  needs: [build]
+  before_script:
+    - *install-zig
+  script:
+    - zig build test --summary all
+  cache:
+    key: zig-${ZIG_VERSION}
+    paths:
+      - zig-${ZIG_VERSION}/
+      - .zig-cache/
+
+test-integration:
+  stage: test
+  image: debian:bookworm-slim
+  needs: [build]
+  before_script:
+    - *install-zig
+  script:
+    - zig build test-integration --summary all
+  cache:
+    key: zig-${ZIG_VERSION}
+    paths:
+      - zig-${ZIG_VERSION}/
+      - .zig-cache/
 
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.
