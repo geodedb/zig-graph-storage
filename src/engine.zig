@@ -301,8 +301,8 @@ pub const GraphEngine = struct {
         // Track the first error encountered during close
         var close_err: ?anyerror = null;
 
-        // Run a final checkpoint -- propagate errors
-        self.checkpointer.run() catch |err| {
+        // Run a final synchronous checkpoint -- propagate errors
+        self.checkpointer.doCheckpoint() catch |err| {
             close_err = err;
         };
 
@@ -318,11 +318,6 @@ pub const GraphEngine = struct {
         self.label_dict.saveToFile(labels_path) catch |err| {
             if (close_err == null) close_err = err;
         };
-
-        // Wait for the final background checkpoint to finish before teardown
-        while (self.checkpointer.is_running.load(.acquire)) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
 
         // Cleanup all resources (always runs)
         self.cleanupResources(allocator);
@@ -534,8 +529,19 @@ pub const GraphEngine = struct {
         self.manifest.next_txn_id = self.txn_manager.next_txn_id;
         self.manifest.label_count = self.label_dict.count();
 
+        // Sync per-store page counts into the manifest so on-disk metadata
+        // reflects actual allocation state.
+        self.manifest.nodes_pages = self.free_space_nodes.allocatedCount();
+        self.manifest.adj_out_pages = self.free_space_adj_out.allocatedCount();
+        self.manifest.adj_in_pages = self.free_space_adj_in.allocatedCount();
+        self.manifest.props_pages = self.free_space_props.allocatedCount();
+        self.manifest.var_pages = self.free_space_var.allocatedCount();
+
+        // Synchronous checkpoint: flush dirty pages, sync files, write
+        // manifest.  Previous versions spawned a detached background thread
+        // which could silently lose writes and made the timer meaningless.
         var timer = std.time.Timer.start() catch null;
-        try self.checkpointer.run();
+        try self.checkpointer.doCheckpoint();
         if (timer) |*t| {
             self.metrics.last_checkpoint_duration_ns = t.read();
         }

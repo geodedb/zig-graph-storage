@@ -116,6 +116,18 @@ pub const FreeSpaceManager = struct {
         return count;
     }
 
+    /// Number of allocated pages (excluding reserved page 0).
+    pub fn allocatedCount(self: *const FreeSpaceManager) u64 {
+        var count: u64 = 0;
+        var i: usize = 1;
+        while (i < self.total_pages) : (i += 1) {
+            if (self.bitmap.isSet(i)) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     /// Expand to accommodate at least `min_pages` total pages.
     pub fn ensureCapacity(self: *FreeSpaceManager, min_pages: u64) !void {
         if (min_pages <= self.total_pages) return;
