@@ -195,6 +195,12 @@ pub const GraphEngine = struct {
         // 5. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         try self.initSubsystems(allocator, graph_uuid, cfg, self.manifest.last_checkpoint_lsn);
 
+        // 5b. Rebuild free space bitmaps from on-disk file sizes.
+        // initSubsystems creates empty bitmaps (only page 0 reserved). After
+        // recovery we need to mark pages that exist on disk as allocated so
+        // that scanNodes and other page-walking operations find them.
+        try self.rebuildFreeSpaceFromDisk();
+
         // 6. Load persisted label dictionary if it exists
         const labels_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path});
         defer allocator.free(labels_path);
@@ -258,6 +264,31 @@ pub const GraphEngine = struct {
             &self.file_manager,
             &self.graph_dir,
         );
+    }
+
+    /// Rebuild free space bitmaps by scanning on-disk file sizes.
+    /// Called during open() after initSubsystems so that pages written in a
+    /// previous session are visible to scanNodes and other page walkers.
+    fn rebuildFreeSpaceFromDisk(self: *GraphEngine) !void {
+        const pairs = [_]struct { fsm: *FreeSpaceManager, fid: types.FileId }{
+            .{ .fsm = &self.free_space_nodes, .fid = .nodes },
+            .{ .fsm = &self.free_space_adj_out, .fid = .adj_out },
+            .{ .fsm = &self.free_space_adj_in, .fid = .adj_in },
+            .{ .fsm = &self.free_space_props, .fid = .props },
+            .{ .fsm = &self.free_space_var, .fid = .var_store },
+        };
+
+        for (pairs) |pair| {
+            const pager = self.file_manager.getPager(pair.fid) orelse continue;
+            const page_count = pager.pageCount() catch continue;
+            if (page_count == 0) continue;
+
+            try pair.fsm.ensureCapacity(page_count);
+            var i: usize = 0;
+            while (i < page_count) : (i += 1) {
+                pair.fsm.bitmap.set(i);
+            }
+        }
     }
 
     /// Clean up the graph engine and its storage resources.
