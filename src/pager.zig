@@ -4,20 +4,26 @@
 const std = @import("std");
 const page_mod = @import("page.zig");
 const types = @import("types.zig");
+const encryption_mod = @import("encryption.zig");
 
 const PageId = types.PageId;
+const FileId = types.FileId;
 const PageHeader = page_mod.PageHeader;
 const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
+const PageEncryption = encryption_mod.PageEncryption;
 
 pub const PagerError = error{
     ChecksumMismatch,
     PageNotFound,
     InvalidBufferSize,
+    DecryptionFailed,
 };
 
 pub const Pager = struct {
     file: std.fs.File,
     page_size: u32,
+    encryption: ?PageEncryption = null,
+    file_id: FileId = .nodes,
 
     pub fn init(file: std.fs.File, page_size: u32) Pager {
         return .{ .file = file, .page_size = page_size };
@@ -25,7 +31,8 @@ pub const Pager = struct {
 
     /// Read a page from disk into the provided buffer.
     /// Buffer must be exactly page_size bytes.
-    /// Validates the page checksum after reading.
+    /// When encryption is enabled, decrypts the page body after reading.
+    /// Validates the page checksum after reading (and decrypting).
     /// Returns error.ChecksumMismatch if checksum doesn't match.
     /// Returns error.PageNotFound if reading beyond file end (short read).
     pub fn readPage(self: *const Pager, page_id: PageId, buf: []u8) !void {
@@ -37,10 +44,15 @@ pub const Pager = struct {
         if (bytes_read < self.page_size) return error.PageNotFound;
 
         // Check if the header is all zeros (fresh/uninitialized page).
-        // Only checks the 32-byte header instead of the full page — a valid
-        // page always has non-zero fields (page_type, checksum, etc.) in the header.
         if (std.mem.readInt(u128, buf[0..16], .little) == 0 and
             std.mem.readInt(u128, buf[16..32], .little) == 0) return;
+
+        // Decrypt page body if encryption is enabled
+        if (self.encryption) |enc| {
+            enc.decryptPage(buf, page_id, @intFromEnum(self.file_id), 0) catch {
+                return error.DecryptionFailed;
+            };
+        }
 
         // Parse header and validate checksum
         const body = buf[PAGE_HEADER_SIZE..];
@@ -53,6 +65,7 @@ pub const Pager = struct {
     /// Write a page to disk from the provided buffer.
     /// Buffer must be exactly page_size bytes.
     /// Computes and sets the checksum in the header before writing.
+    /// When encryption is enabled, encrypts the page body after checksumming.
     pub fn writePage(self: *const Pager, page_id: PageId, buf: []u8) !void {
         if (buf.len != self.page_size) return error.InvalidBufferSize;
 
@@ -60,6 +73,11 @@ pub const Pager = struct {
         const body = buf[PAGE_HEADER_SIZE..];
         const checksum = page_mod.computeChecksum(body);
         std.mem.writeInt(u32, buf[16..20], checksum, .little);
+
+        // Encrypt page body if encryption is enabled
+        if (self.encryption) |enc| {
+            enc.encryptPage(buf, page_id, @intFromEnum(self.file_id), 0);
+        }
 
         // Write page at the correct offset
         const offset: u64 = page_id * @as(u64, self.page_size);

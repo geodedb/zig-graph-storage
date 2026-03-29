@@ -29,6 +29,7 @@ pub const FileManager = struct {
     allocator: Allocator,
     graph_dir: []const u8, // path to graph directory
     page_size: u32,
+    encryption_key: ?[32]u8 = null, // TDE key for page encryption
     files: [FILE_COUNT]?std.fs.File, // indexed by @intFromEnum(FileId)
     pagers: [FILE_COUNT]?Pager, // one Pager per open file
 
@@ -44,6 +45,7 @@ pub const FileManager = struct {
 
     /// Open or create a store file for the given FileId.
     /// Creates the file if it doesn't exist. Opens for read+write.
+    /// When encryption_key is set, the pager will encrypt/decrypt pages.
     pub fn openFile(self: *FileManager, file_id: FileId) !*Pager {
         const idx = @intFromEnum(file_id);
         if (self.pagers[idx] != null) {
@@ -62,7 +64,15 @@ pub const FileManager = struct {
         });
 
         self.files[idx] = file;
-        self.pagers[idx] = Pager.init(file, self.page_size);
+        self.pagers[idx] = .{
+            .file = file,
+            .page_size = self.page_size,
+            .encryption = if (self.encryption_key) |key|
+                @import("encryption.zig").PageEncryption.init(key)
+            else
+                null,
+            .file_id = file_id,
+        };
         return &self.pagers[idx].?;
     }
 

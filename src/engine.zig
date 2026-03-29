@@ -116,6 +116,7 @@ pub const GraphEngine = struct {
 
         // 4. Open all store files via FileManager
         self.file_manager = FileManager.init(allocator, self.graph_dir.path, cfg.page_size);
+        self.file_manager.encryption_key = cfg.encryption_key;
         _ = try self.file_manager.openFile(.nodes);
         _ = try self.file_manager.openFile(.adj_out);
         _ = try self.file_manager.openFile(.adj_in);
@@ -158,6 +159,7 @@ pub const GraphEngine = struct {
 
         // 2. Open store files
         self.file_manager = FileManager.init(allocator, self.graph_dir.path, cfg.page_size);
+        self.file_manager.encryption_key = cfg.encryption_key;
 
         // 3. Create buffer pool
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
