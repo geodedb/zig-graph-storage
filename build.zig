@@ -16,9 +16,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const spice_dep = b.dependency("spice", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const wal_mod = wal_dep.module("wal");
     const uuid_mod = uuid_dep.module("uuid");
+    const spice_mod = spice_dep.module("spice");
 
     // Main library module
     const module = b.addModule("graph_storage", .{
@@ -28,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wal", .module = wal_mod },
             .{ .name = "uuid", .module = uuid_mod },
+            .{ .name = "spice", .module = spice_mod },
         },
     });
 
@@ -51,6 +57,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "wal", .module = wal_mod },
                 .{ .name = "uuid", .module = uuid_mod },
+                .{ .name = "spice", .module = spice_mod },
             },
         }),
     });
@@ -183,6 +190,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "wal", .module = wal_mod },
                 .{ .name = "uuid", .module = uuid_mod },
+                .{ .name = "spice", .module = spice_mod },
             },
         }),
     });

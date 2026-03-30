@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const spice = @import("spice");
 const Allocator = std.mem.Allocator;
 
 const types = @import("types.zig");
@@ -83,6 +84,7 @@ pub const GraphEngine = struct {
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.fs.Dir,
+    thread_pool: spice.ThreadPool,
     metrics: Metrics = .{},
 
     /// Create a new graph.
@@ -137,9 +139,12 @@ pub const GraphEngine = struct {
         // 6. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         try self.initSubsystems(allocator, graph_uuid, cfg, 0);
 
-        // 7. Wire metrics into buffer pool
+        // 7. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
         self.buffer_pool.setMetrics(&self.metrics);
+        self.thread_pool = spice.ThreadPool.init(allocator);
+        self.thread_pool.start(.{});
+        self.buffer_pool.setThreadPool(&self.thread_pool);
 
         return self;
     }
@@ -214,9 +219,12 @@ pub const GraphEngine = struct {
         // 7. Rebuild label index from node store
         try self.label_index.rebuild(&self.node_store, self.manifest.next_node_id);
 
-        // 8. Wire metrics into buffer pool
+        // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
         self.buffer_pool.setMetrics(&self.metrics);
+        self.thread_pool = spice.ThreadPool.init(allocator);
+        self.thread_pool.start(.{});
+        self.buffer_pool.setThreadPool(&self.thread_pool);
 
         return self;
     }
@@ -295,11 +303,7 @@ pub const GraphEngine = struct {
 
     /// Clean up the graph engine and its storage resources.
     pub fn deinit(self: *GraphEngine) void {
-        // Wait for any background checkpoint to finish before tearing down allocators
-        while (self.checkpointer.is_running.load(.acquire)) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-
+        self.thread_pool.deinit();
         self.txn_manager.deinit();
         self.wal.deinit();
         self.wal_dir_handle.close();
@@ -362,11 +366,7 @@ pub const GraphEngine = struct {
     /// Internal cleanup of all engine resources. Always runs on close,
     /// even when errors have occurred.
     fn cleanupResources(self: *GraphEngine, allocator: Allocator) void {
-        // Double check there are no lingering background tasks
-        while (self.checkpointer.is_running.load(.acquire)) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
-
+        self.thread_pool.deinit();
         self.txn_manager.deinit();
         self.wal.deinit();
         self.wal_dir_handle.close();

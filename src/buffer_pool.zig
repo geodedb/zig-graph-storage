@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const spice = @import("spice");
 const types = @import("types.zig");
 const page_frame_mod = @import("page_frame.zig");
 const pager_mod = @import("pager.zig");
@@ -44,6 +45,8 @@ pub const BufferPool = struct {
     metrics: ?*Metrics = null,
     // Concurrency protection for multi-threaded access
     mutex: std.Thread.Mutex = .{},
+    // Optional spice thread pool for parallel page flushes
+    thread_pool: ?*spice.ThreadPool = null,
 
     /// Initialize a buffer pool with the given capacity (number of frames).
     pub fn init(allocator: Allocator, page_size: u32, capacity: u32) !BufferPool {
@@ -105,6 +108,11 @@ pub const BufferPool = struct {
     /// Attach a metrics struct for recording buffer hit/miss and page I/O counters.
     pub fn setMetrics(self: *BufferPool, m: *Metrics) void {
         self.metrics = m;
+    }
+
+    /// Attach a spice thread pool for parallel dirty page flushes.
+    pub fn setThreadPool(self: *BufferPool, tp: *spice.ThreadPool) void {
+        self.thread_pool = tp;
     }
 
     /// Pin a page: return it from cache or read it from disk.
@@ -215,7 +223,12 @@ pub const BufferPool = struct {
     }
 
     /// Flush all dirty frames to disk regardless of LSN.
+    /// When a spice ThreadPool is attached, dirty pages are written in parallel
+    /// using fork/join. Otherwise falls back to sequential I/O.
     pub fn flushAll(self: *BufferPool) !void {
+        if (self.thread_pool) |tp| {
+            return self.flushAllParallel(tp);
+        }
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.frames) |*frame| {
@@ -223,6 +236,99 @@ pub const BufferPool = struct {
                 try self.flushFrame(frame);
             }
         }
+    }
+
+    /// Parallel flush: collect dirty frames under mutex, copy data, then
+    /// write pages concurrently via spice fork/join.
+    fn flushAllParallel(self: *BufferPool, tp: *spice.ThreadPool) !void {
+        self.mutex.lock();
+
+        // Count dirty frames
+        var dirty_count: usize = 0;
+        for (self.frames) |*frame| {
+            if (frame.dirty and frame.valid) dirty_count += 1;
+        }
+
+        if (dirty_count == 0) {
+            self.mutex.unlock();
+            return;
+        }
+
+        // Allocate descriptors and a contiguous data buffer for page copies
+        const items = self.allocator.alloc(FlushItem, dirty_count) catch {
+            self.mutex.unlock();
+            return error.OutOfMemory;
+        };
+        const ps: usize = self.page_size;
+        const data_buf = self.allocator.alloc(u8, dirty_count * ps) catch {
+            self.allocator.free(items);
+            self.mutex.unlock();
+            return error.OutOfMemory;
+        };
+
+        // Collect dirty frames: copy page data, bump pin, clear dirty
+        var idx: usize = 0;
+        for (self.frames, 0..) |*frame, fi| {
+            if (frame.dirty and frame.valid) {
+                const fid = frame.file_id;
+                const p = self.pagers[@intFromEnum(fid)] orelse {
+                    // Undo previously pinned frames and bail
+                    for (items[0..idx]) |item| {
+                        self.frames[item.frame_idx].pin_count -= 1;
+                        self.frames[item.frame_idx].dirty = true;
+                    }
+                    self.allocator.free(data_buf);
+                    self.allocator.free(items);
+                    self.mutex.unlock();
+                    return error.NoPagerRegistered;
+                };
+
+                const offset = idx * ps;
+                @memcpy(data_buf[offset..][0..ps], frame.dataSlice());
+
+                frame.pin_count += 1;
+                frame.dirty = false;
+
+                items[idx] = .{
+                    .pager = p,
+                    .page_id = frame.page_id,
+                    .frame_idx = @intCast(fi),
+                    .data_offset = offset,
+                    .err = null,
+                };
+                idx += 1;
+            }
+        }
+        self.mutex.unlock();
+
+        // Parallel I/O via spice fork/join
+        const ctx = FlushRange{
+            .items = items,
+            .data_buf = data_buf,
+            .page_size = self.page_size,
+        };
+        tp.call(void, parallelFlushFn, ctx);
+
+        // Re-acquire mutex to unpin frames and handle errors
+        self.mutex.lock();
+        var first_err: ?anyerror = null;
+        var write_count: u64 = 0;
+        for (items) |*item| {
+            self.frames[item.frame_idx].pin_count -= 1;
+            if (item.err) |e| {
+                self.frames[item.frame_idx].dirty = true;
+                if (first_err == null) first_err = e;
+            } else {
+                write_count += 1;
+            }
+        }
+        if (self.metrics) |m| m.page_writes += write_count;
+        self.mutex.unlock();
+
+        self.allocator.free(data_buf);
+        self.allocator.free(items);
+
+        if (first_err) |e| return e;
     }
 
     /// Flush up to max_count dirty unpinned pages to disk, starting from the LRU tail.
@@ -385,6 +491,55 @@ pub const BufferPool = struct {
 
         frame.lru_prev = null;
         frame.lru_next = null;
+    }
+
+    // ========================================================================
+    // Parallel flush types (used by flushAllParallel via spice fork/join)
+    // ========================================================================
+
+    const FlushItem = struct {
+        pager: *const Pager,
+        page_id: PageId,
+        frame_idx: u32,
+        data_offset: usize,
+        err: ?anyerror,
+    };
+
+    const FlushRange = struct {
+        items: []FlushItem,
+        data_buf: []u8,
+        page_size: u32,
+    };
+
+    /// Recursive divide-and-conquer flush: splits the item list in half,
+    /// forks one half to a background worker, processes the other half
+    /// inline, then joins.
+    fn parallelFlushFn(task: *spice.Task, range: FlushRange) void {
+        const items = range.items;
+        if (items.len == 0) return;
+
+        if (items.len == 1) {
+            const item = &items[0];
+            const data = range.data_buf[item.data_offset..][0..range.page_size];
+            item.pager.writePage(item.page_id, data) catch |e| {
+                item.err = e;
+            };
+            return;
+        }
+
+        const mid = items.len / 2;
+        var future = spice.Future(FlushRange, void).init();
+        future.fork(task, parallelFlushFn, .{
+            .items = items[mid..],
+            .data_buf = range.data_buf,
+            .page_size = range.page_size,
+        });
+        parallelFlushFn(task, .{
+            .items = items[0..mid],
+            .data_buf = range.data_buf,
+            .page_size = range.page_size,
+        });
+        _ = future.join(task);
     }
 };
 

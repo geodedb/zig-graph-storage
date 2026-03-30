@@ -30,8 +30,6 @@ pub const Checkpointer = struct {
     allocator: Allocator,
     /// Which manifest slot was last written. Alternates each checkpoint.
     last_slot: GraphDir.ManifestSlot = .a,
-    /// Prevents concurrent overlapping checkpoints
-    is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(
         allocator: Allocator,
@@ -52,32 +50,6 @@ pub const Checkpointer = struct {
     }
 
     /// Run a checkpoint:
-    /// 1. Record checkpoint_lsn = wal.currentLsn()
-    /// 2. Flush all dirty pages from buffer pool
-    /// 3. Sync all store files (fsync)
-    /// 4. Update manifest with new last_checkpoint_lsn
-    /// 5. Write manifest to standby slot (alternate A/B)
-    /// 6. Sync manifest
-    /// 7. Truncate WAL up to checkpoint_lsn
-    /// Run a checkpoint asynchronously on a background thread.
-    /// Returns immediately. If a checkpoint is already running, does nothing.
-    pub fn run(self: *Checkpointer) !void {
-        if (self.is_running.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
-            return; // Already in progress
-        }
-        
-        const thread = try std.Thread.spawn(.{}, backgroundRun, .{self});
-        thread.detach();
-    }
-
-    fn backgroundRun(self: *Checkpointer) void {
-        defer self.is_running.store(false, .release);
-        self.doCheckpoint() catch |err| {
-            std.log.err("Background checkpoint failed: {any}", .{err});
-        };
-    }
-
-    /// Synchronous internal checkpoint logic:
     pub fn doCheckpoint(self: *Checkpointer) !void {
         // 1. Record checkpoint LSN
         const checkpoint_lsn = self.wal.currentLsn();
@@ -217,10 +189,7 @@ test "run checkpoint updates manifest counter and last_checkpoint_lsn" {
         &env.graph_dir,
     );
 
-    try cp.run();
-    while (cp.is_running.load(.acquire)) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-    }
+    try cp.doCheckpoint();
 
     // Manifest should be updated
     try testing.expectEqual(@as(u64, 1), env.manifest.counter);
@@ -263,10 +232,7 @@ test "run checkpoint truncates WAL" {
         &env.graph_dir,
     );
 
-    try cp.run();
-    while (cp.is_running.load(.acquire)) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-    }
+    try cp.doCheckpoint();
 
     // After truncation, reading from LSN 1 should return fewer or no records
     // (the external WAL library compacts, so old records are removed)
