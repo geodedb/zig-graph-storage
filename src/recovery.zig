@@ -79,6 +79,9 @@ pub const Recovery = struct {
 
         // Validate manifest format version compatibility
         if (m.format_version != manifest_mod.MANIFEST_VERSION) {
+            if (m.format_version == manifest_mod.MANIFEST_VERSION_V1) {
+                std.log.warn("V1 graph format detected — data directory must be recreated for V2 (40-byte NodeRec is incompatible with 48-byte V2 layout)", .{});
+            }
             return error.IncompatibleVersion;
         }
 

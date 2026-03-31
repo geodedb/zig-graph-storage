@@ -1220,6 +1220,47 @@ test "PERF-0008: open respects buffer_pool_auto_size=false" {
     }
 }
 
+test "V1 format detection returns V1FormatRequiresRecreation" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x61} ** 16;
+    const cfg = testConfig();
+
+    // Create a valid V2 graph so the directory structure exists
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Now overwrite manifest_a with a V1 format_version
+    const graph_dir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&graph_dir).deinit();
+
+    const v1_manifest = Manifest{
+        .graph_uuid = uuid,
+        .page_size = cfg.page_size,
+        .counter = 10, // Higher counter so it wins A/B selection
+        .format_version = manifest_mod.MANIFEST_VERSION_V1,
+    };
+    const path_a = try graph_dir.manifestPath(testing.allocator, .a);
+    defer testing.allocator.free(path_a);
+    try v1_manifest.writeToFile(testing.allocator, path_a);
+
+    // Also write to slot B so selectManifest picks V1
+    const path_b = try graph_dir.manifestPath(testing.allocator, .b);
+    defer testing.allocator.free(path_b);
+    try v1_manifest.writeToFile(testing.allocator, path_b);
+
+    // open() should detect V1 and return error
+    const result = GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    try testing.expectError(error.IncompatibleVersion, result);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

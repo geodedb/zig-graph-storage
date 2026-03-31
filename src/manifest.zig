@@ -6,7 +6,12 @@ const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
 
 pub const MANIFEST_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'M', 'N', 'F', '0', '1' };
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
+
+/// V1 used a 40-byte NodeRec with label_set: u32 bitmap.
+/// V2 uses a 48-byte NodeRec with label_head: u64 + label_count: u16.
+/// Migration from V1 to V2 requires recreating the data directory.
+pub const MANIFEST_VERSION_V1: u32 = 1;
 
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields (see below) + CRC32(4)
