@@ -473,6 +473,40 @@ pub const GraphEngine = struct {
         return &self.metrics;
     }
 
+    /// Summary statistics about the storage engine's current state.
+    pub const StorageStats = struct {
+        node_count: u64,
+        edge_count: u64,
+        label_count: u32,
+        format_version: u32,
+        page_size: u32,
+        wal_lsn: u64,
+        last_checkpoint_lsn: u64,
+        free_pages_nodes: u64,
+        free_pages_adj_out: u64,
+        free_pages_adj_in: u64,
+        free_pages_props: u64,
+        free_pages_var: u64,
+    };
+
+    /// Return a snapshot of storage-level statistics.
+    pub fn getStorageStats(self: *GraphEngine) StorageStats {
+        return .{
+            .node_count = self.manifest.node_count,
+            .edge_count = self.manifest.edge_count,
+            .label_count = self.manifest.label_count,
+            .format_version = self.manifest.format_version,
+            .page_size = self.config.page_size,
+            .wal_lsn = self.txn_manager.next_txn_id,
+            .last_checkpoint_lsn = self.manifest.last_checkpoint_lsn,
+            .free_pages_nodes = self.free_space_nodes.freeCount(),
+            .free_pages_adj_out = self.free_space_adj_out.freeCount(),
+            .free_pages_adj_in = self.free_space_adj_in.freeCount(),
+            .free_pages_props = self.free_space_props.freeCount(),
+            .free_pages_var = self.free_space_var.freeCount(),
+        };
+    }
+
     // ========================================================================
     // Internal: WAL page logging helper
     // ========================================================================
@@ -1218,6 +1252,42 @@ test "PERF-0008: open respects buffer_pool_auto_size=false" {
 
         try testing.expectEqual(@as(u32, 64), engine.buffer_pool.capacity);
     }
+}
+
+test "getStorageStats returns correct counters" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x71} ** 16;
+    const cfg = testConfig();
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    // Fresh engine stats
+    const stats0 = engine.getStorageStats();
+    try testing.expectEqual(@as(u64, 0), stats0.node_count);
+    try testing.expectEqual(@as(u64, 0), stats0.edge_count);
+    try testing.expectEqual(@as(u32, 2), stats0.format_version); // V2
+    try testing.expectEqual(@as(u32, 4096), stats0.page_size);
+
+    // Add a node and check stats update
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    const stats1 = engine.getStorageStats();
+    try testing.expectEqual(@as(u64, 1), stats1.node_count);
 }
 
 test "V1 format detection returns V1FormatRequiresRecreation" {
