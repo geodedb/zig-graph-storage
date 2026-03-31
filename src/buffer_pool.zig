@@ -513,7 +513,9 @@ pub const BufferPool = struct {
 
     /// Recursive divide-and-conquer flush: splits the item list in half,
     /// forks one half to a background worker, processes the other half
-    /// inline, then joins.
+    /// inline, then joins.  If the forked half was not picked up by a
+    /// background worker (join returns null), it is executed inline so
+    /// that no writes are silently dropped.
     fn parallelFlushFn(task: *spice.Task, range: FlushRange) void {
         const items = range.items;
         if (items.len == 0) return;
@@ -528,18 +530,24 @@ pub const BufferPool = struct {
         }
 
         const mid = items.len / 2;
-        var future = spice.Future(FlushRange, void).init();
-        future.fork(task, parallelFlushFn, .{
+        const right_range = FlushRange{
             .items = items[mid..],
             .data_buf = range.data_buf,
             .page_size = range.page_size,
-        });
+        };
+        var future = spice.Future(FlushRange, void).init();
+        future.fork(task, parallelFlushFn, right_range);
         parallelFlushFn(task, .{
             .items = items[0..mid],
             .data_buf = range.data_buf,
             .page_size = range.page_size,
         });
-        _ = future.join(task);
+        // If join returns null the forked job was still queued (never
+        // picked up by a background worker).  Execute it inline to
+        // guarantee all pages are flushed.
+        if (future.join(task) == null) {
+            parallelFlushFn(task, right_range);
+        }
     }
 };
 
