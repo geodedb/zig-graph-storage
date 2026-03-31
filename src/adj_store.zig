@@ -204,6 +204,41 @@ pub const AdjStore = struct {
         };
     }
 
+    /// Update the prop_head of an existing edge entry in the adjacency chain.
+    /// Scans the chain starting at head_page for the given edge_id.
+    /// Returns true if found and updated, false if edge not found.
+    pub fn updateEdgePropHead(self: *AdjStore, head_page: PageId, edge_id: EdgeId, new_prop_head: u32) !bool {
+        if (head_page == 0) return false;
+
+        var current_page = head_page;
+        while (current_page != 0) {
+            const frame = try self.buffer_pool.pin(self.file_id, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+            const bh = self.readBlockHeader(data);
+
+            var i: u16 = 0;
+            while (i < bh.count) : (i += 1) {
+                const e = self.readEntry(data, i);
+                if (e.edge_id == edge_id) {
+                    self.writeEntry(data, i, .{
+                        .neighbor = e.neighbor,
+                        .edge_id = e.edge_id,
+                        .rel_type = e.rel_type,
+                        .prop_head = new_prop_head,
+                    });
+                    self.buffer_pool.unpin(frame_idx, true);
+                    return true;
+                }
+            }
+
+            const next = bh.next_block;
+            self.buffer_pool.unpin(frame_idx, false);
+            current_page = next;
+        }
+        return false;
+    }
+
     /// Count edges in the adjacency list.
     pub fn edgeCount(self: *AdjStore, head_page: PageId) !u64 {
         if (head_page == 0) return 0;
@@ -468,6 +503,60 @@ test "rel_type_filter in expand" {
     var filter9_len: usize = 0;
     while (try filter9_iter.next()) |_| filter9_len += 1;
     try testing.expectEqual(@as(usize, 0), filter9_len);
+}
+
+test "updateEdgePropHead updates matching edge" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    var head: PageId = 0;
+    head = try store.addEdge(head, makeEdge(10, 1, 5));
+    head = try store.addEdge(head, makeEdge(20, 2, 5));
+    head = try store.addEdge(head, makeEdge(30, 3, 5));
+
+    // Update prop_head for edge_id=2
+    const found = try store.updateEdgePropHead(head, 2, 42);
+    try testing.expect(found);
+
+    // Verify via expand
+    var iter = store.expand(head, null);
+    defer iter.deinit();
+
+    while (try iter.next()) |e| {
+        if (e.edge_id == 2) {
+            try testing.expectEqual(@as(u32, 42), e.prop_head);
+        } else {
+            try testing.expectEqual(@as(u32, 0), e.prop_head);
+        }
+    }
+}
+
+test "updateEdgePropHead returns false for missing edge" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    var head: PageId = 0;
+    head = try store.addEdge(head, makeEdge(10, 1, 5));
+
+    const found = try store.updateEdgePropHead(head, 999, 42);
+    try testing.expect(!found);
+}
+
+test "updateEdgePropHead on empty list returns false" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const found = try store.updateEdgePropHead(0, 1, 42);
+    try testing.expect(!found);
 }
 
 test "edgeCount on empty list returns 0" {
