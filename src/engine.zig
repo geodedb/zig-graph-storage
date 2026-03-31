@@ -221,8 +221,8 @@ pub const GraphEngine = struct {
             else => return err,
         };
 
-        // 7. Rebuild label index from node store
-        try self.label_index.rebuild(&self.node_store, self.manifest.next_node_id);
+        // 7. Rebuild label index from LabelStore (var.store-backed labels)
+        try self.rebuildLabelIndex();
 
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
@@ -373,6 +373,32 @@ pub const GraphEngine = struct {
             var i: usize = 0;
             while (i < page_count) : (i += 1) {
                 pair.fsm.bitmap.set(i);
+            }
+        }
+    }
+
+    /// Rebuild the in-memory label index by reading each live node's labels
+    /// from the LabelStore (var.store-backed). Called during open() after all
+    /// subsystems and free-space bitmaps are initialized.
+    fn rebuildLabelIndex(self: *GraphEngine) !void {
+        // Clear any stale entries from the in-memory index.
+        var it = self.label_index.index.valueIterator();
+        while (it.next()) |list| {
+            @constCast(list).deinit(self.label_index.allocator);
+        }
+        self.label_index.index.clearAndFree();
+
+        // Iterate all allocated node IDs and populate the index from LabelStore.
+        var id: u64 = 1;
+        while (id < self.manifest.next_node_id) : (id += 1) {
+            const rec = self.node_store.getNode(id) catch continue orelse continue;
+            if (rec.label_head == 0) continue;
+
+            const labels = self.label_store.getLabels(rec.label_head, self.allocator) catch continue;
+            defer self.allocator.free(labels);
+
+            for (labels) |label_id| {
+                try self.label_index.addNode(label_id, id);
             }
         }
     }

@@ -545,13 +545,15 @@ test "QUAL-0020: storage smoke test — full round-trip with properties and labe
         }
 
         // -- scanLabel --
-        // The in-memory label index is not persisted/rebuilt on reopen,
-        // so we only verify the call doesn't error. Counts may be zero.
+        // Label index is rebuilt from LabelStore on reopen, so counts
+        // should match what was seeded in the first session.
         {
             const person_nodes = try eng.scanLabel(0, allocator);
             defer allocator.free(person_nodes);
+            try std.testing.expect(person_nodes.len > 0);
             const admin_nodes = try eng.scanLabel(1, allocator);
             defer allocator.free(admin_nodes);
+            try std.testing.expect(admin_nodes.len > 0);
         }
 
         // -- Edges (best-effort; adjacency page data may not survive reopen) --
@@ -756,20 +758,25 @@ test "QUAL-0023: 64 distinct labels on a single node survive reopen" {
         try std.testing.expect(rec.label_head != 0);
         try std.testing.expectEqual(@as(u16, 64), rec.label_count);
 
-        // Best-effort: read labels via label_store if var.store data survived reopen.
-        // The var.store pages may be zeroed after close+reopen (known persistence gap).
+        // Verify all 64 labels survived via LabelStore
         const labels = try eng.label_store.getLabels(rec.label_head, allocator);
         defer allocator.free(labels);
-        if (labels.len == 64) {
-            // Full var.store persistence works; verify all 64 IDs present
-            var found = [_]bool{false} ** 65; // index 0 unused, 1..64
-            for (labels) |lid| {
-                try std.testing.expect(lid >= 1 and lid <= 64);
-                found[lid] = true;
-            }
-            for (1..65) |i| {
-                try std.testing.expect(found[i]);
-            }
+        try std.testing.expectEqual(@as(usize, 64), labels.len);
+        var found = [_]bool{false} ** 65; // index 0 unused, 1..64
+        for (labels) |lid| {
+            try std.testing.expect(lid >= 1 and lid <= 64);
+            found[lid] = true;
+        }
+        for (1..65) |i| {
+            try std.testing.expect(found[i]);
+        }
+
+        // Verify label index was rebuilt: scanLabel should find the node
+        for (1..65) |i| {
+            const scan_result = try eng.scanLabel(@intCast(i), allocator);
+            defer allocator.free(scan_result);
+            try std.testing.expectEqual(@as(usize, 1), scan_result.len);
+            try std.testing.expectEqual(@as(u64, 1), scan_result[0]);
         }
     }
 }
@@ -835,16 +842,26 @@ test "QUAL-0024: add and remove labels after node creation survive reopen" {
         try std.testing.expect(rec.label_head != 0);
         try std.testing.expectEqual(@as(u16, 2), rec.label_count);
 
-        // Best-effort: verify label content if var.store data survived reopen.
+        // Verify label content survived reopen
         const labels = try eng.label_store.getLabels(rec.label_head, allocator);
         defer allocator.free(labels);
-        if (labels.len == 2) {
-            // Full var.store persistence works; verify exact content
-            for (labels) |lid| {
-                if (lid == 1) return error.RemovedLabelStillPresent;
-                try std.testing.expect(lid == 2 or lid == 3);
-            }
+        try std.testing.expectEqual(@as(usize, 2), labels.len);
+        for (labels) |lid| {
+            if (lid == 1) return error.RemovedLabelStillPresent;
+            try std.testing.expect(lid == 2 or lid == 3);
         }
+
+        // Verify label index was rebuilt from LabelStore
+        const scan2 = try eng.scanLabel(2, allocator);
+        defer allocator.free(scan2);
+        try std.testing.expectEqual(@as(usize, 1), scan2.len);
+        const scan3 = try eng.scanLabel(3, allocator);
+        defer allocator.free(scan3);
+        try std.testing.expectEqual(@as(usize, 1), scan3.len);
+        // Removed label 1 should not appear in index
+        const scan1 = try eng.scanLabel(1, allocator);
+        defer allocator.free(scan1);
+        try std.testing.expectEqual(@as(usize, 0), scan1.len);
     }
 
     // Phase 3: Reopen again, add a new label to verify mutations on reopened engine
@@ -854,12 +871,9 @@ test "QUAL-0024: add and remove labels after node creation survive reopen" {
         try eng.addLabel(1, 4);
 
         const rec = (try eng.getNode(1)).?;
-        // label_count depends on whether var.store data survived:
-        // If survived: count was 2 + 1 = 3
-        // If not: addLabel sees empty list + adds 1 = count may differ
-        // Verify at least the node is valid and label_head is set
+        // var.store data survives reopen, so count should be 2 + 1 = 3
         try std.testing.expect(rec.label_head != 0);
-        try std.testing.expect(rec.label_count >= 1);
+        try std.testing.expectEqual(@as(u16, 3), rec.label_count);
 
         try eng.checkpoint();
         try eng.close();

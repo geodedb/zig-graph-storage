@@ -124,12 +124,10 @@ pub const LabelIndex = struct {
     }
 
     fn rebuildCallback(_: *LabelIndex, _: NodeId, _: node_mod.NodeRec) void {
-        // With the new label model, label_head is a var.store reference.
-        // Rebuilding from var.store requires a LabelStore + allocator which
-        // the callback signature doesn't support. For now, label index rebuild
-        // on open will not populate from persisted labels. The engine's open()
-        // path can be extended later to do a full label-store-aware rebuild.
-        // Labels added via addLabel() during runtime are tracked correctly.
+        // No-op: label_head is a var.store reference requiring LabelStore +
+        // allocator which the callback signature doesn't support.
+        // The real rebuild is done by GraphEngine.rebuildLabelIndex() which
+        // iterates nodes and reads labels via LabelStore directly.
     }
 };
 
