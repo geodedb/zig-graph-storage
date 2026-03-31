@@ -242,61 +242,13 @@ pub const GraphStorage = struct {
             }
             fn expandOutFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                // Call concrete implementation and allocate the concrete wrapper
-                const concrete_iter = try @call(.auto, @field(T, method_name), .{ self, id, rel_type });
-                const RealIter = @TypeOf(concrete_iter);
-                const heap_iter = try allocator.create(RealIter);
-                heap_iter.* = concrete_iter;
-                
-                const WrapperState = struct {
-                    fn next(vp: *anyopaque) anyerror!?EdgeEntry {
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        return hi.next();
-                    }
-                    fn deinit(vp: *anyopaque) void {
-                        // Note: we can't easily free without the allocator, but vtables assume caller manages or wrapper manages.
-                        // Actually, allocating the state inside the interface wrapper means caller doesn't own it nicely if we don't store allocator.
-                        // For a zero-allocation concrete path, we just let vtable leak if not careful, or store allocator.
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        hi.deinit();
-                        // Memory leak of the wrapper struct itself, but this is a stub test anyway.
-                        // We'll leave it as a known interface abstraction cost, since concrete usage is 0 alloc.
-                    }
-                };
-                
-                return EdgeIterator{
-                    .ptr = heap_iter,
-                    .vtable = &.{
-                        .next = WrapperState.next,
-                        .deinit = WrapperState.deinit,
-                    }
-                };
+                const slice = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
+                return sliceToEdgeIterator(slice, allocator);
             }
             fn expandInFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                const concrete_iter = try @call(.auto, @field(T, method_name), .{ self, id, rel_type });
-                const RealIter = @TypeOf(concrete_iter);
-                const heap_iter = try allocator.create(RealIter);
-                heap_iter.* = concrete_iter;
-                
-                const WrapperState = struct {
-                    fn next(vp: *anyopaque) anyerror!?EdgeEntry {
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        return hi.next();
-                    }
-                    fn deinit(vp: *anyopaque) void {
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        hi.deinit();
-                    }
-                };
-                
-                return EdgeIterator{
-                    .ptr = heap_iter,
-                    .vtable = &.{
-                        .next = WrapperState.next,
-                        .deinit = WrapperState.deinit,
-                    }
-                };
+                const slice = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
+                return sliceToEdgeIterator(slice, allocator);
             }
             fn addEdgeFn(ptr: *anyopaque, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
                 const self: *T = @ptrCast(@alignCast(ptr));
@@ -435,6 +387,45 @@ pub const GraphStorage = struct {
         @compileError("Unknown vtable method: " ++ method_name);
     }
 };
+
+/// Wrap a caller-owned `[]EdgeEntry` slice as an `EdgeIterator`.
+/// The iterator yields entries one by one and frees the backing slice on deinit.
+fn sliceToEdgeIterator(slice: []EdgeEntry, allocator: Allocator) anyerror!EdgeIterator {
+    const State = struct {
+        entries: []EdgeEntry,
+        index: usize,
+        alloc: Allocator,
+
+        fn next(vp: *anyopaque) anyerror!?EdgeEntry {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            if (self.index >= self.entries.len) return null;
+            const entry = self.entries[self.index];
+            self.index += 1;
+            return entry;
+        }
+
+        fn deinit(vp: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            self.alloc.free(self.entries);
+            self.alloc.destroy(self);
+        }
+    };
+
+    const state = try allocator.create(State);
+    state.* = .{
+        .entries = slice,
+        .index = 0,
+        .alloc = allocator,
+    };
+
+    return EdgeIterator{
+        .ptr = @ptrCast(state),
+        .vtable = &.{
+            .next = State.next,
+            .deinit = State.deinit,
+        },
+    };
+}
 
 // ============================================================================
 // Unit Tests

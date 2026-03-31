@@ -436,14 +436,28 @@ pub const GraphEngine = struct {
         return error.EdgeIndexNotImplemented;
     }
 
-    pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
-        const rec = try self.node_store.getNode(id) orelse return self.adj_out.expand(0, rel_type);
-        return self.adj_out.expand(rec.out_head, rel_type);
+    pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        const rec = try self.node_store.getNode(id);
+        var iter = self.adj_out.expand(if (rec) |r| r.out_head else 0, rel_type);
+        defer iter.deinit();
+        return drainEdgeIterator(&iter, allocator);
     }
 
-    pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
-        const rec = try self.node_store.getNode(id) orelse return self.adj_in.expand(0, rel_type);
-        return self.adj_in.expand(rec.in_head, rel_type);
+    pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        const rec = try self.node_store.getNode(id);
+        var iter = self.adj_in.expand(if (rec) |r| r.in_head else 0, rel_type);
+        defer iter.deinit();
+        return drainEdgeIterator(&iter, allocator);
+    }
+
+    /// Drain an AdjEdgeIterator into a heap-allocated slice.
+    fn drainEdgeIterator(iter: *AdjStore.AdjEdgeIterator, allocator: Allocator) anyerror![]EdgeEntry {
+        var list = std.ArrayList(EdgeEntry){};
+        errdefer list.deinit(allocator);
+        while (try iter.next()) |entry| {
+            try list.append(allocator, entry);
+        }
+        return list.toOwnedSlice(allocator);
     }
 
     pub fn addEdge(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
@@ -673,28 +687,20 @@ test "create engine, addEdge, expandOut returns edge" {
     try testing.expectEqual(@as(EdgeId, 1), edge_id);
 
     // Expand outgoing edges from n1
-    var out_iter = try engine.expandOut(n1, null);
-    defer out_iter.deinit();
+    const out_edges = try engine.expandOut(n1, null, testing.allocator);
+    defer testing.allocator.free(out_edges);
 
-    var out_count: usize = 0;
-    while (try out_iter.next()) |e| {
-        try testing.expectEqual(n2, e.neighbor);
-        try testing.expectEqual(edge_id, e.edge_id);
-        try testing.expectEqual(@as(u32, 5), e.rel_type);
-        out_count += 1;
-    }
-    try testing.expectEqual(@as(usize, 1), out_count);
+    try testing.expectEqual(@as(usize, 1), out_edges.len);
+    try testing.expectEqual(n2, out_edges[0].neighbor);
+    try testing.expectEqual(edge_id, out_edges[0].edge_id);
+    try testing.expectEqual(@as(u32, 5), out_edges[0].rel_type);
 
     // Expand incoming edges at n2
-    var in_iter = try engine.expandIn(n2, null);
-    defer in_iter.deinit();
+    const in_edges = try engine.expandIn(n2, null, testing.allocator);
+    defer testing.allocator.free(in_edges);
 
-    var in_count: usize = 0;
-    while (try in_iter.next()) |e| {
-        try testing.expectEqual(n1, e.neighbor);
-        in_count += 1;
-    }
-    try testing.expectEqual(@as(usize, 1), in_count);
+    try testing.expectEqual(@as(usize, 1), in_edges.len);
+    try testing.expectEqual(n1, in_edges[0].neighbor);
 }
 
 test "create engine, checkpoint, close, open again, data persists" {

@@ -202,9 +202,8 @@ fn benchAdjacencyTraversal(
     var timer = try std.time.Timer.start();
     for (0..iterations) |_| {
         const uid = random.intRangeAtMost(NodeId, sr.users.start, sr.users.end - 1);
-        var iter = try engine.expandOut(uid, null);
-        defer iter.deinit();
-        while (try iter.next()) |_| {}
+        const edges = try engine.expandOut(uid, null, std.heap.page_allocator);
+        defer std.heap.page_allocator.free(edges);
     }
     const elapsed = timer.read();
 

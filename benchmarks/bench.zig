@@ -246,9 +246,8 @@ fn benchExpandOut(data_dir: []const u8) !BenchResult {
     var timer = try std.time.Timer.start();
 
     for (0..iterations) |_| {
-        var iter = try engine.expandOut(hub, null);
-        defer iter.deinit();
-        while (try iter.next()) |_| {}
+        const edges = try engine.expandOut(hub, null, std.heap.page_allocator);
+        defer std.heap.page_allocator.free(edges);
     }
 
     const elapsed = timer.read();
