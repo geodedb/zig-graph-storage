@@ -402,6 +402,23 @@ pub const GraphEngine = struct {
     }
 
     // ========================================================================
+    // Internal: WAL page logging helper
+    // ========================================================================
+
+    /// Pin a page, log its current contents to the WAL, and unpin it.
+    fn logPage(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
+        const frame = try self.buffer_pool.pin(file_id, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        defer self.buffer_pool.unpin(frame_idx, false);
+        _ = try self.txn_manager.logPageUpdate(txn_id, @intFromEnum(file_id), page_id, frame.dataSlice());
+    }
+
+    /// Compute the page ID for a given node ID.
+    fn nodePageId(self: *const GraphEngine, node_id: NodeId) u64 {
+        return node_id / self.node_store.nodes_per_page;
+    }
+
+    // ========================================================================
     // VTable implementation methods (called via GraphStorage interface)
     // ========================================================================
 
@@ -410,7 +427,13 @@ pub const GraphEngine = struct {
     }
 
     pub fn putNode(self: *GraphEngine, id: NodeId, rec: NodeRec) anyerror!void {
-        return self.node_store.putNode(id, rec);
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        try self.node_store.putNode(id, rec);
+        try self.logPage(txn, .nodes, self.nodePageId(id));
+
+        try self.txn_manager.commit(txn);
     }
 
     pub fn allocNode(self: *GraphEngine) anyerror!NodeId {
@@ -422,7 +445,14 @@ pub const GraphEngine = struct {
     }
 
     pub fn deleteNode(self: *GraphEngine, id: NodeId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
         try self.node_store.deleteNode(id);
+        try self.logPage(txn, .nodes, self.nodePageId(id));
+
+        try self.txn_manager.commit(txn);
+
         if (self.manifest.node_count > 0) {
             self.manifest.node_count -= 1;
         }
@@ -465,6 +495,9 @@ pub const GraphEngine = struct {
     }
 
     pub fn addEdge(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
         const edge_id = self.manifest.next_edge_id;
         self.manifest.next_edge_id += 1;
 
@@ -493,6 +526,18 @@ pub const GraphEngine = struct {
         to_rec.in_head = new_in_head;
         try self.node_store.putNode(to, to_rec);
 
+        // Log all dirty pages: adj_out page, adj_in page, from-node page, to-node page
+        try self.logPage(txn, .adj_out, new_out_head);
+        try self.logPage(txn, .adj_in, new_in_head);
+        try self.logPage(txn, .nodes, self.nodePageId(from));
+        // Avoid duplicate log if from and to share the same node page
+        const to_page = self.nodePageId(to);
+        if (to_page != self.nodePageId(from)) {
+            try self.logPage(txn, .nodes, to_page);
+        }
+
+        try self.txn_manager.commit(txn);
+
         self.manifest.edge_count += 1;
         self.metrics.edges_created += 1;
 
@@ -500,6 +545,9 @@ pub const GraphEngine = struct {
     }
 
     pub fn removeEdge(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
         // Remove from source node's out adjacency list
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         try self.adj_out.removeEdge(from_rec.out_head, edge_id);
@@ -507,6 +555,12 @@ pub const GraphEngine = struct {
         // Remove from target node's in adjacency list
         const to_rec = try self.node_store.getNode(to) orelse return error.NodeNotFound;
         try self.adj_in.removeEdge(to_rec.in_head, edge_id);
+
+        // Log dirty adjacency pages
+        if (from_rec.out_head != 0) try self.logPage(txn, .adj_out, from_rec.out_head);
+        if (to_rec.in_head != 0) try self.logPage(txn, .adj_in, to_rec.in_head);
+
+        try self.txn_manager.commit(txn);
 
         if (self.manifest.edge_count > 0) {
             self.manifest.edge_count -= 1;
@@ -524,32 +578,68 @@ pub const GraphEngine = struct {
     }
 
     pub fn putProperty(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        const new_head = try self.prop_store.putProperty(owner, key, val);
+
+        // Log the property page that was written to
+        try self.logPage(txn, .props, new_head);
+
+        try self.txn_manager.commit(txn);
+
         self.metrics.properties_written += 1;
-        return self.prop_store.putProperty(owner, key, val);
+        return new_head;
     }
 
     pub fn removeProperty(self: *GraphEngine, owner: u64, key: []const u8) anyerror!void {
-        return self.prop_store.removeProperty(owner, key);
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        try self.prop_store.removeProperty(owner, key);
+
+        // Log the property page if there is one
+        if (owner != 0) try self.logPage(txn, .props, owner);
+
+        try self.txn_manager.commit(txn);
     }
 
     pub fn addLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
         if (result.count != rec.label_count or result.head != rec.label_head) {
             rec.label_head = result.head;
             rec.label_count = result.count;
             try self.node_store.putNode(node_id, rec);
+
+            // Log dirty pages: the var_store page holding the label block, and the node page
+            try self.logPage(txn, .var_store, result.head);
+            try self.logPage(txn, .nodes, self.nodePageId(node_id));
         }
         try self.label_index.addNode(label, node_id);
+
+        try self.txn_manager.commit(txn);
     }
 
     pub fn removeLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
         rec.label_head = result.head;
         rec.label_count = result.count;
         try self.node_store.putNode(node_id, rec);
         self.label_index.removeNode(label, node_id);
+
+        // Log dirty pages: var_store page (if any) and node page
+        if (result.head != 0) try self.logPage(txn, .var_store, result.head);
+        try self.logPage(txn, .nodes, self.nodePageId(node_id));
+
+        try self.txn_manager.commit(txn);
     }
 
     pub fn scanLabel(self: *GraphEngine, label: LabelId, alloc: Allocator) anyerror![]NodeId {
