@@ -205,11 +205,13 @@ pub const GraphEngine = struct {
         // 5. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         try self.initSubsystems(allocator, graph_uuid, cfg, self.manifest.last_checkpoint_lsn);
 
-        // 5b. Rebuild free space bitmaps from on-disk file sizes.
-        // initSubsystems creates empty bitmaps (only page 0 reserved). After
-        // recovery we need to mark pages that exist on disk as allocated so
-        // that scanNodes and other page-walking operations find them.
-        try self.rebuildFreeSpaceFromDisk();
+        // 5b. Restore free space bitmaps. Prefer the persisted free.store
+        // file which accurately tracks freed pages. Fall back to rebuilding
+        // from on-disk file sizes (lossy — freed pages appear allocated).
+        const loaded_free_store = try self.loadFreeStore();
+        if (!loaded_free_store) {
+            try self.rebuildFreeSpaceFromDisk();
+        }
 
         // 6. Load persisted label dictionary if it exists
         const labels_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path});
@@ -278,6 +280,76 @@ pub const GraphEngine = struct {
             &self.file_manager,
             &self.graph_dir,
         );
+    }
+
+    /// Persist the 5 free space bitmaps to a `free.store` file so that
+    /// freed pages are correctly tracked across restarts.
+    fn saveFreeStore(self: *GraphEngine) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/free.store", .{self.graph_dir.path});
+        defer self.allocator.free(path);
+
+        // Compute total size needed for all 5 bitmaps.
+        const total_size = self.free_space_nodes.serializedSize() +
+            self.free_space_adj_out.serializedSize() +
+            self.free_space_adj_in.serializedSize() +
+            self.free_space_props.serializedSize() +
+            self.free_space_var.serializedSize();
+
+        const buf = try self.allocator.alloc(u8, total_size);
+        defer self.allocator.free(buf);
+
+        var offset: usize = 0;
+        const managers = [_]*const FreeSpaceManager{
+            &self.free_space_nodes,
+            &self.free_space_adj_out,
+            &self.free_space_adj_in,
+            &self.free_space_props,
+            &self.free_space_var,
+        };
+        for (managers) |fsm| {
+            const written = fsm.serialize(buf[offset..]) catch return error.BufferTooSmall;
+            offset += written;
+        }
+
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.writeAll(buf[0..offset]);
+    }
+
+    /// Try to load free space bitmaps from a persisted `free.store` file.
+    /// Returns true if the file was loaded successfully, false if it does
+    /// not exist.
+    fn loadFreeStore(self: *GraphEngine) !bool {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/free.store", .{self.graph_dir.path});
+        defer self.allocator.free(path);
+
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer file.close();
+
+        const stat = try file.stat();
+        const buf = try self.allocator.alloc(u8, stat.size);
+        defer self.allocator.free(buf);
+
+        const bytes_read = try file.readAll(buf);
+        if (bytes_read != stat.size) return error.UnexpectedEof;
+
+        var offset: usize = 0;
+        var managers = [_]*FreeSpaceManager{
+            &self.free_space_nodes,
+            &self.free_space_adj_out,
+            &self.free_space_adj_in,
+            &self.free_space_props,
+            &self.free_space_var,
+        };
+        for (&managers) |fsm| {
+            const consumed = try fsm.deserialize(buf[offset..]);
+            offset += consumed;
+        }
+
+        return true;
     }
 
     /// Rebuild free space bitmaps by scanning on-disk file sizes.
@@ -689,6 +761,10 @@ pub const GraphEngine = struct {
         // which could silently lose writes and made the timer meaningless.
         var timer = std.time.Timer.start() catch null;
         try self.checkpointer.doCheckpoint();
+
+        // Persist free space bitmaps so freed pages survive restart.
+        try self.saveFreeStore();
+
         if (timer) |*t| {
             self.metrics.last_checkpoint_duration_ns = t.read();
         }

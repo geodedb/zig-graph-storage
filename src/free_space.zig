@@ -134,6 +134,59 @@ pub const FreeSpaceManager = struct {
         try self.bitmap.resize(@intCast(min_pages), false);
         self.total_pages = min_pages;
     }
+
+    /// Size of the fixed header (total_pages + next_free_hint).
+    const header_size: usize = 16;
+
+    /// Number of mask words needed for a given page count.
+    fn maskCount(total_pages: u64) usize {
+        return @intCast((total_pages + @bitSizeOf(usize) - 1) / @bitSizeOf(usize));
+    }
+
+    /// Total serialized size in bytes.
+    pub fn serializedSize(self: *const FreeSpaceManager) usize {
+        return header_size + maskCount(self.total_pages) * @sizeOf(usize);
+    }
+
+    /// Serialize bitmap state into `buf`. Returns the number of bytes written.
+    pub fn serialize(self: *const FreeSpaceManager, buf: []u8) error{BufferTooSmall}!usize {
+        const needed = self.serializedSize();
+        if (buf.len < needed) return error.BufferTooSmall;
+
+        std.mem.writeInt(u64, buf[0..8], self.total_pages, .little);
+        std.mem.writeInt(u64, buf[8..16], @intCast(self.next_free_hint), .little);
+
+        const mc = maskCount(self.total_pages);
+        if (mc > 0) {
+            const masks = self.bitmap.unmanaged.masks[0..mc];
+            const src = std.mem.sliceAsBytes(masks);
+            @memcpy(buf[header_size .. header_size + src.len], src);
+        }
+        return needed;
+    }
+
+    /// Deserialize bitmap state from `buf`. Returns the number of bytes consumed.
+    pub fn deserialize(self: *FreeSpaceManager, buf: []const u8) !usize {
+        if (buf.len < header_size) return error.UnexpectedEof;
+
+        const total_pages = std.mem.readInt(u64, buf[0..8], .little);
+        const next_free_hint = std.mem.readInt(u64, buf[8..16], .little);
+
+        const mc = maskCount(total_pages);
+        const needed = header_size + mc * @sizeOf(usize);
+        if (buf.len < needed) return error.UnexpectedEof;
+
+        self.total_pages = total_pages;
+        self.next_free_hint = @intCast(next_free_hint);
+        try self.bitmap.resize(@intCast(total_pages), false);
+
+        if (mc > 0) {
+            const masks = self.bitmap.unmanaged.masks[0..mc];
+            const dst = std.mem.sliceAsBytes(masks);
+            @memcpy(dst, buf[header_size .. header_size + dst.len]);
+        }
+        return needed;
+    }
 };
 
 // ============================================================================
@@ -311,6 +364,103 @@ test "allocPage wraps around to find freed pages before hint" {
     try fsm.freePage(5);
     const p = try fsm.allocPage();
     try testing.expectEqual(@as(PageId, 5), p);
+}
+
+test "serialize and deserialize round-trip preserves bitmap state" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    // Build a bitmap with some allocated and freed pages
+    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm.deinit();
+
+    _ = try fsm.allocPage(); // page 1
+    _ = try fsm.allocPage(); // page 2
+    _ = try fsm.allocPage(); // page 3
+    try fsm.freePage(2); // free page 2
+
+    // Serialize
+    var buf: [256]u8 = undefined;
+    const written = try fsm.serialize(&buf);
+    try testing.expect(written > 0);
+
+    // Deserialize into a fresh manager
+    var fsm2 = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm2.deinit();
+
+    const consumed = try fsm2.deserialize(buf[0..written]);
+    try testing.expectEqual(written, consumed);
+
+    // Verify state matches
+    try testing.expectEqual(fsm.total_pages, fsm2.total_pages);
+    try testing.expectEqual(fsm.next_free_hint, fsm2.next_free_hint);
+    try testing.expect(fsm2.isAllocated(0)); // reserved
+    try testing.expect(fsm2.isAllocated(1));
+    try testing.expect(!fsm2.isAllocated(2)); // was freed
+    try testing.expect(fsm2.isAllocated(3));
+    try testing.expect(!fsm2.isAllocated(4));
+}
+
+test "serialize and deserialize with expanded bitmap" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 256);
+    defer pool.deinit();
+
+    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm.deinit();
+
+    // Expand and allocate pages beyond initial 64
+    try fsm.ensureCapacity(200);
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        _ = try fsm.allocPage();
+    }
+    try fsm.freePage(50);
+    try fsm.freePage(75);
+
+    // Serialize
+    var buf: [512]u8 = undefined;
+    const written = try fsm.serialize(&buf);
+
+    // Deserialize
+    var fsm2 = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm2.deinit();
+
+    const consumed = try fsm2.deserialize(buf[0..written]);
+    try testing.expectEqual(written, consumed);
+
+    try testing.expectEqual(fsm.total_pages, fsm2.total_pages);
+    try testing.expectEqual(fsm.next_free_hint, fsm2.next_free_hint);
+    try testing.expect(!fsm2.isAllocated(50));
+    try testing.expect(!fsm2.isAllocated(75));
+    try testing.expect(fsm2.isAllocated(99));
+    try testing.expect(fsm2.isAllocated(1));
+}
+
+test "serializedSize matches actual serialized output" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm.deinit();
+
+    _ = try fsm.allocPage();
+    _ = try fsm.allocPage();
+
+    var buf: [256]u8 = undefined;
+    const written = try fsm.serialize(&buf);
+    try testing.expectEqual(fsm.serializedSize(), written);
+}
+
+test "deserialize rejects truncated input" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm.deinit();
+
+    // Too short for header
+    const short: [4]u8 = .{ 0, 0, 0, 0 };
+    try testing.expectError(error.UnexpectedEof, fsm.deserialize(&short));
 }
 
 test {
