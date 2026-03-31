@@ -507,6 +507,61 @@ pub const GraphEngine = struct {
         };
     }
 
+    /// Result of a storage integrity check.
+    pub const IntegrityReport = struct {
+        node_count_consistent: bool,
+        edge_count_consistent: bool,
+        label_index_entries: u64,
+        total_errors: u64,
+    };
+
+    /// Walk the node and edge stores and compare actual live counts against
+    /// the manifest counters. Returns a report with any inconsistencies.
+    pub fn checkIntegrity(self: *GraphEngine) IntegrityReport {
+        var report = IntegrityReport{
+            .node_count_consistent = true,
+            .edge_count_consistent = true,
+            .label_index_entries = 0,
+            .total_errors = 0,
+        };
+
+        // Count actual live nodes (not deleted, not empty)
+        var actual_nodes: u64 = 0;
+        var id: u64 = 1;
+        while (id < self.manifest.next_node_id) : (id += 1) {
+            if (self.node_store.getNode(id) catch null) |rec| {
+                if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec)) {
+                    actual_nodes += 1;
+                }
+            }
+        }
+        if (actual_nodes != self.manifest.node_count) {
+            report.node_count_consistent = false;
+            report.total_errors += 1;
+        }
+
+        // Count actual edges by scanning outgoing adjacency lists of all live nodes
+        var actual_edges: u64 = 0;
+        var nid: u64 = 1;
+        while (nid < self.manifest.next_node_id) : (nid += 1) {
+            if (self.node_store.getNode(nid) catch null) |rec| {
+                if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec) and rec.out_head != 0) {
+                    var iter = self.adj_out.expand(rec.out_head, null);
+                    defer iter.deinit();
+                    while (iter.next() catch null) |_| {
+                        actual_edges += 1;
+                    }
+                }
+            }
+        }
+        if (actual_edges != self.manifest.edge_count) {
+            report.edge_count_consistent = false;
+            report.total_errors += 1;
+        }
+
+        return report;
+    }
+
     // ========================================================================
     // Internal: WAL page logging helper
     // ========================================================================
@@ -1288,6 +1343,53 @@ test "getStorageStats returns correct counters" {
 
     const stats1 = engine.getStorageStats();
     try testing.expectEqual(@as(u64, 1), stats1.node_count);
+}
+
+test "checkIntegrity reports consistent state" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x72} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Empty engine should be consistent
+    const r0 = engine.checkIntegrity();
+    try testing.expect(r0.node_count_consistent);
+    try testing.expect(r0.edge_count_consistent);
+    try testing.expectEqual(@as(u64, 0), r0.total_errors);
+
+    // Add two nodes and an edge
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0, .in_head = 0, .prop_head = 0,
+        .label_head = 0, .label_count = 0, .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 }, .txn_stamp = 1,
+    });
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0, .in_head = 0, .prop_head = 0,
+        .label_head = 0, .label_count = 0, .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 }, .txn_stamp = 1,
+    });
+    _ = try engine.addEdge(n1, n2, 1);
+
+    // Should still be consistent
+    const r1 = engine.checkIntegrity();
+    try testing.expect(r1.node_count_consistent);
+    try testing.expect(r1.edge_count_consistent);
+    try testing.expectEqual(@as(u64, 0), r1.total_errors);
+
+    // Remove the edge, then delete a node — counts should stay consistent
+    try engine.removeEdge(n1, n2, 1);
+    try engine.deleteNode(n1);
+    const r2 = engine.checkIntegrity();
+    try testing.expect(r2.node_count_consistent);
+    try testing.expect(r2.edge_count_consistent);
+    try testing.expectEqual(@as(u64, 0), r2.total_errors);
 }
 
 test "V1 format detection returns V1FormatRequiresRecreation" {
