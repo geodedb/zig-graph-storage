@@ -60,6 +60,7 @@ pub const node_store = @import("node_store.zig");
 pub const adj_store = @import("adj_store.zig");
 pub const prop_store = @import("prop_store.zig");
 pub const var_store = @import("var_store.zig");
+pub const label_store = @import("label_store.zig");
 
 // WAL and transactions
 pub const wal_record = @import("wal_record.zig");

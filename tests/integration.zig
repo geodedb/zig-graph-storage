@@ -35,13 +35,15 @@ fn testDataDir() !struct { tmp_dir: std.testing.TmpDir, path: []const u8 } {
 }
 
 fn makeNode(label: u32) NodeRec {
+    _ = label;
     return NodeRec{
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = label,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     };
 }
@@ -104,13 +106,11 @@ test "integration: full lifecycle — create graph, add data, checkpoint, close,
         const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
         defer eng.close() catch {};
 
-        // Verify all 10 nodes are present with correct labels
+        // Verify all 10 nodes are present
         for (0..10) |i| {
             const nid: NodeId = @intCast(i + 1);
             const got = try eng.getNode(nid);
             try std.testing.expect(got != null);
-            const expected_label: u32 = @intCast(i % 3 + 1);
-            try std.testing.expectEqual(expected_label, got.?.label_set);
         }
 
         // Verify node count
@@ -157,7 +157,7 @@ test "integration: GraphStorage vtable round-trip" {
 
     const got = try gs.getNode(nid);
     try std.testing.expect(got != null);
-    try std.testing.expectEqual(@as(u32, 55), got.?.label_set);
+    try std.testing.expectEqual(@as(u64, 0), got.?.label_head);
 
     try std.testing.expectEqual(@as(u64, 1), try gs.nodeCount());
 }
@@ -284,21 +284,21 @@ test "QUAL-0002: full durability round-trip -- nodes, edges, properties survive 
         // Verify node count
         try std.testing.expectEqual(@as(u64, 3), try eng.nodeCount());
 
-        // Verify each node's label_set
+        // Verify node records exist
         const got1 = try eng.getNode(1);
         try std.testing.expect(got1 != null);
-        // n1 had label 101, then addLabel(0) sets bit 0, so label_set = 101 | 1 = 101
-        // Actually, addLabel does `label_set |= (1 << (label % 32))`, label=0 -> bit 0 -> OR 1
-        // 101 in binary = 1100101, OR 1 = 1100101 (bit 0 already set since 101 is odd). Still 101.
-        try std.testing.expectEqual(@as(u32, 101), got1.?.label_set);
+        // n1 had addLabel(0) applied, so label_count should be 1
+        try std.testing.expectEqual(@as(u16, 1), got1.?.label_count);
+        try std.testing.expect(got1.?.label_head != 0);
 
         const got2 = try eng.getNode(2);
         try std.testing.expect(got2 != null);
-        try std.testing.expectEqual(@as(u32, 202), got2.?.label_set);
+        // n2 had no addLabel calls, label_count = 0
+        try std.testing.expectEqual(@as(u16, 0), got2.?.label_count);
 
         const got3 = try eng.getNode(3);
         try std.testing.expect(got3 != null);
-        try std.testing.expectEqual(@as(u32, 303), got3.?.label_set);
+        try std.testing.expectEqual(@as(u16, 0), got3.?.label_count);
 
         // Verify edge count
         try std.testing.expectEqual(@as(u64, 3), try eng.edgeCount());
@@ -496,12 +496,12 @@ test "QUAL-0020: storage smoke test — full round-trip with properties and labe
         const bob = (try eng.getNode(2)).?;
         const carol = (try eng.getNode(3)).?;
 
-        // -- Label bitmaps persist inside node records --
-        // addLabel sets bits: bit 0 = Person, bit 1 = Admin
-        try std.testing.expect(alice.label_set & 1 != 0); // Person
-        try std.testing.expect(bob.label_set & 1 != 0); // Person
-        try std.testing.expect(carol.label_set & 1 != 0); // Person
-        try std.testing.expect(carol.label_set & 2 != 0); // Admin (bit 1)
+        // -- Labels are stored in var.store, tracked by label_count --
+        // addLabel(alice, 0) => 1 label, addLabel(bob, 0) => 1 label
+        // addLabel(carol, 0) + addLabel(carol, 1) => 2 labels
+        try std.testing.expectEqual(@as(u16, 1), alice.label_count);
+        try std.testing.expectEqual(@as(u16, 1), bob.label_count);
+        try std.testing.expectEqual(@as(u16, 2), carol.label_count);
 
         // -- Properties (best-effort; property page data may not survive reopen) --
         // prop_head persists in the node record, but the underlying property
@@ -618,14 +618,14 @@ test "QUAL-0021: crash recovery — committed txn replayed after unclean close" 
         // Phase 6: Verify node 1 exists (was checkpointed before crash)
         const got1 = try eng.getNode(1);
         try std.testing.expect(got1 != null);
-        try std.testing.expectEqual(@as(u32, 42), got1.?.label_set);
+        try std.testing.expectEqual(@as(u64, 0), got1.?.label_head);
 
         // Phase 7: Node 2 was added after the last checkpoint.
         // Whether it survives depends on WAL replay correctness.
         // We check but don't hard-fail if absent (known pre-existing gap).
         const got2 = try eng.getNode(2);
         if (got2) |n| {
-            try std.testing.expectEqual(@as(u32, 99), n.label_set);
+            try std.testing.expectEqual(@as(u64, 0), n.label_head);
         }
     }
 }

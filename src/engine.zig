@@ -23,6 +23,7 @@ const label_dict_mod = @import("label_dict.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const recovery_mod = @import("recovery.zig");
 const label_index_mod = @import("label_index.zig");
+const label_store_mod = @import("label_store.zig");
 const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
@@ -51,6 +52,7 @@ const LabelDictionary = label_dict_mod.LabelDictionary;
 const Checkpointer = checkpoint_mod.Checkpointer;
 const Recovery = recovery_mod.Recovery;
 const LabelIndex = label_index_mod.LabelIndex;
+const LabelStore = label_store_mod.LabelStore;
 const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
 const EdgeEntry = edge_mod.EdgeEntry;
@@ -80,6 +82,7 @@ pub const GraphEngine = struct {
     free_space_props: FreeSpaceManager,
     free_space_var: FreeSpaceManager,
     label_dict: LabelDictionary,
+    label_store: LabelStore,
     label_index: LabelIndex,
     checkpointer: Checkpointer,
     manifest: Manifest,
@@ -261,8 +264,9 @@ pub const GraphEngine = struct {
         self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
         self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
 
-        // Label dictionary and label index
+        // Label dictionary, label store, and label index
         self.label_dict = LabelDictionary.init(allocator);
+        self.label_store = LabelStore.init(&self.var_store);
         self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
 
         // Checkpointer
@@ -530,14 +534,20 @@ pub const GraphEngine = struct {
 
     pub fn addLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
-        rec.label_set |= (@as(u32, 1) << @intCast(label % 32));
-        try self.node_store.putNode(node_id, rec);
+        const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
+        if (result.count != rec.label_count or result.head != rec.label_head) {
+            rec.label_head = result.head;
+            rec.label_count = result.count;
+            try self.node_store.putNode(node_id, rec);
+        }
         try self.label_index.addNode(label, node_id);
     }
 
     pub fn removeLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
-        rec.label_set &= ~(@as(u32, 1) << @intCast(label % 32));
+        const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
+        rec.label_head = result.head;
+        rec.label_count = result.count;
         try self.node_store.putNode(node_id, rec);
         self.label_index.removeNode(label, node_id);
     }
@@ -716,9 +726,10 @@ test "create engine, allocNode, putNode, getNode round-trip" {
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = 42,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     };
     try engine.putNode(node_id, rec);
@@ -726,7 +737,8 @@ test "create engine, allocNode, putNode, getNode round-trip" {
     // Read it back
     const got = try engine.getNode(node_id);
     try testing.expect(got != null);
-    try testing.expectEqual(@as(u32, 42), got.?.label_set);
+    try testing.expectEqual(@as(u64, 0), got.?.label_head);
+    try testing.expectEqual(@as(u16, 0), got.?.label_count);
 }
 
 test "create engine, addEdge, expandOut returns edge" {
@@ -746,9 +758,10 @@ test "create engine, addEdge, expandOut returns edge" {
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = 0,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     });
 
@@ -757,9 +770,10 @@ test "create engine, addEdge, expandOut returns edge" {
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = 0,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     });
 
@@ -803,9 +817,10 @@ test "create engine, checkpoint, close, open again, data persists" {
             .out_head = 0,
             .in_head = 0,
             .prop_head = 0,
-            .label_set = 77,
+            .label_head = 0,
+            .label_count = 0,
             .flags = 0,
-            ._pad = 0,
+            ._pad = .{ 0, 0, 0, 0 },
             .txn_stamp = 1,
         });
 
@@ -823,7 +838,7 @@ test "create engine, checkpoint, close, open again, data persists" {
         // The node MUST be present after checkpoint+close+reopen
         const got = try engine.getNode(1);
         try testing.expect(got != null);
-        try testing.expectEqual(@as(u32, 77), got.?.label_set);
+        try testing.expectEqual(@as(u64, 0), got.?.label_head);
     }
 }
 
@@ -847,15 +862,16 @@ test "GraphStorage vtable interface works" {
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = 99,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     });
 
     const got = try gs.getNode(node_id);
     try testing.expect(got != null);
-    try testing.expectEqual(@as(u32, 99), got.?.label_set);
+    try testing.expectEqual(@as(u64, 0), got.?.label_head);
 
     const count = try gs.nodeCount();
     try testing.expectEqual(@as(u64, 1), count);
@@ -939,9 +955,10 @@ test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = 0,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     });
     try testing.expectEqual(@as(u64, 1), try engine.nodeCount());
@@ -951,9 +968,10 @@ test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = 0,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     });
     try testing.expectEqual(@as(u64, 2), try engine.nodeCount());

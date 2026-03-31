@@ -403,15 +403,17 @@ fn createNodes(
     return first_id;
 }
 
-/// Create a NodeRec with the label set in label_set bitmap and txn_stamp=1.
+/// Create a NodeRec with no labels (labels are added via engine.addLabel).
 fn makeNode(label: LabelId) NodeRec {
+    _ = label;
     return NodeRec{
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = @as(u32, 1) << @intCast(label % 32),
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     };
 }

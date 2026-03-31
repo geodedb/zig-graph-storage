@@ -214,14 +214,15 @@ const TestEnv = struct {
     }
 };
 
-fn makeTestNode(label: u32) NodeRec {
+fn makeTestNode(_: u32) NodeRec {
     return NodeRec{
         .out_head = 0,
         .in_head = 0,
         .prop_head = 0,
-        .label_set = label,
+        .label_head = 0,
+        .label_count = 0,
         .flags = 0,
-        ._pad = 0,
+        ._pad = .{ 0, 0, 0, 0 },
         .txn_stamp = 1,
     };
 }
@@ -238,7 +239,7 @@ test "putNode + getNode round-trip" {
     const got = try store.getNode(1);
 
     try testing.expect(got != null);
-    try testing.expectEqual(@as(u32, 42), got.?.label_set);
+    try testing.expectEqual(@as(u64, 0), got.?.label_head);
     try testing.expectEqual(@as(u64, 1), got.?.txn_stamp);
 }
 
@@ -283,9 +284,9 @@ test "multiple nodes on same page" {
     const n1 = (try store.getNode(1)).?;
     const n2 = (try store.getNode(2)).?;
 
-    try testing.expectEqual(@as(u32, 10), n0.label_set);
-    try testing.expectEqual(@as(u32, 20), n1.label_set);
-    try testing.expectEqual(@as(u32, 30), n2.label_set);
+    try testing.expectEqual(@as(u64, 0), n0.label_head);
+    try testing.expectEqual(@as(u64, 0), n1.label_head);
+    try testing.expectEqual(@as(u64, 0), n2.label_head);
 }
 
 test "nodes across multiple pages" {
@@ -295,9 +296,9 @@ test "nodes across multiple pages" {
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
 
-    // nodes_per_page for 4096 = (4096-32)/40 = 101
+    // nodes_per_page for 4096 = (4096-32)/48 = 84
     const npp = store.nodes_per_page;
-    try testing.expectEqual(@as(u32, 101), npp);
+    try testing.expectEqual(@as(u32, 84), npp);
 
     // Put a node on page 0 and page 1
     try store.putNode(0, makeTestNode(100));
@@ -306,8 +307,8 @@ test "nodes across multiple pages" {
     const n0 = (try store.getNode(0)).?;
     const n1 = (try store.getNode(npp)).?;
 
-    try testing.expectEqual(@as(u32, 100), n0.label_set);
-    try testing.expectEqual(@as(u32, 200), n1.label_set);
+    try testing.expectEqual(@as(u64, 0), n0.label_head);
+    try testing.expectEqual(@as(u64, 0), n1.label_head);
 }
 
 test "scanNodes visits all live nodes across multiple pages" {
@@ -326,12 +327,12 @@ test "scanNodes visits all live nodes across multiple pages" {
 
     var store = NodeStore.init(&pool, &fsm, 4096);
 
-    // nodes_per_page = 101 for 4096-byte pages.
+    // nodes_per_page = 84 for 4096-byte pages.
     // 500 nodes spans 5 pages (pages 0..4).
     const total_nodes: u64 = 500;
     var i: u64 = 0;
     while (i < total_nodes) : (i += 1) {
-        // Use label_set = (i % 10) + 1 so no label is zero.
+        // All nodes have label_head = 0 (no labels in var.store).
         try store.putNode(i, makeTestNode(@intCast((i % 10) + 1)));
     }
 

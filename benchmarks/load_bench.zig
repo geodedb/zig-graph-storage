@@ -308,9 +308,10 @@ fn benchMixedWorkload(
                 .out_head = 0,
                 .in_head = 0,
                 .prop_head = 0,
-                .label_set = 0,
+                .label_head = 0,
+                .label_count = 0,
                 .flags = 0,
-                ._pad = 0,
+                ._pad = .{ 0, 0, 0, 0 },
                 .txn_stamp = 1,
             });
         } else {
