@@ -82,6 +82,11 @@ pub const GraphStorage = struct {
         getAllProperties: *const fn (ptr: *anyopaque, prop_head: u64, allocator: Allocator) anyerror!PropertyIterator,
         putProperty: *const fn (ptr: *anyopaque, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64,
         removeProperty: *const fn (ptr: *anyopaque, owner: u64, key: []const u8) anyerror!void,
+        // Edge properties
+        setEdgeProperty: *const fn (ptr: *anyopaque, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, val: PropertyValue) anyerror!void,
+        removeEdgeProperty: *const fn (ptr: *anyopaque, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void,
+        getEdgeProperty: *const fn (ptr: *anyopaque, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue,
+        getAllEdgeProperties: *const fn (ptr: *anyopaque, from: NodeId, edge_id: EdgeId, allocator: Allocator) anyerror!?PropertyIterator,
         // Labels
         addLabel: *const fn (ptr: *anyopaque, node_id: NodeId, label: LabelId) anyerror!void,
         removeLabel: *const fn (ptr: *anyopaque, node_id: NodeId, label: LabelId) anyerror!void,
@@ -140,6 +145,18 @@ pub const GraphStorage = struct {
     pub fn removeProperty(self: GraphStorage, owner: u64, key: []const u8) anyerror!void {
         return self.vtable.removeProperty(self.ptr, owner, key);
     }
+    pub fn setEdgeProperty(self: GraphStorage, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, val: PropertyValue) anyerror!void {
+        return self.vtable.setEdgeProperty(self.ptr, from, to, edge_id, key, val);
+    }
+    pub fn removeEdgeProperty(self: GraphStorage, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
+        return self.vtable.removeEdgeProperty(self.ptr, from, edge_id, key);
+    }
+    pub fn getEdgeProperty(self: GraphStorage, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
+        return self.vtable.getEdgeProperty(self.ptr, from, edge_id, key, allocator);
+    }
+    pub fn getAllEdgeProperties(self: GraphStorage, from: NodeId, edge_id: EdgeId, allocator: Allocator) anyerror!?PropertyIterator {
+        return self.vtable.getAllEdgeProperties(self.ptr, from, edge_id, allocator);
+    }
     pub fn addLabel(self: GraphStorage, node_id: NodeId, label: LabelId) anyerror!void {
         return self.vtable.addLabel(self.ptr, node_id, label);
     }
@@ -193,6 +210,10 @@ pub const GraphStorage = struct {
                 .getAllProperties = typeErasedFn(T, "getAllProperties"),
                 .putProperty = typeErasedFn(T, "putProperty"),
                 .removeProperty = typeErasedFn(T, "removeProperty"),
+                .setEdgeProperty = typeErasedFn(T, "setEdgeProperty"),
+                .removeEdgeProperty = typeErasedFn(T, "removeEdgeProperty"),
+                .getEdgeProperty = typeErasedFn(T, "getEdgeProperty"),
+                .getAllEdgeProperties = typeErasedFn(T, "getAllEdgeProperties"),
                 .addLabel = typeErasedFn(T, "addLabel"),
                 .removeLabel = typeErasedFn(T, "removeLabel"),
                 .scanLabel = typeErasedFn(T, "scanLabel"),
@@ -305,6 +326,52 @@ pub const GraphStorage = struct {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{ self, owner, key });
             }
+            fn setEdgePropertyFn(ptr: *anyopaque, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, val: PropertyValue) anyerror!void {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return @call(.auto, @field(T, method_name), .{ self, from, to, edge_id, key, val });
+            }
+            fn removeEdgePropertyFn(ptr: *anyopaque, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return @call(.auto, @field(T, method_name), .{ self, from, edge_id, key });
+            }
+            fn getEdgePropertyFn(ptr: *anyopaque, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return @call(.auto, @field(T, method_name), .{ self, from, edge_id, key, allocator });
+            }
+            fn getAllEdgePropertiesFn(ptr: *anyopaque, from: NodeId, edge_id: EdgeId, allocator: Allocator) anyerror!?PropertyIterator {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                const maybe_iter = try @call(.auto, @field(T, method_name), .{ self, from, edge_id });
+                const concrete_iter = maybe_iter orelse return null;
+                const RealIter = @TypeOf(concrete_iter);
+                const heap_iter = try allocator.create(RealIter);
+                heap_iter.* = concrete_iter;
+
+                const WrapperState = struct {
+                    fn next(vp: *anyopaque) anyerror!?PropertyEntry {
+                        const hi: *RealIter = @ptrCast(@alignCast(vp));
+                        if (try hi.next()) |slice| {
+                            const val2 = try property_mod.decode(std.heap.page_allocator, slice.encoded_value);
+                            return PropertyEntry{
+                                .key = slice.key,
+                                .value = val2.value,
+                            };
+                        }
+                        return null;
+                    }
+                    fn deinit(vp: *anyopaque) void {
+                        const hi: *RealIter = @ptrCast(@alignCast(vp));
+                        hi.deinit();
+                    }
+                };
+
+                return PropertyIterator{
+                    .ptr = heap_iter,
+                    .vtable = &.{
+                        .next = WrapperState.next,
+                        .deinit = WrapperState.deinit,
+                    },
+                };
+            }
             fn addLabelFn(ptr: *anyopaque, node_id: NodeId, label: LabelId) anyerror!void {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{ self, node_id, label });
@@ -366,6 +433,10 @@ pub const GraphStorage = struct {
             .{ "getAllProperties", Wrapper.getAllPropertiesFn },
             .{ "putProperty", Wrapper.putPropertyFn },
             .{ "removeProperty", Wrapper.removePropertyFn },
+            .{ "setEdgeProperty", Wrapper.setEdgePropertyFn },
+            .{ "removeEdgeProperty", Wrapper.removeEdgePropertyFn },
+            .{ "getEdgeProperty", Wrapper.getEdgePropertyFn },
+            .{ "getAllEdgeProperties", Wrapper.getAllEdgePropertiesFn },
             .{ "addLabel", Wrapper.addLabelFn },
             .{ "removeLabel", Wrapper.removeLabelFn },
             .{ "scanLabel", Wrapper.scanLabelFn },
@@ -431,9 +502,9 @@ fn sliceToEdgeIterator(slice: []EdgeEntry, allocator: Allocator) anyerror!EdgeIt
 // Unit Tests
 // ============================================================================
 
-test "VTable has exactly 24 method fields" {
+test "VTable has exactly 28 method fields" {
     const fields = std.meta.fields(GraphStorage.VTable);
-    try std.testing.expectEqual(@as(usize, 24), fields.len);
+    try std.testing.expectEqual(@as(usize, 28), fields.len);
 }
 
 test "PropertyEntry can be constructed" {
@@ -469,6 +540,10 @@ test "GraphStorage with mock vtable dispatches close" {
         .getAllProperties = undefined,
         .putProperty = undefined,
         .removeProperty = undefined,
+        .setEdgeProperty = undefined,
+        .removeEdgeProperty = undefined,
+        .getEdgeProperty = undefined,
+        .getAllEdgeProperties = undefined,
         .addLabel = undefined,
         .removeLabel = undefined,
         .scanLabel = undefined,
