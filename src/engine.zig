@@ -330,11 +330,11 @@ pub const GraphEngine = struct {
         defer file.close();
 
         const stat = try file.stat();
-        const buf = try self.allocator.alloc(u8, stat.size);
+        const buf = try self.allocator.alloc(u8, @intCast(stat.size));
         defer self.allocator.free(buf);
 
         const bytes_read = try file.readAll(buf);
-        if (bytes_read != stat.size) return error.UnexpectedEof;
+        if (bytes_read != @as(usize, @intCast(stat.size))) return error.UnexpectedEof;
 
         var offset: usize = 0;
         var managers = [_]*FreeSpaceManager{
