@@ -475,6 +475,12 @@ pub const GraphEngine = struct {
         try self.property_index.saveToFile(prop_file, self.manifest.counter);
     }
 
+    fn saveLabelDictionary(self: *GraphEngine) !void {
+        const labels_path = try std.fmt.allocPrint(self.allocator, "{s}/labels.dict", .{self.graph_dir.path});
+        defer self.allocator.free(labels_path);
+        try self.label_dict.saveToFile(labels_path);
+    }
+
     /// Clean up the graph engine and its storage resources.
     pub fn deinit(self: *GraphEngine) void {
         self.thread_pool.deinit();
@@ -534,16 +540,7 @@ pub const GraphEngine = struct {
             };
         }
 
-        // Save label dictionary -- propagate errors
-        const labels_path = std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path}) catch |err| {
-            if (close_err == null) close_err = err;
-            self.cleanupResources(allocator);
-            if (close_err) |e| return e;
-            return;
-        };
-        defer allocator.free(labels_path);
-
-        self.label_dict.saveToFile(labels_path) catch |err| {
+        self.saveLabelDictionary() catch |err| {
             if (close_err == null) close_err = err;
         };
 
@@ -982,6 +979,7 @@ pub const GraphEngine = struct {
         try self.saveFreeStore();
         try self.rebuildDerivedIndexes();
         try self.saveDerivedIndexes();
+        try self.saveLabelDictionary();
 
         if (timer) |*t| {
             self.metrics.last_checkpoint_duration_ns = t.read();
@@ -1231,7 +1229,7 @@ test "create engine, checkpoint, close, open again, data persists" {
     }
 }
 
-test "checkpoint persists labels.idx and props.idx snapshots" {
+test "checkpoint persists labels.dict, labels.idx and props.idx snapshots" {
     var td = try testDataDir();
     defer {
         testing.allocator.free(td.path);
@@ -1273,9 +1271,13 @@ test "checkpoint persists labels.idx and props.idx snapshots" {
     defer testing.allocator.free(labels_idx_path);
     const props_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/props.idx", .{graph_dir.path});
     defer testing.allocator.free(props_idx_path);
+    const labels_dict_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.dict", .{graph_dir.path});
+    defer testing.allocator.free(labels_dict_path);
 
+    const labels_dict_stat = try std.fs.cwd().statFile(labels_dict_path);
     const labels_stat = try std.fs.cwd().statFile(labels_idx_path);
     const props_stat = try std.fs.cwd().statFile(props_idx_path);
+    try testing.expect(labels_dict_stat.size > 0);
     try testing.expect(labels_stat.size > 0);
     try testing.expect(props_stat.size > 0);
 }
