@@ -85,6 +85,15 @@ pub const FileManager = struct {
         return null;
     }
 
+    /// Get the underlying file handle for a file (must already be opened).
+    pub fn getFile(self: *FileManager, file_id: FileId) ?*std.fs.File {
+        const idx = @intFromEnum(file_id);
+        if (self.files[idx] != null) {
+            return &self.files[idx].?;
+        }
+        return null;
+    }
+
     /// Close all open files.
     pub fn deinit(self: *FileManager) void {
         for (&self.files) |*maybe_file| {

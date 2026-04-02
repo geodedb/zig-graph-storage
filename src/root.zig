@@ -81,6 +81,7 @@ pub const engine = @import("engine.zig");
 pub const label_index = @import("label_index.zig");
 pub const btree = @import("btree.zig");
 pub const property_index = @import("property_index.zig");
+pub const property_chain_index = @import("property_chain_index.zig");
 pub const index_catalog = @import("index_catalog.zig");
 
 // Encryption and integrity

@@ -23,6 +23,7 @@ const label_dict_mod = @import("label_dict.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const recovery_mod = @import("recovery.zig");
 const label_index_mod = @import("label_index.zig");
+const property_chain_index_mod = @import("property_chain_index.zig");
 const label_store_mod = @import("label_store.zig");
 const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
@@ -52,6 +53,7 @@ const LabelDictionary = label_dict_mod.LabelDictionary;
 const Checkpointer = checkpoint_mod.Checkpointer;
 const Recovery = recovery_mod.Recovery;
 const LabelIndex = label_index_mod.LabelIndex;
+const PropertyChainIndex = property_chain_index_mod.PropertyChainIndex;
 const LabelStore = label_store_mod.LabelStore;
 const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
@@ -84,6 +86,7 @@ pub const GraphEngine = struct {
     label_dict: LabelDictionary,
     label_store: LabelStore,
     label_index: LabelIndex,
+    property_index: PropertyChainIndex,
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.fs.Dir,
@@ -128,6 +131,8 @@ pub const GraphEngine = struct {
         _ = try self.file_manager.openFile(.props);
         _ = try self.file_manager.openFile(.var_store);
         _ = try self.file_manager.openFile(.free);
+        _ = try self.file_manager.openFile(.label_idx);
+        _ = try self.file_manager.openFile(.prop_idx);
 
         // 5. Create buffer pool, register pagers
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
@@ -177,6 +182,9 @@ pub const GraphEngine = struct {
         var recovery = Recovery.init(allocator, cfg.encryption_key);
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
 
+        _ = try self.file_manager.openFile(.label_idx);
+        _ = try self.file_manager.openFile(.prop_idx);
+
         // SEC-0010: Validate page_size matches manifest after recovery
         if (cfg.page_size != self.manifest.page_size) {
             return error.PageSizeMismatch;
@@ -221,8 +229,12 @@ pub const GraphEngine = struct {
             else => return err,
         };
 
-        // 7. Rebuild label index from LabelStore (var.store-backed labels)
-        try self.rebuildLabelIndex();
+        // 7. Load persisted derived indexes when they match the active
+        // checkpoint. Otherwise rebuild from the primary stores.
+        const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
+        if (!loaded_indexes) {
+            try self.rebuildDerivedIndexes();
+        }
 
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
@@ -270,6 +282,7 @@ pub const GraphEngine = struct {
         self.label_dict = LabelDictionary.init(allocator);
         self.label_store = LabelStore.init(&self.var_store);
         self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
+        self.property_index = PropertyChainIndex.init(allocator);
 
         // Checkpointer
         self.checkpointer = Checkpointer.init(
@@ -381,17 +394,13 @@ pub const GraphEngine = struct {
     /// from the LabelStore (var.store-backed). Called during open() after all
     /// subsystems and free-space bitmaps are initialized.
     fn rebuildLabelIndex(self: *GraphEngine) !void {
-        // Clear any stale entries from the in-memory index.
-        var it = self.label_index.index.valueIterator();
-        while (it.next()) |list| {
-            @constCast(list).deinit(self.label_index.allocator);
-        }
-        self.label_index.index.clearAndFree();
+        self.label_index.clear();
 
         // Iterate all allocated node IDs and populate the index from LabelStore.
         var id: u64 = 1;
         while (id < self.manifest.next_node_id) : (id += 1) {
             const rec = self.node_store.getNode(id) catch continue orelse continue;
+            if (node_mod.isDeleted(&rec) or node_mod.isEmpty(&rec)) continue;
             if (rec.label_head == 0) continue;
 
             const labels = self.label_store.getLabels(rec.label_head, self.allocator) catch continue;
@@ -401,6 +410,69 @@ pub const GraphEngine = struct {
                 try self.label_index.addNode(label_id, id);
             }
         }
+    }
+
+    fn refreshPropertyChainIndex(self: *GraphEngine, prop_head: u64) !void {
+        if (prop_head == 0) {
+            return;
+        }
+
+        var iter = self.prop_store.getAllProperties(prop_head);
+        defer iter.deinit();
+        try self.property_index.refreshFromIterator(prop_head, &iter);
+    }
+
+    fn rebuildPropertyIndex(self: *GraphEngine) !void {
+        self.property_index.clear();
+
+        var id: u64 = 1;
+        while (id < self.manifest.next_node_id) : (id += 1) {
+            const rec = self.node_store.getNode(id) catch continue orelse continue;
+            if (node_mod.isDeleted(&rec) or node_mod.isEmpty(&rec)) continue;
+
+            try self.refreshPropertyChainIndex(rec.prop_head);
+
+            if (rec.out_head == 0) continue;
+            var iter = self.adj_out.expand(rec.out_head, null);
+            defer iter.deinit();
+            while (try iter.next()) |entry| {
+                try self.refreshPropertyChainIndex(entry.prop_head);
+            }
+        }
+    }
+
+    fn rebuildDerivedIndexes(self: *GraphEngine) !void {
+        try self.rebuildLabelIndex();
+        try self.rebuildPropertyIndex();
+    }
+
+    fn tryLoadDerivedIndexes(self: *GraphEngine) !bool {
+        const label_file = self.file_manager.getFile(.label_idx) orelse return false;
+        const prop_file = self.file_manager.getFile(.prop_idx) orelse return false;
+
+        self.label_index.clear();
+        self.property_index.clear();
+        errdefer {
+            self.label_index.clear();
+            self.property_index.clear();
+        }
+
+        const label_counter = try self.label_index.loadFromFile(label_file) orelse return false;
+        const prop_counter = try self.property_index.loadFromFile(prop_file) orelse return false;
+        if (label_counter != self.manifest.counter or prop_counter != self.manifest.counter) {
+            self.label_index.clear();
+            self.property_index.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    fn saveDerivedIndexes(self: *GraphEngine) !void {
+        const label_file = self.file_manager.getFile(.label_idx) orelse return error.LabelIndexFileNotOpen;
+        const prop_file = self.file_manager.getFile(.prop_idx) orelse return error.PropertyIndexFileNotOpen;
+        try self.label_index.saveToFile(label_file, self.manifest.counter);
+        try self.property_index.saveToFile(prop_file, self.manifest.counter);
     }
 
     /// Clean up the graph engine and its storage resources.
@@ -416,6 +488,7 @@ pub const GraphEngine = struct {
         self.free_space_var.deinit();
         self.label_dict.deinit();
         self.label_index.deinit();
+        self.property_index.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
@@ -444,6 +517,22 @@ pub const GraphEngine = struct {
         self.checkpointer.doCheckpoint() catch |err| {
             close_err = err;
         };
+
+        if (close_err == null) {
+            self.saveFreeStore() catch |err| {
+                if (close_err == null) close_err = err;
+            };
+        }
+        if (close_err == null) {
+            self.rebuildDerivedIndexes() catch |err| {
+                if (close_err == null) close_err = err;
+            };
+        }
+        if (close_err == null) {
+            self.saveDerivedIndexes() catch |err| {
+                if (close_err == null) close_err = err;
+            };
+        }
 
         // Save label dictionary -- propagate errors
         const labels_path = std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path}) catch |err| {
@@ -479,6 +568,7 @@ pub const GraphEngine = struct {
         self.free_space_var.deinit();
         self.label_dict.deinit();
         self.label_index.deinit();
+        self.property_index.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
@@ -757,6 +847,10 @@ pub const GraphEngine = struct {
 
     pub fn getProperty(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
         self.metrics.properties_read += 1;
+        if (prop_head == 0) return null;
+        if (self.property_index.containsChain(prop_head) and !self.property_index.hasKey(prop_head, key)) {
+            return null;
+        }
         return self.prop_store.getProperty(prop_head, key, alloc);
     }
 
@@ -775,6 +869,11 @@ pub const GraphEngine = struct {
 
         try self.txn_manager.commit(txn);
 
+        if (owner != 0 and owner != new_head) {
+            self.property_index.removeChain(owner);
+        }
+        try self.refreshPropertyChainIndex(new_head);
+
         self.metrics.properties_written += 1;
         return new_head;
     }
@@ -789,6 +888,8 @@ pub const GraphEngine = struct {
         if (owner != 0) try self.logPage(txn, .props, owner);
 
         try self.txn_manager.commit(txn);
+
+        try self.refreshPropertyChainIndex(owner);
     }
 
     pub fn addLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
@@ -879,6 +980,8 @@ pub const GraphEngine = struct {
 
         // Persist free space bitmaps so freed pages survive restart.
         try self.saveFreeStore();
+        try self.rebuildDerivedIndexes();
+        try self.saveDerivedIndexes();
 
         if (timer) |*t| {
             self.metrics.last_checkpoint_duration_ns = t.read();
@@ -918,6 +1021,11 @@ pub const GraphEngine = struct {
             const to_rec = (try self.node_store.getNode(to)) orelse return error.NodeNotFound;
             _ = try self.adj_in.updateEdgePropHead(to_rec.in_head, edge_id, new_head);
         }
+
+        if (found_prop_head != 0 and found_prop_head != new_head) {
+            self.property_index.removeChain(found_prop_head);
+        }
+        try self.refreshPropertyChainIndex(new_head_u64);
     }
 
     /// Remove a property from an edge. The removal is in-place so the prop_head
@@ -1121,6 +1229,116 @@ test "create engine, checkpoint, close, open again, data persists" {
         try testing.expect(got != null);
         try testing.expectEqual(@as(u64, 0), got.?.label_head);
     }
+}
+
+test "checkpoint persists labels.idx and props.idx snapshots" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x11} ** 16;
+    const cfg = testConfig();
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        const node_id = try engine.allocNode();
+        var rec = NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        };
+        try engine.putNode(node_id, rec);
+        try engine.addLabel(node_id, 7);
+
+        rec = (try engine.getNode(node_id)).?;
+        rec.prop_head = try engine.putProperty(rec.prop_head, "name", .{ .string = "Alice" });
+        try engine.putNode(node_id, rec);
+
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    const graph_dir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&graph_dir).deinit();
+
+    const labels_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.idx", .{graph_dir.path});
+    defer testing.allocator.free(labels_idx_path);
+    const props_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/props.idx", .{graph_dir.path});
+    defer testing.allocator.free(props_idx_path);
+
+    const labels_stat = try std.fs.cwd().statFile(labels_idx_path);
+    const props_stat = try std.fs.cwd().statFile(props_idx_path);
+    try testing.expect(labels_stat.size > 0);
+    try testing.expect(props_stat.size > 0);
+}
+
+test "open rebuilds derived indexes when snapshot files are stale" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x12} ** 16;
+    const cfg = testConfig();
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        const node_id = try engine.allocNode();
+        var rec = NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        };
+        try engine.putNode(node_id, rec);
+        try engine.addLabel(node_id, 9);
+
+        rec = (try engine.getNode(node_id)).?;
+        rec.prop_head = try engine.putProperty(rec.prop_head, "email", .{ .string = "alice@example.com" });
+        try engine.putNode(node_id, rec);
+
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    const graph_dir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&graph_dir).deinit();
+    const labels_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.idx", .{graph_dir.path});
+    defer testing.allocator.free(labels_idx_path);
+
+    const labels_file = try std.fs.cwd().createFile(labels_idx_path, .{ .read = true, .truncate = true });
+    labels_file.close();
+
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    const labeled_nodes = try engine.scanLabel(9, testing.allocator);
+    defer testing.allocator.free(labeled_nodes);
+    try testing.expectEqualSlices(NodeId, &[_]NodeId{1}, labeled_nodes);
+
+    const rec = (try engine.getNode(1)).?;
+    const email = try engine.getProperty(rec.prop_head, "email", testing.allocator);
+    defer if (email) |value| switch (value) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(email != null);
+    try testing.expectEqualStrings("alice@example.com", email.?.string);
 }
 
 test "GraphStorage vtable interface works" {
@@ -1391,15 +1609,25 @@ test "checkIntegrity reports consistent state" {
     // Add two nodes and an edge
     const n1 = try engine.allocNode();
     try engine.putNode(n1, NodeRec{
-        .out_head = 0, .in_head = 0, .prop_head = 0,
-        .label_head = 0, .label_count = 0, .flags = 0,
-        ._pad = .{ 0, 0, 0, 0 }, .txn_stamp = 1,
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
     });
     const n2 = try engine.allocNode();
     try engine.putNode(n2, NodeRec{
-        .out_head = 0, .in_head = 0, .prop_head = 0,
-        .label_head = 0, .label_count = 0, .flags = 0,
-        ._pad = .{ 0, 0, 0, 0 }, .txn_stamp = 1,
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
     });
     _ = try engine.addEdge(n1, n2, 1);
 
