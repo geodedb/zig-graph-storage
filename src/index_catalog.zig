@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const owner_only_file_mode = 0o600;
 
 pub const IndexType = enum(u8) {
     btree_property = 0,
@@ -90,7 +91,7 @@ pub const IndexCatalog = struct {
     /// Format: [u32 count] then for each entry:
     ///   [u32 label_id] [u8 index_type] [u8 state] [u16 key_len] [key_len bytes]
     pub fn saveToFile(self: *const IndexCatalog, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
+        const file = try std.fs.cwd().createFile(path, .{ .mode = owner_only_file_mode });
         defer file.close();
 
         // Serialize to an in-memory buffer, then write all at once.
@@ -256,6 +257,13 @@ test "saveToFile + loadFromFile round-trip" {
         });
 
         try catalog.saveToFile(full_path);
+    }
+
+    {
+        const saved_file = try std.fs.cwd().openFile(full_path, .{});
+        defer saved_file.close();
+        const saved_stat = try saved_file.stat();
+        try testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.mode & 0o777);
     }
 
     // Load and verify.

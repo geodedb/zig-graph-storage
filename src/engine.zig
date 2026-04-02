@@ -58,6 +58,7 @@ const LabelStore = label_store_mod.LabelStore;
 const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
 const EdgeEntry = edge_mod.EdgeEntry;
+const owner_only_file_mode = 0o600;
 
 /// The central GraphEngine that wires everything together and implements
 /// the GraphStorage vtable.
@@ -324,7 +325,7 @@ pub const GraphEngine = struct {
             offset += written;
         }
 
-        const file = try std.fs.cwd().createFile(path, .{});
+        const file = try std.fs.cwd().createFile(path, .{ .mode = owner_only_file_mode });
         defer file.close();
         try file.writeAll(buf[0..offset]);
     }

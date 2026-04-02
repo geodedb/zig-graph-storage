@@ -22,6 +22,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const owner_only_file_mode = 0o600;
 
 const graph_dir_mod = @import("graph_dir.zig");
 const GraphDir = graph_dir_mod.GraphDir;
@@ -41,6 +42,8 @@ const BACKUP_FILES = [_][]const u8{
     "var.store",
     "free.store",
     "labels.dict",
+    "labels.idx",
+    "props.idx",
 };
 
 /// Optional files that may or may not exist.
@@ -75,7 +78,7 @@ pub const Backup = struct {
     /// The backup is a simple archive: header + file entries.
     /// When encryption_key is set, uses version 2 with HMAC-SHA256 tag.
     pub fn createBackup(self: *Backup, graph_dir: *const GraphDir, output_path: []const u8) !BackupResult {
-        const out_file = try std.fs.cwd().createFile(output_path, .{});
+        const out_file = try std.fs.cwd().createFile(output_path, .{ .mode = owner_only_file_mode });
         defer out_file.close();
 
         const version: u16 = if (self.encryption_key != null) BACKUP_VERSION_HMAC else BACKUP_VERSION;
@@ -274,7 +277,7 @@ pub const Backup = struct {
             const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name });
             defer self.allocator.free(file_path);
 
-            const file = try std.fs.cwd().createFile(file_path, .{});
+            const file = try std.fs.cwd().createFile(file_path, .{ .mode = owner_only_file_mode });
             defer file.close();
             try file.writeAll(file_data);
         }
@@ -428,6 +431,30 @@ fn createTestGraphDir(allocator: Allocator) !struct { tmp_dir: testing.TmpDir, g
     return .{ .tmp_dir = tmp_dir, .graph_dir = gd };
 }
 
+fn writeTestFile(path: []const u8, data: []const u8) !void {
+    const file = try std.fs.cwd().createFile(path, .{ .mode = owner_only_file_mode });
+    defer file.close();
+    try file.writeAll(data);
+}
+
+fn expectFileContents(path: []const u8, expected: []const u8) !void {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const data = try file.readToEndAlloc(testing.allocator, expected.len + 16);
+    defer testing.allocator.free(data);
+
+    try testing.expectEqualStrings(expected, data);
+}
+
+fn expectOwnerOnlyMode(path: []const u8) !void {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    try testing.expectEqual(@as(u32, owner_only_file_mode), stat.mode & 0o777);
+}
+
 test "createBackup produces file with correct magic" {
     const allocator = testing.allocator;
 
@@ -451,6 +478,7 @@ test "createBackup produces file with correct magic" {
 
     try testing.expect(result.files_backed_up > 0);
     try testing.expect(result.total_bytes > 0);
+    try expectOwnerOnlyMode(out_path);
 
     // Verify magic bytes
     const file = try std.fs.cwd().openFile(out_path, .{});
@@ -469,14 +497,22 @@ test "restoreBackup restores files to new directory" {
         env.tmp_dir.cleanup();
     }
 
-    // Write some data to a store file
+    // Write some data to files that must round-trip through backup/restore.
     const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
     defer allocator.free(nodes_path);
-    {
-        const f = try std.fs.cwd().openFile(nodes_path, .{ .mode = .write_only });
-        defer f.close();
-        try f.writeAll("test node data");
-    }
+    try writeTestFile(nodes_path, "test node data");
+
+    const labels_dict_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{env.graph_dir.path});
+    defer allocator.free(labels_dict_path);
+    try writeTestFile(labels_dict_path, "Person:1");
+
+    const labels_idx_path = try std.fmt.allocPrint(allocator, "{s}/labels.idx", .{env.graph_dir.path});
+    defer allocator.free(labels_idx_path);
+    try writeTestFile(labels_idx_path, "label index snapshot");
+
+    const props_idx_path = try std.fmt.allocPrint(allocator, "{s}/props.idx", .{env.graph_dir.path});
+    defer allocator.free(props_idx_path);
+    try writeTestFile(props_idx_path, "property index snapshot");
 
     // Create backup
     var out_tmp = testing.tmpDir(.{});
@@ -496,15 +532,26 @@ test "restoreBackup restores files to new directory" {
 
     try backup.restoreBackup(backup_path, restore_path);
 
-    // Verify nodes.store was restored with correct content
+    // Verify files were restored with correct content and permissions.
     const restored_nodes = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{restore_path});
     defer allocator.free(restored_nodes);
+    try expectFileContents(restored_nodes, "test node data");
+    try expectOwnerOnlyMode(restored_nodes);
 
-    const file = try std.fs.cwd().openFile(restored_nodes, .{});
-    defer file.close();
-    var buf: [64]u8 = undefined;
-    const n = try file.readAll(&buf);
-    try testing.expectEqualStrings("test node data", buf[0..n]);
+    const restored_labels_dict = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{restore_path});
+    defer allocator.free(restored_labels_dict);
+    try expectFileContents(restored_labels_dict, "Person:1");
+    try expectOwnerOnlyMode(restored_labels_dict);
+
+    const restored_labels_idx = try std.fmt.allocPrint(allocator, "{s}/labels.idx", .{restore_path});
+    defer allocator.free(restored_labels_idx);
+    try expectFileContents(restored_labels_idx, "label index snapshot");
+    try expectOwnerOnlyMode(restored_labels_idx);
+
+    const restored_props_idx = try std.fmt.allocPrint(allocator, "{s}/props.idx", .{restore_path});
+    defer allocator.free(restored_props_idx);
+    try expectFileContents(restored_props_idx, "property index snapshot");
+    try expectOwnerOnlyMode(restored_props_idx);
 }
 
 test "validateBackup returns true for valid backup" {

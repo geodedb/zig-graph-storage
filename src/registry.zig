@@ -4,6 +4,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
+const owner_only_file_mode = 0o600;
 
 pub const REGISTRY_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'D', 'R', 'E', 'G', '1' };
 pub const REGISTRY_VERSION: u32 = 1;
@@ -113,7 +114,7 @@ pub const GraphRegistry = struct {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{});
+        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .mode = owner_only_file_mode });
         defer tmp_file.close();
         try tmp_file.writeAll(buf.items);
         try tmp_file.sync();
@@ -282,6 +283,11 @@ test "save/load round-trip" {
     reg.next_edge_id = 99;
 
     try reg.saveToFile(file_path);
+
+    const saved_file = try std.fs.cwd().openFile(file_path, .{});
+    defer saved_file.close();
+    const saved_stat = try saved_file.stat();
+    try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.mode & 0o777);
 
     // Load into new registry
     var reg2 = GraphRegistry.init(allocator);
