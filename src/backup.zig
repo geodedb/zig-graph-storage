@@ -419,7 +419,6 @@ fn readU64(data: []const u8, offset: usize) u64 {
 // ============================================================================
 
 const testing = std.testing;
-const file_manager = @import("file_manager.zig");
 
 fn createTestGraphDir(allocator: Allocator) !struct { tmp_dir: testing.TmpDir, graph_dir: GraphDir } {
     var tmp_dir = testing.tmpDir(.{});
