@@ -1,0 +1,221 @@
+# Operations Guide
+
+Practical reference for operating the graph-storage engine in production.
+
+---
+
+## Opening and Creating a Graph Database
+
+### First-time creation
+
+```zig
+const cfg = GraphConfig{
+    .page_size = 8192,
+    .encryption_key = my_key,   // optional, [32]u8
+    .data_dir = "/var/data/graphs",
+};
+var uuid: [16]u8 = undefined;
+std.crypto.random.bytes(&uuid);
+
+var engine = try GraphEngine.create(allocator, cfg.data_dir, uuid, cfg);
+defer engine.close() catch {};
+```
+
+`GraphEngine.create()` initializes the directory layout, creates empty store
+files, writes the initial manifest, and returns a ready-to-use engine.
+
+### Opening an existing graph
+
+```zig
+var engine = try GraphEngine.open(allocator, "/var/data/graphs", uuid, cfg);
+defer engine.close() catch {};
+```
+
+`GraphEngine.open()` reads the manifest (A/B), runs crash recovery if needed,
+rebuilds the label index, and loads the index catalog.
+
+---
+
+## Transactions
+
+All mutations require an explicit transaction:
+
+```zig
+const txn = try engine.beginTxn();
+try engine.putNode(txn, node_id, &rec);
+try engine.commitTxn(txn);
+```
+
+If a transaction is not committed it will be discarded during recovery.
+
+---
+
+## Checkpoint
+
+Checkpointing flushes dirty pages, syncs store files, and writes a fresh
+manifest to the alternate A/B slot:
+
+```zig
+try engine.checkpoint();
+```
+
+Automatic checkpointing can be triggered by monitoring
+`GraphConfig.checkpoint_byte_threshold` and
+`GraphConfig.checkpoint_time_threshold_ms`. The engine does not run an
+automatic checkpoint timer internally; the application is responsible for
+calling `checkpoint()` at appropriate intervals.
+
+---
+
+## Backup and Restore
+
+### Creating a backup
+
+```zig
+const backup_mod = @import("backup.zig");
+var backup = backup_mod.Backup.init(allocator);
+// Or with HMAC integrity protection:
+// var backup = backup_mod.Backup.initWithKey(allocator, encryption_key);
+
+const result = try backup.createBackup(&graph_dir, "/backups/graph.geob");
+// result.files_backed_up, result.total_bytes
+```
+
+The backup format is a self-contained archive containing manifests, all store
+files, label dictionary, and index catalog. When an encryption key is provided,
+the backup uses version 2 with an HMAC-SHA256 integrity tag.
+
+### Restoring from backup
+
+```zig
+try backup.restoreBackup("/backups/graph.geob", "/var/data/restored");
+```
+
+Restore extracts all files to the target directory. After restore, open the
+graph normally with `GraphEngine.open()`.
+
+**Important:** Always checkpoint before creating a backup to ensure the backup
+reflects the latest committed state.
+
+---
+
+## Crash Recovery
+
+Recovery is automatic during `GraphEngine.open()`. The process:
+
+1. Read manifest.a and manifest.b; select the valid one with the highest counter
+2. Open all store files
+3. Open the WAL and read from the last checkpoint LSN
+4. Classify transactions by scanning BEGIN/COMMIT/ABORT records
+5. Replay committed page_update records into the buffer pool
+6. Discard uncommitted transactions
+7. Flush the buffer pool and write a fresh checkpoint
+
+If WAL records have checksum mismatches they are skipped. The count of skipped
+records is available in `Recovery.skipped_checksum_failures`.
+
+### Metrics
+
+When a `Metrics` struct is wired into the `Recovery` instance,
+`recovery_duration_ns` records the wall-clock time of the recovery operation.
+
+---
+
+## Encryption Key Management
+
+### Setting a key
+
+Pass a 32-byte key via `GraphConfig.encryption_key` when creating or opening
+the graph. The key is used for AES-256-CTR page encryption and optionally for
+HMAC-SHA256 backup integrity.
+
+### Key zeroing
+
+Call `GraphConfig.zeroKey()` during shutdown to securely clear the key from
+memory. The engine's `close()` method handles this automatically.
+
+### Key rotation
+
+Key rotation is not yet supported as a built-in operation. To rotate:
+
+1. Create a backup with the current key
+2. Create a new graph with the new key
+3. Restore data programmatically (re-insert nodes/edges/properties)
+
+A future migration utility may automate this process.
+
+---
+
+## Upgrading from V1 to V2 Format
+
+V2 introduced a 48-byte NodeRec layout (V1 used 40 bytes). The formats are
+incompatible at the page level.
+
+### Reject mode (default)
+
+By default, `GraphConfig.legacy_policy` is `.reject`. Opening a V1 graph
+returns `error.IncompatibleVersion`.
+
+### Read-only mode
+
+Set `GraphConfig.legacy_policy = .read_only` to open a V1 graph in read-only
+mode for data extraction:
+
+```zig
+const cfg = GraphConfig{
+    .legacy_policy = .read_only,
+};
+var engine = try GraphEngine.open(allocator, data_dir, uuid, cfg);
+// Read operations work; mutations are not permitted
+```
+
+### Full migration
+
+1. Open the V1 graph in read-only mode
+2. Create a new V2 graph
+3. Iterate nodes and edges from V1, insert into V2
+4. Verify the new graph with `VerifyTool`
+5. Replace the old data directory
+
+---
+
+## Verification
+
+Use `VerifyTool` to check graph integrity:
+
+```zig
+const verify_mod = @import("verify.zig");
+var tool = verify_mod.VerifyTool.init(allocator);
+var result = try tool.verifyGraph(&graph_dir, page_size);
+defer result.deinit();
+
+if (!result.isClean()) {
+    // result.corrupted_pages, result.errors contain details
+}
+```
+
+Verification checks manifest validity and page checksums across all store files.
+
+---
+
+## Monitoring
+
+The `Metrics` struct provides counters for:
+
+- Page I/O: `page_reads`, `page_writes`, `buffer_hits`, `buffer_misses`
+- WAL: `wal_appends`, `wal_bytes_written`, `wal_segment_count`
+- Transactions: `txn_begun`, `txn_committed`, `txn_aborted`
+- Operations: `nodes_created`, `nodes_deleted`, `edges_created`, `edges_removed`
+- Properties: `properties_written`, `properties_read`
+- Checkpoint: `checkpoints_completed`, `last_checkpoint_duration_ns`
+- Recovery: `recovery_duration_ns`
+- Health: `fragmentation_ratio`, `index_rebuild_progress`
+
+Use `Metrics.bufferHitRate()` to monitor cache effectiveness. A sustained hit
+rate below 0.90 may indicate the buffer pool is undersized.
+
+### Structured events
+
+Set `GraphConfig.log_fn` to receive lifecycle events (checkpoint_start/end,
+recovery_start/end, backup_start/end) as `StorageEvent` labels through the
+callback.
