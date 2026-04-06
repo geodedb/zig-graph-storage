@@ -34,6 +34,7 @@ pub const IntegrityReport = struct {
     edge_count_consistent: bool,
     label_index_entries: u64,
     total_errors: u64,
+    io_errors: u64 = 0,
 };
 
 /// Return a read-only pointer to the engine's metrics counters.
@@ -73,7 +74,11 @@ pub fn checkIntegrity(engine: *GraphEngine) IntegrityReport {
     var actual_nodes: u64 = 0;
     var id: u64 = 1;
     while (id < engine.manifest.next_node_id) : (id += 1) {
-        if (engine.node_store.getNode(id) catch null) |rec| {
+        const maybe_rec = engine.node_store.getNode(id) catch {
+            report.io_errors += 1;
+            continue;
+        };
+        if (maybe_rec) |rec| {
             if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec)) {
                 actual_nodes += 1;
             }
@@ -88,11 +93,20 @@ pub fn checkIntegrity(engine: *GraphEngine) IntegrityReport {
     var actual_edges: u64 = 0;
     var nid: u64 = 1;
     while (nid < engine.manifest.next_node_id) : (nid += 1) {
-        if (engine.node_store.getNode(nid) catch null) |rec| {
+        const maybe_rec = engine.node_store.getNode(nid) catch {
+            report.io_errors += 1;
+            continue;
+        };
+        if (maybe_rec) |rec| {
             if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec) and rec.out_head != 0) {
                 var iter = engine.adj_out.expand(rec.out_head, null);
                 defer iter.deinit();
-                while (iter.next() catch null) |_| {
+                while (true) {
+                    const entry = iter.next() catch {
+                        report.io_errors += 1;
+                        break;
+                    };
+                    if (entry == null) break;
                     actual_edges += 1;
                 }
             }
