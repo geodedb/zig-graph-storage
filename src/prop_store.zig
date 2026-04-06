@@ -100,6 +100,14 @@ pub const PropStore = struct {
         encoded_value: []const u8,
     };
 
+    /// Zero-allocation iterator over property entries in a page chain.
+    ///
+    /// **Lifetime:** Returned `PropertyEntrySlice` values contain slices that
+    /// point directly into pinned buffer pool frames. These slices become
+    /// invalid after the next call to `next()` (which may unpin the current
+    /// frame and pin a new one) or after `deinit()` is called. Callers must
+    /// copy any key or encoded_value data they need to retain beyond the
+    /// current iteration step.
     pub const PropIterator = struct {
         store: *PropStore,
         current_page: u64,
