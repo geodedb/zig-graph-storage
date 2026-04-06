@@ -50,6 +50,15 @@ pub const Recovery = struct {
         };
     }
 
+    /// Securely zero the encryption key material. Must be called when the
+    /// Recovery instance is no longer needed to avoid leaving key material
+    /// in memory.
+    pub fn deinit(self: *Recovery) void {
+        if (self.encryption_key) |*key| {
+            std.crypto.secureZero(u8, key);
+        }
+    }
+
     /// Recover a graph from its directory.
     /// 1. Read manifest A and B, select valid one with highest counter
     /// 2. Open store files
@@ -951,6 +960,29 @@ test "GAP-0005d: recovery with many pages (>100 page updates in WAL)" {
         }
         try testing.expect(match);
     }
+}
+
+test "deinit zeros encryption key" {
+    const key = [_]u8{0xAA} ** 32;
+    var recovery = Recovery.init(testing.allocator, key);
+
+    // Before deinit, key should be present
+    try testing.expect(recovery.encryption_key != null);
+    try testing.expect(recovery.encryption_key.?[0] == 0xAA);
+
+    recovery.deinit();
+
+    // After deinit, key should be zeroed
+    if (recovery.encryption_key) |k| {
+        for (k) |byte| {
+            try testing.expectEqual(@as(u8, 0), byte);
+        }
+    }
+}
+
+test "deinit with null encryption key does not panic" {
+    var recovery = Recovery.init(testing.allocator, null);
+    recovery.deinit(); // should not panic
 }
 
 test {
