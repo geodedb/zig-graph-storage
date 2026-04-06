@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2025 CodePros
+
+//! Unit tests for GraphEngine, extracted from engine.zig.
+
+const std = @import("std");
+const testing = std.testing;
+
+const types = @import("types.zig");
+const config_mod = @import("config.zig");
+const manifest_mod = @import("manifest.zig");
+const graph_dir_mod = @import("graph_dir.zig");
+const node_mod = @import("node.zig");
+const engine_mod = @import("engine.zig");
+
+const NodeId = types.NodeId;
+const EdgeId = types.EdgeId;
+const GraphConfig = config_mod.GraphConfig;
+const Manifest = manifest_mod.Manifest;
+const GraphDir = graph_dir_mod.GraphDir;
+const NodeRec = node_mod.NodeRec;
+const GraphEngine = engine_mod.GraphEngine;
+
+fn testDataDir() !struct { tmp_dir: testing.TmpDir, path: []const u8 } {
+    var tmp_dir = testing.tmpDir(.{});
+    const path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    return .{ .tmp_dir = tmp_dir, .path = path };
+}
+
+fn testConfig() GraphConfig {
+    return .{
+        .page_size = 4096,
+        .buffer_pool_pages = 64,
+        .data_dir = "data",
+    };
+}
+
+test "create engine, allocNode, putNode, getNode round-trip" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x01} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Allocate and write a node
+    const node_id = try engine.allocNode();
+    try testing.expectEqual(@as(NodeId, 1), node_id);
+
+    const rec = NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+    try engine.putNode(node_id, rec);
+
+    // Read it back
+    const got = try engine.getNode(node_id);
+    try testing.expect(got != null);
+    try testing.expectEqual(@as(u64, 0), got.?.label_head);
+    try testing.expectEqual(@as(u16, 0), got.?.label_count);
+}
+
+test "create engine, addEdge, expandOut returns edge" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x02} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Create two nodes
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    // Add an edge
+    const edge_id = try engine.addEdge(n1, n2, 5);
+    try testing.expectEqual(@as(EdgeId, 1), edge_id);
+
+    // Expand outgoing edges from n1
+    const out_edges = try engine.expandOut(n1, null, testing.allocator);
+    defer testing.allocator.free(out_edges);
+
+    try testing.expectEqual(@as(usize, 1), out_edges.len);
+    try testing.expectEqual(n2, out_edges[0].neighbor);
+    try testing.expectEqual(edge_id, out_edges[0].edge_id);
+    try testing.expectEqual(@as(u32, 5), out_edges[0].rel_type);
+
+    // Expand incoming edges at n2
+    const in_edges = try engine.expandIn(n2, null, testing.allocator);
+    defer testing.allocator.free(in_edges);
+
+    try testing.expectEqual(@as(usize, 1), in_edges.len);
+    try testing.expectEqual(n1, in_edges[0].neighbor);
+}
+
+test "create engine, checkpoint, close, open again, data persists" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x03} ** 16;
+    const cfg = testConfig();
+
+    // Create and populate
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        const n1 = try engine.allocNode();
+        try engine.putNode(n1, NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        });
+
+        // Checkpoint to persist
+        try engine.checkpoint();
+
+        try engine.close();
+    }
+
+    // Re-open and verify data survived checkpoint+close+reopen
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        // The node MUST be present after checkpoint+close+reopen
+        const got = try engine.getNode(1);
+        try testing.expect(got != null);
+        try testing.expectEqual(@as(u64, 0), got.?.label_head);
+    }
+}
+
+test "checkpoint persists labels.dict, labels.idx and props.idx snapshots" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x11} ** 16;
+    const cfg = testConfig();
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        const node_id = try engine.allocNode();
+        var rec = NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        };
+        try engine.putNode(node_id, rec);
+        try engine.addLabel(node_id, 7);
+
+        rec = (try engine.getNode(node_id)).?;
+        rec.prop_head = try engine.putProperty(rec.prop_head, "name", .{ .string = "Alice" });
+        try engine.putNode(node_id, rec);
+
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    const graph_dir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&graph_dir).deinit();
+
+    const labels_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.idx", .{graph_dir.path});
+    defer testing.allocator.free(labels_idx_path);
+    const props_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/props.idx", .{graph_dir.path});
+    defer testing.allocator.free(props_idx_path);
+    const labels_dict_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.dict", .{graph_dir.path});
+    defer testing.allocator.free(labels_dict_path);
+
+    const labels_dict_stat = try std.fs.cwd().statFile(labels_dict_path);
+    const labels_stat = try std.fs.cwd().statFile(labels_idx_path);
+    const props_stat = try std.fs.cwd().statFile(props_idx_path);
+    try testing.expect(labels_dict_stat.size > 0);
+    try testing.expect(labels_stat.size > 0);
+    try testing.expect(props_stat.size > 0);
+}
+
+test "open rebuilds derived indexes when snapshot files are stale" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x12} ** 16;
+    const cfg = testConfig();
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        const node_id = try engine.allocNode();
+        var rec = NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        };
+        try engine.putNode(node_id, rec);
+        try engine.addLabel(node_id, 9);
+
+        rec = (try engine.getNode(node_id)).?;
+        rec.prop_head = try engine.putProperty(rec.prop_head, "email", .{ .string = "alice@example.com" });
+        try engine.putNode(node_id, rec);
+
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    const graph_dir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&graph_dir).deinit();
+    const labels_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.idx", .{graph_dir.path});
+    defer testing.allocator.free(labels_idx_path);
+
+    const labels_file = try std.fs.cwd().createFile(labels_idx_path, .{ .read = true, .truncate = true });
+    labels_file.close();
+
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    const labeled_nodes = try engine.scanLabel(9, testing.allocator);
+    defer testing.allocator.free(labeled_nodes);
+    try testing.expectEqualSlices(NodeId, &[_]NodeId{1}, labeled_nodes);
+
+    const rec = (try engine.getNode(1)).?;
+    const email = try engine.getProperty(rec.prop_head, "email", testing.allocator);
+    defer if (email) |value| switch (value) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(email != null);
+    try testing.expectEqualStrings("alice@example.com", email.?.string);
+}
+
+test "GraphStorage vtable interface works" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x04} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Get the vtable interface
+    const gs = engine.storage();
+
+    // Use vtable methods
+    const node_id = try gs.allocNode();
+    try gs.putNode(node_id, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    const got = try gs.getNode(node_id);
+    try testing.expect(got != null);
+    try testing.expectEqual(@as(u64, 0), got.?.label_head);
+
+    const count = try gs.nodeCount();
+    try testing.expectEqual(@as(u64, 1), count);
+}
+
+test "GAP-0006: close returns error union, not void" {
+    // Verify that close() returns !void by calling try on it
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x06} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+
+    // This call would fail to compile if close() returned void
+    try engine.close();
+}
+
+test "SEC-0010: open rejects page_size mismatch" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x10} ** 16;
+    const cfg = testConfig(); // page_size = 4096
+
+    // Create with page_size 4096
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Try to open with different page_size -- should fail
+    {
+        var bad_cfg = testConfig();
+        bad_cfg.page_size = 8192;
+        const result = GraphEngine.open(testing.allocator, td.path, uuid, bad_cfg);
+        try testing.expectError(error.PageSizeMismatch, result);
+    }
+}
+
+test "QUAL-0006: getEdge returns null for nonexistent edge" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x07} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // getEdge should return null for an edge that does not exist
+    const result = try engine.getEdge(999);
+    try testing.expect(result == null);
+}
+
+test "GAP-0021: getEdge returns edge after addEdge" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x21} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Create two nodes
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    // Add an edge and look it up by ID
+    const edge_id = try engine.addEdge(n1, n2, 42);
+    const edge = try engine.getEdge(edge_id);
+    try testing.expect(edge != null);
+    try testing.expectEqual(n2, edge.?.neighbor);
+    try testing.expectEqual(edge_id, edge.?.edge_id);
+    try testing.expectEqual(@as(u32, 42), edge.?.rel_type);
+    try testing.expectEqual(@as(u32, 0), edge.?.prop_head);
+
+    // Remove the edge, getEdge should return null
+    try engine.removeEdge(n1, n2, edge_id);
+    const removed = try engine.getEdge(edge_id);
+    try testing.expect(removed == null);
+}
+
+test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x50} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Initially zero
+    try testing.expectEqual(@as(u64, 0), try engine.nodeCount());
+    try testing.expectEqual(@as(u64, 0), try engine.edgeCount());
+
+    // Allocate and write two nodes
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    try testing.expectEqual(@as(u64, 1), try engine.nodeCount());
+
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    try testing.expectEqual(@as(u64, 2), try engine.nodeCount());
+
+    // Add edges
+    _ = try engine.addEdge(n1, n2, 1);
+    try testing.expectEqual(@as(u64, 1), try engine.edgeCount());
+
+    _ = try engine.addEdge(n2, n1, 2);
+    try testing.expectEqual(@as(u64, 2), try engine.edgeCount());
+
+    // Remove an edge
+    try engine.removeEdge(n1, n2, 1);
+    try testing.expectEqual(@as(u64, 1), try engine.edgeCount());
+
+    // Delete a node
+    try engine.deleteNode(n1);
+    try testing.expectEqual(@as(u64, 1), try engine.nodeCount());
+
+    // Counters are directly from manifest (O(1))
+    try testing.expectEqual(@as(u64, 1), engine.manifest.node_count);
+    try testing.expectEqual(@as(u64, 1), engine.manifest.edge_count);
+}
+
+test "PERF-0008: open auto-sizes buffer pool from manifest" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x08} ** 16;
+
+    // Create with small buffer pool
+    var cfg = testConfig();
+    cfg.buffer_pool_pages = 64;
+    cfg.buffer_pool_auto_size = true;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Re-open: auto-size should kick in (minimum 1024 even for empty graph)
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        // Buffer pool should be at least 1024 (the auto-size minimum)
+        try testing.expect(engine.buffer_pool.capacity >= 1024);
+    }
+}
+
+test "PERF-0008: open respects buffer_pool_auto_size=false" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x09} ** 16;
+
+    var cfg = testConfig();
+    cfg.buffer_pool_pages = 64;
+    cfg.buffer_pool_auto_size = false;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Re-open with auto-size disabled: should keep configured size
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        try testing.expectEqual(@as(u32, 64), engine.buffer_pool.capacity);
+    }
+}
+
+test "getStorageStats returns correct counters" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x71} ** 16;
+    const cfg = testConfig();
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    // Fresh engine stats
+    const stats0 = engine.getStorageStats();
+    try testing.expectEqual(@as(u64, 0), stats0.node_count);
+    try testing.expectEqual(@as(u64, 0), stats0.edge_count);
+    try testing.expectEqual(@as(u32, 2), stats0.format_version); // V2
+    try testing.expectEqual(@as(u32, 4096), stats0.page_size);
+
+    // Add a node and check stats update
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    const stats1 = engine.getStorageStats();
+    try testing.expectEqual(@as(u64, 1), stats1.node_count);
+}
+
+test "checkIntegrity reports consistent state" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x72} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Empty engine should be consistent
+    const r0 = engine.checkIntegrity();
+    try testing.expect(r0.node_count_consistent);
+    try testing.expect(r0.edge_count_consistent);
+    try testing.expectEqual(@as(u64, 0), r0.total_errors);
+
+    // Add two nodes and an edge
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    _ = try engine.addEdge(n1, n2, 1);
+
+    // Should still be consistent
+    const r1 = engine.checkIntegrity();
+    try testing.expect(r1.node_count_consistent);
+    try testing.expect(r1.edge_count_consistent);
+    try testing.expectEqual(@as(u64, 0), r1.total_errors);
+
+    // Remove the edge, then delete a node -- counts should stay consistent
+    try engine.removeEdge(n1, n2, 1);
+    try engine.deleteNode(n1);
+    const r2 = engine.checkIntegrity();
+    try testing.expect(r2.node_count_consistent);
+    try testing.expect(r2.edge_count_consistent);
+    try testing.expectEqual(@as(u64, 0), r2.total_errors);
+}
+
+test "V1 format detection returns V1FormatRequiresRecreation" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x61} ** 16;
+    const cfg = testConfig();
+
+    // Create a valid V2 graph so the directory structure exists
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Now overwrite manifest_a with a V1 format_version
+    const graph_dir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&graph_dir).deinit();
+
+    const v1_manifest = Manifest{
+        .graph_uuid = uuid,
+        .page_size = cfg.page_size,
+        .counter = 10, // Higher counter so it wins A/B selection
+        .format_version = manifest_mod.MANIFEST_VERSION_V1,
+    };
+    const path_a = try graph_dir.manifestPath(testing.allocator, .a);
+    defer testing.allocator.free(path_a);
+    try v1_manifest.writeToFile(testing.allocator, path_a);
+
+    // Also write to slot B so selectManifest picks V1
+    const path_b = try graph_dir.manifestPath(testing.allocator, .b);
+    defer testing.allocator.free(path_b);
+    try v1_manifest.writeToFile(testing.allocator, path_b);
+
+    // open() should detect V1 and return error
+    const result = GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    try testing.expectError(error.IncompatibleVersion, result);
+}
+
+test "GAP-0022: multi-op transaction groups mutations" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x70} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Begin an explicit transaction
+    const txn = try engine.beginTxn();
+
+    // Allocate and put two nodes within the same transaction
+    const n1 = try engine.allocNode();
+    const rec1 = NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+    try engine.putNodeTxn(n1, rec1, txn);
+
+    const n2 = try engine.allocNode();
+    const rec2 = NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+    try engine.putNodeTxn(n2, rec2, txn);
+
+    // Add an edge within the same transaction
+    const edge_id = try engine.addEdgeTxn(n1, n2, 42, txn);
+
+    // Commit the single transaction covering all three mutations
+    try engine.commitTxn(txn);
+
+    // Verify all data is present
+    const got1 = try engine.getNode(n1);
+    try testing.expect(got1 != null);
+
+    const got2 = try engine.getNode(n2);
+    try testing.expect(got2 != null);
+
+    const edges = try engine.expandOut(n1, null, testing.allocator);
+    defer testing.allocator.free(edges);
+    try testing.expectEqual(@as(usize, 1), edges.len);
+    try testing.expectEqual(edge_id, edges[0].edge_id);
+    try testing.expectEqual(@as(u32, 42), edges[0].rel_type);
+}
