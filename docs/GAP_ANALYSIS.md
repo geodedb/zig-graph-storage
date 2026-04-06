@@ -1,6 +1,6 @@
 # Gap Analysis -- Requirements & Implementation
 
-**Last updated:** 2026-04-06
+**Last updated:** 2026-04-06 (gap closure pass)
 **Source:** Full Codebase Audit (docs/AUDIT_REPORT.md)
 
 ## Summary
@@ -8,10 +8,10 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 19 |
+| Closed | 22 |
 | Won't Do | 1 |
 | Blocked | 1 |
-| Deferred | 4 |
+| Deferred | 6 |
 
 ---
 
@@ -238,13 +238,13 @@
 
 ## GAP-0021: getEdge() always returns error.EdgeIndexNotImplemented
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** High
 - **Requirement:** FR-003, FR-008
 - **Description:** `getEdge()` always returns `error.EdgeIndexNotImplemented`. No edge-ID index exists; edge lookups by ID are non-functional.
 - **Effort:** L
 - **Affected Files:** `src/engine.zig`
-- **Deferral Reason:** Large feature requiring its own branch. Edge index implementation involves new index structure and integration with adjacency store.
+- **Resolution:** `getEdge()` now uses `self.edge_index.get(edge_id)` via AutoHashMap and returns a proper `EdgeEntry`. No `EdgeIndexNotImplemented` error remains. See `src/engine.zig:480-488`.
 
 ## GAP-0022: Per-mutation auto-commit generates excessive WAL traffic
 
@@ -285,3 +285,86 @@
 - **Effort:** S
 - **Affected Files:** `src/`
 - **Resolution:** Added `writeJson` methods to result structs for structured JSON output.
+
+---
+
+## GAP-0026: 3 metrics counters never wired
+
+- **Status:** Closed / Implemented
+- **Severity:** Medium
+- **Requirement:** NFR-OBS-001
+- **Category:** Observability
+- **Description:** `wal_segment_count`, `fragmentation_ratio`, and `index_rebuild_progress` were declared in `src/metrics.zig` but never populated by any subsystem.
+- **Resolution:** Wired all three metrics counters: `wal_segment_count` populated by WAL manager during segment tracking, `fragmentation_ratio` populated by FreeSpaceManager, `index_rebuild_progress` populated during index catalog rebuild. TODO comments removed.
+- **Evidence:** Commit `1bed851` (feat: close GAP-0026). Files: `src/metrics.zig`, `src/wal.zig`, `src/free_space.zig`, `src/engine_index.zig`.
+- **Effort:** S
+- **Affected Files:** `src/metrics.zig`, `src/wal.zig`, `src/free_space.zig`, `src/engine_index.zig`
+
+## GAP-0027: B+tree not integrated into engine query/checkpoint path
+
+- **Status:** Deferred
+- **Severity:** Medium
+- **Requirement:** FR-016, FR-017
+- **Category:** Feature
+- **Description:** `btree.zig` implements a full B+tree with serialize/deserialize support (GAP-0020), but it is never imported in `engine.zig`. The engine uses `PropertyChainIndex` for property lookups instead. `IndexCatalog` is not wired into the checkpoint or recovery path.
+- **Current state (evidence):**
+  - `src/engine.zig` -- no `@import("btree.zig")` found
+  - `src/engine.zig` -- `PropertyChainIndex` used for all property lookups
+  - Checkpoint path does not call `IndexCatalog.save()` or `btree.saveToFile()`
+- **Why this is a gap:** FR-016 (range queries) and FR-017 (composite indexes) require B+tree integration. The B+tree is implemented and can persist, but is not reachable from the engine.
+- **Impact/Risk:** Range queries and composite index lookups are not available through the engine API. The B+tree implementation is dead code from the engine's perspective.
+- **Recommended fix:** Import `btree.zig` in `engine.zig`, wire `IndexCatalog` into checkpoint/recovery, and expose B+tree-backed queries via the engine API.
+- **Effort:** L
+- **Affected Files:** `src/engine.zig`, `src/btree.zig`, `src/checkpoint.zig`, `src/recovery.zig`
+- **Deferral Reason:** Large feature requiring query path redesign. B+tree persistence is implemented (GAP-0020) but engine integration requires wiring IndexCatalog into checkpoint/recovery and exposing range-query APIs. Deferred to a dedicated branch.
+
+## GAP-0028: Edge index not persisted (rebuilt on open)
+
+- **Status:** Deferred
+- **Severity:** Low
+- **Requirement:** FR-003, FR-008
+- **Category:** Performance
+- **Description:** The in-memory edge index (`AutoHashMap`) has no save/load path. It is rebuilt from the adjacency store on every `open()` call, adding startup latency proportional to edge count.
+- **Current state (evidence):**
+  - `src/engine.zig:250-251` -- comment: `// Edge index is in-memory only (no persistence) so always rebuild` followed by `try self.rebuildEdgeIndex();`
+- **Why this is a gap:** For large graphs, rebuilding the edge index on every open adds avoidable startup time. Other derived indexes (label index, property chain index) are persisted and loaded from snapshots.
+- **Impact/Risk:** Cold-start latency grows linearly with edge count. Acceptable for small datasets but problematic at scale.
+- **Recommended fix:** Add `saveEdgeIndex()`/`loadEdgeIndex()` methods following the same pattern used by `PropertyChainIndex`. Persist during checkpoint, load during `open()`.
+- **Effort:** M
+- **Affected Files:** `src/engine.zig`
+- **Deferral Reason:** Medium feature, not a correctness issue. Edge index rebuild on open is functionally correct; persistence is a startup-latency optimization. Deferred to post-v1.
+
+## GAP-0029: 3 files over 800-line guideline
+
+- **Status:** Deferred
+- **Severity:** Low
+- **Requirement:** Coding style guideline (800-line max)
+- **Category:** Code Quality
+- **Description:** Three source files exceed the 800-line coding style guideline.
+- **Current state (evidence):**
+  - `src/recovery.zig` -- 1183 lines
+  - `src/prop_store.zig` -- 1147 lines
+  - `src/backup.zig` -- 958 lines
+- **Why this is a gap:** Large files increase cognitive load and make code review, navigation, and maintenance harder.
+- **Impact/Risk:** Low immediate risk. Long-term maintenance burden.
+- **Recommended fix:** Extract cohesive subsections into separate modules. For example, recovery test helpers, property encoding/decoding utilities, and backup verification logic could each become separate files.
+- **Effort:** M
+- **Affected Files:** `src/recovery.zig`, `src/prop_store.zig`, `src/backup.zig`
+- **Deferral Reason:** Cosmetic refactor with no correctness or performance impact. Cross-references QUAL-0027. Deferred to post-v1.
+
+## GAP-0030: Recovery two-pass loads entire WAL into memory
+
+- **Status:** Deferred
+- **Severity:** Low
+- **Requirement:** NFR-PERF-001, NFR-PERF-004
+- **Category:** Performance
+- **Description:** `recovery.zig:164` calls `wal.readFrom(start_lsn, allocator)` which loads all WAL records from the checkpoint LSN forward into a single allocation. For large WAL backlogs this could cause significant memory pressure.
+- **Current state (evidence):**
+  - `src/recovery.zig:164` -- `const records = try wal.readFrom(start_lsn, self.allocator);`
+  - Cross-reference: PERF-0014 (streaming WAL replay)
+- **Why this is a gap:** NFR-PERF-001 targets bounded memory usage. Loading the entire WAL tail into memory violates this for crash recovery after long checkpoint intervals.
+- **Impact/Risk:** Memory spike during recovery proportional to WAL size since last checkpoint. Could cause OOM on memory-constrained systems with large WAL backlogs.
+- **Recommended fix:** Implement streaming/chunked WAL replay that processes records in fixed-size batches rather than loading all at once. See PERF-0014 for detailed approach.
+- **Effort:** M
+- **Affected Files:** `src/recovery.zig`, `src/wal.zig`
+- **Deferral Reason:** Same scope as PERF-0014 (streaming WAL replay). Requires significant refactor of WAL read path. Deferred to post-v1.

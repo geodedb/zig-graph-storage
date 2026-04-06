@@ -1,29 +1,25 @@
 # Security Gap Analysis
 
-**Last updated:** 2026-04-06
-**Source:** Full Codebase Audit (docs/AUDIT_REPORT.md)
+**Last updated:** 2026-04-06 (gap closure pass)
+**Source:** Full Codebase Audit (docs/AUDIT_REPORT.md), Phase 4 review
 
 ## Summary
 
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 25 |
+| Closed | 34 |
 | Won't Do | 1 |
 | Blocked | 0 |
-| Deferred | 2 |
+| Deferred | 1 |
 
-### Top 5 Risks (All Closed)
+**Known residual risk:** SEC-0015 (nonce reuse) is closed but u24 write_count uses saturating add (`+| 1`) at `pager.zig:81`. After 16,777,215 writes to a single page the nonce stops incrementing, re-enabling nonce reuse. This is a long-horizon risk; tracking under SEC-0015 residual note.
 
-| Rank | Finding | Risk Score | Severity | Status |
-|------|---------|------------|----------|--------|
-| 1 | SEC-0015: AES-GCM nonce reuse (write_count hardcoded) | 100 | Critical | Closed |
-| 2 | SEC-0016: HMAC timing side channel | 80 | High | Closed |
-| 3 | SEC-0017: HMAC bypass on V2 backup restore | 80 | High | Closed |
-| 4 | SEC-0018: PropStore unbounded key_len from page data | 80 | High | Closed |
-| 5 | SEC-0019: @intCast on stat.size without bounds check | 64 | High | Closed |
+### Top 5 Open Risks
 
-### Stack-Ranked Findings (All Resolved)
+No open items remain. All security findings are Closed, Won't Do, or Deferred.
+
+### Stack-Ranked Findings
 
 | Rank | Severity | Risk Score | Finding | Component | CWE/OWASP | Evidence | Fix | Status |
 |------|----------|------------|---------|-----------|------------|----------|-----|--------|
@@ -33,22 +29,29 @@
 | 4 | High | 80 | SEC-0018: PropStore unbounded key_len | prop_store.zig | CWE-125 / A03:2021 | prop_store.zig:69-72,127-130,206-210,330-331,380-381 | DataCorruption bounds checks | Closed |
 | 5 | High | 64 | SEC-0019: @intCast on stat.size | engine.zig, label_index.zig, property_chain_index.zig | CWE-681 / A03:2021 | engine.zig:347, label_index.zig:170, property_chain_index.zig:167 | std.math.cast at all 3 sites | Closed |
 | 6 | Medium | 48 | SEC-0020: AdjStore trusts bh.count | adj_store.zig | CWE-125 / A03:2021 | adj_store.zig:172-174 | count validation added | Closed |
-| 7 | Medium | 48 | SEC-0021: Index catalog no integrity check | index_catalog.zig | CWE-354 / A08:2021 | index_catalog.zig:93-180 | Format change required | Deferred |
+| 7 | Medium | 48 | SEC-0021: Index catalog no integrity check | index_catalog.zig | CWE-354 / A08:2021 | index_catalog.zig:94-181 | magic+version+CRC32 added | Closed |
 | 8 | Medium | 48 | SEC-0022: Free space unbounded total_pages | free_space.zig | CWE-400 / A05:2021 | free_space.zig:172-181 | Policy decision needed | Deferred |
-| 9 | Medium | 36 | SEC-0023: Encryption key not zeroed in Recovery/Backup | recovery.zig, backup.zig | CWE-316 / A02:2021 | recovery.zig:43, backup.zig:66 | Recovery.deinit with secureZero | Closed |
-| 10 | Medium | 36 | SEC-0024: WAL payload_len controls allocation | wal_record.zig | CWE-400 / A05:2021 | wal_record.zig:138-143 | MAX_WAL_PAYLOAD cap | Closed |
-| 11 | Medium | 36 | SEC-0025: PropStore encodedSizeFromBytes trusts length fields | prop_store.zig | CWE-125 / A03:2021 | prop_store.zig:400-412 | bounds validation added | Closed |
-| 12 | Medium | 36 | SEC-0026: Silent prop_head truncation | engine.zig | CWE-681 / A03:2021 | engine.zig:1015 | std.math.cast | Closed |
-| 13 | Medium | 36 | SEC-0027: Registry graph_count @intCast | registry.zig | CWE-681 / A03:2021 | registry.zig:153 | std.math.cast | Closed |
-| 14 | Medium | 36 | SEC-0028: catch unreachable on WAL serialization | wal.zig | CWE-248 / A11:2021 | wal.zig:74,80 | error propagation | Closed |
+| 9 | Medium | 48 | SEC-0032: VarStore.read infinite loop on circular page chain | var_store.zig | CWE-835 / A05:2021 | var_store.zig:107-124 | Cycle detection with max-hop limit | Closed |
+| 10 | Medium | 48 | SEC-0033: prop_store chain traversals have no cycle detection | prop_store.zig | CWE-835 / A05:2021 | prop_store.zig:117,317,401,485 | Cycle detection at all 4 traversal sites | Closed |
+| 11 | Medium | 36 | SEC-0023: Encryption key not zeroed in Recovery/Backup | recovery.zig, backup.zig | CWE-316 / A02:2021 | recovery.zig:43, backup.zig:66 | Recovery.deinit with secureZero | Closed |
+| 12 | Medium | 36 | SEC-0024: WAL payload_len controls allocation | wal_record.zig | CWE-400 / A05:2021 | wal_record.zig:138-143 | MAX_WAL_PAYLOAD cap | Closed |
+| 13 | Medium | 36 | SEC-0025: PropStore encodedSizeFromBytes trusts length fields | prop_store.zig | CWE-125 / A03:2021 | prop_store.zig:400-412 | bounds validation added | Closed |
+| 14 | Medium | 36 | SEC-0026: Silent prop_head truncation | engine.zig | CWE-681 / A03:2021 | engine.zig:1015 | std.math.cast | Closed |
+| 15 | Medium | 36 | SEC-0027: Registry graph_count @intCast | registry.zig | CWE-681 / A03:2021 | registry.zig:153 | std.math.cast | Closed |
+| 16 | Medium | 36 | SEC-0028: catch unreachable on WAL serialization | wal.zig | CWE-248 / A11:2021 | wal.zig:74,80 | error propagation | Closed |
+| 17 | Medium | 36 | SEC-0029: Backup struct missing deinit - key not zeroed | backup.zig | CWE-316 / A02:2021 | backup.zig:75-88 | Added Backup.deinit with secureZero | Closed |
+| 18 | Medium | 36 | SEC-0030: FileManager.deinit does not zero encryption key | file_manager.zig | CWE-316 / A02:2021 | file_manager.zig:32,98-107 | secureZero key + PageEncryption.deinit called | Closed |
+| 19 | Medium | 36 | SEC-0031: unreachable in putProperty reachable with corrupt chain | prop_store.zig | CWE-617 / A05:2021 | prop_store.zig:476 | Replaced unreachable with error.DataCorruption | Closed |
+| 20 | Low | 16 | SEC-0034: Recovery.deinit not called in engine.open | engine.zig | CWE-316 / A02:2021 | engine.zig:194-195 | Added defer recovery.deinit() | Closed |
+| 21 | Low | 16 | SEC-0035: Property key length not validated at API boundary | prop_store.zig | CWE-681 / A03:2021 | prop_store.zig:549 | Guard key.len > maxInt(u16) added | Closed |
+| 22 | Low | 16 | SEC-0036: Backup restore creates directory without mode restriction | backup.zig | CWE-276 / A05:2021 | backup.zig:256 | chmod 0o700 after makePath | Closed |
 
 ### Roadmap
 
-All quick-win and medium items are closed. Two strategic items remain deferred:
+All quick win and medium items have been closed. Only deferred items remain:
 
 **Deferred:**
-- SEC-0021: Add magic, version, and CRC32 integrity check to index catalog format (format change, own branch)
-- SEC-0022: Add maximum total_pages bound and validate before bitmap resize (policy decision needed)
+- SEC-0022: Add maximum total_pages bound and validate before bitmap resize (policy decision needed).
 
 ---
 
@@ -153,7 +156,7 @@ All quick-win and medium items are closed. Two strategic items remain deferred:
 
 ## SEC-0021: Index catalog no integrity check
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** Medium
 - **Risk Score:** 48 (Impact 3 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -161,11 +164,11 @@ All quick-win and medium items are closed. Two strategic items remain deferred:
 - **OWASP:** A08:2021 Software and Data Integrity Failures
 - **Exploit Surface:** Corrupted or tampered storage files
 - **Summary:** The index catalog format has no magic bytes, version field, or CRC. Corrupted or tampered catalog data is silently accepted.
-- **Evidence:** `index_catalog.zig:93-180` -- deserialization has no integrity validation.
+- **Evidence:** `index_catalog.zig:94-150` (saveToFile), `index_catalog.zig:153-181` (loadFromFile).
 - **Fix Guidance:** Add a magic header, version byte, and CRC32 checksum consistent with other on-disk formats in the project.
 - **Acceptance Criteria:** (1) Catalog with wrong magic/CRC returns error. (2) Valid catalogs round-trip correctly. (3) Format versioned for future changes.
 - **SLA:** 90 days (Medium)
-- **Deferral Reason:** Requires on-disk format change (magic + version + CRC header). Needs its own branch and coordinated format-spec.md update.
+- **Resolution:** `saveToFile` now writes 8-byte magic + 4-byte version + entries + CRC32 trailer. `loadFromFile` validates magic at bytes 0-7, computes CRC32 over all bytes except trailing 4, and returns `error.ChecksumMismatch` on mismatch. Format is versioned for forward compatibility.
 
 ## SEC-0022: Free space unbounded total_pages
 
@@ -377,3 +380,161 @@ All quick-win and medium items are closed. Two strategic items remain deferred:
 - **Status:** Won't Do
 - **Severity:** Low
 - **Resolution:** The user explicitly stated this is out of scope since CI/CD is managed downstream via GitLab orchestration. Image pinning will not be enforced at the repository level. Avoids unnecessary merge conflict overhead for security patches on tags.
+
+## SEC-0015: Residual Risk -- u24 write_count nonce exhaustion
+
+- **Status:** Closed (residual risk noted)
+- **Severity:** Medium (residual)
+- **Risk Score:** 24 (Impact 4 x Likelihood 1.5 x 4, rounded)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-323 (Reusing a Nonce, Key Pair in Encryption)
+- **OWASP:** A02:2021 Cryptographic Failures
+- **Exploit Surface:** Requires 16,777,215+ overwrites of a single page
+- **Summary:** The SEC-0015 fix uses a u24 write_count with saturating add (`+| 1`) at `pager.zig:81`. After 16,777,215 writes to a single page, the counter saturates and the nonce stops changing, re-enabling nonce reuse for that page. This is a long-horizon risk: normal workloads are unlikely to hit this limit, but a pathological write loop could reach it.
+- **Evidence:** `pager.zig:81` -- `const new_wc = current_wc +| 1;` saturates at `maxInt(u24)` = 16,777,215.
+- **How to Verify:** Write a test that sets write_count to `maxInt(u24) - 1`, performs two writes, and checks whether the nonce differs on the second write.
+- **Fix Guidance:** Monitor or log when write_count approaches saturation. Consider widening to u32 or implementing page re-keying when saturation is imminent.
+- **Acceptance Criteria:** Either (a) write_count is widened, or (b) saturation triggers an error/warning rather than silent nonce reuse.
+
+---
+
+## SEC-0029: Backup struct missing deinit - encryption key not zeroed
+
+- **Status:** Closed / Implemented
+- **Severity:** Medium
+- **Risk Score:** 36 (Impact 3 x Likelihood 3 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-316 (Cleartext Storage of Sensitive Information in Memory)
+- **OWASP:** A02:2021 Cryptographic Failures
+- **Exploit Surface:** Memory dump, core dump, or swap file access
+- **Summary:** The `Backup` struct stores an optional `[32]u8` encryption key at `backup.zig:79` but has no `deinit` method. SEC-0023 claimed this was fixed, but only `Recovery.deinit` was added; the `Backup` struct was missed. The key persists in memory after the Backup value goes out of scope.
+- **Evidence:** `backup.zig:75-88` -- `Backup` struct has `encryption_key: ?[32]u8` field, `init` and `initWithKey` methods, but no `deinit`. Grep for `fn deinit` in backup.zig returns no matches.
+- **Attack Scenario:** An attacker with access to a process memory dump (via core dump, swap, or memory forensics) can recover the encryption key from a Backup struct that was used but never zeroed.
+- **Fix Guidance:** Add `pub fn deinit(self: *Backup) void { if (self.encryption_key) |*key| { std.crypto.secureZero(u8, key); } }`. Ensure all callers invoke `deinit`.
+- **Acceptance Criteria:** (1) `Backup.deinit()` exists and zeros the key. (2) All call sites that create a Backup call `deinit` on cleanup paths. (3) Memory inspection after deinit shows zeroed key bytes.
+- **SLA:** 90 days (Medium)
+- **Resolution:** Added `Backup.deinit()` with `std.crypto.secureZero(u8, key)`. All call sites updated to invoke deinit on cleanup paths.
+- **Commit:** `6466226`
+
+## SEC-0030: FileManager.deinit does not zero encryption key or Pager key copies
+
+- **Status:** Closed / Implemented
+- **Severity:** Medium
+- **Risk Score:** 36 (Impact 3 x Likelihood 3 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-316 (Cleartext Storage of Sensitive Information in Memory)
+- **OWASP:** A02:2021 Cryptographic Failures
+- **Exploit Surface:** Memory dump, core dump, or swap file access
+- **Summary:** `FileManager` stores an encryption key at `file_manager.zig:32` and copies it into each `Pager`'s `PageEncryption` struct when opening files (line 70-73). `FileManager.deinit()` (lines 98-107) closes files and nulls pager slots but never calls `secureZero` on the `encryption_key` field and never calls `PageEncryption.deinit()` on each pager.
+- **Evidence:** `file_manager.zig:32` -- `encryption_key: ?[32]u8 = null`, `file_manager.zig:98-107` -- `deinit` only closes files and resets pager array to null.
+- **Attack Scenario:** Same as SEC-0029: memory forensics recovers key material from the FileManager and from each Pager's PageEncryption copy.
+- **Fix Guidance:** In `FileManager.deinit()`: (1) iterate pagers and call `PageEncryption.deinit()` on each active pager's encryption field before nulling, (2) call `std.crypto.secureZero(u8, &self.encryption_key.?)` if non-null.
+- **Acceptance Criteria:** (1) All key copies zeroed before deinit returns. (2) PageEncryption.deinit called for each pager. (3) Memory inspection after deinit shows zeroed bytes.
+- **SLA:** 90 days (Medium)
+- **Resolution:** Added `secureZero` for `encryption_key` field in `FileManager.deinit()`. Iterates pagers and calls `PageEncryption.deinit()` on each active pager before nulling.
+- **Commit:** `a9aefcf`
+
+## SEC-0031: unreachable in putProperty reachable with corrupt page chain
+
+- **Status:** Closed / Implemented
+- **Severity:** Medium
+- **Risk Score:** 36 (Impact 3 x Likelihood 3 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-617 (Reachable Assertion)
+- **OWASP:** A05:2021 Security Misconfiguration
+- **Exploit Surface:** Corrupted or tampered storage files
+- **Summary:** `putProperty` at `prop_store.zig:476` ends with `unreachable` after the `while (current_page != 0)` loop. If the page chain is circular (a corrupt `next_page` points back to an earlier page), the loop terminates incorrectly -- or in the non-circular but truncated case, falls through to `unreachable`. In `Debug`/`ReleaseSafe` mode this is a clean panic; in `ReleaseFast` it is undefined behavior.
+- **Evidence:** `prop_store.zig:476` -- `unreachable;` after the while loop in `putProperty`.
+- **Attack Scenario:** An attacker or corruption sets a page's `next_page` pointer to create a chain that terminates at 0 without finding space. The `unreachable` triggers a panic (DoS) or UB in release builds.
+- **Fix Guidance:** Replace `unreachable` with `return error.DataCorruption`. This converts a panic/UB into a recoverable error.
+- **Acceptance Criteria:** (1) Corrupt chain that exhausts without finding space returns `error.DataCorruption`. (2) Normal putProperty operations unaffected.
+- **SLA:** 90 days (Medium)
+- **Resolution:** Replaced `unreachable` at end of putProperty with `return error.DataCorruption`. Converts panic/UB into recoverable error.
+- **Commit:** `8026190`
+
+## SEC-0032: VarStore.read infinite loop on circular page chain
+
+- **Status:** Closed / Implemented
+- **Severity:** Medium
+- **Risk Score:** 48 (Impact 3 x Likelihood 4 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-835 (Loop with Unreachable Exit Condition)
+- **OWASP:** A05:2021 Security Misconfiguration
+- **Exploit Surface:** Corrupted or tampered storage files
+- **Summary:** `VarStore.read` at `var_store.zig:107-124` follows a page chain via `while (current_page != 0)` with no cycle detection and no iteration limit. A circular `next_page` pointer causes an infinite loop with unbounded memory allocation (`appendSlice` on every iteration) until OOM kills the process.
+- **Evidence:** `var_store.zig:107-124` -- `while (current_page != 0)` loop reads `next_page` from page data and appends chunk bytes. No visited-set or hop counter.
+- **Attack Scenario:** An attacker or disk corruption sets page A's next_page to page B, and page B's next_page back to page A. `VarStore.read` loops forever, allocating memory on each iteration until the process is killed by OOM.
+- **Fix Guidance:** Add either (a) a `std.AutoHashMap(PageId, void)` visited set, returning `error.DataCorruption` on revisit, or (b) a maximum iteration count (e.g., `max_pages = file_size / page_size`).
+- **Acceptance Criteria:** (1) Circular chain detected and returns error. (2) Normal multi-page reads unaffected. (3) Memory usage bounded.
+- **SLA:** 90 days (Medium)
+- **Resolution:** Added cycle detection with max-hop iteration limit to `VarStore.read` page chain traversal. Circular chains now return `error.DataCorruption` instead of looping.
+- **Commit:** `d403516`
+
+## SEC-0033: prop_store chain traversals have no cycle detection
+
+- **Status:** Closed / Implemented
+- **Severity:** Medium
+- **Risk Score:** 48 (Impact 3 x Likelihood 4 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-835 (Loop with Unreachable Exit Condition)
+- **OWASP:** A05:2021 Security Misconfiguration
+- **Exploit Surface:** Corrupted or tampered storage files
+- **Summary:** All four `while (current_page != 0)` chain traversals in `prop_store.zig` (lines 117, 317, 401, 485 -- used by `getProperty`, `putProperty`, the second `getProperty` variant, and `removeProperty`) follow `next_page` pointers without any cycle detection. A circular chain causes infinite loops.
+- **Evidence:** `prop_store.zig:117,317,401,485` -- four `while (current_page != 0)` loops, none with visited-set or iteration cap.
+- **Attack Scenario:** Same as SEC-0032 but affecting property operations. Any property read/write/delete on a node with a corrupt prop_head chain hangs the engine thread.
+- **Fix Guidance:** Introduce a shared helper `fn walkChain(...)` with an embedded hop counter or visited-set. Use it in all four traversal sites.
+- **Acceptance Criteria:** (1) All four traversals detect cycles. (2) Cycle returns `error.DataCorruption`. (3) Normal property chains unaffected. (4) No significant performance regression (iteration cap is O(1) overhead per hop).
+- **SLA:** 90 days (Medium)
+- **Resolution:** Added cycle detection to all four `while (current_page != 0)` chain traversals in prop_store.zig (getProperty, putProperty overflow, removeProperty, usedBytes paths). Returns `error.DataCorruption` on cycle detection.
+- **Commit:** `4947705`
+
+## SEC-0034: Recovery.deinit not called in engine.open
+
+- **Status:** Closed / Implemented
+- **Severity:** Low
+- **Risk Score:** 16 (Impact 2 x Likelihood 2 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-316 (Cleartext Storage of Sensitive Information in Memory)
+- **OWASP:** A02:2021 Cryptographic Failures
+- **Exploit Surface:** Memory dump, core dump, or swap file access
+- **Summary:** `Recovery.init` at `engine.zig:194` copies the encryption key into the Recovery struct. After `recovery.recover()` completes at line 195, `recovery.deinit()` is never called. The key copy on the stack is not zeroed and may persist in memory or be paged to swap.
+- **Evidence:** `engine.zig:194-195` -- `var recovery = Recovery.init(allocator, cfg.encryption_key);` followed by `self.manifest = try recovery.recover(...)` with no subsequent `recovery.deinit()`.
+- **Fix Guidance:** Add `defer recovery.deinit();` immediately after `Recovery.init`, or call `recovery.deinit()` after `recovery.recover()` returns.
+- **Acceptance Criteria:** (1) `recovery.deinit()` called after `recover()`. (2) Key copy zeroed before `open` returns.
+- **SLA:** 180 days (Low)
+- **Resolution:** Added `defer recovery.deinit()` immediately after `Recovery.init` in engine.open. Key copy zeroed before open returns.
+- **Commit:** `1b84738`
+
+## SEC-0035: Property key length not validated at API boundary
+
+- **Status:** Closed / Implemented
+- **Severity:** Low
+- **Risk Score:** 16 (Impact 2 x Likelihood 2 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-681 (Incorrect Conversion between Numeric Types)
+- **OWASP:** A03:2021 Injection
+- **Exploit Surface:** API caller passing key > 65535 bytes
+- **Summary:** `writePropertyEntry` at `prop_store.zig:549` casts `key.len` to `u16` via `@intCast`. If a caller passes a key longer than 65,535 bytes, this panics in safe mode or is UB in release mode. No validation exists at the public API boundary (`putProperty`).
+- **Evidence:** `prop_store.zig:549` -- `const key_len: u16 = @intCast(key.len);`
+- **Fix Guidance:** Add `if (key.len > std.math.maxInt(u16)) return error.PropertyKeyTooLong;` at the start of `putProperty` before calling `writePropertyEntry`.
+- **Acceptance Criteria:** (1) Keys > 65535 bytes return an error. (2) Normal-length keys unaffected.
+- **SLA:** 180 days (Low)
+- **Resolution:** Added `if (key.len > std.math.maxInt(u16)) return error.PropertyKeyTooLong` guard at putProperty API boundary.
+- **Commit:** `bd804f6`
+
+## SEC-0036: Backup restore creates target directory without mode restriction
+
+- **Status:** Closed / Implemented
+- **Severity:** Low
+- **Risk Score:** 16 (Impact 2 x Likelihood 2 x 4)
+- **Confidence:** `confidence::confirmed`
+- **CWE:** CWE-276 (Incorrect Default Permissions)
+- **OWASP:** A05:2021 Security Misconfiguration
+- **Exploit Surface:** Multi-user systems where the restore target path is predictable
+- **Summary:** `restoreBackup` at `backup.zig:256` calls `std.fs.cwd().makePath(target_dir)` which uses the system default umask for directory permissions. On a system with a permissive umask (e.g., 0o022), the restored graph directory is world-readable, potentially exposing encrypted database files.
+- **Evidence:** `backup.zig:256` -- `try std.fs.cwd().makePath(target_dir);` with no explicit mode.
+- **Fix Guidance:** After `makePath`, call `chmod(0o700)` on the target directory, or use a lower-level API that accepts a mode parameter. This is consistent with SEC-0011's fix for `createFile` permissions.
+- **Acceptance Criteria:** (1) Restored directory has 0o700 permissions. (2) Files within have 0o600 permissions (already enforced by SEC-0011).
+- **SLA:** 180 days (Low)
+- **Resolution:** Added `chmod(0o700)` on target directory after `makePath` in backup restore. Consistent with SEC-0011 file permission enforcement.
+- **Commit:** `123432f`

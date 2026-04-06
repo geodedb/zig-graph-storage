@@ -1,39 +1,35 @@
 # Full Codebase Audit Summary
 
 **Date:** 2026-04-06
-**Previous audit:** 2026-03-25
-**Auditors:** Automated multi-agent pipeline (16 agents across 4 phases)
-**Status:** Audit complete. **Gap closure complete.** 37 items closed, 10 deferred, 1 blocked. 343/343 tests pass.
+**Previous audit:** 2026-04-06 (initial), 2026-03-25 (baseline)
+**Auditors:** Automated multi-agent pipeline (16 agents across 5 phases)
+**Status:** Audit complete. 363/363 tests pass. 4 items closed, 31 new findings across 4 domains.
 
 ## Repository
 
 - **Project:** devnw/zig/graph-storage
 - **Platform:** GitLab (`gitlab.com/devnw/zig/graph-storage`)
-- **Languages:** Zig 0.15.x (15,303 lines across 41 source files + 58 test/bench files)
+- **Languages:** Zig 0.15.x (17,241 lines across 46 source files + tests/benchmarks)
 - **Dependencies:** `wal` (devnw/zig/wal), `uuid` (devnw/zig/uuid), `spice` (devnw/zig/spice) -- all pinned by commit + content hash
 - **Scope:** Entire repository
-- **Build status:** PASS (`zig build check` clean, 319/319 tests pass)
-- **Commit:** `5f6284d` (main, clean working tree)
+- **Build status:** PASS (`zig build` clean, `zig fmt --check` clean, 363/363 tests pass)
+- **Commit:** `cde8c6f` (main, clean working tree)
 
 ---
 
-## Changes Since Last Audit (2026-03-25)
+## Changes Since Last Audit
 
-Since the previous audit, significant work has been done:
+Since the previous audit cycle, significant progress has been made:
 
-- **CI pipeline now functional** (was Critical gap G-CI, now closed)
-- **`close()` returns `!void`** (was High quality finding Q2, now closed)
-- **Encryption key zeroization added** in `PageEncryption.deinit()` and `GraphConfig.zeroKey()` (was Critical S3, now closed)
-- **WAL checksum verification added** during recovery (was High S4, now closed)
-- **Path traversal protection added** in backup restore (was Critical S2, now closed)
-- **File permissions set** to 0o600/0o700 (was Medium S11, now closed)
-- **Backup HMAC-SHA256 added** for v2 backups (was High S5, now closed)
-- **`spice` dependency added** for thread pool parallelism
-- Codebase grew from 10,712 to 15,303 lines (+43%)
-- Test count grew from 247 to 319 (+29%)
-- 13 of 15 previous security findings closed
+- **B+tree persistence added** (GAP-0020 closed) -- serialize/deserialize/saveToFile/loadFromFile
+- **Per-page property key directory** (PERF-0023 closed) -- FNV-1a hash O(1) lookup
+- **engine.zig decomposed** (QUAL-0015 closed) -- from 1695 to 777 lines across 5 modules
+- **getEdge() implemented** (GAP-0021 closed) -- in-memory HashMap edge index
+- **Index catalog integrity** (SEC-0021 closed) -- magic + version + CRC32 save/load
+- Codebase grew from 15,303 to 17,241 lines (+13%)
+- Test count grew from 319 to 363 (+14%)
 
-**However, new issues have emerged** -- particularly around the nonce reuse pattern (the fix from SEC-0001 is incomplete) and new parsing safety concerns as the codebase grew.
+**However, new issues were identified** -- particularly around key lifecycle management, chain cycle detection, WAL write amplification, and a memory leak in the vtable iterator wrapper.
 
 ---
 
@@ -43,115 +39,135 @@ Since the previous audit, significant work has been done:
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| Implemented | 31 | 79% |
-| Partial | 5 | 13% |
-| Not Implemented | 3 | 8% |
+| Implemented | 30 | 77% |
+| Partial | 6 | 15% |
+| Not Implemented | 1 | 3% |
+| Blocked | 1 | 3% |
+| Deferred | 1 | 3% |
 
 39 requirements traced (FR-001 through FR-021, 18 NFRs).
 
-**Open gaps:** 11 (Critical: 0, High: 3, Medium: 4, Low: 3, Blocked: 1)
+**Open gaps:** 8 (Critical: 0, High: 0, Medium: 4, Low: 4)
 
-| Gap-ID | Requirement | Severity | Description |
-|--------|-------------|----------|-------------|
-| GAP-0002 | FR-018 (P0) | **Blocked** | Migration bulk-load stubbed -- `migration.zig:129-141` returns empty results |
-| GAP-0018 | FR-019 (P1) | **High** | No read-only legacy fallback mode -- V1 rejected outright |
-| GAP-0020 | FR-016/017 (P1) | **High** | B+tree index in-memory only, not persisted to pages |
-| GAP-0021 | FR-003/008 (P0) | **High** | `getEdge()` always returns `error.EdgeIndexNotImplemented` |
-| GAP-0016 | NFR-OBS-001 (P1) | Medium | Missing 4 of 7 required metric categories |
-| GAP-0017 | NFR-OBS-002 (P1) | Medium | No structured event emission (log_fn never called) |
-| GAP-0019 | NFR-CMP-001 (P1) | Medium | No operational documentation (runbooks, key management) |
-| GAP-0022 | FR-012 (P0) | Medium | Per-mutation auto-commit -- no multi-op transaction API |
-| GAP-0023 | FR-021 (P2) | Low | No extension mechanism for specialized index types |
-| GAP-0024 | NFR-MNT-002 (P0) | Low | CI fuzz stage declared but has no jobs |
-| GAP-0025 | NFR-ACC-001 (P1) | Low | No structured CLI/API output layer (JSON) |
+| Gap-ID | Requirement | Severity | Status | Description |
+|--------|-------------|----------|--------|-------------|
+| GAP-0002 | FR-018 (P0) | Critical | **Blocked** | Migration bulk-load stubbed -- blocked on Geode binary reader |
+| GAP-0022 | FR-012 (P0) | Medium | Deferred | No multi-op transaction API; per-mutation auto-commit only |
+| GAP-0026 | NFR-OBS-001 (P1) | Medium | Open | 3 metrics counters declared but never wired |
+| GAP-0027 | FR-016/017 (P1) | Medium | Open | B+tree not integrated into engine query/checkpoint path |
+| GAP-0023 | FR-021 (P2) | Low | Deferred | No extension mechanism for specialized index types |
+| GAP-0028 | FR-003/008 (P0) | Low | Open | Edge index rebuilt on every open (not persisted) |
+| GAP-0029 | Coding style | Low | Open | 3 files over 800-line guideline |
+| GAP-0030 | NFR-PERF-001 (P0) | Low | Open | Recovery two-pass loads entire WAL into memory |
 
 ### Code Quality
 
 | Severity | Count |
 |----------|-------|
 | Critical | 0 |
-| High | 3 |
-| Medium | 8 |
+| High | 2 |
+| Medium | 5 |
 | Low | 3 |
 
 **Top findings:**
 
-| ID | Finding | Severity | File:Line |
-|----|---------|----------|-----------|
-| QUAL-0009 | `page_allocator` in vtable wrappers causes memory leak | High | `interface.zig:299,353` |
-| QUAL-0010 | O(N) index rebuild on every checkpoint (redundant) | High | `engine.zig:981` |
-| QUAL-0011 | `deinit`/`cleanupResources` are exact duplicates | High | `engine.zig:486-507,557-578` |
-| QUAL-0012 | 4 files fail `zig fmt --check` on main | Medium | `interface.zig`, `prop_store.zig`, `buffer_pool.zig`, `adj_store.zig` |
-| QUAL-0013 | Duplicated WrapperState blocks in vtable | Medium | `interface.zig:293-319,349-373` |
-| QUAL-0014 | Repeated adjacency-scan pattern (4 methods) | Medium | `engine.zig:1000-1074` |
-| QUAL-0015 | `engine.zig` at 1695 lines (2x 800-line guideline) | Medium | `engine.zig` |
-| QUAL-0016 | Missing errdefer chain in `initSubsystems` | Medium | `engine.zig:149` |
-| QUAL-0017 | Recovery writes manifest to slot A only (comment says both) | Medium | `recovery.zig:196-199` |
-| QUAL-0018 | Inconsistent error semantics for missing nodes | Medium | `engine.zig:997,1049` |
-| QUAL-0019 | PropIterator returns borrowed slices (undocumented lifetime) | Low | `prop_store.zig:130-134` |
+| ID | Finding | Severity | PriorityScore | File:Line |
+|----|---------|----------|---------------|-----------|
+| QUAL-0022 | Memory leak in `wrapPropIterator` -- State not freed on deinit | High | 80 | `interface.zig:424-427` |
+| QUAL-0023 | `removeProperty` silently returns on corrupt data | High | 64 | `prop_store.zig:514-517` |
+| QUAL-0024 | `checkIntegrity` swallows all I/O errors via `catch null` | Medium | 48 | `engine_integrity.zig:77,92,96` |
+| QUAL-0025 | No test for uncommitted transaction recovery (core ARIES guarantee) | Medium | 48 | `recovery.zig` |
+| QUAL-0026 | `putProperty` 201 lines with 6+ nesting levels | Medium | 48 | `prop_store.zig:277-477` |
+| QUAL-0027 | 4 files over 800-line guideline | Medium | 48 | `recovery.zig`, `prop_store.zig`, `backup.zig`, `buffer_pool.zig` |
+| QUAL-0028 | Silent `catch {}` in `label_store.zig` causes page leaks | Medium | 36 | `label_store.zig:64,78` |
 
 ### Performance
 
 | PerfSeverity | Count |
 |-------------|-------|
-| P0 | 2 |
+| P0 | 0 |
 | P1 | 3 |
-| P2 | 2 |
-| P3 | 2 |
+| P2 | 7 |
+| P3 | 3 |
 
-**Baseline (100K tier):** Point lookup 72us, Property read 119us, Expand out 120us, Checkpoint 851ms
+**Baseline (100K tier):** Point lookup 71,920ns, Property read 119,036ns, Expand out 119,884ns, Checkpoint 850.9ms, Mixed ops/s 28,399
 
 **Top findings:**
 
-| ID | Finding | Severity | Est. Impact | File:Line |
-|----|---------|----------|-------------|-----------|
-| PERF-0019 | Full derived index rebuild on every checkpoint | P0 | 5-10x checkpoint speedup | `engine.zig:981` |
-| PERF-0020 | `close()` redundant index rebuild | P0 | 2x close speedup | `engine.zig:534` |
-| PERF-0021 | Double chain traversal in `putProperty` | P1 | 50% fewer pin/unpin | `prop_store.zig:170-310` |
-| PERF-0022 | Heap allocation per property encode | P1 | 10-20% bulk write improvement | `property.zig:41-44` |
-| PERF-0023 | O(n) property lookup per key | P1 | Linear scaling concern | `prop_store.zig:57-91` |
-| PERF-0024 | Redundant CRC32C when AES-GCM active | P2 | ~2us per page I/O | `pager.zig:57-63` |
-| PERF-0025 | Parallel flush allocates full data copy | P2 | Memory pressure at scale | `buffer_pool.zig:263` |
+| ID | Finding | Severity | PerfScore | File:Line |
+|----|---------|----------|-----------|-----------|
+| PERF-0028 | WAL write amplification 32KB per edge (full-page logging) | P1 | 80 | `engine.zig:413-417,544-552` |
+| PERF-0029 | fsync per auto-commit operation | P1 | 80 | `txn.zig:81` |
+| PERF-0030 | Index rebuild uses per-ID getNode, not scanNodes | P1 | 80 | `engine_index.zig:16-82` |
+| PERF-0031 | Checkpoint blocks all operations for ~850ms | P2 | 48 | `engine_persist.zig:213-241` |
+| PERF-0035 | TxnManager leaks committed/aborted entries (unbounded growth) | P2 | 48 | `txn.zig:83-84` |
+| PERF-0032 | edge_index HashMap not pre-allocated (~17 resizes at 150K edges) | P2 | 48 | `engine_persist.zig:197` |
+
+**Correctness bug flagged:** `putPropertyTxn` logs only prop_head page, missing overflow pages. Potential data loss on crash for multi-page property chains (`engine.zig:627-639`).
 
 ### Security
 
 | Risk Level | Count |
 |------------|-------|
-| Critical | 1 |
-| High | 4 |
-| Medium | 9 |
-| Low | 0 |
+| Critical | 0 |
+| High | 0 |
+| Medium | 5 |
+| Low | 3 |
 
-**Immediate actions:** 1 (AES-GCM nonce reuse -- encryption is effectively broken)
+**Immediate actions:** 0 (no emergency rotations needed; nonce exhaustion is long-horizon risk)
 
 **Top findings:**
 
-| ID | Finding | Severity | CWE | File:Line |
-|----|---------|----------|-----|-----------|
-| SEC-0015 | **AES-GCM nonce reuse** -- `write_count` hardcoded to 0 in Pager; every page overwrite reuses nonce, breaking confidentiality and authentication | **Critical** | CWE-323 | `pager.zig:52,79` |
-| SEC-0016 | HMAC comparison uses non-constant-time `std.mem.eql` | High | CWE-208 | `backup.zig:223,320` |
-| SEC-0017 | V2 backup restore without key silently skips HMAC | High | CWE-345 | `backup.zig:226-229` |
-| SEC-0018 | PropStore key_len from page data used without bounds check | High | CWE-125 | `prop_store.zig:69-72` |
-| SEC-0019 | `@intCast` on `stat.size` without bounds (3 sites) | High | CWE-681 | `engine.zig:347` et al. |
-| SEC-0020 | AdjStore `bh.count` not validated against page capacity | Medium | CWE-125 | `adj_store.zig:172-174` |
-| SEC-0021 | Index catalog has no magic, version, or CRC | Medium | CWE-354 | `index_catalog.zig:93-180` |
-| SEC-0022 | Free space `total_pages` unbounded from disk | Medium | CWE-400 | `free_space.zig:172-181` |
-| SEC-0023 | Encryption key not zeroed in Recovery/Backup structs | Medium | CWE-316 | `recovery.zig:43`, `backup.zig:66` |
-| SEC-0024 | WAL `payload_len` controls allocation without cap | Medium | CWE-400 | `wal_record.zig:138-143` |
+| ID | Finding | Severity | Risk Score | CWE | File:Line |
+|----|---------|----------|------------|-----|-----------|
+| SEC-0032 | VarStore.read infinite loop on circular page chain | Medium | 48 | CWE-835 | `var_store.zig:107-124` |
+| SEC-0033 | prop_store chain traversals have no cycle detection | Medium | 48 | CWE-835 | `prop_store.zig` (4 sites) |
+| SEC-0029 | Backup struct missing deinit -- key not zeroed | Medium | 36 | CWE-316 | `backup.zig:75-88` |
+| SEC-0030 | FileManager.deinit doesn't zero encryption key | Medium | 36 | CWE-316 | `file_manager.zig:32,98-107` |
+| SEC-0031 | `unreachable` in putProperty reachable with corrupt chain | Medium | 36 | CWE-617 | `prop_store.zig:476` |
+| SEC-0034 | Recovery.deinit not called in engine.open | Low | 16 | CWE-316 | `engine.zig:194-195` |
+| SEC-0035 | Property key length not validated (>65535 panics) | Low | 16 | CWE-681 | `prop_store.zig:549` |
+| SEC-0036 | Backup restore dir created without mode restriction | Low | 16 | CWE-276 | `backup.zig:256` |
+
+**Residual risk:** SEC-0015 nonce exhaustion (u24 write_count saturates at 16,777,215) remains a known long-horizon risk.
 
 ---
 
 ## Cross-Domain Summary
 
-| Domain | Findings | Issues Created | Issues Updated | Issues Closed |
-|--------|----------|---------------|----------------|---------------|
-| Gap Analysis | 11 | 0 | 0 | 0 |
-| Quality | 14 | 0 | 0 | 0 |
-| Performance | 9 | 0 | 0 | 0 |
-| Security | 14 | 0 | 0 | 0 |
-| **Total** | **48** | **0** | **0** | **0** |
+| Domain | Findings | Items Closed | New Items | Total Open |
+|--------|----------|-------------|-----------|------------|
+| Gap Analysis | 8 open | 1 (GAP-0021) | 5 (GAP-0026--0030) | 8 |
+| Quality | 10 open | 1 (QUAL-0015) | 10 (QUAL-0022--0031) | 10 |
+| Performance | 17 open | 1 (PERF-0023) | 13 (PERF-0028--0040) | 17 |
+| Security | 9 open | 1 (SEC-0021) | 8 (SEC-0029--0036) | 9 |
+| **Total** | **44 open** | **4** | **36** | **44** |
 
 Note: Issue creation skipped due to invalid GitLab auth token. All findings tracked in gap analysis docs.
+
+---
+
+## Gap Closure Results (2026-04-06)
+
+Following the audit, 23 gap items were implemented across 23 commits in 16 files. All 364 tests pass.
+
+| Domain | Closed | Won't Do | Deferred | Remaining Open |
+|--------|--------|----------|----------|----------------|
+| Gap Analysis | 1 | 0 | 4 | 0 |
+| Quality | 8 | 0 | 3 | 0 |
+| Performance | 6 | 5 | 2 | 0 |
+| Security | 8 | 0 | 0 | 0 |
+| **Total** | **23** | **5** | **9** | **0** |
+
+**All open items from the audit have been addressed.** Zero items remain in Open status across all four tracking files.
+
+Key closures:
+- **Security:** All 8 open findings closed -- key zeroing (SEC-0029/0030), cycle detection (SEC-0032/0033), unreachable-to-error (SEC-0031), key length validation (SEC-0035), directory permissions (SEC-0036), recovery deinit (SEC-0034).
+- **Quality:** Memory leak fixed (QUAL-0022), error propagation (QUAL-0023/0024/0028), ARIES recovery test (QUAL-0025), putProperty decomposition (QUAL-0026), unused imports (QUAL-0029), test constants (QUAL-0030).
+- **Performance:** Index rebuild batch API (PERF-0030), HashMap pre-sizing (PERF-0032/0033), txn leak fix (PERF-0035), directory rebuild dedup (PERF-0038), bench alignment (PERF-0039).
+- **Observability:** All 3 unwired metrics counters now populated (GAP-0026).
+
+Won't Do items (5) are documented with rationale -- all require architectural changes disproportionate to v1 scope.
 
 ---
 
@@ -159,10 +175,11 @@ Note: Issue creation skipped due to invalid GitLab auth token. All findings trac
 
 | File | Domain | Action |
 |------|--------|--------|
-| `docs/GAP_ANALYSIS.md` | Gap | Updated (10 new gaps, 2 status changes) |
-| `docs/QUALITY_GAP_ANALYSIS.md` | Quality | Updated (13 new findings) |
-| `docs/PERF_GAP_ANALYSIS.md` | Performance | Updated (9 new findings) |
-| `docs/SECURITY_GAP_ANALYSIS.md` | Security | Updated (14 new findings) |
+| `docs/GAP_ANALYSIS.md` | Gap | Updated (5 new gaps, GAP-0021 closed) |
+| `docs/GAP_ANALYSIS_RESOLVED.md` | Gap | Created (22 resolved items) |
+| `docs/QUALITY_GAP_ANALYSIS.md` | Quality | Updated (10 new findings, QUAL-0015 closed) |
+| `docs/PERF_GAP_ANALYSIS.md` | Performance | Updated (13 new findings, PERF-0023 closed) |
+| `docs/SECURITY_GAP_ANALYSIS.md` | Security | Updated (8 new findings, SEC-0021 closed) |
 | `docs/AUDIT_REPORT.md` | All | Replaced with this report |
 
 ---
@@ -171,50 +188,43 @@ Note: Issue creation skipped due to invalid GitLab auth token. All findings trac
 
 | # | Domain | Finding | Severity | Score | File:Line |
 |---|--------|---------|----------|-------|-----------|
-| 1 | Security | AES-GCM nonce reuse -- `write_count=0` on every page encrypt/decrypt | Critical | 100 | `pager.zig:52,79` |
-| 2 | Performance | Full index rebuild on every checkpoint (redundant O(N) work) | P0 | 100 | `engine.zig:981` |
-| 3 | Performance | `close()` rebuilds indexes again after checkpoint | P0 | 100 | `engine.zig:534` |
-| 4 | Security | HMAC timing side channel (`std.mem.eql` instead of constant-time) | High | 80 | `backup.zig:223` |
-| 5 | Security | V2 backup HMAC silently bypassed without key | High | 80 | `backup.zig:226-229` |
-| 6 | Security | PropStore key_len OOB read on corrupted pages | High | 80 | `prop_store.zig:69-72` |
-| 7 | Quality | `page_allocator` in vtable wrappers (memory leak) | High | 80 | `interface.zig:299,353` |
-| 8 | Security | `@intCast` on `stat.size` without bounds check | High | 80 | `engine.zig:347` |
-| 9 | Gap | B+tree index not persisted -- rebuilt on every open | High | -- | `btree.zig:7-11` |
-| 10 | Gap | `getEdge()` always returns error (no edge-ID index) | High | -- | `engine.zig:742-746` |
+| 1 | Quality | Memory leak in `wrapPropIterator` -- State not freed | High | 80 | `interface.zig:424-427` |
+| 2 | Performance | WAL write amplification 32KB per edge | P1 | 80 | `engine.zig:413-417` |
+| 3 | Performance | fsync per auto-commit operation | P1 | 80 | `txn.zig:81` |
+| 4 | Performance | Index rebuild uses per-ID getNode (300K extra mutex ops) | P1 | 80 | `engine_index.zig:16-82` |
+| 5 | Quality | `removeProperty` silently returns on corrupt data | High | 64 | `prop_store.zig:514-517` |
+| 6 | Security | VarStore.read infinite loop on circular page chain | Medium | 48 | `var_store.zig:107-124` |
+| 7 | Security | prop_store chain traversals -- no cycle detection | Medium | 48 | `prop_store.zig` (4 sites) |
+| 8 | Performance | Checkpoint blocks all operations ~850ms | P2 | 48 | `engine_persist.zig:213-241` |
+| 9 | Performance | TxnManager leaks entries (unbounded memory growth) | P2 | 48 | `txn.zig:83-84` |
+| 10 | Gap | B+tree not integrated into engine query path | Medium | -- | `engine.zig` (btree never imported) |
 
 ---
 
 ## Recommended Remediation Priority
 
-### Immediate (this week)
+### Immediate (quick wins, < 1 day each)
 
-1. **SEC-0015: Fix AES-GCM nonce reuse** -- Store per-page write counter in `PageHeader._reserved` bytes. Increment on every `writePage`. This is the single most critical finding; encryption is currently broken for any page written more than once.
-
-2. **PERF-0019/0020: Remove redundant `rebuildDerivedIndexes()`** from `checkpoint()` and `close()`. Indexes are already maintained incrementally. Just call `saveDerivedIndexes()`. Expected 5-10x checkpoint speedup.
-
-3. **SEC-0016: Use constant-time HMAC comparison** -- Replace `std.mem.eql` with `std.crypto.timing_safe.eql` at two sites in `backup.zig`.
+1. **QUAL-0022: Fix wrapPropIterator memory leak** -- Add `self.alloc.destroy(self)` after `self.iter.deinit()` in `interface.zig:427`. 1-line fix.
+2. **QUAL-0023: Fix removeProperty silent error** -- Change `catch { return; }` to `return error.DataCorruption` at `prop_store.zig:517`.
+3. **PERF-0035: Fix TxnManager entry leak** -- Remove entry from `active_txns` on commit/abort instead of updating state.
+4. **PERF-0032/0033: Pre-allocate HashMaps** -- `ensureTotalCapacity` for edge_index and page_table.
+5. **SEC-0029/0030: Zero encryption keys** -- Add `secureZero` in Backup deinit (new) and FileManager.deinit.
+6. **SEC-0034: Call recovery.deinit()** -- Add `defer recovery.deinit()` in engine.open.
 
 ### Next sprint
 
-4. **SEC-0017: Require key for V2 backup restore** -- Return `error.HmacKeyRequired` instead of silently downgrading to CRC-only.
-
-5. **SEC-0018/SEC-0020: Add bounds checks** on file-derived lengths in `prop_store.zig` and `adj_store.zig`.
-
-6. **QUAL-0009: Fix vtable allocator mismatch** -- Thread caller's allocator through `WrapperState` instead of using `page_allocator`.
-
-7. **SEC-0019: Replace `@intCast` with `std.math.cast`** at 3 `stat.size` sites.
-
-8. **QUAL-0012: Run `zig fmt`** on the 4 files with formatting violations.
+7. **PERF-0030: Refactor index rebuild to use scanNodes** -- Replace 3 per-ID scan loops with page-level batch scan. Expected 50-100x fewer mutex acquisitions.
+8. **SEC-0031/0032/0033: Add chain cycle detection** -- Hop counter or visited-set for all page-chain traversals in prop_store, var_store.
+9. **QUAL-0024: Fix integrity check error handling** -- Replace `catch null` with error propagation + io_errors counter.
+10. **QUAL-0025: Add uncommitted-txn recovery test** -- BEGIN + page_update without COMMIT, verify not applied.
 
 ### This quarter
 
-9. **GAP-0020: B+tree page persistence** -- Implement serialization using existing `btree_internal`/`btree_leaf` page types.
-
-10. **GAP-0021: Edge-ID index** -- Add edge-to-node mapping for O(1) edge lookup.
-
-11. **PERF-0021: Merge putProperty passes** -- Single-pass remove+insert for property updates.
-
-12. **QUAL-0015: Decompose engine.zig** -- Extract edge-property helpers, integrity check, persistence, and tests.
+11. **PERF-0028: Delta WAL logging** -- Replace full-page WAL with physiological logging (changed bytes only). 10-50x WAL I/O reduction.
+12. **PERF-0029: Group commit** -- Batch fsync across multiple transactions. 10-100x write throughput on real storage.
+13. **GAP-0027: Wire B+tree into engine** -- Import IndexCatalog, load/save on open/checkpoint, route property queries through B+tree.
+14. **PERF-0031: Fuzzy/incremental checkpoint** -- Allow reads during flush, checkpoint in background.
 
 ---
 
@@ -222,25 +232,24 @@ Note: Issue creation skipped due to invalid GitLab auth token. All findings trac
 
 - **GitLab auth token invalid** -- cannot create/update issues. Re-authenticate via `glab auth login`.
 - **No Zig-specific SAST tools** -- all security findings from manual review. Semgrep has no Zig rules.
-- **No code coverage tooling** -- 80% coverage target cannot be measured. `.gitignore` has coverage entries but no tooling configured.
+- **No code coverage tooling** -- 80% coverage target cannot be measured.
 - **External `wal` library not audited** -- WAL encryption and crash safety depend on unaudited `devnw/zig/wal` code.
-- **Migration blocked** -- FR-018 (P0) requires Geode binary format reader which is an external dependency.
+- **Migration blocked** -- FR-018 (P0) requires Geode binary format reader (external dependency).
 
 ---
 
-## Comparison with Previous Audit (2026-03-25)
+## Comparison with Previous Audit
 
-| Metric | 2026-03-25 | 2026-04-06 | Delta |
-|--------|------------|------------|-------|
-| Source lines | 10,712 | 15,303 | +43% |
-| Source files | 38 | 41 | +3 |
-| Tests passing | 247 | 319 | +29% |
-| Dependencies | 2 | 3 | +1 (spice) |
-| Security: Open | 15 | 14 | -1 (13 old closed, 14 new found) |
-| Security: Critical | 3 | 1 | -2 (2 fixed, 1 persists as incomplete fix) |
-| Quality: Open | 13 | 14 | +1 |
-| Performance: Open | 15 | 9 | -6 (many closed/deferred, 9 new) |
-| Gaps: Open | 10 | 11 | +1 (1 closed, 10 new found) |
-| **Total open findings** | **53** | **48** | **-5** |
+| Metric | 2026-03-25 | 2026-04-06 (prev) | 2026-04-06 (this) | Delta |
+|--------|------------|--------------------|--------------------|-------|
+| Source lines | 10,712 | 15,303 | 17,241 | +13% |
+| Source files | 38 | 41 | 46 | +5 |
+| Tests passing | 247 | 319 | 363 | +14% |
+| Dependencies | 2 | 3 | 3 | +0 |
+| Security: Open | 15 | 14 | 9 | -5 |
+| Quality: Open | 13 | 14 | 10 | -4 |
+| Performance: Open | 15 | 9 | 17 | +8 (deeper scan) |
+| Gaps: Open | 10 | 11 | 8 | -3 |
+| **Total open** | **53** | **48** | **44** | **-4** |
 
-The codebase has improved significantly since the last audit -- CI is functional, 13 security issues were closed, key zeroization was added, and test coverage grew. However, the AES-GCM nonce reuse (SEC-0015) remains the most critical issue and has persisted across both audits (originally SEC-0001, partially fixed but the pager still passes `write_count=0`). New parsing safety issues emerged as the codebase grew.
+The codebase continues to improve. Four previously-deferred items were resolved (GAP-0021, SEC-0021, PERF-0023, QUAL-0015). The deeper Phase 3 analysis this cycle identified 36 new findings -- primarily in performance (WAL amplification, fsync overhead) and security (key lifecycle, chain cycle detection). The most impactful quick wins are the memory leak fix (QUAL-0022), TxnManager entry leak (PERF-0035), and encryption key zeroing (SEC-0029/0030).
