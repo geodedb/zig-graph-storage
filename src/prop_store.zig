@@ -279,6 +279,7 @@ pub const PropStore = struct {
     ///
     /// PERF-0002: Combined find-and-remove pass reduces 3 chain traversals
     /// to at most 2 (find+remove in pass 1, insert in pass 2).
+    /// QUAL-0026: Decomposed into findAndRemoveKey + insertEntry helpers.
     pub fn putProperty(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
         if (key.len > std.math.maxInt(u16)) return error.PropertyKeyTooLong;
 
@@ -318,8 +319,28 @@ pub const PropStore = struct {
             return new_page;
         }
 
-        // Pass 1: Scan chain to find and remove existing key (combined find+remove).
-        // This replaces the separate getProperty + removeProperty calls.
+        // Pass 1: find and remove existing key. If the key is found and
+        // there is enough space on the same page, inserts immediately
+        // (PERF-0021 fast path) and returns the prop_head directly.
+        if (try self.findAndRemoveKey(prop_head, key, encoded_val, entry_size)) |head| {
+            return head;
+        }
+
+        // Pass 2: insert the new entry into the first page with space,
+        // allocating an overflow page if necessary.
+        return try self.insertEntry(prop_head, key, encoded_val, entry_size);
+    }
+
+    /// Pass 1: Scan the chain to find and remove an existing key.
+    /// Returns prop_head if the entry was removed and re-inserted on the
+    /// same page (PERF-0021 fast path), or null if Pass 2 is needed.
+    fn findAndRemoveKey(
+        self: *PropStore,
+        prop_head: u64,
+        key: []const u8,
+        encoded_val: []const u8,
+        entry_size: u32,
+    ) !?u64 {
         var current_page: PageId = prop_head;
         var chain_hops: u32 = 0;
         while (current_page != 0) : (chain_hops += 1) {
@@ -349,8 +370,7 @@ pub const PropStore = struct {
                 offset += @intCast(val_size);
 
                 if (std.mem.eql(u8, entry_key, key)) {
-                    // Found existing key: compact it out (same logic as removeProperty).
-                    // Scan remaining entries to find total used end.
+                    // Found existing key: compact it out.
                     var ri: u32 = i + 1;
                     var scan_end = offset;
                     while (ri < entry_count) : (ri += 1) {
@@ -372,16 +392,13 @@ pub const PropStore = struct {
 
                     entry_count -= 1;
 
-                    // PERF-0021: Check if freed space on this page is enough
-                    // for the new entry, avoiding a full Pass 2 rescan.
-                    // Account for directory overhead: entry_count entries + 1 new.
+                    // PERF-0021: Check if freed space is enough for the new entry.
                     const used_after_remove = new_end - PROP_DATA_OFFSET;
                     const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
                     const available = self.dataCapacity() -| (used_after_remove + new_dir_size);
                     if (available >= entry_size) {
                         self.writePropertyEntry(data, new_end, key, encoded_val);
                         writeEntryCount(data, entry_count + 1);
-                        // PERF-0023: Rebuild directory for this page.
                         rebuildDirectory(data, entry_count + 1, self.page_size);
                         self.buffer_pool.unpin(frame_idx, true);
                         return prop_head;
@@ -389,28 +406,36 @@ pub const PropStore = struct {
 
                     writeEntryCount(data, entry_count);
                     // PERF-0038/PERF-0023: Rebuild directory after removal.
-                    // Required because entry offsets shifted during compaction.
-                    // This is the only rebuild for this page; Pass 2 rebuilds
-                    // only the (different) insertion page.
                     rebuildDirectory(data, entry_count, self.page_size);
                     self.buffer_pool.unpin(frame_idx, true);
 
-                    // Key removed but page too full; fall through to pass 2 (insert)
-                    break;
+                    // Key removed but page too full; caller needs Pass 2.
+                    return null;
                 }
             } else {
-                // Didn't find key on this page, move to next
+                // Key not on this page, move to next.
                 self.buffer_pool.unpin(frame_idx, false);
                 current_page = next_page;
                 continue;
             }
-            // If we broke out of the inner loop (key found and removed), stop pass 1
-            break;
+            // Inner loop broke (key found and removed), stop Pass 1.
+            return null;
         }
+        // Key not found anywhere in chain; Pass 2 will insert.
+        return null;
+    }
 
-        // Pass 2: Find space and insert the new entry
-        current_page = prop_head;
-        chain_hops = 0;
+    /// Pass 2: Find space in the chain and insert the new entry.
+    /// Allocates an overflow page if no existing page has room.
+    fn insertEntry(
+        self: *PropStore,
+        prop_head: u64,
+        key: []const u8,
+        encoded_val: []const u8,
+        entry_size: u32,
+    ) !u64 {
+        var current_page: PageId = prop_head;
+        var chain_hops: u32 = 0;
         while (current_page != 0) : (chain_hops += 1) {
             if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
@@ -423,7 +448,7 @@ pub const PropStore = struct {
                 return error.DataCorruption;
             };
 
-            // Compute used space inline (avoids separate usedBytes rescan)
+            // Compute used space inline.
             var used: u32 = 0;
             {
                 var scan_off: u32 = PROP_DATA_OFFSET;
@@ -439,19 +464,15 @@ pub const PropStore = struct {
                 }
                 used = scan_off - PROP_DATA_OFFSET;
             }
-            // Account for directory: existing entries + 1 new dir entry.
             const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
             const available = self.dataCapacity() -| (used + new_dir_size);
 
             if (available >= entry_size) {
-                // Append here
                 const write_offset = PROP_DATA_OFFSET + used;
                 self.writePropertyEntry(data, write_offset, key, encoded_val);
                 writeEntryCount(data, entry_count + 1);
 
-                // PERF-0038: Append a single directory entry instead of
-                // rebuilding the entire directory. Existing entries on this
-                // page have not moved, only a new entry was appended.
+                // PERF-0038: Append a single directory entry.
                 const new_count: u16 = @intCast(entry_count + 1);
                 writeDirCount(data, new_count);
                 writeDirEntry(data, @intCast(entry_count), keyHash(key), @intCast(write_offset));
@@ -461,7 +482,7 @@ pub const PropStore = struct {
             }
 
             if (next_page == 0) {
-                // Allocate overflow page
+                // Allocate overflow page.
                 const new_page = try self.free_space.allocPage();
                 const new_frame = try self.buffer_pool.pinNew(.props, new_page);
                 const new_frame_idx = self.buffer_pool.frameIndex(new_frame);
@@ -471,13 +492,11 @@ pub const PropStore = struct {
                 writeEntryCount(new_data, 1);
                 self.writePropertyEntry(new_data, PROP_DATA_OFFSET, key, encoded_val);
 
-                // PERF-0023: Initialize directory on the new overflow page.
                 writeDirCount(new_data, 1);
                 writeDirEntry(new_data, 0, keyHash(key), PROP_DATA_OFFSET);
 
                 self.buffer_pool.unpin(new_frame_idx, true);
 
-                // Link from current page
                 writeNextPage(data, new_page);
                 self.buffer_pool.unpin(frame_idx, true);
                 return prop_head;
