@@ -84,7 +84,7 @@ fn printFooter() void {
 
 fn makeConfig() GraphConfig {
     return .{
-        .page_size = 4096,
+        .page_size = 8192,
         .buffer_pool_pages = 1024,
         .data_dir = "data",
     };
