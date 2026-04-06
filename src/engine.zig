@@ -749,7 +749,7 @@ pub const GraphEngine = struct {
 
     /// Drain an AdjEdgeIterator into a heap-allocated slice.
     fn drainEdgeIterator(iter: *AdjStore.AdjEdgeIterator, allocator: Allocator) anyerror![]EdgeEntry {
-        var list = std.ArrayList(EdgeEntry){};
+        var list = try std.ArrayList(EdgeEntry).initCapacity(allocator, 16);
         errdefer list.deinit(allocator);
         while (try iter.next()) |entry| {
             try list.append(allocator, entry);
