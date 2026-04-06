@@ -183,9 +183,20 @@ pub const PropStore = struct {
     /// PERF-0002: Combined find-and-remove pass reduces 3 chain traversals
     /// to at most 2 (find+remove in pass 1, insert in pass 2).
     pub fn putProperty(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
-        // Encode value up front (needed for size calculation)
-        const encoded_val = try property_mod.encode(self.buffer_pool.allocator, val);
-        defer self.buffer_pool.allocator.free(encoded_val);
+        // PERF-0022: Use a stack buffer for small fixed-size types to avoid
+        // heap allocation on every putProperty call.
+        var stack_buf: [32]u8 = undefined;
+        const size = property_mod.encodedSize(val);
+        var heap_alloc: ?[]const u8 = null;
+        const encoded_val: []const u8 = if (size <= stack_buf.len) blk: {
+            const n = property_mod.encodeInto(&stack_buf, val) catch unreachable;
+            break :blk stack_buf[0..n];
+        } else blk: {
+            const h = try property_mod.encode(self.buffer_pool.allocator, val);
+            heap_alloc = h;
+            break :blk h;
+        };
+        defer if (heap_alloc) |h| self.buffer_pool.allocator.free(h);
 
         const entry_size: u32 = 2 + @as(u32, @intCast(key.len)) + @as(u32, @intCast(encoded_val.len));
 

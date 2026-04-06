@@ -37,11 +37,13 @@ pub fn encodedSize(value: PropertyValue) usize {
     };
 }
 
-/// Encode a PropertyValue to a newly allocated byte slice. Caller owns the returned memory.
-pub fn encode(allocator: Allocator, value: PropertyValue) ![]u8 {
+/// Encode a PropertyValue into a caller-provided buffer.
+/// Returns the number of bytes written, or error.BufferTooSmall if the
+/// buffer is not large enough. Use `encodedSize` to determine the required
+/// buffer length before calling.
+pub fn encodeInto(buf: []u8, value: PropertyValue) error{BufferTooSmall}!usize {
     const size = encodedSize(value);
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
+    if (buf.len < size) return error.BufferTooSmall;
 
     switch (value) {
         .null => {
@@ -79,6 +81,15 @@ pub fn encode(allocator: Allocator, value: PropertyValue) ![]u8 {
         },
     }
 
+    return size;
+}
+
+/// Encode a PropertyValue to a newly allocated byte slice. Caller owns the returned memory.
+pub fn encode(allocator: Allocator, value: PropertyValue) ![]u8 {
+    const size = encodedSize(value);
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    _ = encodeInto(buf, value) catch unreachable; // size is pre-computed, cannot fail
     return buf;
 }
 
@@ -267,6 +278,44 @@ test "decode returns error on empty input" {
     const allocator = std.testing.allocator;
     const result = decode(allocator, &[_]u8{});
     try std.testing.expectError(error.UnexpectedEndOfInput, result);
+}
+
+test "encodeInto round-trip matches encode for all fixed types" {
+    const allocator = std.testing.allocator;
+    const values = [_]PropertyValue{
+        PropertyValue.null,
+        PropertyValue{ .bool = true },
+        PropertyValue{ .int = -42 },
+        PropertyValue{ .float = 2.718 },
+        PropertyValue{ .decimal = .{ .coeff = 999, .scale = 3 } },
+    };
+
+    for (values) |val| {
+        var buf: [32]u8 = undefined;
+        const n = try encodeInto(&buf, val);
+        const heap = try encode(allocator, val);
+        defer allocator.free(heap);
+        try std.testing.expectEqualSlices(u8, heap, buf[0..n]);
+    }
+}
+
+test "encodeInto returns BufferTooSmall for undersized buffer" {
+    var tiny: [1]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, encodeInto(&tiny, PropertyValue{ .int = 42 }));
+}
+
+test "encodeInto works for variable-length string" {
+    const allocator = std.testing.allocator;
+    const val = PropertyValue{ .string = "hello" };
+    const size = encodedSize(val);
+    const buf = try allocator.alloc(u8, size);
+    defer allocator.free(buf);
+    const n = try encodeInto(buf, val);
+    try std.testing.expectEqual(size, n);
+
+    const decoded = try decode(allocator, buf[0..n]);
+    defer freeDecoded(allocator, decoded.value);
+    try std.testing.expectEqualStrings("hello", decoded.value.string);
 }
 
 test {
