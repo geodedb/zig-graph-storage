@@ -9,6 +9,7 @@ const wal_mod = @import("wal.zig");
 const manifest_mod = @import("manifest.zig");
 const file_manager_mod = @import("file_manager.zig");
 const graph_dir_mod = @import("graph_dir.zig");
+const config_mod = @import("config.zig");
 
 const BufferPool = buffer_pool_mod.BufferPool;
 const WalManager = wal_mod.WalManager;
@@ -30,6 +31,8 @@ pub const Checkpointer = struct {
     allocator: Allocator,
     /// Which manifest slot was last written. Alternates each checkpoint.
     last_slot: GraphDir.ManifestSlot = .a,
+    /// Optional log callback for structured event emission.
+    log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
 
     pub fn init(
         allocator: Allocator,
@@ -51,6 +54,9 @@ pub const Checkpointer = struct {
 
     /// Run a checkpoint:
     pub fn doCheckpoint(self: *Checkpointer) !void {
+        config_mod.emitEvent(self.log_fn, .checkpoint_start);
+        errdefer config_mod.emitEvent(self.log_fn, .checkpoint_end);
+
         // 1. Record checkpoint LSN
         const checkpoint_lsn = self.wal.currentLsn();
 
@@ -82,6 +88,8 @@ pub const Checkpointer = struct {
         if (checkpoint_lsn > 0) {
             try self.wal.truncate(checkpoint_lsn);
         }
+
+        config_mod.emitEvent(self.log_fn, .checkpoint_end);
     }
 
     /// Check if checkpoint is needed based on WAL size.
@@ -273,6 +281,34 @@ test "needsCheckpoint returns correct value" {
 
     // With a low threshold it should now need a checkpoint
     try testing.expect(cp.needsCheckpoint(100));
+}
+
+var checkpoint_event_count: usize = 0;
+
+fn checkpointTestLogFn(_: config_mod.LogLevel, _: []const u8) void {
+    checkpoint_event_count += 1;
+}
+
+test "checkpoint emits start and end events via log_fn" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    env.fixup();
+
+    var cp = Checkpointer.init(
+        testing.allocator,
+        &env.buffer_pool,
+        &env.wal,
+        &env.manifest,
+        &env.file_manager,
+        &env.graph_dir,
+    );
+    cp.log_fn = &checkpointTestLogFn;
+
+    checkpoint_event_count = 0;
+    try cp.doCheckpoint();
+
+    // Expect checkpoint_start + checkpoint_end = 2 events
+    try testing.expectEqual(@as(usize, 2), checkpoint_event_count);
 }
 
 test {

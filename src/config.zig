@@ -5,6 +5,38 @@ const std = @import("std");
 
 pub const LogLevel = enum { debug, info, warn, err };
 
+/// Structured lifecycle event emitted through the config log_fn callback.
+pub const StorageEvent = enum {
+    checkpoint_start,
+    checkpoint_end,
+    recovery_start,
+    recovery_end,
+    backup_start,
+    backup_end,
+
+    /// Return a human-readable label for the event.
+    pub fn label(self: StorageEvent) []const u8 {
+        return switch (self) {
+            .checkpoint_start => "checkpoint_start",
+            .checkpoint_end => "checkpoint_end",
+            .recovery_start => "recovery_start",
+            .recovery_end => "recovery_end",
+            .backup_start => "backup_start",
+            .backup_end => "backup_end",
+        };
+    }
+};
+
+/// Helper to emit a storage event through the log callback if present.
+pub fn emitEvent(
+    log_fn: ?*const fn (level: LogLevel, msg: []const u8) void,
+    event: StorageEvent,
+) void {
+    if (log_fn) |f| {
+        f(.info, event.label());
+    }
+}
+
 pub const GraphConfig = struct {
     page_size: u32 = 8192,
     buffer_pool_pages: u32 = 1024,
@@ -141,6 +173,39 @@ test "zeroKey is safe to call when no key is set" {
     cfg.zeroKey();
 
     try std.testing.expectEqual(@as(?[32]u8, null), cfg.encryption_key);
+}
+
+test "StorageEvent labels are distinct and non-empty" {
+    const events = [_]StorageEvent{
+        .checkpoint_start,
+        .checkpoint_end,
+        .recovery_start,
+        .recovery_end,
+        .backup_start,
+        .backup_end,
+    };
+    for (events) |ev| {
+        try std.testing.expect(ev.label().len > 0);
+    }
+}
+
+var test_event_count: usize = 0;
+
+fn testLogFn(_: LogLevel, _: []const u8) void {
+    test_event_count += 1;
+}
+
+test "emitEvent invokes log_fn callback" {
+    test_event_count = 0;
+    const log: *const fn (level: LogLevel, msg: []const u8) void = &testLogFn;
+    emitEvent(log, .checkpoint_start);
+    emitEvent(log, .checkpoint_end);
+    try std.testing.expectEqual(@as(usize, 2), test_event_count);
+}
+
+test "emitEvent is safe with null log_fn" {
+    // Should not panic
+    emitEvent(null, .recovery_start);
 }
 
 test {

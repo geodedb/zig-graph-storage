@@ -13,6 +13,7 @@ const checkpoint_mod = @import("checkpoint.zig");
 const wal_record_mod = @import("wal_record.zig");
 const types = @import("types.zig");
 const metrics_mod = @import("metrics.zig");
+const config_mod = @import("config.zig");
 
 const BufferPool = buffer_pool_mod.BufferPool;
 const WalManager = wal_mod.WalManager;
@@ -44,6 +45,8 @@ pub const Recovery = struct {
     encryption_key: ?[32]u8 = null,
     /// Optional metrics sink for recording recovery_duration_ns.
     metrics: ?*metrics_mod.Metrics = null,
+    /// Optional log callback for structured event emission.
+    log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
@@ -78,6 +81,8 @@ pub const Recovery = struct {
         buffer_pool: *BufferPool,
         file_manager: *FileManager,
     ) !Manifest {
+        config_mod.emitEvent(self.log_fn, .recovery_start);
+
         var timer = std.time.Timer.start() catch null;
         defer {
             if (timer) |*t| {
@@ -86,6 +91,7 @@ pub const Recovery = struct {
                     m.recovery_duration_ns = elapsed_ns;
                 }
             }
+            config_mod.emitEvent(self.log_fn, .recovery_end);
         }
 
         // 1. Read manifest A and B, select valid one with highest counter
