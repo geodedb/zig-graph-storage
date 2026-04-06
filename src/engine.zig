@@ -1001,7 +1001,7 @@ pub const GraphEngine = struct {
 
         // 3. Write property, get new prop_head
         const new_head_u64 = try self.putProperty(@as(u64, found_prop_head), key, value);
-        const new_head: u32 = @intCast(new_head_u64 & 0xFFFFFFFF);
+        const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
 
         // 4. If prop_head changed, update BOTH adjacency copies
         if (new_head != found_prop_head) {
