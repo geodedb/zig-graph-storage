@@ -71,13 +71,13 @@ pub const WalManager = struct {
         if (needed <= STACK_BUF_SIZE) {
             // Fast path: use stack buffer, no heap allocation
             var buf: [STACK_BUF_SIZE]u8 = undefined;
-            const n = record.serializeInto(&buf) catch unreachable;
+            const n = try record.serializeInto(&buf);
             return try self.inner.append(buf[0..n]);
         } else {
             // Fallback: heap-allocate for very large payloads
             const buf = try self.allocator.alloc(u8, needed);
             defer self.allocator.free(buf);
-            const n = record.serializeInto(buf) catch unreachable;
+            const n = try record.serializeInto(buf);
             return try self.inner.append(buf[0..n]);
         }
     }
