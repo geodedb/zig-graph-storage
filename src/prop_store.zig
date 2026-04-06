@@ -275,6 +275,8 @@ pub const PropStore = struct {
     /// PERF-0002: Combined find-and-remove pass reduces 3 chain traversals
     /// to at most 2 (find+remove in pass 1, insert in pass 2).
     pub fn putProperty(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
+        if (key.len > std.math.maxInt(u16)) return error.PropertyKeyTooLong;
+
         // PERF-0022: Use a stack buffer for small fixed-size types to avoid
         // heap allocation on every putProperty call.
         var stack_buf: [32]u8 = undefined;
