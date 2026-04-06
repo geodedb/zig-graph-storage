@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Crc32 = std.hash.crc.Crc32Iscsi;
 
 /// Generic in-memory B+tree.
 ///
@@ -293,6 +294,137 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
         pub fn len(self: *const Self) usize {
             return self.count;
         }
+
+        // ====================================================================
+        // Snapshot serialization / deserialization
+        // ====================================================================
+
+        /// Flat binary format (all little-endian):
+        ///   [entry_count: u32]
+        ///   For each key-value pair (leaf-linked-list order):
+        ///     [key: @sizeOf(K) bytes] [value: @sizeOf(V) bytes]
+        pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
+            const entry_count: u32 = @intCast(self.count);
+            const header_size = @sizeOf(u32);
+            const entry_size = @sizeOf(K) + @sizeOf(V);
+            const total = header_size + @as(usize, entry_count) * entry_size;
+
+            const buf = try allocator.alloc(u8, total);
+            errdefer allocator.free(buf);
+
+            std.mem.writeInt(u32, buf[0..4], entry_count, .little);
+            var offset: usize = header_size;
+
+            // Walk leaf linked list from leftmost leaf.
+            var leaf: ?*Node = self.findLeftmostLeaf();
+            while (leaf) |cur| {
+                for (cur.keys.items, 0..) |key, i| {
+                    std.mem.writeInt(K, buf[offset..][0..@sizeOf(K)], key, .little);
+                    offset += @sizeOf(K);
+                    std.mem.writeInt(V, buf[offset..][0..@sizeOf(V)], cur.values.?.items[i], .little);
+                    offset += @sizeOf(V);
+                }
+                leaf = cur.next_leaf;
+            }
+
+            std.debug.assert(offset == total);
+            return buf;
+        }
+
+        /// Deserialize a tree from a buffer produced by `serialize`.
+        /// Entries are in sorted order so bulk-insert is efficient.
+        pub fn deserialize(allocator: Allocator, data: []const u8) !Self {
+            if (data.len < @sizeOf(u32)) return error.InvalidFormat;
+
+            const entry_count = std.mem.readInt(u32, data[0..4], .little);
+            const entry_size = @sizeOf(K) + @sizeOf(V);
+            const expected = @sizeOf(u32) + @as(usize, entry_count) * entry_size;
+            if (data.len != expected) return error.InvalidFormat;
+
+            var tree = Self.init(allocator);
+            errdefer tree.deinit();
+
+            var offset: usize = @sizeOf(u32);
+            var i: u32 = 0;
+            while (i < entry_count) : (i += 1) {
+                const key = std.mem.readInt(K, data[offset..][0..@sizeOf(K)], .little);
+                offset += @sizeOf(K);
+                const value = std.mem.readInt(V, data[offset..][0..@sizeOf(V)], .little);
+                offset += @sizeOf(V);
+                try tree.insert(key, value);
+            }
+
+            return tree;
+        }
+
+        /// Find the leftmost leaf by descending through first children.
+        fn findLeftmostLeaf(self: *const Self) ?*Node {
+            var node = self.root orelse return null;
+            while (!node.is_leaf) {
+                node = node.children.?.items[0];
+            }
+            return node;
+        }
+
+        // ====================================================================
+        // File-based snapshot persistence
+        // ====================================================================
+
+        pub const BTREE_SNAPSHOT_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'B', 'T', 'R', '0', '1' };
+        const BTREE_SNAPSHOT_VERSION: u32 = 1;
+
+        /// Save the tree to a file.
+        /// Format: [magic 8B] [version 4B] [serialized tree data] [CRC32 4B]
+        pub fn saveToFile(self: *const Self, allocator: Allocator, path: []const u8) !void {
+            const tree_data = try self.serialize(allocator);
+            defer allocator.free(tree_data);
+
+            const total_size = 8 + 4 + tree_data.len + 4;
+            const buf = try allocator.alloc(u8, total_size);
+            defer allocator.free(buf);
+
+            @memcpy(buf[0..8], &BTREE_SNAPSHOT_MAGIC);
+            std.mem.writeInt(u32, buf[8..12], BTREE_SNAPSHOT_VERSION, .little);
+            @memcpy(buf[12 .. 12 + tree_data.len], tree_data);
+
+            const crc = Crc32.hash(buf[0 .. total_size - 4]);
+            std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
+
+            const file = try std.fs.cwd().createFile(path, .{ .mode = 0o600 });
+            defer file.close();
+            try file.writeAll(buf);
+        }
+
+        /// Load a tree from a file written by `saveToFile`.
+        pub fn loadFromFile(allocator: Allocator, path: []const u8) !Self {
+            const file = try std.fs.cwd().openFile(path, .{});
+            defer file.close();
+
+            const stat = try file.stat();
+            const file_size: usize = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
+            if (file_size < 8 + 4 + 4 + 4) return error.InvalidFormat; // magic + version + min tree data + crc
+
+            const buf = try allocator.alloc(u8, file_size);
+            defer allocator.free(buf);
+
+            const bytes_read = try file.readAll(buf);
+            if (bytes_read != file_size) return error.UnexpectedEndOfFile;
+
+            // Verify magic
+            if (!std.mem.eql(u8, buf[0..8], &BTREE_SNAPSHOT_MAGIC)) return error.InvalidFormat;
+
+            // Verify version
+            const version = std.mem.readInt(u32, buf[8..12], .little);
+            if (version != BTREE_SNAPSHOT_VERSION) return error.InvalidFormat;
+
+            // Verify CRC
+            const stored_crc = std.mem.readInt(u32, buf[file_size - 4 ..][0..4], .little);
+            const computed_crc = Crc32.hash(buf[0 .. file_size - 4]);
+            if (stored_crc != computed_crc) return error.InvalidFormat;
+
+            // Deserialize tree data (between version and CRC)
+            return Self.deserialize(allocator, buf[12 .. file_size - 4]);
+        }
     };
 }
 
@@ -450,6 +582,188 @@ test "insert in reverse order with splits" {
     while (i < n) : (i += 1) {
         try testing.expectEqual(i, tree.search(i).?);
     }
+}
+
+// ============================================================================
+// Serialization / Deserialization Tests
+// ============================================================================
+
+test "serialize + deserialize — empty tree round-trips" {
+    const Tree = BPlusTree(u64, u64);
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+
+    const data = try tree.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var loaded = try Tree.deserialize(testing.allocator, data);
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(usize, 0), loaded.len());
+}
+
+test "serialize + deserialize — 100 entries round-trip" {
+    const Tree = BPlusTree(u64, u64);
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) {
+        try tree.insert(i, i * 7);
+    }
+
+    const data = try tree.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var loaded = try Tree.deserialize(testing.allocator, data);
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(usize, 100), loaded.len());
+    i = 0;
+    while (i < 100) : (i += 1) {
+        const v = loaded.search(i);
+        try testing.expect(v != null);
+        try testing.expectEqual(i * 7, v.?);
+    }
+}
+
+test "deserialized tree supports get and range scan" {
+    const Tree = BPlusTree(u64, u64);
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+
+    var i: u64 = 0;
+    while (i < 50) : (i += 1) {
+        try tree.insert(i, i + 1000);
+    }
+
+    const data = try tree.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var loaded = try Tree.deserialize(testing.allocator, data);
+    defer loaded.deinit();
+
+    // Point lookup
+    try testing.expectEqual(@as(u64, 1010), loaded.search(10).?);
+    try testing.expect(loaded.search(999) == null);
+
+    // Range scan
+    const result = try loaded.range(5, 9, testing.allocator);
+    defer testing.allocator.free(result);
+    try testing.expectEqual(@as(usize, 5), result.len);
+    for (result, 0..) |v, j| {
+        try testing.expectEqual(@as(u64, 1005 + j), v);
+    }
+}
+
+test "serialize + deserialize — large tree with splits" {
+    const Tree = BPlusTree(u64, u64);
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+
+    const n: u64 = Tree.ORDER * 4;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        try tree.insert(i, i * 3);
+    }
+
+    const data = try tree.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var loaded = try Tree.deserialize(testing.allocator, data);
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(usize, @intCast(n)), loaded.len());
+    i = 0;
+    while (i < n) : (i += 1) {
+        try testing.expectEqual(i * 3, loaded.search(i).?);
+    }
+}
+
+test "deserialize — invalid data returns error" {
+    const Tree = BPlusTree(u64, u64);
+    // Too short
+    try testing.expectError(error.InvalidFormat, Tree.deserialize(testing.allocator, &[_]u8{ 0, 0 }));
+
+    // Wrong length (claims 1 entry but no data)
+    var bad: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bad, 1, .little);
+    try testing.expectError(error.InvalidFormat, Tree.deserialize(testing.allocator, &bad));
+}
+
+// ============================================================================
+// File-based Snapshot Tests
+// ============================================================================
+
+test "saveToFile + loadFromFile — round-trip" {
+    const Tree = BPlusTree(u64, u64);
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+
+    var i: u64 = 0;
+    while (i < 75) : (i += 1) {
+        try tree.insert(i, i + 500);
+    }
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    const file_path = try std.fmt.allocPrint(testing.allocator, "{s}/btree.snap", .{path});
+    defer testing.allocator.free(file_path);
+
+    try tree.saveToFile(testing.allocator, file_path);
+
+    var loaded = try Tree.loadFromFile(testing.allocator, file_path);
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(usize, 75), loaded.len());
+    i = 0;
+    while (i < 75) : (i += 1) {
+        try testing.expectEqual(i + 500, loaded.search(i).?);
+    }
+}
+
+test "saveToFile + loadFromFile — empty tree round-trip" {
+    const Tree = BPlusTree(u64, u64);
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    const file_path = try std.fmt.allocPrint(testing.allocator, "{s}/btree_empty.snap", .{path});
+    defer testing.allocator.free(file_path);
+
+    try tree.saveToFile(testing.allocator, file_path);
+
+    var loaded = try Tree.loadFromFile(testing.allocator, file_path);
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(usize, 0), loaded.len());
+}
+
+test "loadFromFile — corrupted file returns error" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(path);
+    const file_path = try std.fmt.allocPrint(testing.allocator, "{s}/btree_bad.snap", .{path});
+    defer testing.allocator.free(file_path);
+
+    // Write garbage data
+    {
+        const file = try std.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+        try file.writeAll("this is not a valid snapshot file!!");
+    }
+
+    const Tree = BPlusTree(u64, u64);
+    try testing.expectError(error.InvalidFormat, Tree.loadFromFile(testing.allocator, file_path));
 }
 
 test {
