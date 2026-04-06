@@ -448,24 +448,36 @@ optionally indexes/catalog.bin.
 ### Label Index
 
 In-memory posting lists mapping `LabelId` to sorted `[]NodeId`. Rebuilt from
-the node store on startup. Used by `scanLabel()` for label-based node lookups.
+the node store on startup. Snapshots are persisted to `labels.idx` at
+checkpoint boundaries for faster warm restarts. Used by `scanLabel()` for
+label-based node lookups.
 
-### Property Index (B+tree)
+### PropertyChainIndex
 
-Optional secondary indexes on property values. The B+tree maps
-`hash(value)` to `NodeId` and supports exact-match and range queries.
+In-memory hash index that maps `(key_hash, value_hash)` pairs to sorted
+`[]NodeId` lists. Built by scanning the property store on startup. Used for
+fast exact-match property lookups without requiring a B+tree on disk.
+Snapshots are persisted to `props.idx` at checkpoint boundaries for faster
+warm restarts.
+
+### PropertyIndex (B+tree)
+
+Optional persistent secondary indexes on property values backed by the
+in-memory B+tree (`btree.zig`). Maps `hash(value)` to `NodeId` and supports
+exact-match and range queries.
 
 ```mermaid
 graph TD
     IC["IndexCatalog<br/>(persistent metadata)"]
     IC -->|"btree_property"| PI["PropertyIndex<br/>B+tree pages"]
-    IC -->|"label_posting"| LI["LabelIndex<br/>in-memory posting lists"]
+    IC -->|"chain_index"| PCI["PropertyChainIndex<br/>in-memory hash index"]
+    IC -->|"label_posting"| LI["LabelIndex<br/>in-memory posting lists<br/>+ snapshot persistence"]
 
     PI --> BT["BPlusTree<br/>internal + leaf pages"]
     BT --> Disk["btree_internal / btree_leaf<br/>page types on disk"]
 ```
 
-Index states: `building` → `active` → `inactive` / `failed`.
+Index states: `building` -> `active` -> `inactive` / `failed`.
 
 ---
 
@@ -483,7 +495,7 @@ Index states: `building` → `active` → `inactive` / `failed`.
 | WalManager (segmented WAL) | FR-011 (segmented WAL per graph) | storage-research.md §"WAL integration risks" |
 | TxnManager (real txn IDs) | FR-012 (transaction boundaries) | storage-research.md §"WAL integration risks" |
 | Checkpointer (incremental) | FR-013 (incremental checkpoint) | storage-research.md §"Checkpoint cost" |
-| LabelIndex + PropertyIndex | FR-018+ (index support) | storage-research.md §"LMDB COW B+tree" |
+| LabelIndex + PropertyChainIndex + PropertyIndex | FR-018+ (index support) | storage-research.md §"LMDB COW B+tree" |
 
 ---
 
