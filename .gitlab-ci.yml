@@ -29,6 +29,7 @@ stages:
   - build
   - test
   - fuzz
+  - performance
   - security
   - sbom
   - release
@@ -131,6 +132,26 @@ fuzz:
     paths:
       - zig-${ZIG_VERSION}/
       - .zig-cache/
+
+benchmark:
+  stage: performance
+  image: debian:bookworm-slim
+  needs: [test-unit]
+  before_script:
+    - *install-zig
+    - apt-get install -y make
+  script:
+    - make bench-compare
+  allow_failure: true
+  cache:
+    key: zig-${ZIG_VERSION}
+    paths:
+      - zig-${ZIG_VERSION}/
+      - .zig-cache/
+  artifacts:
+    paths:
+      - benchmarks/results/
+    expire_in: 30 days
 
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.
