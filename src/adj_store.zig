@@ -78,7 +78,7 @@ pub const AdjStore = struct {
         const frame = try self.buffer_pool.pin(self.file_id, head_page);
         const frame_idx = self.buffer_pool.frameIndex(frame);
         const data = frame.dataSlice();
-        var bh = self.readBlockHeader(data);
+        var bh = try self.readBlockHeader(data);
 
         if (bh.count < @as(u16, @intCast(self.entries_per_block))) {
             // Space in the head block -- insert here
@@ -121,7 +121,7 @@ pub const AdjStore = struct {
             const frame = try self.buffer_pool.pin(self.file_id, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
-            var bh = self.readBlockHeader(data);
+            var bh = try self.readBlockHeader(data);
 
             var i: u16 = 0;
             while (i < bh.count) : (i += 1) {
@@ -169,7 +169,7 @@ pub const AdjStore = struct {
 
                 const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
                 const data = frame.dataSlice();
-                const bh = self.store.readBlockHeader(data);
+                const bh = try self.store.readBlockHeader(data);
 
                 while (self.current_index < bh.count) {
                     const entry = self.store.readEntry(data, self.current_index);
@@ -215,7 +215,7 @@ pub const AdjStore = struct {
             const frame = try self.buffer_pool.pin(self.file_id, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
-            const bh = self.readBlockHeader(data);
+            const bh = try self.readBlockHeader(data);
 
             var i: u16 = 0;
             while (i < bh.count) : (i += 1) {
@@ -249,7 +249,7 @@ pub const AdjStore = struct {
             const frame = try self.buffer_pool.pin(self.file_id, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
-            const bh = self.readBlockHeader(data);
+            const bh = try self.readBlockHeader(data);
 
             count += bh.count;
             const next = bh.next_block;
@@ -270,10 +270,12 @@ pub const AdjStore = struct {
         return self.blockHeaderOffset() + BLOCK_HEADER_SIZE + @as(u32, slot) * ENTRY_SIZE;
     }
 
-    fn readBlockHeader(self: *const AdjStore, data: []u8) EdgeBlockHeader {
+    fn readBlockHeader(self: *const AdjStore, data: []u8) error{DataCorruption}!EdgeBlockHeader {
         const off = self.blockHeaderOffset();
         const bytes = data[off..][0..BLOCK_HEADER_SIZE];
-        return @bitCast(bytes.*);
+        const bh: EdgeBlockHeader = @bitCast(bytes.*);
+        if (bh.count > @as(u16, @intCast(self.entries_per_block))) return error.DataCorruption;
+        return bh;
     }
 
     fn writeBlockHeader(self: *const AdjStore, data: []u8, bh: EdgeBlockHeader) void {
