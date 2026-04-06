@@ -254,25 +254,33 @@ pub const GraphEngine = struct {
     fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]u8, cfg: GraphConfig, wal_start_lsn: u64) !void {
         // Free space managers for each store
         self.free_space_nodes = try FreeSpaceManager.init(allocator, &self.buffer_pool, .nodes);
+        errdefer self.free_space_nodes.deinit();
         self.free_space_adj_out = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_out);
+        errdefer self.free_space_adj_out.deinit();
         self.free_space_adj_in = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_in);
+        errdefer self.free_space_adj_in.deinit();
         self.free_space_props = try FreeSpaceManager.init(allocator, &self.buffer_pool, .props);
+        errdefer self.free_space_props.deinit();
         self.free_space_var = try FreeSpaceManager.init(allocator, &self.buffer_pool, .var_store);
+        errdefer self.free_space_var.deinit();
 
         // WAL directory + WalManager
         const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{self.graph_dir.path});
         defer allocator.free(wal_dir_path);
         try std.fs.cwd().makePath(wal_dir_path);
         self.wal_dir_handle = try std.fs.cwd().openDir(wal_dir_path, .{});
+        errdefer self.wal_dir_handle.close();
 
         self.wal = try WalManager.init(allocator, self.wal_dir_handle, graph_uuid, wal_start_lsn, .{
             .encryption_key = cfg.encryption_key,
         });
+        errdefer self.wal.deinit();
 
         // Transaction manager
         self.txn_manager = TxnManager.init(allocator, &self.wal, self.manifest.next_txn_id);
+        errdefer self.txn_manager.deinit();
 
-        // Data stores
+        // Data stores (non-fallible but clean up if a later init fails)
         self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);
         self.adj_out = AdjStore.init(&self.buffer_pool, &self.free_space_adj_out, .adj_out, cfg.page_size);
         self.adj_in = AdjStore.init(&self.buffer_pool, &self.free_space_adj_in, .adj_in, cfg.page_size);
@@ -281,9 +289,12 @@ pub const GraphEngine = struct {
 
         // Label dictionary, label store, and label index
         self.label_dict = LabelDictionary.init(allocator);
+        errdefer self.label_dict.deinit();
         self.label_store = LabelStore.init(&self.var_store);
         self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
+        errdefer self.label_index.deinit();
         self.property_index = PropertyChainIndex.init(allocator);
+        errdefer self.property_index.deinit();
 
         // Checkpointer
         self.checkpointer = Checkpointer.init(
@@ -344,11 +355,12 @@ pub const GraphEngine = struct {
         defer file.close();
 
         const stat = try file.stat();
-        const buf = try self.allocator.alloc(u8, @intCast(stat.size));
+        const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
+        const buf = try self.allocator.alloc(u8, file_size);
         defer self.allocator.free(buf);
 
         const bytes_read = try file.readAll(buf);
-        if (bytes_read != @as(usize, @intCast(stat.size))) return error.UnexpectedEof;
+        if (bytes_read != file_size) return error.UnexpectedEof;
 
         var offset: usize = 0;
         var managers = [_]*FreeSpaceManager{
@@ -484,26 +496,7 @@ pub const GraphEngine = struct {
 
     /// Clean up the graph engine and its storage resources.
     pub fn deinit(self: *GraphEngine) void {
-        self.thread_pool.deinit();
-        self.txn_manager.deinit();
-        self.wal.deinit();
-        self.wal_dir_handle.close();
-        self.free_space_nodes.deinit();
-        self.free_space_adj_out.deinit();
-        self.free_space_adj_in.deinit();
-        self.free_space_props.deinit();
-        self.free_space_var.deinit();
-        self.label_dict.deinit();
-        self.label_index.deinit();
-        self.property_index.deinit();
-        self.buffer_pool.deinit();
-        self.file_manager.deinit();
-        self.graph_dir.deinit();
-
-        // SEC-0003: Zero encryption key material before freeing memory
-        self.config.zeroKey();
-
-        self.allocator.destroy(self);
+        self.cleanupResources(self.allocator);
     }
 
     /// Close the engine (flush, checkpoint, close files).
@@ -527,11 +520,6 @@ pub const GraphEngine = struct {
 
         if (close_err == null) {
             self.saveFreeStore() catch |err| {
-                if (close_err == null) close_err = err;
-            };
-        }
-        if (close_err == null) {
-            self.rebuildDerivedIndexes() catch |err| {
                 if (close_err == null) close_err = err;
             };
         }
@@ -761,7 +749,7 @@ pub const GraphEngine = struct {
 
     /// Drain an AdjEdgeIterator into a heap-allocated slice.
     fn drainEdgeIterator(iter: *AdjStore.AdjEdgeIterator, allocator: Allocator) anyerror![]EdgeEntry {
-        var list = std.ArrayList(EdgeEntry){};
+        var list = try std.ArrayList(EdgeEntry).initCapacity(allocator, 16);
         errdefer list.deinit(allocator);
         while (try iter.next()) |entry| {
             try list.append(allocator, entry);
@@ -978,7 +966,6 @@ pub const GraphEngine = struct {
 
         // Persist free space bitmaps so freed pages survive restart.
         try self.saveFreeStore();
-        try self.rebuildDerivedIndexes();
         try self.saveDerivedIndexes();
         try self.saveLabelDictionary();
 
@@ -990,6 +977,19 @@ pub const GraphEngine = struct {
 
     // ── Edge property helpers ──────────────────────────────────────────
 
+    /// Scan the outgoing adjacency list of a node for a specific edge_id
+    /// and return its prop_head. Returns null if the edge was not found.
+    fn findEdgePropHead(self: *GraphEngine, from_out_head: u64, edge_id: EdgeId) anyerror!?u32 {
+        var iter = self.adj_out.expand(from_out_head, null);
+        defer iter.deinit();
+        while (try iter.next()) |entry| {
+            if (entry.edge_id == edge_id) {
+                return entry.prop_head;
+            }
+        }
+        return null;
+    }
+
     /// Set (or overwrite) a property on an edge identified by (from, to, edge_id).
     /// Updates the prop_head in both the outgoing and incoming adjacency lists.
     pub fn setEdgeProperty(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue) anyerror!void {
@@ -997,22 +997,11 @@ pub const GraphEngine = struct {
         const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
 
         // 2. Scan outgoing edges to find current prop_head for this edge_id
-        var iter = self.adj_out.expand(from_rec.out_head, null);
-        defer iter.deinit();
-        var found_prop_head: u32 = 0;
-        var found = false;
-        while (try iter.next()) |entry| {
-            if (entry.edge_id == edge_id) {
-                found_prop_head = entry.prop_head;
-                found = true;
-                break;
-            }
-        }
-        if (!found) return error.EdgeNotFound;
+        const found_prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return error.EdgeNotFound;
 
         // 3. Write property, get new prop_head
         const new_head_u64 = try self.putProperty(@as(u64, found_prop_head), key, value);
-        const new_head: u32 = @intCast(new_head_u64 & 0xFFFFFFFF);
+        const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
 
         // 4. If prop_head changed, update BOTH adjacency copies
         if (new_head != found_prop_head) {
@@ -1032,46 +1021,27 @@ pub const GraphEngine = struct {
     pub fn removeEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
         const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
 
-        var iter = self.adj_out.expand(from_rec.out_head, null);
-        defer iter.deinit();
-        while (try iter.next()) |entry| {
-            if (entry.edge_id == edge_id) {
-                if (entry.prop_head == 0) return; // no properties to remove
-                try self.removeProperty(@as(u64, entry.prop_head), key);
-                return;
-            }
-        }
-        return error.EdgeNotFound;
+        const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return error.EdgeNotFound;
+        if (prop_head == 0) return; // no properties to remove
+        try self.removeProperty(@as(u64, prop_head), key);
     }
 
     /// Read a single property from an edge.
     pub fn getEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
-        const from_rec = (try self.node_store.getNode(from)) orelse return null;
+        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
 
-        var iter = self.adj_out.expand(from_rec.out_head, null);
-        defer iter.deinit();
-        while (try iter.next()) |entry| {
-            if (entry.edge_id == edge_id) {
-                if (entry.prop_head == 0) return null;
-                return self.getProperty(@as(u64, entry.prop_head), key, allocator);
-            }
-        }
-        return null;
+        const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return null;
+        if (prop_head == 0) return null;
+        return self.getProperty(@as(u64, prop_head), key, allocator);
     }
 
     /// Return an iterator over all properties on an edge.
     pub fn getAllEdgeProperties(self: *GraphEngine, from: NodeId, edge_id: EdgeId) anyerror!?PropStore.PropIterator {
-        const from_rec = (try self.node_store.getNode(from)) orelse return null;
+        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
 
-        var iter = self.adj_out.expand(from_rec.out_head, null);
-        defer iter.deinit();
-        while (try iter.next()) |entry| {
-            if (entry.edge_id == edge_id) {
-                if (entry.prop_head == 0) return null;
-                return self.prop_store.getAllProperties(@as(u64, entry.prop_head));
-            }
-        }
-        return null;
+        const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return null;
+        if (prop_head == 0) return null;
+        return self.prop_store.getAllProperties(@as(u64, prop_head));
     }
 };
 
