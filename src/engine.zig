@@ -28,6 +28,7 @@ const label_store_mod = @import("label_store.zig");
 const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
+const engine_edge_props = @import("engine_edge_props.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -439,7 +440,7 @@ pub const GraphEngine = struct {
         }
     }
 
-    fn refreshPropertyChainIndex(self: *GraphEngine, prop_head: u64) !void {
+    pub fn refreshPropertyChainIndex(self: *GraphEngine, prop_head: u64) !void {
         if (prop_head == 0) {
             return;
         }
@@ -1073,78 +1074,22 @@ pub const GraphEngine = struct {
         self.metrics.checkpoints_completed += 1;
     }
 
-    // ── Edge property helpers ──────────────────────────────────────────
+    // ── Edge property helpers (delegated to engine_edge_props.zig) ─────
 
-    /// Scan the outgoing adjacency list of a node for a specific edge_id
-    /// and return its prop_head. Returns null if the edge was not found.
-    fn findEdgePropHead(self: *GraphEngine, from_out_head: u64, edge_id: EdgeId) anyerror!?u32 {
-        var iter = self.adj_out.expand(from_out_head, null);
-        defer iter.deinit();
-        while (try iter.next()) |entry| {
-            if (entry.edge_id == edge_id) {
-                return entry.prop_head;
-            }
-        }
-        return null;
-    }
-
-    /// Set (or overwrite) a property on an edge identified by (from, to, edge_id).
-    /// Updates the prop_head in both the outgoing and incoming adjacency lists.
     pub fn setEdgeProperty(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue) anyerror!void {
-        // 1. Look up source node to get out_head
-        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
-
-        // 2. Scan outgoing edges to find current prop_head for this edge_id
-        const found_prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return error.EdgeNotFound;
-
-        // 3. Write property, get new prop_head
-        const new_head_u64 = try self.putProperty(@as(u64, found_prop_head), key, value);
-        const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
-
-        // 4. If prop_head changed, update BOTH adjacency copies and edge index
-        if (new_head != found_prop_head) {
-            _ = try self.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head);
-            const to_rec = (try self.node_store.getNode(to)) orelse return error.NodeNotFound;
-            _ = try self.adj_in.updateEdgePropHead(to_rec.in_head, edge_id, new_head);
-
-            // Keep edge index prop_head in sync
-            if (self.edge_index.getPtr(edge_id)) |idx_entry| {
-                idx_entry.prop_head = new_head;
-            }
-        }
-
-        if (found_prop_head != 0 and found_prop_head != new_head) {
-            self.property_index.removeChain(found_prop_head);
-        }
-        try self.refreshPropertyChainIndex(new_head_u64);
+        return engine_edge_props.setEdgeProperty(self, from, to, edge_id, key, value);
     }
 
-    /// Remove a property from an edge. The removal is in-place so the prop_head
-    /// does not change.
     pub fn removeEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
-        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
-
-        const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return error.EdgeNotFound;
-        if (prop_head == 0) return; // no properties to remove
-        try self.removeProperty(@as(u64, prop_head), key);
+        return engine_edge_props.removeEdgeProperty(self, from, edge_id, key);
     }
 
-    /// Read a single property from an edge.
     pub fn getEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
-        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
-
-        const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return null;
-        if (prop_head == 0) return null;
-        return self.getProperty(@as(u64, prop_head), key, allocator);
+        return engine_edge_props.getEdgeProperty(self, from, edge_id, key, allocator);
     }
 
-    /// Return an iterator over all properties on an edge.
     pub fn getAllEdgeProperties(self: *GraphEngine, from: NodeId, edge_id: EdgeId) anyerror!?PropStore.PropIterator {
-        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
-
-        const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return null;
-        if (prop_head == 0) return null;
-        return self.prop_store.getAllProperties(@as(u64, prop_head));
+        return engine_edge_props.getAllEdgeProperties(self, from, edge_id);
     }
 };
 
