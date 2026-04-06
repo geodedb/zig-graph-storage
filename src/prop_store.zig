@@ -513,7 +513,7 @@ pub const PropStore = struct {
                 // Skip value bytes by encoded size (no heap alloc)
                 const val_size = encodedSizeFromBytes(data[offset..]) catch {
                     self.buffer_pool.unpin(frame_idx, false);
-                    return;
+                    return error.DataCorruption;
                 };
                 offset += @intCast(val_size);
 
