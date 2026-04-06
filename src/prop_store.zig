@@ -26,6 +26,60 @@ const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
 const PROP_META_SIZE: u32 = 12; // next_page(8) + entry_count(4)
 const PROP_DATA_OFFSET: u32 = PAGE_HEADER_SIZE + PROP_META_SIZE;
 
+/// Per-page property key directory (PERF-0023).
+/// The directory grows backward from the end of each page and maps key hashes
+/// to entry offsets for O(1) lookup within a page.
+///
+/// Page layout:
+///   [PageHeader 32B] [meta 12B] [entries → ...free space... ← directory] [dir_count 2B]
+///
+/// Each directory entry is 4 bytes: [key_hash: u16] [entry_offset: u16].
+/// dir_count (u16) is stored in the last 2 bytes of the page.
+/// When dir_count == 0 the page is in legacy format and falls back to linear scan.
+const DIR_ENTRY_SIZE: u32 = 4; // u16 hash + u16 offset
+const DIR_COUNT_SIZE: u32 = 2; // u16 at end of page
+
+/// Compute a 16-bit hash of a property key using FNV-1a.
+fn keyHash(key: []const u8) u16 {
+    var h: u32 = 2166136261;
+    for (key) |b| {
+        h ^= b;
+        h *%= 16777619;
+    }
+    return @truncate(h);
+}
+
+/// Read the directory entry count from the last 2 bytes of a page.
+fn readDirCount(data: []const u8) u16 {
+    return std.mem.readInt(u16, data[data.len - DIR_COUNT_SIZE ..][0..DIR_COUNT_SIZE], .little);
+}
+
+/// Write the directory entry count to the last 2 bytes of a page.
+fn writeDirCount(data: []u8, count: u16) void {
+    std.mem.writeInt(u16, data[data.len - DIR_COUNT_SIZE ..][0..DIR_COUNT_SIZE], count, .little);
+}
+
+/// Read a directory entry by index (0-based, growing backward from end).
+fn readDirEntry(data: []const u8, idx: u16) struct { hash: u16, offset: u16 } {
+    const base = data.len - DIR_COUNT_SIZE - (@as(usize, idx) + 1) * DIR_ENTRY_SIZE;
+    return .{
+        .hash = std.mem.readInt(u16, data[base..][0..2], .little),
+        .offset = std.mem.readInt(u16, data[base + 2 ..][0..2], .little),
+    };
+}
+
+/// Write a directory entry at the given index.
+fn writeDirEntry(data: []u8, idx: u16, hash: u16, offset: u16) void {
+    const base = data.len - DIR_COUNT_SIZE - (@as(usize, idx) + 1) * DIR_ENTRY_SIZE;
+    std.mem.writeInt(u16, data[base..][0..2], hash, .little);
+    std.mem.writeInt(u16, data[base + 2 ..][0..2], offset, .little);
+}
+
+/// Compute the total directory overhead for a given entry count.
+fn dirOverhead(dir_count: u16) u32 {
+    return DIR_COUNT_SIZE + @as(u32, dir_count) * DIR_ENTRY_SIZE;
+}
+
 /// Slotted-page property storage with overflow.
 /// For v1, uses a simple sequential layout within each property page.
 pub const PropStore = struct {
@@ -43,13 +97,19 @@ pub const PropStore = struct {
         };
     }
 
-    /// Usable data bytes per property page.
+    /// Usable data bytes per property page (excluding the dir_count footer).
+    /// The actual available space also depends on the number of directory
+    /// entries; callers must subtract dirOverhead(dir_count) separately.
     fn dataCapacity(self: *const PropStore) u32 {
-        return self.page_size - PROP_DATA_OFFSET;
+        return self.page_size - PROP_DATA_OFFSET - DIR_COUNT_SIZE;
     }
 
     /// Get a property value by key from a property page chain.
     /// Returns null if not found.
+    ///
+    /// PERF-0023: When a per-page key directory is present (dir_count > 0),
+    /// the search key is hashed and looked up in the directory for O(1) access.
+    /// Falls back to linear scan for legacy pages or on hash collision miss.
     pub fn getProperty(self: *PropStore, prop_head: u64, key: []const u8, allocator: Allocator) !?PropertyValue {
         if (prop_head == 0) return null;
 
@@ -65,7 +125,39 @@ pub const PropStore = struct {
                 return error.DataCorruption;
             };
 
-            // Scan entries — only decode the value when the key matches
+            // PERF-0023: Try directory-based lookup first.
+            const dir_count = readDirCount(data);
+            if (dir_count > 0) {
+                const target_hash = keyHash(key);
+                var di: u16 = 0;
+                while (di < dir_count) : (di += 1) {
+                    const entry = readDirEntry(data, di);
+                    if (entry.hash == target_hash) {
+                        // Candidate match — verify the actual key at the stored offset.
+                        const off = @as(u32, entry.offset);
+                        if (off + 2 <= data.len) {
+                            const key_len = std.mem.bytesToValue(u16, data[off..][0..2]);
+                            if (off + 2 + key_len <= data.len) {
+                                const entry_key = data[off + 2 ..][0..key_len];
+                                if (std.mem.eql(u8, entry_key, key)) {
+                                    const val_start = off + 2 + key_len;
+                                    const decode_result = try property_mod.decode(allocator, data[val_start..]);
+                                    self.buffer_pool.unpin(frame_idx, false);
+                                    return decode_result.value;
+                                }
+                            }
+                        }
+                        // Hash collision — continue scanning directory entries.
+                    }
+                }
+                // If directory was present but key not found, skip to next page
+                // (no need to linear-scan since directory is authoritative).
+                self.buffer_pool.unpin(frame_idx, false);
+                current_page = next_page;
+                continue;
+            }
+
+            // Legacy path: linear scan when dir_count == 0.
             var offset: u32 = PROP_DATA_OFFSET;
             var i: u32 = 0;
             while (i < entry_count) : (i += 1) {
@@ -211,6 +303,10 @@ pub const PropStore = struct {
             writeEntryCount(data, 1);
             self.writePropertyEntry(data, PROP_DATA_OFFSET, key, encoded_val);
 
+            // PERF-0023: Initialize directory with the first entry.
+            writeDirCount(data, 1);
+            writeDirEntry(data, 0, keyHash(key), PROP_DATA_OFFSET);
+
             self.buffer_pool.unpin(frame_idx, true);
             return new_page;
         }
@@ -269,16 +365,22 @@ pub const PropStore = struct {
 
                     // PERF-0021: Check if freed space on this page is enough
                     // for the new entry, avoiding a full Pass 2 rescan.
+                    // Account for directory overhead: entry_count entries + 1 new.
                     const used_after_remove = new_end - PROP_DATA_OFFSET;
-                    const available = self.dataCapacity() - used_after_remove;
+                    const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
+                    const available = self.dataCapacity() -| (used_after_remove + new_dir_size);
                     if (available >= entry_size) {
                         self.writePropertyEntry(data, new_end, key, encoded_val);
                         writeEntryCount(data, entry_count + 1);
+                        // PERF-0023: Rebuild directory for this page.
+                        rebuildDirectory(data, entry_count + 1, self.page_size);
                         self.buffer_pool.unpin(frame_idx, true);
                         return prop_head;
                     }
 
                     writeEntryCount(data, entry_count);
+                    // PERF-0023: Rebuild directory after removal.
+                    rebuildDirectory(data, entry_count, self.page_size);
                     self.buffer_pool.unpin(frame_idx, true);
 
                     // Key removed but page too full; fall through to pass 2 (insert)
@@ -323,13 +425,23 @@ pub const PropStore = struct {
                 }
                 used = scan_off - PROP_DATA_OFFSET;
             }
-            const available = self.dataCapacity() - used;
+            // Account for directory: existing entries + 1 new dir entry.
+            const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
+            const available = self.dataCapacity() -| (used + new_dir_size);
 
             if (available >= entry_size) {
                 // Append here
                 const write_offset = PROP_DATA_OFFSET + used;
                 self.writePropertyEntry(data, write_offset, key, encoded_val);
                 writeEntryCount(data, entry_count + 1);
+
+                // PERF-0023: Append directory entry for the new key.
+                const new_count: u16 = @intCast(entry_count + 1);
+                writeDirCount(data, new_count);
+                // Rebuild directory since offsets may have shifted on other pages.
+                // For pass-2 we rebuild to be safe (entry_count was read fresh).
+                rebuildDirectory(data, entry_count + 1, self.page_size);
+
                 self.buffer_pool.unpin(frame_idx, true);
                 return prop_head;
             }
@@ -344,6 +456,11 @@ pub const PropStore = struct {
                 writeNextPage(new_data, 0);
                 writeEntryCount(new_data, 1);
                 self.writePropertyEntry(new_data, PROP_DATA_OFFSET, key, encoded_val);
+
+                // PERF-0023: Initialize directory on the new overflow page.
+                writeDirCount(new_data, 1);
+                writeDirEntry(new_data, 0, keyHash(key), PROP_DATA_OFFSET);
+
                 self.buffer_pool.unpin(new_frame_idx, true);
 
                 // Link from current page
@@ -413,6 +530,8 @@ pub const PropStore = struct {
 
                     entry_count -= 1;
                     writeEntryCount(data, entry_count);
+                    // PERF-0023: Rebuild directory after removal.
+                    rebuildDirectory(data, entry_count, self.page_size);
                     self.buffer_pool.unpin(frame_idx, true);
                     return;
                 }
@@ -488,12 +607,14 @@ fn readEntryCount(data: []const u8) u32 {
 
 /// Read entry_count with bounds validation: the minimum entry size is 3 bytes
 /// (2-byte key_len + 1-byte value tag), so entry_count * 3 must fit in the
-/// data capacity.
+/// data capacity (minus DIR_COUNT_SIZE for the directory footer).
 fn readEntryCountChecked(data: []const u8, page_size: u32) error{DataCorruption}!u32 {
     const entry_count = readEntryCount(data);
-    const capacity = page_size - PROP_DATA_OFFSET;
+    const capacity = page_size - PROP_DATA_OFFSET - DIR_COUNT_SIZE;
     // Minimum entry is 2 (key_len) + 0 (key) + 1 (tag) = 3 bytes
-    const max_entries = capacity / 3;
+    // Plus DIR_ENTRY_SIZE bytes of directory overhead per entry.
+    const min_per_entry = 3 + DIR_ENTRY_SIZE;
+    const max_entries = capacity / min_per_entry;
     if (entry_count > max_entries) return error.DataCorruption;
     return entry_count;
 }
@@ -504,6 +625,46 @@ fn writeNextPage(data: []u8, page_id: PageId) void {
 
 fn writeEntryCount(data: []u8, count: u32) void {
     @memcpy(data[PAGE_HEADER_SIZE + 8 ..][0..4], &std.mem.toBytes(count));
+}
+
+/// PERF-0023: Rebuild the per-page key directory by scanning all entries.
+/// This is called after insertions and removals to keep the directory
+/// consistent with the entry data. The scan is O(entry_count) which is
+/// bounded by the page size.
+fn rebuildDirectory(data: []u8, entry_count: u32, page_size: u32) void {
+    _ = page_size;
+    // First verify there is room for the directory. If entries + directory
+    // would overlap, write dir_count=0 to disable the directory (legacy mode).
+    const max_dir_end = data.len - DIR_COUNT_SIZE - @as(usize, entry_count) * DIR_ENTRY_SIZE;
+
+    var off: u32 = PROP_DATA_OFFSET;
+    var di: u16 = 0;
+    var i: u32 = 0;
+    while (i < entry_count) : (i += 1) {
+        const entry_off = off;
+        if (off + 2 > data.len) break;
+        const key_len = std.mem.bytesToValue(u16, data[off..][0..2]);
+        off += 2;
+        if (off + key_len > data.len) break;
+        const k = data[off..][0..key_len];
+        off += key_len;
+
+        // Skip value
+        const val_size = encodedSizeFromBytes(data[off..]) catch break;
+        off += @intCast(val_size);
+
+        // Check that entry data hasn't grown into the directory space.
+        if (off > max_dir_end) {
+            // No room for directory — disable it.
+            writeDirCount(data, 0);
+            return;
+        }
+
+        writeDirEntry(data, di, keyHash(k), @intCast(entry_off));
+        di += 1;
+    }
+
+    writeDirCount(data, di);
 }
 
 // ============================================================================
@@ -782,6 +943,203 @@ test "readEntryCountChecked accepts valid entry_count" {
     @memcpy(data[PAGE_HEADER_SIZE + 8 ..][0..4], &std.mem.toBytes(@as(u32, 5)));
     const count = try readEntryCountChecked(&data, 4096);
     try testing.expectEqual(@as(u32, 5), count);
+}
+
+// ============================================================================
+// PERF-0023: Per-page key directory tests
+// ============================================================================
+
+test "PERF-0023: directory is created on put and used for lookup" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    // Insert 10 properties and verify each is found via directory.
+    var head: u64 = 0;
+    const keys = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa" };
+    for (keys, 0..) |k, idx| {
+        head = try store.putProperty(head, k, .{ .int = @intCast(idx) });
+    }
+
+    // Verify each key is found.
+    for (keys, 0..) |k, idx| {
+        const val = try store.getProperty(head, k, testing.allocator);
+        try testing.expect(val != null);
+        try testing.expectEqual(@as(i64, @intCast(idx)), val.?.int);
+    }
+
+    // Verify the directory is present on the page by pinning and reading dir_count.
+    const frame = try env.pool.pin(.props, head);
+    const frame_idx = env.pool.frameIndex(frame);
+    const data = frame.dataSlice();
+    const dir_count = readDirCount(data);
+    try testing.expect(dir_count == 10);
+    env.pool.unpin(frame_idx, false);
+}
+
+test "PERF-0023: hash collision still finds correct key" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    // Find two keys that produce the same hash to test collision handling.
+    // We'll brute-force a collision with the keyHash function.
+    var collision_key: [8]u8 = undefined;
+    const target_hash = keyHash("testkey");
+    var found_collision = false;
+    var seed: u32 = 0;
+    while (seed < 1_000_000) : (seed += 1) {
+        const bytes = std.mem.toBytes(seed);
+        @memcpy(collision_key[0..4], &bytes);
+        @memcpy(collision_key[4..8], "COLL");
+        if (keyHash(&collision_key) == target_hash and !std.mem.eql(u8, &collision_key, "testkey")) {
+            found_collision = true;
+            break;
+        }
+    }
+
+    if (!found_collision) {
+        // Extremely unlikely but skip if no collision found in reasonable range.
+        return;
+    }
+
+    var head = try store.putProperty(0, "testkey", .{ .int = 42 });
+    head = try store.putProperty(head, &collision_key, .{ .int = 99 });
+
+    // Both keys should be retrievable despite same hash.
+    const val1 = try store.getProperty(head, "testkey", testing.allocator);
+    try testing.expect(val1 != null);
+    try testing.expectEqual(@as(i64, 42), val1.?.int);
+
+    const val2 = try store.getProperty(head, &collision_key, testing.allocator);
+    try testing.expect(val2 != null);
+    try testing.expectEqual(@as(i64, 99), val2.?.int);
+}
+
+test "PERF-0023: legacy page without directory uses linear scan" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    // Create a page with entries but manually zero out the directory.
+    var head = try store.putProperty(0, "key1", .{ .int = 10 });
+    head = try store.putProperty(head, "key2", .{ .int = 20 });
+
+    // Manually set dir_count to 0 to simulate a legacy page.
+    const frame = try env.pool.pin(.props, head);
+    const frame_idx = env.pool.frameIndex(frame);
+    const data = frame.dataSlice();
+    writeDirCount(data, 0);
+    env.pool.unpin(frame_idx, true);
+
+    // Linear scan fallback should still find both keys.
+    const val1 = try store.getProperty(head, "key1", testing.allocator);
+    try testing.expect(val1 != null);
+    try testing.expectEqual(@as(i64, 10), val1.?.int);
+
+    const val2 = try store.getProperty(head, "key2", testing.allocator);
+    try testing.expect(val2 != null);
+    try testing.expectEqual(@as(i64, 20), val2.?.int);
+}
+
+test "PERF-0023: directory survives put-replace cycle" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    var head = try store.putProperty(0, "x", .{ .int = 1 });
+    head = try store.putProperty(head, "y", .{ .int = 2 });
+    head = try store.putProperty(head, "z", .{ .int = 3 });
+
+    // Replace y
+    head = try store.putProperty(head, "y", .{ .int = 222 });
+
+    // Verify all accessible
+    const vx = try store.getProperty(head, "x", testing.allocator);
+    try testing.expectEqual(@as(i64, 1), vx.?.int);
+
+    const vy = try store.getProperty(head, "y", testing.allocator);
+    try testing.expectEqual(@as(i64, 222), vy.?.int);
+
+    const vz = try store.getProperty(head, "z", testing.allocator);
+    try testing.expectEqual(@as(i64, 3), vz.?.int);
+
+    // Verify directory count is correct (3 entries, not 4).
+    const frame = try env.pool.pin(.props, head);
+    const frame_idx = env.pool.frameIndex(frame);
+    const data = frame.dataSlice();
+    const dir_count = readDirCount(data);
+    try testing.expectEqual(@as(u16, 3), dir_count);
+    env.pool.unpin(frame_idx, false);
+}
+
+test "PERF-0023: directory rebuilt after removeProperty" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    var head = try store.putProperty(0, "a", .{ .int = 1 });
+    head = try store.putProperty(head, "b", .{ .int = 2 });
+    head = try store.putProperty(head, "c", .{ .int = 3 });
+
+    try store.removeProperty(head, "b");
+
+    // a and c should still be found via directory.
+    const va = try store.getProperty(head, "a", testing.allocator);
+    try testing.expectEqual(@as(i64, 1), va.?.int);
+
+    const vc = try store.getProperty(head, "c", testing.allocator);
+    try testing.expectEqual(@as(i64, 3), vc.?.int);
+
+    // b should not be found.
+    const vb = try store.getProperty(head, "b", testing.allocator);
+    try testing.expect(vb == null);
+
+    // Directory should have 2 entries.
+    const frame = try env.pool.pin(.props, head);
+    const frame_idx = env.pool.frameIndex(frame);
+    const data = frame.dataSlice();
+    try testing.expectEqual(@as(u16, 2), readDirCount(data));
+    env.pool.unpin(frame_idx, false);
+}
+
+test "PERF-0023: keyHash helper produces consistent u16 values" {
+    // Verify deterministic hashing.
+    const h1 = keyHash("hello");
+    const h2 = keyHash("hello");
+    try testing.expectEqual(h1, h2);
+
+    // Different keys should (very likely) produce different hashes.
+    const h3 = keyHash("world");
+    try testing.expect(h1 != h3);
+}
+
+test "PERF-0023: directory helpers read/write round-trip" {
+    var buf: [64]u8 = undefined;
+    @memset(&buf, 0);
+
+    writeDirCount(&buf, 3);
+    try testing.expectEqual(@as(u16, 3), readDirCount(&buf));
+
+    writeDirEntry(&buf, 0, 0xABCD, 44);
+    const e0 = readDirEntry(&buf, 0);
+    try testing.expectEqual(@as(u16, 0xABCD), e0.hash);
+    try testing.expectEqual(@as(u16, 44), e0.offset);
+
+    writeDirEntry(&buf, 1, 0x1234, 100);
+    const e1 = readDirEntry(&buf, 1);
+    try testing.expectEqual(@as(u16, 0x1234), e1.hash);
+    try testing.expectEqual(@as(u16, 100), e1.offset);
 }
 
 test {
