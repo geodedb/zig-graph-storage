@@ -12,6 +12,7 @@ const graph_dir_mod = @import("graph_dir.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const wal_record_mod = @import("wal_record.zig");
 const types = @import("types.zig");
+const metrics_mod = @import("metrics.zig");
 
 const BufferPool = buffer_pool_mod.BufferPool;
 const WalManager = wal_mod.WalManager;
@@ -41,6 +42,8 @@ pub const Recovery = struct {
     skipped_checksum_failures: u64 = 0,
     /// Encryption key for WAL access. Must match the key used when writing.
     encryption_key: ?[32]u8 = null,
+    /// Optional metrics sink for recording recovery_duration_ns.
+    metrics: ?*metrics_mod.Metrics = null,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
@@ -75,6 +78,16 @@ pub const Recovery = struct {
         buffer_pool: *BufferPool,
         file_manager: *FileManager,
     ) !Manifest {
+        var timer = std.time.Timer.start() catch null;
+        defer {
+            if (timer) |*t| {
+                const elapsed_ns: u64 = t.read();
+                if (self.metrics) |m| {
+                    m.recovery_duration_ns = elapsed_ns;
+                }
+            }
+        }
+
         // 1. Read manifest A and B, select valid one with highest counter
         const path_a = try graph_dir.manifestPath(self.allocator, .a);
         defer self.allocator.free(path_a);
@@ -1043,6 +1056,42 @@ test "recovery writes manifest to both slots A and B" {
     // Both manifests should have the same counter
     try testing.expectEqual(manifest_a.counter, manifest_b.counter);
     try testing.expectEqual(manifest_a.last_checkpoint_lsn, manifest_b.last_checkpoint_lsn);
+}
+
+test "recovery records duration in metrics when wired" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write an initial manifest to slot A
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .next_node_id = 10,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var m = metrics_mod.Metrics{};
+    try testing.expectEqual(@as(u64, 0), m.recovery_duration_ns);
+
+    var recovery = Recovery.init(allocator, null);
+    recovery.metrics = &m;
+    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // Recovery should have recorded a non-zero duration
+    try testing.expect(m.recovery_duration_ns > 0);
 }
 
 test {

@@ -35,6 +35,16 @@ pub const Metrics = struct {
     checkpoints_completed: u64 = 0,
     last_checkpoint_duration_ns: u64 = 0,
 
+    // Recovery
+    recovery_duration_ns: u64 = 0,
+
+    // WAL segments
+    wal_segment_count: u64 = 0, // TODO: wire in WalManager segment tracking
+
+    // Storage health
+    fragmentation_ratio: u64 = 0, // TODO: wire in FreeSpaceManager fragmentation tracking (fixed-point ×10000)
+    index_rebuild_progress: u64 = 0, // TODO: wire in IndexCatalog rebuild progress (0–10000 for 0%–100%)
+
     /// Return the buffer pool hit rate as a fraction in [0.0, 1.0].
     /// Returns 1.0 when no buffer accesses have been recorded yet.
     pub fn bufferHitRate(self: *const Metrics) f64 {
@@ -74,6 +84,10 @@ test "Metrics zero-initialized by default" {
     try testing.expectEqual(@as(u64, 0), m.properties_read);
     try testing.expectEqual(@as(u64, 0), m.checkpoints_completed);
     try testing.expectEqual(@as(u64, 0), m.last_checkpoint_duration_ns);
+    try testing.expectEqual(@as(u64, 0), m.recovery_duration_ns);
+    try testing.expectEqual(@as(u64, 0), m.wal_segment_count);
+    try testing.expectEqual(@as(u64, 0), m.fragmentation_ratio);
+    try testing.expectEqual(@as(u64, 0), m.index_rebuild_progress);
 }
 
 test "bufferHitRate returns 1.0 when no accesses" {
