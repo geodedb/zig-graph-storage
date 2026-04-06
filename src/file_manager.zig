@@ -104,6 +104,10 @@ pub const FileManager = struct {
         }
         // Reset pagers
         self.pagers = [_]?Pager{null} ** FILE_COUNT;
+        // Zero sensitive key material
+        if (self.encryption_key) |*k| {
+            std.crypto.secureZero(u8, k);
+        }
     }
 
     /// Sync all open files to disk.
