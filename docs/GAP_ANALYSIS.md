@@ -1,6 +1,6 @@
 # Gap Analysis -- Requirements & Implementation
 
-**Last updated:** 2026-03-30
+**Last updated:** 2026-04-06
 **Source:** Full Codebase Audit (docs/AUDIT_REPORT.md)
 
 ## Summary
@@ -8,21 +8,21 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 11 |
-| Won't Do | 3 |
+| Closed | 19 |
+| Won't Do | 1 |
 | Blocked | 1 |
-| Deferred | 0 |
+| Deferred | 4 |
 
 ---
 
 ## GAP-0001: CI pipeline has no build or test jobs
 
-- **Status:** Won't Do
+- **Status:** Closed
 - **Severity:** Critical
 - **Requirement:** NFR-MNT-002 (P0)
 - **File:** `.gitlab-ci.yml`
 - **Description:** `.gitlab-ci.yml` defines `build` and `test` stages but includes no jobs. Only security scans and format checks run.
-- **Resolution:** CI/CD pipeline configuration is managed via GitLab CI catalog components and requires direct GitLab access. Not addressable via code changes alone.
+- **Resolution:** `.gitlab-ci.yml` now has build, test-unit, test-integration, and zig-format jobs.
 - **Affected Files:** `.gitlab-ci.yml`
 
 ## GAP-0002: Migration bulk-load is stubbed (P0 requirement)
@@ -49,11 +49,11 @@
 
 ## GAP-0004: No metrics/telemetry module
 
-- **Status:** Won't Do
+- **Status:** Closed
 - **Severity:** Medium
 - **Requirement:** NFR-OBS-001, NFR-OBS-002 (P1)
 - **Description:** v1 library scope. Enterprise observability is a feature request requiring a new module, not a gap in existing functionality.
-- **Resolution:** Deferred to post-v1. The `config.zig` log_fn callback provides a basic hook point for future observability.
+- **Resolution:** `metrics.zig` now exists with 17 counters. Remaining observability gaps are tracked as GAP-0016 (missing metric categories) and GAP-0017 (no structured event emission).
 
 ## GAP-0005: Crash recovery test suite incomplete
 
@@ -183,3 +183,105 @@
   - [x] No `std.Thread.sleep` calls remain for synchronization purposes
   - [x] Shutdown is deterministic (no polling delay)
 - **Resolution:** Removed both `while(is_running) sleep` loops from `deinit()` and `cleanupResources()`. With GAP-0013's removal of background checkpoint threading, these spin loops were dead code — `doCheckpoint()` runs synchronously and completes before shutdown proceeds.
+
+---
+
+## GAP-0016: Missing metrics for fragmentation, index progress, recovery duration, WAL growth
+
+- **Status:** Closed
+- **Severity:** Medium
+- **Requirement:** NFR-OBS-001
+- **Description:** `metrics.zig` has 17 counters but 4 of 7 required metric categories are absent: fragmentation ratio, index rebuild progress, recovery duration, and WAL segment growth.
+- **Effort:** S
+- **Affected Files:** `src/metrics.zig`
+- **Resolution:** Added 4 new metric counters covering fragmentation ratio, index rebuild progress, recovery duration, and WAL segment growth.
+
+## GAP-0017: No structured event emission
+
+- **Status:** Closed
+- **Severity:** Medium
+- **Requirement:** NFR-OBS-002
+- **Description:** `config.zig:20` has a `log_fn` callback but it is never invoked. No structured events are emitted for checkpoint, recovery, backup, verify, or migration operations.
+- **Effort:** M
+- **Affected Files:** `src/config.zig`
+- **Resolution:** Added `StorageEvent` tagged union and `emitEvent()` method. Structured events now emitted for checkpoint, recovery, backup, verify, and migration operations.
+
+## GAP-0018: No read-only legacy fallback mode
+
+- **Status:** Closed
+- **Severity:** High
+- **Requirement:** FR-019
+- **Description:** V1 manifests are rejected with `IncompatibleVersion`. There is no `LegacyPolicy` enum or read-only open mode to allow fallback access to older format data.
+- **Effort:** M
+- **Affected Files:** `src/recovery.zig`, `src/engine.zig`
+- **Resolution:** Added `LegacyPolicy` enum with read-only fallback mode. V1 manifests can now be opened in read-only mode when legacy policy is configured.
+
+## GAP-0019: No operational documentation (runbooks, upgrade guides, key management)
+
+- **Status:** Closed
+- **Severity:** Medium
+- **Requirement:** NFR-CMP-001
+- **Description:** No runbooks, upgrade guides, or key management documentation exists. Operators have no reference for day-to-day administration tasks.
+- **Effort:** M
+- **Affected Files:** `docs/`
+- **Resolution:** Created `docs/operations.md` with runbooks, upgrade guides, and key management documentation.
+
+## GAP-0020: B+tree index is in-memory only, not persisted to pages
+
+- **Status:** Deferred
+- **Severity:** High
+- **Requirement:** FR-016, FR-017
+- **Description:** `btree.zig` has no serialize/persist logic. Page types `btree_internal` and `btree_leaf` are defined but unused. The B+tree index is rebuilt from scratch on every open.
+- **Effort:** L
+- **Affected Files:** `src/btree.zig`
+- **Deferral Reason:** Large feature requiring its own branch. B+tree persistence involves page format changes and migration path.
+
+## GAP-0021: getEdge() always returns error.EdgeIndexNotImplemented
+
+- **Status:** Deferred
+- **Severity:** High
+- **Requirement:** FR-003, FR-008
+- **Description:** `getEdge()` always returns `error.EdgeIndexNotImplemented`. No edge-ID index exists; edge lookups by ID are non-functional.
+- **Effort:** L
+- **Affected Files:** `src/engine.zig`
+- **Deferral Reason:** Large feature requiring its own branch. Edge index implementation involves new index structure and integration with adjacency store.
+
+## GAP-0022: Per-mutation auto-commit generates excessive WAL traffic
+
+- **Status:** Deferred
+- **Severity:** Medium
+- **Requirement:** FR-012
+- **Description:** Per-mutation auto-commit generates excessive WAL traffic. No multi-operation transaction API exists. Each single mutation produces 3+ WAL records.
+- **Effort:** M
+- **Affected Files:** `src/txn.zig`, `src/engine.zig`
+- **Deferral Reason:** Multi-operation transaction API requires its own branch. Involves transaction batching, rollback support, and WAL protocol changes.
+
+## GAP-0023: No extension mechanism for specialized index types
+
+- **Status:** Deferred
+- **Severity:** Low
+- **Requirement:** FR-021
+- **Description:** `IndexType` is a fixed closed enum. There is no extension mechanism for registering or loading specialized index types.
+- **Effort:** M
+- **Affected Files:** `src/btree.zig`
+- **Deferral Reason:** Post-v1 feature. Index extension points require API design for plugin registration and stable ABI considerations.
+
+## GAP-0024: CI fuzz stage declared but has no jobs
+
+- **Status:** Closed
+- **Severity:** Low
+- **Requirement:** NFR-MNT-002
+- **Description:** CI fuzz stage is declared in `.gitlab-ci.yml` but contains no jobs. Fuzz testing is not executed.
+- **Effort:** S
+- **Affected Files:** `.gitlab-ci.yml`
+- **Resolution:** Added fuzz job to CI pipeline in `.gitlab-ci.yml`.
+
+## GAP-0025: No structured CLI/API output layer (JSON)
+
+- **Status:** Closed
+- **Severity:** Low
+- **Requirement:** NFR-ACC-001
+- **Description:** Result structs exist but have no serialization support. There is no structured output layer (e.g., JSON) for CLI or API consumers.
+- **Effort:** S
+- **Affected Files:** `src/`
+- **Resolution:** Added `writeJson` methods to result structs for structured JSON output.
