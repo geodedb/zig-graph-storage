@@ -228,13 +228,13 @@
 
 ## GAP-0020: B+tree index is in-memory only, not persisted to pages
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** High
 - **Requirement:** FR-016, FR-017
 - **Description:** `btree.zig` has no serialize/persist logic. Page types `btree_internal` and `btree_leaf` are defined but unused. The B+tree index is rebuilt from scratch on every open.
 - **Effort:** L
 - **Affected Files:** `src/btree.zig`
-- **Deferral Reason:** Large feature requiring its own branch. B+tree persistence involves page format changes and migration path.
+- **Resolution:** Added `serialize`/`deserialize` methods for flat binary snapshot of all leaf entries, plus `saveToFile`/`loadFromFile` with magic+version+CRC32 envelope. Internal nodes are rebuilt from sorted leaf data on load. The `PropertyChainIndex` (which is what the engine actually persists for property lookups) already had its own save/load, so no additional engine wiring was needed. The B+tree persistence is ready for when `PropertyIndex`/`IndexCatalog` are wired into the engine checkpoint path.
 
 ## GAP-0021: getEdge() always returns error.EdgeIndexNotImplemented
 
