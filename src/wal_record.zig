@@ -20,6 +20,10 @@ const HEADER_SIZE: usize = 30;
 const CHECKSUM_SIZE: usize = 4;
 const MIN_RECORD_SIZE: usize = HEADER_SIZE + CHECKSUM_SIZE;
 
+/// Maximum WAL record payload size (1 MiB). Prevents untrusted payload_len
+/// from triggering unbounded memory allocation during deserialization.
+pub const MAX_WAL_PAYLOAD: u32 = 1024 * 1024;
+
 /// A WAL record representing a single logged operation.
 ///
 /// Format (serialized):
@@ -138,6 +142,7 @@ pub const WalRecord = struct {
         const payload_len = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, data[offset..][0..4]));
         offset += 4;
 
+        if (payload_len > MAX_WAL_PAYLOAD) return error.WalRecordTooLarge;
         if (data.len < offset + payload_len + CHECKSUM_SIZE) return error.InvalidFormat;
 
         const payload = try allocator.alloc(u8, payload_len);
@@ -377,6 +382,23 @@ test "serializeInto writes into caller buffer and computes checksum inline" {
     try std.testing.expectEqualStrings(payload_data, result.record.payload);
     try std.testing.expectEqual(record.checksum, result.record.checksum);
     try std.testing.expectEqual(n, result.bytes_read);
+}
+
+test "SEC-0024: deserialize rejects payload_len exceeding MAX_WAL_PAYLOAD" {
+    // Craft a minimal record with a huge payload_len in the header
+    var buf: [MIN_RECORD_SIZE]u8 = undefined;
+    @memset(&buf, 0);
+
+    // Set a valid record_type at offset 16
+    buf[16] = @intFromEnum(WalRecordType.begin_txn);
+
+    // Write a payload_len that exceeds MAX_WAL_PAYLOAD at offset 26
+    const huge_len: u32 = MAX_WAL_PAYLOAD + 1;
+    @memcpy(buf[26..30], &std.mem.toBytes(std.mem.nativeToLittle(u32, huge_len)));
+
+    const allocator = std.testing.allocator;
+    const result = WalRecord.deserialize(allocator, &buf);
+    try std.testing.expectError(error.WalRecordTooLarge, result);
 }
 
 test "serializeInto returns BufferTooSmall on undersized buffer" {
