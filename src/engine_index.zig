@@ -84,9 +84,14 @@ pub fn rebuildPropertyIndex(engine: *GraphEngine) !void {
 
 /// Rebuild all derived indexes (label, property, edge).
 pub fn rebuildDerivedIndexes(engine: *GraphEngine) !void {
+    // GAP-0026: Track index rebuild progress (0-10000).
+    engine.metrics.index_rebuild_progress = 0;
     try rebuildLabelIndex(engine);
+    engine.metrics.index_rebuild_progress = 3333;
     try rebuildPropertyIndex(engine);
+    engine.metrics.index_rebuild_progress = 6666;
     try rebuildEdgeIndex(engine);
+    engine.metrics.index_rebuild_progress = 10000;
 }
 
 /// Rebuild the in-memory edge index by scanning each live node's outgoing

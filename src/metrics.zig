@@ -38,12 +38,12 @@ pub const Metrics = struct {
     // Recovery
     recovery_duration_ns: u64 = 0,
 
-    // WAL segments
-    wal_segment_count: u64 = 0, // TODO: wire in WalManager segment tracking
+    // WAL segments (wired in engine.wireMetricsCounters)
+    wal_segment_count: u64 = 0,
 
-    // Storage health
-    fragmentation_ratio: u64 = 0, // TODO: wire in FreeSpaceManager fragmentation tracking (fixed-point ×10000)
-    index_rebuild_progress: u64 = 0, // TODO: wire in IndexCatalog rebuild progress (0–10000 for 0%–100%)
+    // Storage health (wired in engine.wireMetricsCounters and engine_index.rebuildDerivedIndexes)
+    fragmentation_ratio: u64 = 0, // fixed-point x10000
+    index_rebuild_progress: u64 = 0, // 0-10000 for 0%-100%
 
     /// Return the buffer pool hit rate as a fraction in [0.0, 1.0].
     /// Returns 1.0 when no buffer accesses have been recorded yet.

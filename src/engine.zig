@@ -161,6 +161,7 @@ pub const GraphEngine = struct {
 
         // 7. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
+        self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
         self.thread_pool = spice.ThreadPool.init(allocator);
         self.thread_pool.start(.{});
@@ -254,6 +255,7 @@ pub const GraphEngine = struct {
 
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
+        self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
         self.thread_pool = spice.ThreadPool.init(allocator);
         self.thread_pool.start(.{});
@@ -264,6 +266,31 @@ pub const GraphEngine = struct {
 
     fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]u8, cfg: GraphConfig, wal_start_lsn: u64) !void {
         return engine_persist.initSubsystems(self, allocator, graph_uuid, cfg, wal_start_lsn);
+    }
+
+    /// GAP-0026: Wire metrics counters that were previously TODO stubs.
+    fn wireMetricsCounters(self: *GraphEngine) void {
+        // wal_segment_count: single-file WAL always has 1 segment.
+        self.metrics.wal_segment_count = 1;
+
+        // fragmentation_ratio: fraction of allocated-but-unused pages across
+        // all stores, as fixed-point x10000.
+        const total = self.free_space_nodes.total_pages +
+            self.free_space_adj_out.total_pages +
+            self.free_space_adj_in.total_pages +
+            self.free_space_props.total_pages +
+            self.free_space_var.total_pages;
+        if (total > 0) {
+            const free = self.free_space_nodes.freeCount() +
+                self.free_space_adj_out.freeCount() +
+                self.free_space_adj_in.freeCount() +
+                self.free_space_props.freeCount() +
+                self.free_space_var.freeCount();
+            self.metrics.fragmentation_ratio = (free * 10000) / total;
+        }
+
+        // index_rebuild_progress: 10000 = 100% (rebuild complete).
+        self.metrics.index_rebuild_progress = 10000;
     }
 
     // ── Persistence helpers (delegated to engine_persist.zig) ─────────
