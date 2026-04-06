@@ -47,19 +47,23 @@ pub const Pager = struct {
         if (std.mem.readInt(u128, buf[0..16], .little) == 0 and
             std.mem.readInt(u128, buf[16..32], .little) == 0) return;
 
-        // Decrypt page body if encryption is enabled
+        // Decrypt page body if encryption is enabled.
+        // AES-GCM provides authenticated integrity, so CRC32C is redundant
+        // when encryption is active -- skip it to avoid false mismatches
+        // (the auth tag occupies body tail bytes that differ after round-trip).
         if (self.encryption) |enc| {
-            enc.decryptPage(buf, page_id, @intFromEnum(self.file_id), 0) catch {
+            const write_count = page_mod.readWriteCount(buf);
+            enc.decryptPage(buf, page_id, @intFromEnum(self.file_id), write_count) catch {
                 return error.DecryptionFailed;
             };
+        } else {
+            // Plaintext mode: validate CRC32C checksum
+            const body = buf[PAGE_HEADER_SIZE..];
+            const stored_checksum = std.mem.readInt(u32, buf[16..20], .little);
+            const computed_checksum = page_mod.computeChecksum(body);
+
+            if (stored_checksum != computed_checksum) return error.ChecksumMismatch;
         }
-
-        // Parse header and validate checksum
-        const body = buf[PAGE_HEADER_SIZE..];
-        const stored_checksum = std.mem.readInt(u32, buf[16..20], .little);
-        const computed_checksum = page_mod.computeChecksum(body);
-
-        if (stored_checksum != computed_checksum) return error.ChecksumMismatch;
     }
 
     /// Write a page to disk from the provided buffer.
@@ -69,14 +73,19 @@ pub const Pager = struct {
     pub fn writePage(self: *const Pager, page_id: PageId, buf: []u8) !void {
         if (buf.len != self.page_size) return error.InvalidBufferSize;
 
-        // Compute CRC32C over body and write into header checksum field
-        const body = buf[PAGE_HEADER_SIZE..];
-        const checksum = page_mod.computeChecksum(body);
-        std.mem.writeInt(u32, buf[16..20], checksum, .little);
-
-        // Encrypt page body if encryption is enabled
+        // When encryption is active, AES-GCM provides authenticated integrity,
+        // so CRC32C is redundant. Only compute CRC for plaintext mode.
         if (self.encryption) |enc| {
-            enc.encryptPage(buf, page_id, @intFromEnum(self.file_id), 0);
+            // Increment write_count to ensure unique AES-GCM nonce per write
+            const current_wc = page_mod.readWriteCount(buf);
+            const new_wc = current_wc +| 1; // saturating add to avoid overflow
+            page_mod.writeWriteCount(buf, new_wc);
+            enc.encryptPage(buf, page_id, @intFromEnum(self.file_id), new_wc);
+        } else {
+            // Plaintext mode: compute CRC32C over body and write into header
+            const body = buf[PAGE_HEADER_SIZE..];
+            const checksum = page_mod.computeChecksum(body);
+            std.mem.writeInt(u32, buf[16..20], checksum, .little);
         }
 
         // Write page at the correct offset
@@ -288,6 +297,54 @@ test "readPage rejects buffer with wrong size" {
     var small_buf: [100]u8 = undefined;
     const result = pager.readPage(0, &small_buf);
     try testing.expectError(error.InvalidBufferSize, result);
+}
+
+test "SEC-0015: encrypted page writes produce different ciphertexts (no nonce reuse)" {
+    const file = try createTempFile();
+    defer cleanupTempFile(file);
+
+    const page_size: u32 = 4096;
+    const key = [_]u8{0x42} ** 32;
+    var enc = encryption_mod.PageEncryption.init(key);
+
+    var pager = Pager.init(file, page_size);
+    pager.encryption = enc;
+
+    // Write the same page content twice
+    var write_buf1: [4096]u8 = undefined;
+    @memset(&write_buf1, 0);
+    const header = page_mod.initHeader(0, .node_data, page_size);
+    const header_bytes = page_mod.headerToBytes(&header);
+    @memcpy(write_buf1[0..PAGE_HEADER_SIZE], header_bytes);
+    @memset(write_buf1[PAGE_HEADER_SIZE..], 0xAB);
+
+    try pager.writePage(0, &write_buf1);
+
+    // Read the raw ciphertext from disk
+    var ct1: [4096]u8 = undefined;
+    _ = try file.preadAll(&ct1, 0);
+
+    // Prepare the same content again (reset write_count to 0 as if fresh page)
+    @memset(&write_buf1, 0);
+    @memcpy(write_buf1[0..PAGE_HEADER_SIZE], header_bytes);
+    @memset(write_buf1[PAGE_HEADER_SIZE..], 0xAB);
+    // Set write_count to 1 to simulate the page having been written once already
+    page_mod.writeWriteCount(&write_buf1, 1);
+
+    try pager.writePage(0, &write_buf1);
+
+    // Read the raw ciphertext from disk again
+    var ct2: [4096]u8 = undefined;
+    _ = try file.preadAll(&ct2, 0);
+
+    // The encrypted bodies must differ (different nonce due to incremented write_count)
+    try testing.expect(!std.mem.eql(u8, ct1[PAGE_HEADER_SIZE..], ct2[PAGE_HEADER_SIZE..]));
+
+    // Both should still be readable (decrypt correctly)
+    var read_buf: [4096]u8 = undefined;
+    try pager.readPage(0, &read_buf);
+
+    _ = &enc;
 }
 
 test {

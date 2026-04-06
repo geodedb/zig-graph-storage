@@ -39,7 +39,8 @@ pub const PageHeader = extern struct {
     item_count: u16, // 2 bytes
     free_start: u16, // 2 bytes (for slotted pages)
     free_end: u16, // 2 bytes (for slotted pages)
-    _reserved: [4]u8, // 4 bytes padding
+    write_count: [3]u8, // 3 bytes (u24 LE, monotonic counter for AES-GCM nonce)
+    _reserved: [1]u8, // 1 byte padding
 };
 
 comptime {
@@ -64,13 +65,27 @@ pub fn initHeader(page_id: PageId, page_type: PageType, page_size: u32) PageHead
         .item_count = 0,
         .free_start = 0,
         .free_end = @intCast(page_size - PAGE_HEADER_SIZE),
-        ._reserved = .{ 0, 0, 0, 0 },
+        .write_count = .{ 0, 0, 0 },
+        ._reserved = .{ 0 },
     };
 }
 
 /// Cast a PageHeader pointer to a byte array pointer for I/O.
 pub fn headerToBytes(header: *const PageHeader) *const [32]u8 {
     return @ptrCast(header);
+}
+
+/// Byte offset of write_count within the page header (after free_end at offset 28).
+pub const WRITE_COUNT_OFFSET: usize = 28;
+
+/// Read the write_count (u24 LE) directly from a page buffer without full header decode.
+pub fn readWriteCount(buf: []const u8) u24 {
+    return std.mem.readInt(u24, buf[WRITE_COUNT_OFFSET..][0..3], .little);
+}
+
+/// Write the write_count (u24 LE) directly into a page buffer.
+pub fn writeWriteCount(buf: []u8, count: u24) void {
+    std.mem.writeInt(u24, buf[WRITE_COUNT_OFFSET..][0..3], count, .little);
 }
 
 /// Decode a PageHeader from a 32-byte array.
@@ -113,7 +128,8 @@ test "initHeader sets correct default values" {
     try std.testing.expectEqual(@as(u16, 0), header.item_count);
     try std.testing.expectEqual(@as(u16, 0), header.free_start);
     try std.testing.expectEqual(@as(u16, DEFAULT_PAGE_SIZE - PAGE_HEADER_SIZE), header.free_end);
-    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, header._reserved);
+    try std.testing.expectEqual([3]u8{ 0, 0, 0 }, header.write_count);
+    try std.testing.expectEqual([1]u8{0}, header._reserved);
 }
 
 test "headerToBytes / headerFromBytes round-trip preserves all fields" {
@@ -129,6 +145,7 @@ test "headerToBytes / headerFromBytes round-trip preserves all fields" {
     try std.testing.expectEqual(original.item_count, restored.item_count);
     try std.testing.expectEqual(original.free_start, restored.free_start);
     try std.testing.expectEqual(original.free_end, restored.free_end);
+    try std.testing.expectEqual(original.write_count, restored.write_count);
     try std.testing.expectEqual(original._reserved, restored._reserved);
 }
 
