@@ -192,6 +192,7 @@ pub const GraphEngine = struct {
 
         // 4. Run recovery (loads manifest, replays WAL)
         var recovery = Recovery.init(allocator, cfg.encryption_key);
+        defer recovery.deinit();
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
 
         _ = try self.file_manager.openFile(.label_idx);
