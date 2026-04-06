@@ -531,11 +531,6 @@ pub const GraphEngine = struct {
             };
         }
         if (close_err == null) {
-            self.rebuildDerivedIndexes() catch |err| {
-                if (close_err == null) close_err = err;
-            };
-        }
-        if (close_err == null) {
             self.saveDerivedIndexes() catch |err| {
                 if (close_err == null) close_err = err;
             };
