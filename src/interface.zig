@@ -286,34 +286,7 @@ pub const GraphStorage = struct {
             fn getAllPropertiesFn(ptr: *anyopaque, prop_head: u64, allocator: Allocator) anyerror!PropertyIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 const concrete_iter = try @call(.auto, @field(T, method_name), .{ self, prop_head });
-                const RealIter = @TypeOf(concrete_iter);
-                const heap_iter = try allocator.create(RealIter);
-                heap_iter.* = concrete_iter;
-
-                const WrapperState = struct {
-                    fn next(vp: *anyopaque) anyerror!?PropertyEntry {
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        if (try hi.next()) |slice| {
-                            // Note: for the vtable wrapper we must decode to match generic PropertyEntry.
-                            // The engine API will be zero-allocation.
-                            const val = try property_mod.decode(std.heap.page_allocator, slice.encoded_value);
-                            return PropertyEntry{
-                                .key = slice.key,
-                                .value = val.value,
-                            };
-                        }
-                        return null;
-                    }
-                    fn deinit(vp: *anyopaque) void {
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        hi.deinit();
-                    }
-                };
-
-                return PropertyIterator{ .ptr = heap_iter, .vtable = &.{
-                    .next = WrapperState.next,
-                    .deinit = WrapperState.deinit,
-                } };
+                return wrapPropIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
             }
             fn putPropertyFn(ptr: *anyopaque, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
                 const self: *T = @ptrCast(@alignCast(ptr));
@@ -339,35 +312,7 @@ pub const GraphStorage = struct {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 const maybe_iter = try @call(.auto, @field(T, method_name), .{ self, from, edge_id });
                 const concrete_iter = maybe_iter orelse return null;
-                const RealIter = @TypeOf(concrete_iter);
-                const heap_iter = try allocator.create(RealIter);
-                heap_iter.* = concrete_iter;
-
-                const WrapperState = struct {
-                    fn next(vp: *anyopaque) anyerror!?PropertyEntry {
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        if (try hi.next()) |slice| {
-                            const val2 = try property_mod.decode(std.heap.page_allocator, slice.encoded_value);
-                            return PropertyEntry{
-                                .key = slice.key,
-                                .value = val2.value,
-                            };
-                        }
-                        return null;
-                    }
-                    fn deinit(vp: *anyopaque) void {
-                        const hi: *RealIter = @ptrCast(@alignCast(vp));
-                        hi.deinit();
-                    }
-                };
-
-                return PropertyIterator{
-                    .ptr = heap_iter,
-                    .vtable = &.{
-                        .next = WrapperState.next,
-                        .deinit = WrapperState.deinit,
-                    },
-                };
+                return @as(?PropertyIterator, try wrapPropIterator(@TypeOf(concrete_iter), concrete_iter, allocator));
             }
             fn addLabelFn(ptr: *anyopaque, node_id: NodeId, label: LabelId) anyerror!void {
                 const self: *T = @ptrCast(@alignCast(ptr));
@@ -455,6 +400,47 @@ pub const GraphStorage = struct {
         @compileError("Unknown vtable method: " ++ method_name);
     }
 };
+
+/// Wrap a concrete PropIterator (or similar) into a type-erased PropertyIterator.
+/// The caller-provided allocator is used both to heap-allocate the iterator state
+/// and to decode property values during iteration.
+fn wrapPropIterator(comptime RealIter: type, concrete_iter: RealIter, allocator: Allocator) anyerror!PropertyIterator {
+    const State = struct {
+        iter: RealIter,
+        alloc: Allocator,
+
+        fn next(vp: *anyopaque) anyerror!?PropertyEntry {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            if (try self.iter.next()) |slice| {
+                const val = try property_mod.decode(self.alloc, slice.encoded_value);
+                return PropertyEntry{
+                    .key = slice.key,
+                    .value = val.value,
+                };
+            }
+            return null;
+        }
+
+        fn deinit(vp: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            self.iter.deinit();
+        }
+    };
+
+    const state = try allocator.create(State);
+    state.* = .{
+        .iter = concrete_iter,
+        .alloc = allocator,
+    };
+
+    return PropertyIterator{
+        .ptr = @ptrCast(state),
+        .vtable = &.{
+            .next = State.next,
+            .deinit = State.deinit,
+        },
+    };
+}
 
 /// Wrap a caller-owned `[]EdgeEntry` slice as an `EdgeIterator`.
 /// The iterator yields entries one by one and frees the backing slice on deinit.
