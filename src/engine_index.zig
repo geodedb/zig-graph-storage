@@ -63,6 +63,12 @@ pub fn rebuildDerivedIndexes(engine: *GraphEngine) !void {
 pub fn rebuildEdgeIndex(engine: *GraphEngine) !void {
     engine.edge_index.clearAndFree();
 
+    // PERF-0032: Pre-allocate edge_index based on manifest edge count.
+    const estimated_edges: u32 = @intCast(@min(engine.manifest.next_edge_id, std.math.maxInt(u32)));
+    if (estimated_edges > 1) {
+        try engine.edge_index.ensureTotalCapacity(estimated_edges);
+    }
+
     var id: u64 = 1;
     while (id < engine.manifest.next_node_id) : (id += 1) {
         const rec = engine.node_store.getNode(id) catch continue orelse continue;
