@@ -9,7 +9,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("types.zig");
-const interface_mod = @import("interface.zig");
 const prop_store_mod = @import("prop_store.zig");
 const engine_mod = @import("engine.zig");
 

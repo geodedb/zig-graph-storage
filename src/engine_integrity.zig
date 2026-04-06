@@ -5,7 +5,6 @@
 
 const std = @import("std");
 
-const types = @import("types.zig");
 const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
 const engine_mod = @import("engine.zig");
