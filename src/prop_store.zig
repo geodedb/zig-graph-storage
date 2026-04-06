@@ -26,6 +26,9 @@ const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
 const PROP_META_SIZE: u32 = 12; // next_page(8) + entry_count(4)
 const PROP_DATA_OFFSET: u32 = PAGE_HEADER_SIZE + PROP_META_SIZE;
 
+/// Maximum hops allowed in a page chain traversal before assuming corruption.
+const MAX_CHAIN_HOPS: u32 = 100_000;
+
 /// Per-page property key directory (PERF-0023).
 /// The directory grows backward from the end of each page and maps key hashes
 /// to entry offsets for O(1) lookup within a page.
@@ -114,7 +117,9 @@ pub const PropStore = struct {
         if (prop_head == 0) return null;
 
         var current_page: PageId = prop_head;
-        while (current_page != 0) {
+        var chain_hops: u32 = 0;
+        while (current_page != 0) : (chain_hops += 1) {
+            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
@@ -316,7 +321,9 @@ pub const PropStore = struct {
         // Pass 1: Scan chain to find and remove existing key (combined find+remove).
         // This replaces the separate getProperty + removeProperty calls.
         var current_page: PageId = prop_head;
-        while (current_page != 0) {
+        var chain_hops: u32 = 0;
+        while (current_page != 0) : (chain_hops += 1) {
+            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
@@ -400,7 +407,9 @@ pub const PropStore = struct {
 
         // Pass 2: Find space and insert the new entry
         current_page = prop_head;
-        while (current_page != 0) {
+        chain_hops = 0;
+        while (current_page != 0) : (chain_hops += 1) {
+            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
@@ -484,7 +493,9 @@ pub const PropStore = struct {
         if (prop_head == 0) return;
 
         var current_page: PageId = prop_head;
-        while (current_page != 0) {
+        var chain_hops: u32 = 0;
+        while (current_page != 0) : (chain_hops += 1) {
+            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
