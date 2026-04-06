@@ -170,6 +170,85 @@ For the default 8192-byte page: `(8192 - 32 - 16) / 24 = 339` entries per block.
 
 ---
 
+## 3.5 Property Page Layout
+
+**Source:** `src/prop_store.zig`
+
+Property pages use page type `prop_slotted` (PageType = 3). Each page stores
+a sequential list of property entries with an optional per-page key directory
+for O(1) lookup.
+
+### 3.5.1 Page Structure
+
+```
++---------------------+  offset 0
+| PageHeader (32 B)   |
++---------------------+  offset 32
+| next_page (8 B)     |  u64 LE -- pointer to overflow property page (0 = none)
+| entry_count (4 B)   |  u32 LE -- number of property entries on this page
++---------------------+  offset 44 (PROP_DATA_OFFSET)
+| Entry[0]            |
+| Entry[1]            |
+| ...                 |
+| Entry[N-1]          |
++---------------------+
+| (free space)        |
++---------------------+
+| DirEntry[M-1] (4 B) |  ← directory grows backward
+| ...                 |
+| DirEntry[0] (4 B)  |
++---------------------+  offset page_size - 2
+| dir_count (2 B)     |  u16 LE -- number of directory entries
++---------------------+  offset page_size
+```
+
+### 3.5.2 Property Entry (variable length)
+
+| Offset | Size    | Field       | Type   | Description                   |
+|--------|---------|-------------|--------|-------------------------------|
+| 0      | 2       | `key_len`   | u16 LE | Length of property key string |
+| 2      | key_len | `key`       | [N]u8  | Property key name (UTF-8)    |
+| 2+N    | varies  | `value`     | bytes  | Encoded property value (see Section 4) |
+
+### 3.5.3 Per-Page Key Directory (PERF-0023)
+
+The key directory is an optimization structure stored at the end of each
+property page, growing backward from the `dir_count` footer. It enables
+O(1) property lookup by key hash instead of O(n) linear scan.
+
+**Directory entry (4 bytes):**
+
+| Offset | Size | Field        | Type   | Description                          |
+|--------|------|--------------|--------|--------------------------------------|
+| 0      | 2    | `key_hash`   | u16 LE | FNV-1a hash of the key, truncated to 16 bits |
+| 2      | 2    | `entry_offset` | u16 LE | Byte offset of the entry from page start |
+
+**dir_count (2 bytes):** stored in the last 2 bytes of the page as u16 LE.
+
+- When `dir_count > 0`: the directory is present and authoritative. Lookups
+  hash the search key and scan the directory for matching hashes, then verify
+  the actual key at the stored offset to handle collisions.
+- When `dir_count == 0`: the page is in legacy format (no directory). Lookups
+  fall back to linear scan of all entries.
+
+The directory is rebuilt on every insert, replace, and remove operation.
+Entry data grows forward from `PROP_DATA_OFFSET`; directory entries grow
+backward from the `dir_count` footer. If the two regions would overlap,
+the directory is disabled (`dir_count = 0`) and the page reverts to
+linear-scan mode.
+
+**Hash function:** FNV-1a with 32-bit state, truncated to u16:
+
+```
+h = 2166136261
+for each byte b in key:
+    h ^= b
+    h *= 16777619
+return h[15:0]
+```
+
+---
+
 ## 4. Property Encoding
 
 **Source:** `src/property.zig`
