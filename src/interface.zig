@@ -424,6 +424,7 @@ fn wrapPropIterator(comptime RealIter: type, concrete_iter: RealIter, allocator:
         fn deinit(vp: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(vp));
             self.iter.deinit();
+            self.alloc.destroy(self);
         }
     };
 
