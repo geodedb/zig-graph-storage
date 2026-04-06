@@ -77,13 +77,17 @@ pub const BufferPool = struct {
             free_list.appendAssumeCapacity(i);
         }
 
+        // PERF-0033: Pre-size page_table to avoid rehashing during initial load.
+        var page_table = std.AutoHashMap(PageKey, u32).init(allocator);
+        try page_table.ensureTotalCapacity(@intCast(capacity));
+
         return BufferPool{
             .allocator = allocator,
             .page_size = page_size,
             .capacity = capacity,
             .frames = frames,
             .page_buf = page_buf,
-            .page_table = std.AutoHashMap(PageKey, u32).init(allocator),
+            .page_table = page_table,
             .lru_head = null,
             .lru_tail = null,
             .free_list = free_list,
