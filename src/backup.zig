@@ -87,6 +87,13 @@ pub const Backup = struct {
         return .{ .allocator = allocator, .encryption_key = key };
     }
 
+    /// Zero sensitive key material.
+    pub fn deinit(self: *Backup) void {
+        if (self.encryption_key) |*k| {
+            std.crypto.secureZero(u8, k);
+        }
+    }
+
     /// Create a backup of a graph directory.
     /// The backup is a simple archive: header + file entries.
     /// When encryption_key is set, uses version 2 with HMAC-SHA256 tag.
