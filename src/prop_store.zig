@@ -60,14 +60,19 @@ pub const PropStore = struct {
             const data = frame.dataSlice();
 
             const next_page = readNextPage(data);
-            const entry_count = readEntryCount(data);
+            const entry_count = readEntryCountChecked(data, self.page_size) catch {
+                self.buffer_pool.unpin(frame_idx, false);
+                return error.DataCorruption;
+            };
 
             // Scan entries — only decode the value when the key matches
             var offset: u32 = PROP_DATA_OFFSET;
             var i: u32 = 0;
             while (i < entry_count) : (i += 1) {
+                if (offset + 2 > data.len) return error.DataCorruption;
                 const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                 offset += 2;
+                if (offset + key_len > data.len) return error.DataCorruption;
                 const entry_key = data[offset..][0..key_len];
                 offset += key_len;
 
@@ -116,7 +121,7 @@ pub const PropStore = struct {
                     const frame = try self.store.buffer_pool.pin(.props, self.current_page);
                     self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
                     const data = frame.dataSlice();
-                    self.entry_count_cache = readEntryCount(data);
+                    self.entry_count_cache = try readEntryCountChecked(data, self.store.page_size);
                     self.current_offset = PROP_DATA_OFFSET;
                 }
 
@@ -124,8 +129,10 @@ pub const PropStore = struct {
                 const data = frame.dataSlice();
 
                 if (self.current_index < self.entry_count_cache) {
+                    if (self.current_offset + 2 > data.len) return error.DataCorruption;
                     const key_len = std.mem.bytesToValue(u16, data[self.current_offset..][0..2]);
                     self.current_offset += 2;
+                    if (self.current_offset + key_len > data.len) return error.DataCorruption;
 
                     const entry_key = data[self.current_offset..][0..key_len];
                     self.current_offset += key_len;
@@ -198,14 +205,19 @@ pub const PropStore = struct {
             const data = frame.dataSlice();
 
             const next_page = readNextPage(data);
-            var entry_count = readEntryCount(data);
+            var entry_count = readEntryCountChecked(data, self.page_size) catch {
+                self.buffer_pool.unpin(frame_idx, false);
+                return error.DataCorruption;
+            };
 
             var offset: u32 = PROP_DATA_OFFSET;
             var i: u32 = 0;
             while (i < entry_count) : (i += 1) {
                 const entry_start = offset;
+                if (offset + 2 > data.len) return error.DataCorruption;
                 const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                 offset += 2;
+                if (offset + key_len > data.len) return error.DataCorruption;
                 const entry_key = data[offset..][0..key_len];
                 offset += key_len;
 
@@ -218,8 +230,10 @@ pub const PropStore = struct {
                     var ri: u32 = i + 1;
                     var scan_end = offset;
                     while (ri < entry_count) : (ri += 1) {
+                        if (scan_end + 2 > data.len) return error.DataCorruption;
                         const rkl = std.mem.bytesToValue(u16, data[scan_end..][0..2]);
                         scan_end += 2;
+                        if (scan_end + rkl > data.len) return error.DataCorruption;
                         scan_end += rkl;
                         const rsize = try encodedSizeFromBytes(data[scan_end..]);
                         scan_end += @intCast(rsize);
@@ -257,7 +271,10 @@ pub const PropStore = struct {
             const data = frame.dataSlice();
 
             const next_page = readNextPage(data);
-            const entry_count = readEntryCount(data);
+            const entry_count = readEntryCountChecked(data, self.page_size) catch {
+                self.buffer_pool.unpin(frame_idx, false);
+                return error.DataCorruption;
+            };
 
             // Compute used space inline (avoids separate usedBytes rescan)
             var used: u32 = 0;
@@ -265,8 +282,10 @@ pub const PropStore = struct {
                 var scan_off: u32 = PROP_DATA_OFFSET;
                 var ei: u32 = 0;
                 while (ei < entry_count) : (ei += 1) {
+                    if (scan_off + 2 > data.len) return error.DataCorruption;
                     const kl = std.mem.bytesToValue(u16, data[scan_off..][0..2]);
                     scan_off += 2;
+                    if (scan_off + kl > data.len) return error.DataCorruption;
                     scan_off += kl;
                     const esize = try encodedSizeFromBytes(data[scan_off..]);
                     scan_off += @intCast(esize);
@@ -321,14 +340,25 @@ pub const PropStore = struct {
             const data = frame.dataSlice();
 
             const next_page = readNextPage(data);
-            var entry_count = readEntryCount(data);
+            var entry_count = readEntryCountChecked(data, self.page_size) catch {
+                self.buffer_pool.unpin(frame_idx, false);
+                return error.DataCorruption;
+            };
 
             var offset: u32 = PROP_DATA_OFFSET;
             var i: u32 = 0;
             while (i < entry_count) : (i += 1) {
                 const entry_start = offset;
+                if (offset + 2 > data.len) {
+                    self.buffer_pool.unpin(frame_idx, false);
+                    return error.DataCorruption;
+                }
                 const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                 offset += 2;
+                if (offset + key_len > data.len) {
+                    self.buffer_pool.unpin(frame_idx, false);
+                    return error.DataCorruption;
+                }
                 const entry_key = data[offset..][0..key_len];
                 offset += key_len;
 
@@ -378,8 +408,10 @@ pub const PropStore = struct {
         var i: u32 = 0;
         var off: u32 = PROP_DATA_OFFSET;
         while (i < entry_count) : (i += 1) {
+            if (off + 2 > data.len) return error.DataCorruption;
             const key_len = std.mem.bytesToValue(u16, data[off..][0..2]);
             off += 2;
+            if (off + key_len > data.len) return error.DataCorruption;
             off += key_len;
             const esize = try encodedSizeFromBytes(data[off..]);
             off += @intCast(esize);
@@ -390,26 +422,29 @@ pub const PropStore = struct {
 
 /// Determine the encoded size of a property value from its raw bytes.
 /// This avoids needing to fully decode the value.
-fn encodedSizeFromBytes(bytes: []const u8) error{InvalidData}!usize {
-    if (bytes.len < 1) return 0;
+/// Returns error.DataCorruption if the encoded length exceeds available bytes.
+fn encodedSizeFromBytes(bytes: []const u8) error{ InvalidData, DataCorruption }!usize {
+    if (bytes.len < 1) return error.DataCorruption;
     const tag: property_mod.Tag = std.meta.intToEnum(property_mod.Tag, bytes[0]) catch return error.InvalidData;
-    return switch (tag) {
+    const size: usize = switch (tag) {
         .null => 1,
         .bool => 2,
         .int => 9,
         .float => 9,
         .string => blk: {
-            if (bytes.len < 5) break :blk 1;
+            if (bytes.len < 5) return error.DataCorruption;
             const len = std.mem.bytesToValue(u32, bytes[1..5]);
             break :blk 5 + @as(usize, len);
         },
         .decimal => 18,
         .ext => blk: {
-            if (bytes.len < 7) break :blk 1;
+            if (bytes.len < 7) return error.DataCorruption;
             const data_len = std.mem.bytesToValue(u32, bytes[3..7]);
             break :blk 7 + @as(usize, data_len);
         },
     };
+    if (size > bytes.len) return error.DataCorruption;
+    return size;
 }
 
 fn readNextPage(data: []const u8) PageId {
@@ -418,6 +453,18 @@ fn readNextPage(data: []const u8) PageId {
 
 fn readEntryCount(data: []const u8) u32 {
     return std.mem.bytesToValue(u32, data[PAGE_HEADER_SIZE + 8 ..][0..4]);
+}
+
+/// Read entry_count with bounds validation: the minimum entry size is 3 bytes
+/// (2-byte key_len + 1-byte value tag), so entry_count * 3 must fit in the
+/// data capacity.
+fn readEntryCountChecked(data: []const u8, page_size: u32) error{DataCorruption}!u32 {
+    const entry_count = readEntryCount(data);
+    const capacity = page_size - PROP_DATA_OFFSET;
+    // Minimum entry is 2 (key_len) + 0 (key) + 1 (tag) = 3 bytes
+    const max_entries = capacity / 3;
+    if (entry_count > max_entries) return error.DataCorruption;
+    return entry_count;
 }
 
 fn writeNextPage(data: []u8, page_id: PageId) void {
@@ -646,10 +693,40 @@ test "encodedSizeFromBytes rejects invalid property tag byte" {
     try testing.expectError(error.InvalidData, encodedSizeFromBytes(&bad_bytes));
 }
 
-test "encodedSizeFromBytes returns 0 for empty input" {
+test "encodedSizeFromBytes returns DataCorruption for empty input" {
     const empty: []const u8 = &.{};
-    const result = try encodedSizeFromBytes(empty);
-    try testing.expectEqual(@as(usize, 0), result);
+    try testing.expectError(error.DataCorruption, encodedSizeFromBytes(empty));
+}
+
+test "encodedSizeFromBytes returns DataCorruption for truncated string" {
+    // string tag with only 2 bytes (needs at least 5 for tag + u32 length)
+    const truncated = [_]u8{ @intFromEnum(property_mod.Tag.string), 0x05 };
+    try testing.expectError(error.DataCorruption, encodedSizeFromBytes(&truncated));
+}
+
+test "encodedSizeFromBytes returns DataCorruption for string length exceeding buffer" {
+    // string tag with length 100 but only 9 bytes total
+    var buf: [9]u8 = undefined;
+    buf[0] = @intFromEnum(property_mod.Tag.string);
+    @memcpy(buf[1..5], &std.mem.toBytes(@as(u32, 100)));
+    try testing.expectError(error.DataCorruption, encodedSizeFromBytes(&buf));
+}
+
+test "readEntryCountChecked rejects entry_count exceeding page capacity" {
+    // Build a fake page buffer with an absurdly large entry_count
+    var data: [4096]u8 = undefined;
+    @memset(&data, 0);
+    // Write entry_count = 10000 which is way more than (4096 - PROP_DATA_OFFSET) / 3
+    @memcpy(data[PAGE_HEADER_SIZE + 8 ..][0..4], &std.mem.toBytes(@as(u32, 10000)));
+    try testing.expectError(error.DataCorruption, readEntryCountChecked(&data, 4096));
+}
+
+test "readEntryCountChecked accepts valid entry_count" {
+    var data: [4096]u8 = undefined;
+    @memset(&data, 0);
+    @memcpy(data[PAGE_HEADER_SIZE + 8 ..][0..4], &std.mem.toBytes(@as(u32, 5)));
+    const count = try readEntryCountChecked(&data, 4096);
+    try testing.expectEqual(@as(u32, 5), count);
 }
 
 test {
