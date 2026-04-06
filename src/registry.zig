@@ -150,7 +150,7 @@ pub const GraphRegistry = struct {
         pos += 8;
         self.next_edge_id = readU64(data, pos);
         pos += 8;
-        const graph_count: usize = @intCast(readU64(data, pos));
+        const graph_count: usize = std.math.cast(usize, readU64(data, pos)) orelse return error.InvalidData;
         pos += 8;
 
         // Clear existing entries
