@@ -164,7 +164,7 @@ pub const PropertyChainIndex = struct {
         const stat = try file.stat();
         if (stat.size == 0) return null;
 
-        const size: usize = @intCast(stat.size);
+        const size: usize = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
         const data = try self.allocator.alloc(u8, size);
         defer self.allocator.free(data);
 
