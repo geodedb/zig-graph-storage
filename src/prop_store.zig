@@ -266,10 +266,22 @@ pub const PropStore = struct {
                     @memset(data[new_end..scan_end], 0);
 
                     entry_count -= 1;
+
+                    // PERF-0021: Check if freed space on this page is enough
+                    // for the new entry, avoiding a full Pass 2 rescan.
+                    const used_after_remove = new_end - PROP_DATA_OFFSET;
+                    const available = self.dataCapacity() - used_after_remove;
+                    if (available >= entry_size) {
+                        self.writePropertyEntry(data, new_end, key, encoded_val);
+                        writeEntryCount(data, entry_count + 1);
+                        self.buffer_pool.unpin(frame_idx, true);
+                        return prop_head;
+                    }
+
                     writeEntryCount(data, entry_count);
                     self.buffer_pool.unpin(frame_idx, true);
 
-                    // Key removed; now fall through to pass 2 (insert)
+                    // Key removed but page too full; fall through to pass 2 (insert)
                     break;
                 }
             } else {
@@ -705,6 +717,30 @@ test "getProperty returns null for empty prop_head" {
 
     const val = try store.getProperty(0, "anything", testing.allocator);
     try testing.expect(val == null);
+}
+
+test "putProperty replace-in-place uses single-pass optimization" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+
+    // Write a property then replace it with a value of same or smaller size.
+    // This exercises the PERF-0021 in-place replacement path.
+    var head = try store.putProperty(0, "counter", .{ .int = 100 });
+    head = try store.putProperty(head, "counter", .{ .int = 999 });
+
+    const val = try store.getProperty(head, "counter", testing.allocator);
+    try testing.expect(val != null);
+    try testing.expectEqual(@as(i64, 999), val.?.int);
+
+    // Verify only one entry exists (no duplicate after replace)
+    var iter = store.getAllProperties(head);
+    defer iter.deinit();
+    var count: usize = 0;
+    while (try iter.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 1), count);
 }
 
 test "encodedSizeFromBytes rejects invalid property tag byte" {
