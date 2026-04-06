@@ -66,7 +66,7 @@ pub fn initHeader(page_id: PageId, page_type: PageType, page_size: u32) PageHead
         .free_start = 0,
         .free_end = @intCast(page_size - PAGE_HEADER_SIZE),
         .write_count = .{ 0, 0, 0 },
-        ._reserved = .{ 0 },
+        ._reserved = .{0},
     };
 }
 

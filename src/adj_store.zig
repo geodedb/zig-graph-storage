@@ -407,7 +407,7 @@ test "multiple edges in same block" {
         if (edges_found == 2) try testing.expectEqual(@as(u64, 30), e.neighbor);
         edges_found += 1;
     }
-    
+
     try testing.expectEqual(@as(usize, 3), edges_found);
 }
 
@@ -435,7 +435,7 @@ test "overflow to second block when first is full" {
 
     var iter = store.expand(head, null);
     defer iter.deinit();
-    
+
     var edges_len: usize = 0;
     var first_neighbor: u64 = 0;
     while (try iter.next()) |e| {
