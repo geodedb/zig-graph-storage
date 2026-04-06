@@ -105,7 +105,11 @@ pub const VarStore = struct {
         errdefer result.deinit(allocator);
 
         var current_page = start_page;
-        while (current_page != 0) {
+        var hops: u32 = 0;
+        const max_hops: u32 = 100_000;
+        while (current_page != 0) : (hops += 1) {
+            if (hops >= max_hops) return error.CircularChainDetected;
+
             const frame = try self.buffer_pool.pin(.var_store, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const page_data = frame.dataSlice();
@@ -133,7 +137,11 @@ pub const VarStore = struct {
         if (start_page == 0) return;
 
         var current_page = start_page;
-        while (current_page != 0) {
+        var hops: u32 = 0;
+        const max_hops: u32 = 100_000;
+        while (current_page != 0) : (hops += 1) {
+            if (hops >= max_hops) return error.CircularChainDetected;
+
             const frame = try self.buffer_pool.pin(.var_store, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const page_data = frame.dataSlice();
