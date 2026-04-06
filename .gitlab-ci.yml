@@ -115,6 +115,23 @@ test-integration:
       - zig-${ZIG_VERSION}/
       - .zig-cache/
 
+fuzz:
+  stage: fuzz
+  image: debian:bookworm-slim
+  needs: [test-unit]
+  before_script:
+    - *install-zig
+  script:
+    # Zig 0.15+ supports built-in fuzz testing via `zig build test --fuzz`.
+    # Run with a time bound to keep CI predictable.
+    - timeout 120 zig build test --fuzz --summary all || true
+  allow_failure: true
+  cache:
+    key: zig-${ZIG_VERSION}
+    paths:
+      - zig-${ZIG_VERSION}/
+      - .zig-cache/
+
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.
 zig-format:
