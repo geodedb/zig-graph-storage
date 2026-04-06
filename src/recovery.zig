@@ -47,6 +47,10 @@ pub const Recovery = struct {
     metrics: ?*metrics_mod.Metrics = null,
     /// Optional log callback for structured event emission.
     log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
+    /// Policy for handling legacy (V1) graph formats.
+    legacy_policy: config_mod.LegacyPolicy = .reject,
+    /// Set to true when recovery opened a V1 graph in read-only mode.
+    read_only: bool = false,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
@@ -108,9 +112,17 @@ pub const Recovery = struct {
         // Validate manifest format version compatibility
         if (m.format_version != manifest_mod.MANIFEST_VERSION) {
             if (m.format_version == manifest_mod.MANIFEST_VERSION_V1) {
-                std.log.warn("V1 graph format detected — data directory must be recreated for V2 (40-byte NodeRec is incompatible with 48-byte V2 layout)", .{});
+                if (self.legacy_policy == .read_only) {
+                    std.log.warn("V1 graph format detected — opening in read-only mode (mutations will be rejected)", .{});
+                    self.read_only = true;
+                    // Continue opening; actual mutation enforcement is in engine.zig
+                } else {
+                    std.log.warn("V1 graph format detected — data directory must be recreated for V2 (40-byte NodeRec is incompatible with 48-byte V2 layout)", .{});
+                    return error.IncompatibleVersion;
+                }
+            } else {
+                return error.IncompatibleVersion;
             }
-            return error.IncompatibleVersion;
         }
 
         // 2. Open store files
@@ -1062,6 +1074,72 @@ test "recovery writes manifest to both slots A and B" {
     // Both manifests should have the same counter
     try testing.expectEqual(manifest_a.counter, manifest_b.counter);
     try testing.expectEqual(manifest_a.last_checkpoint_lsn, manifest_b.last_checkpoint_lsn);
+}
+
+test "V1 format with reject policy returns IncompatibleVersion" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write a V1 manifest
+    var v1_manifest = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+    };
+    v1_manifest.format_version = manifest_mod.MANIFEST_VERSION_V1;
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try v1_manifest.writeToFile(allocator, path_a);
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    recovery.legacy_policy = .reject;
+    const result = recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectError(error.IncompatibleVersion, result);
+}
+
+test "V1 format with read_only policy succeeds and sets read_only flag" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write a V1 manifest
+    var v1_manifest = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+    };
+    v1_manifest.format_version = manifest_mod.MANIFEST_VERSION_V1;
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try v1_manifest.writeToFile(allocator, path_a);
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    recovery.legacy_policy = .read_only;
+    try testing.expect(!recovery.read_only);
+
+    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // read_only flag should be set
+    try testing.expect(recovery.read_only);
 }
 
 test "recovery records duration in metrics when wired" {

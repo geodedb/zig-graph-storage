@@ -37,6 +37,14 @@ pub fn emitEvent(
     }
 }
 
+/// Policy for handling V1 (legacy) graph format during recovery.
+pub const LegacyPolicy = enum {
+    /// Reject V1 format with IncompatibleVersion error (default).
+    reject,
+    /// Open V1 format in read-only mode. Mutations are not permitted.
+    read_only,
+};
+
 pub const GraphConfig = struct {
     page_size: u32 = 8192,
     buffer_pool_pages: u32 = 1024,
@@ -50,6 +58,8 @@ pub const GraphConfig = struct {
     encryption_key: ?[32]u8 = null,
     data_dir: []const u8 = "data",
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
+    /// Policy for handling legacy (V1) graph formats during recovery.
+    legacy_policy: LegacyPolicy = .reject,
 
     /// Compute the effective buffer pool size, applying auto-sizing when enabled.
     ///
