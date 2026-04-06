@@ -978,7 +978,6 @@ pub const GraphEngine = struct {
 
         // Persist free space bitmaps so freed pages survive restart.
         try self.saveFreeStore();
-        try self.rebuildDerivedIndexes();
         try self.saveDerivedIndexes();
         try self.saveLabelDictionary();
 
