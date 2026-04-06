@@ -46,10 +46,11 @@ pub const Integrity = struct {
 // ============================================================================
 
 const testing = std.testing;
+const test_page_size: u32 = 4096;
 
 test "valid page passes verification" {
-    const page_size: u32 = 4096;
-    var buf: [4096]u8 = undefined;
+    const page_size = test_page_size;
+    var buf: [test_page_size]u8 = undefined;
     @memset(&buf, 0);
 
     // Set up header
@@ -69,8 +70,8 @@ test "valid page passes verification" {
 }
 
 test "corrupted page fails verification" {
-    const page_size: u32 = 4096;
-    var buf: [4096]u8 = undefined;
+    const page_size = test_page_size;
+    var buf: [test_page_size]u8 = undefined;
     @memset(&buf, 0);
 
     // Set up header
@@ -90,7 +91,7 @@ test "corrupted page fails verification" {
 }
 
 test "all-zero page passes verification (uninitialized)" {
-    var buf: [4096]u8 = undefined;
+    var buf: [test_page_size]u8 = undefined;
     @memset(&buf, 0);
     try testing.expect(Integrity.verifyPage(&buf));
 }
