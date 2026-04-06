@@ -37,7 +37,7 @@ pub const EdgeIterator = struct {
     pub fn next(self: EdgeIterator) anyerror!?EdgeEntry {
         return self.vtable.next(self.ptr);
     }
-    
+
     pub fn deinit(self: EdgeIterator) void {
         self.vtable.deinit(self.ptr);
     }
@@ -55,7 +55,7 @@ pub const PropertyIterator = struct {
     pub fn next(self: PropertyIterator) anyerror!?PropertyEntry {
         return self.vtable.next(self.ptr);
     }
-    
+
     pub fn deinit(self: PropertyIterator) void {
         self.vtable.deinit(self.ptr);
     }
@@ -289,7 +289,7 @@ pub const GraphStorage = struct {
                 const RealIter = @TypeOf(concrete_iter);
                 const heap_iter = try allocator.create(RealIter);
                 heap_iter.* = concrete_iter;
-                
+
                 const WrapperState = struct {
                     fn next(vp: *anyopaque) anyerror!?PropertyEntry {
                         const hi: *RealIter = @ptrCast(@alignCast(vp));
@@ -309,14 +309,11 @@ pub const GraphStorage = struct {
                         hi.deinit();
                     }
                 };
-                
-                return PropertyIterator{
-                    .ptr = heap_iter,
-                    .vtable = &.{
-                        .next = WrapperState.next,
-                        .deinit = WrapperState.deinit,
-                    }
-                };
+
+                return PropertyIterator{ .ptr = heap_iter, .vtable = &.{
+                    .next = WrapperState.next,
+                    .deinit = WrapperState.deinit,
+                } };
             }
             fn putPropertyFn(ptr: *anyopaque, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
                 const self: *T = @ptrCast(@alignCast(ptr));

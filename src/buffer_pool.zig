@@ -378,7 +378,7 @@ pub const BufferPool = struct {
         var buf: [16384]u8 = undefined;
         std.debug.assert(self.page_size <= buf.len);
         @memcpy(buf[0..self.page_size], frame.dataSlice());
-        
+
         self.mutex.unlock();
         p.writePage(pid, buf[0..self.page_size]) catch |err| {
             self.mutex.lock();
@@ -388,7 +388,7 @@ pub const BufferPool = struct {
             return err;
         };
         self.mutex.lock();
-        
+
         // Allowed to be evicted again
         frame.pin_count -= 1;
 

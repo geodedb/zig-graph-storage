@@ -126,7 +126,7 @@ pub const PropStore = struct {
                 if (self.current_index < self.entry_count_cache) {
                     const key_len = std.mem.bytesToValue(u16, data[self.current_offset..][0..2]);
                     self.current_offset += 2;
-                    
+
                     const entry_key = data[self.current_offset..][0..key_len];
                     self.current_offset += key_len;
 
@@ -135,7 +135,7 @@ pub const PropStore = struct {
                     self.current_offset += @intCast(val_size);
 
                     self.current_index += 1;
-                    
+
                     return PropertyEntrySlice{
                         .key = entry_key,
                         .encoded_value = encoded_val,
