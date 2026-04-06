@@ -31,6 +31,7 @@ const edge_mod = @import("edge.zig");
 const engine_edge_props = @import("engine_edge_props.zig");
 const engine_integrity = @import("engine_integrity.zig");
 const engine_index = @import("engine_index.zig");
+const engine_persist = @import("engine_persist.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -324,100 +325,18 @@ pub const GraphEngine = struct {
         );
     }
 
-    /// Persist the 5 free space bitmaps to a `free.store` file so that
-    /// freed pages are correctly tracked across restarts.
+    // ── Persistence helpers (delegated to engine_persist.zig) ─────────
+
     fn saveFreeStore(self: *GraphEngine) !void {
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/free.store", .{self.graph_dir.path});
-        defer self.allocator.free(path);
-
-        // Compute total size needed for all 5 bitmaps.
-        const total_size = self.free_space_nodes.serializedSize() +
-            self.free_space_adj_out.serializedSize() +
-            self.free_space_adj_in.serializedSize() +
-            self.free_space_props.serializedSize() +
-            self.free_space_var.serializedSize();
-
-        const buf = try self.allocator.alloc(u8, total_size);
-        defer self.allocator.free(buf);
-
-        var offset: usize = 0;
-        const managers = [_]*const FreeSpaceManager{
-            &self.free_space_nodes,
-            &self.free_space_adj_out,
-            &self.free_space_adj_in,
-            &self.free_space_props,
-            &self.free_space_var,
-        };
-        for (managers) |fsm| {
-            const written = fsm.serialize(buf[offset..]) catch return error.BufferTooSmall;
-            offset += written;
-        }
-
-        const file = try std.fs.cwd().createFile(path, .{ .mode = owner_only_file_mode });
-        defer file.close();
-        try file.writeAll(buf[0..offset]);
+        return engine_persist.saveFreeStore(self);
     }
 
-    /// Try to load free space bitmaps from a persisted `free.store` file.
-    /// Returns true if the file was loaded successfully, false if it does
-    /// not exist.
     fn loadFreeStore(self: *GraphEngine) !bool {
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/free.store", .{self.graph_dir.path});
-        defer self.allocator.free(path);
-
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        defer file.close();
-
-        const stat = try file.stat();
-        const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
-        const buf = try self.allocator.alloc(u8, file_size);
-        defer self.allocator.free(buf);
-
-        const bytes_read = try file.readAll(buf);
-        if (bytes_read != file_size) return error.UnexpectedEof;
-
-        var offset: usize = 0;
-        var managers = [_]*FreeSpaceManager{
-            &self.free_space_nodes,
-            &self.free_space_adj_out,
-            &self.free_space_adj_in,
-            &self.free_space_props,
-            &self.free_space_var,
-        };
-        for (&managers) |fsm| {
-            const consumed = try fsm.deserialize(buf[offset..]);
-            offset += consumed;
-        }
-
-        return true;
+        return engine_persist.loadFreeStore(self);
     }
 
-    /// Rebuild free space bitmaps by scanning on-disk file sizes.
-    /// Called during open() after initSubsystems so that pages written in a
-    /// previous session are visible to scanNodes and other page walkers.
     fn rebuildFreeSpaceFromDisk(self: *GraphEngine) !void {
-        const pairs = [_]struct { fsm: *FreeSpaceManager, fid: types.FileId }{
-            .{ .fsm = &self.free_space_nodes, .fid = .nodes },
-            .{ .fsm = &self.free_space_adj_out, .fid = .adj_out },
-            .{ .fsm = &self.free_space_adj_in, .fid = .adj_in },
-            .{ .fsm = &self.free_space_props, .fid = .props },
-            .{ .fsm = &self.free_space_var, .fid = .var_store },
-        };
-
-        for (pairs) |pair| {
-            const pager = self.file_manager.getPager(pair.fid) orelse continue;
-            const page_count = pager.pageCount() catch continue;
-            if (page_count == 0) continue;
-
-            try pair.fsm.ensureCapacity(page_count);
-            var i: usize = 0;
-            while (i < page_count) : (i += 1) {
-                pair.fsm.bitmap.set(i);
-            }
-        }
+        return engine_persist.rebuildFreeSpaceFromDisk(self);
     }
 
     // ── Index operations (delegated to engine_index.zig) ──────────────
@@ -449,9 +368,7 @@ pub const GraphEngine = struct {
     }
 
     fn saveLabelDictionary(self: *GraphEngine) !void {
-        const labels_path = try std.fmt.allocPrint(self.allocator, "{s}/labels.dict", .{self.graph_dir.path});
-        defer self.allocator.free(labels_path);
-        try self.label_dict.saveToFile(labels_path);
+        return engine_persist.saveLabelDictionary(self);
     }
 
     /// Clean up the graph engine and its storage resources.
