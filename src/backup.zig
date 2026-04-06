@@ -259,8 +259,13 @@ pub const Backup = struct {
         const file_count = readU32(data, pos);
         pos += 4;
 
-        // Ensure target directory exists
+        // Ensure target directory exists with restricted permissions
         try std.fs.cwd().makePath(target_dir);
+        {
+            var dir = try std.fs.cwd().openDir(target_dir, .{ .iterate = true });
+            defer dir.close();
+            dir.chmod(0o700) catch {};
+        }
 
         // Extract files
         var i: u32 = 0;
