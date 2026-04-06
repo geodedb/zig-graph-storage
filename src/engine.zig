@@ -29,6 +29,7 @@ const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
 const engine_edge_props = @import("engine_edge_props.zig");
+const engine_integrity = @import("engine_integrity.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -611,98 +612,21 @@ pub const GraphEngine = struct {
         return GraphStorage.init(GraphEngine, self);
     }
 
-    /// Return a read-only pointer to the engine's metrics counters.
+    // ── Integrity and stats (delegated to engine_integrity.zig) ────────
+
+    pub const StorageStats = engine_integrity.StorageStats;
+    pub const IntegrityReport = engine_integrity.IntegrityReport;
+
     pub fn getMetrics(self: *GraphEngine) *const Metrics {
-        return &self.metrics;
+        return engine_integrity.getMetrics(self);
     }
 
-    /// Summary statistics about the storage engine's current state.
-    pub const StorageStats = struct {
-        node_count: u64,
-        edge_count: u64,
-        label_count: u32,
-        format_version: u32,
-        page_size: u32,
-        wal_lsn: u64,
-        last_checkpoint_lsn: u64,
-        free_pages_nodes: u64,
-        free_pages_adj_out: u64,
-        free_pages_adj_in: u64,
-        free_pages_props: u64,
-        free_pages_var: u64,
-    };
-
-    /// Return a snapshot of storage-level statistics.
     pub fn getStorageStats(self: *GraphEngine) StorageStats {
-        return .{
-            .node_count = self.manifest.node_count,
-            .edge_count = self.manifest.edge_count,
-            .label_count = self.manifest.label_count,
-            .format_version = self.manifest.format_version,
-            .page_size = self.config.page_size,
-            .wal_lsn = self.txn_manager.next_txn_id,
-            .last_checkpoint_lsn = self.manifest.last_checkpoint_lsn,
-            .free_pages_nodes = self.free_space_nodes.freeCount(),
-            .free_pages_adj_out = self.free_space_adj_out.freeCount(),
-            .free_pages_adj_in = self.free_space_adj_in.freeCount(),
-            .free_pages_props = self.free_space_props.freeCount(),
-            .free_pages_var = self.free_space_var.freeCount(),
-        };
+        return engine_integrity.getStorageStats(self);
     }
 
-    /// Result of a storage integrity check.
-    pub const IntegrityReport = struct {
-        node_count_consistent: bool,
-        edge_count_consistent: bool,
-        label_index_entries: u64,
-        total_errors: u64,
-    };
-
-    /// Walk the node and edge stores and compare actual live counts against
-    /// the manifest counters. Returns a report with any inconsistencies.
     pub fn checkIntegrity(self: *GraphEngine) IntegrityReport {
-        var report = IntegrityReport{
-            .node_count_consistent = true,
-            .edge_count_consistent = true,
-            .label_index_entries = 0,
-            .total_errors = 0,
-        };
-
-        // Count actual live nodes (not deleted, not empty)
-        var actual_nodes: u64 = 0;
-        var id: u64 = 1;
-        while (id < self.manifest.next_node_id) : (id += 1) {
-            if (self.node_store.getNode(id) catch null) |rec| {
-                if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec)) {
-                    actual_nodes += 1;
-                }
-            }
-        }
-        if (actual_nodes != self.manifest.node_count) {
-            report.node_count_consistent = false;
-            report.total_errors += 1;
-        }
-
-        // Count actual edges by scanning outgoing adjacency lists of all live nodes
-        var actual_edges: u64 = 0;
-        var nid: u64 = 1;
-        while (nid < self.manifest.next_node_id) : (nid += 1) {
-            if (self.node_store.getNode(nid) catch null) |rec| {
-                if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec) and rec.out_head != 0) {
-                    var iter = self.adj_out.expand(rec.out_head, null);
-                    defer iter.deinit();
-                    while (iter.next() catch null) |_| {
-                        actual_edges += 1;
-                    }
-                }
-            }
-        }
-        if (actual_edges != self.manifest.edge_count) {
-            report.edge_count_consistent = false;
-            report.total_errors += 1;
-        }
-
-        return report;
+        return engine_integrity.checkIntegrity(self);
     }
 
     // ========================================================================
