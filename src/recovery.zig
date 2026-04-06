@@ -207,6 +207,10 @@ pub const Recovery = struct {
         defer self.allocator.free(manifest_path_a);
         try m.writeToFile(self.allocator, manifest_path_a);
 
+        const manifest_path_b = try graph_dir.manifestPath(self.allocator, .b);
+        defer self.allocator.free(manifest_path_b);
+        try m.writeToFile(self.allocator, manifest_path_b);
+
         return m;
     }
 };
@@ -983,6 +987,62 @@ test "deinit zeros encryption key" {
 test "deinit with null encryption key does not panic" {
     var recovery = Recovery.init(testing.allocator, null);
     recovery.deinit(); // should not panic
+}
+
+test "recovery writes manifest to both slots A and B" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write initial manifest to slot A only
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    // Write a committed transaction so recovery writes a fresh manifest
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+    defer wal_dir.close();
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+    var begin_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin_rec);
+    var commit_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&commit_rec);
+    try wal.sync();
+    wal.deinit();
+
+    // Run recovery
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+    var recovery = Recovery.init(allocator, null);
+    defer recovery.deinit();
+    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // Both slots should now have a valid manifest
+    const slot_a_path = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(slot_a_path);
+    const manifest_a = (try Manifest.readFromFile(allocator, slot_a_path)) orelse return error.TestUnexpectedResult;
+
+    const slot_b_path = try setup.graph_dir.manifestPath(allocator, .b);
+    defer allocator.free(slot_b_path);
+    const manifest_b = (try Manifest.readFromFile(allocator, slot_b_path)) orelse return error.TestUnexpectedResult;
+
+    // Both manifests should have the same counter
+    try testing.expectEqual(manifest_a.counter, manifest_b.counter);
+    try testing.expectEqual(manifest_a.last_checkpoint_lsn, manifest_b.last_checkpoint_lsn);
 }
 
 test {
