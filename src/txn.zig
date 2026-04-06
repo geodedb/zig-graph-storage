@@ -81,7 +81,7 @@ pub const TxnManager = struct {
         _ = try self.wal.appendRecord(&rec);
         try self.wal.sync();
 
-        try self.active_txns.put(txn_id, .committed);
+        _ = self.active_txns.remove(txn_id);
     }
 
     /// Abort a transaction. Writes an ABORT record to the WAL.
@@ -101,7 +101,7 @@ pub const TxnManager = struct {
         };
         _ = try self.wal.appendRecord(&rec);
 
-        try self.active_txns.put(txn_id, .aborted);
+        _ = self.active_txns.remove(txn_id);
     }
 
     /// Check if a transaction is currently active.
