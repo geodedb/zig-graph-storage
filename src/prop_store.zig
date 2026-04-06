@@ -388,7 +388,10 @@ pub const PropStore = struct {
                     }
 
                     writeEntryCount(data, entry_count);
-                    // PERF-0023: Rebuild directory after removal.
+                    // PERF-0038/PERF-0023: Rebuild directory after removal.
+                    // Required because entry offsets shifted during compaction.
+                    // This is the only rebuild for this page; Pass 2 rebuilds
+                    // only the (different) insertion page.
                     rebuildDirectory(data, entry_count, self.page_size);
                     self.buffer_pool.unpin(frame_idx, true);
 
@@ -446,12 +449,12 @@ pub const PropStore = struct {
                 self.writePropertyEntry(data, write_offset, key, encoded_val);
                 writeEntryCount(data, entry_count + 1);
 
-                // PERF-0023: Append directory entry for the new key.
+                // PERF-0038: Append a single directory entry instead of
+                // rebuilding the entire directory. Existing entries on this
+                // page have not moved, only a new entry was appended.
                 const new_count: u16 = @intCast(entry_count + 1);
                 writeDirCount(data, new_count);
-                // Rebuild directory since offsets may have shifted on other pages.
-                // For pass-2 we rebuild to be safe (entry_count was read fresh).
-                rebuildDirectory(data, entry_count + 1, self.page_size);
+                writeDirEntry(data, @intCast(entry_count), keyHash(key), @intCast(write_offset));
 
                 self.buffer_pool.unpin(frame_idx, true);
                 return prop_head;
