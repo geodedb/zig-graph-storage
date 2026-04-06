@@ -22,6 +22,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const timing_safe = std.crypto.timing_safe;
 const owner_only_file_mode = 0o600;
 
 const graph_dir_mod = @import("graph_dir.zig");
@@ -220,7 +221,7 @@ pub const Backup = struct {
                 const hmac_input = data[0..integrity_end];
                 var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
                 HmacSha256.create(&computed_hmac, hmac_input, &key);
-                if (!std.mem.eql(u8, stored_hmac, &computed_hmac)) {
+                if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac.*, computed_hmac)) {
                     return error.HmacMismatch;
                 }
             } else {
@@ -317,7 +318,7 @@ pub const Backup = struct {
             const hmac_input = data[0..integrity_end];
             var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
             HmacSha256.create(&computed_hmac, hmac_input, &self.encryption_key.?);
-            if (!std.mem.eql(u8, stored_hmac, &computed_hmac)) return false;
+            if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac.*, computed_hmac)) return false;
         }
 
         return true;
