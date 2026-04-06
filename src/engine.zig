@@ -1027,7 +1027,7 @@ pub const GraphEngine = struct {
 
     /// Read a single property from an edge.
     pub fn getEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
-        const from_rec = (try self.node_store.getNode(from)) orelse return null;
+        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
 
         const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return null;
         if (prop_head == 0) return null;
@@ -1036,7 +1036,7 @@ pub const GraphEngine = struct {
 
     /// Return an iterator over all properties on an edge.
     pub fn getAllEdgeProperties(self: *GraphEngine, from: NodeId, edge_id: EdgeId) anyerror!?PropStore.PropIterator {
-        const from_rec = (try self.node_store.getNode(from)) orelse return null;
+        const from_rec = (try self.node_store.getNode(from)) orelse return error.NodeNotFound;
 
         const prop_head = (try self.findEdgePropHead(from_rec.out_head, edge_id)) orelse return null;
         if (prop_head == 0) return null;
