@@ -689,12 +689,18 @@ pub const GraphEngine = struct {
         return self.node_store.getNode(id);
     }
 
+    /// Put a node within an existing transaction (no auto-commit).
+    pub fn putNodeTxn(self: *GraphEngine, id: NodeId, rec: NodeRec, txn: TxnId) anyerror!void {
+        try self.node_store.putNode(id, rec);
+        try self.logPage(txn, .nodes, self.nodePageId(id));
+    }
+
+    /// Put a node with auto-commit (backward compatible).
     pub fn putNode(self: *GraphEngine, id: NodeId, rec: NodeRec) anyerror!void {
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
-        try self.node_store.putNode(id, rec);
-        try self.logPage(txn, .nodes, self.nodePageId(id));
+        try self.putNodeTxn(id, rec, txn);
 
         try self.txn_manager.commit(txn);
     }
@@ -707,19 +713,25 @@ pub const GraphEngine = struct {
         return id;
     }
 
-    pub fn deleteNode(self: *GraphEngine, id: NodeId) anyerror!void {
-        const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
-
+    /// Delete a node within an existing transaction (no auto-commit).
+    pub fn deleteNodeTxn(self: *GraphEngine, id: NodeId, txn: TxnId) anyerror!void {
         try self.node_store.deleteNode(id);
         try self.logPage(txn, .nodes, self.nodePageId(id));
-
-        try self.txn_manager.commit(txn);
 
         if (self.manifest.node_count > 0) {
             self.manifest.node_count -= 1;
         }
         self.metrics.nodes_deleted += 1;
+    }
+
+    /// Delete a node with auto-commit (backward compatible).
+    pub fn deleteNode(self: *GraphEngine, id: NodeId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        try self.deleteNodeTxn(id, txn);
+
+        try self.txn_manager.commit(txn);
     }
 
     /// Look up an edge by its ID.
@@ -757,10 +769,8 @@ pub const GraphEngine = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    pub fn addEdge(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
-        const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
-
+    /// Add an edge within an existing transaction (no auto-commit).
+    pub fn addEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
         const edge_id = self.manifest.next_edge_id;
         self.manifest.next_edge_id += 1;
 
@@ -799,18 +809,26 @@ pub const GraphEngine = struct {
             try self.logPage(txn, .nodes, to_page);
         }
 
-        try self.txn_manager.commit(txn);
-
         self.manifest.edge_count += 1;
         self.metrics.edges_created += 1;
 
         return edge_id;
     }
 
-    pub fn removeEdge(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
+    /// Add an edge with auto-commit (backward compatible).
+    pub fn addEdge(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
+        const edge_id = try self.addEdgeTxn(from, to, rel_type, txn);
+
+        try self.txn_manager.commit(txn);
+
+        return edge_id;
+    }
+
+    /// Remove an edge within an existing transaction (no auto-commit).
+    pub fn removeEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, txn: TxnId) anyerror!void {
         // Remove from source node's out adjacency list
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         try self.adj_out.removeEdge(from_rec.out_head, edge_id);
@@ -823,12 +841,20 @@ pub const GraphEngine = struct {
         if (from_rec.out_head != 0) try self.logPage(txn, .adj_out, from_rec.out_head);
         if (to_rec.in_head != 0) try self.logPage(txn, .adj_in, to_rec.in_head);
 
-        try self.txn_manager.commit(txn);
-
         if (self.manifest.edge_count > 0) {
             self.manifest.edge_count -= 1;
         }
         self.metrics.edges_removed += 1;
+    }
+
+    /// Remove an edge with auto-commit (backward compatible).
+    pub fn removeEdge(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        try self.removeEdgeTxn(from, to, edge_id, txn);
+
+        try self.txn_manager.commit(txn);
     }
 
     pub fn getProperty(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
@@ -844,16 +870,12 @@ pub const GraphEngine = struct {
         return self.prop_store.getAllProperties(prop_head);
     }
 
-    pub fn putProperty(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
-        const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
-
+    /// Put a property within an existing transaction (no auto-commit).
+    pub fn putPropertyTxn(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId) anyerror!u64 {
         const new_head = try self.prop_store.putProperty(owner, key, val);
 
         // Log the property page that was written to
         try self.logPage(txn, .props, new_head);
-
-        try self.txn_manager.commit(txn);
 
         if (owner != 0 and owner != new_head) {
             self.property_index.removeChain(owner);
@@ -861,6 +883,18 @@ pub const GraphEngine = struct {
         try self.refreshPropertyChainIndex(new_head);
 
         self.metrics.properties_written += 1;
+        return new_head;
+    }
+
+    /// Put a property with auto-commit (backward compatible).
+    pub fn putProperty(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        const new_head = try self.putPropertyTxn(owner, key, val, txn);
+
+        try self.txn_manager.commit(txn);
+
         return new_head;
     }
 
@@ -878,10 +912,8 @@ pub const GraphEngine = struct {
         try self.refreshPropertyChainIndex(owner);
     }
 
-    pub fn addLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
-        const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
-
+    /// Add a label within an existing transaction (no auto-commit).
+    pub fn addLabelTxn(self: *GraphEngine, node_id: NodeId, label: LabelId, txn: TxnId) anyerror!void {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
         if (result.count != rec.label_count or result.head != rec.label_head) {
@@ -894,14 +926,20 @@ pub const GraphEngine = struct {
             try self.logPage(txn, .nodes, self.nodePageId(node_id));
         }
         try self.label_index.addNode(label, node_id);
+    }
+
+    /// Add a label with auto-commit (backward compatible).
+    pub fn addLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        try self.addLabelTxn(node_id, label, txn);
 
         try self.txn_manager.commit(txn);
     }
 
-    pub fn removeLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
-        const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
-
+    /// Remove a label within an existing transaction (no auto-commit).
+    pub fn removeLabelTxn(self: *GraphEngine, node_id: NodeId, label: LabelId, txn: TxnId) anyerror!void {
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
         rec.label_head = result.head;
@@ -912,6 +950,14 @@ pub const GraphEngine = struct {
         // Log dirty pages: var_store page (if any) and node page
         if (result.head != 0) try self.logPage(txn, .var_store, result.head);
         try self.logPage(txn, .nodes, self.nodePageId(node_id));
+    }
+
+    /// Remove a label with auto-commit (backward compatible).
+    pub fn removeLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        try self.removeLabelTxn(node_id, label, txn);
 
         try self.txn_manager.commit(txn);
     }
@@ -1658,6 +1704,67 @@ test "V1 format detection returns V1FormatRequiresRecreation" {
     // open() should detect V1 and return error
     const result = GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     try testing.expectError(error.IncompatibleVersion, result);
+}
+
+test "GAP-0022: multi-op transaction groups mutations" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x70} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Begin an explicit transaction
+    const txn = try engine.beginTxn();
+
+    // Allocate and put two nodes within the same transaction
+    const n1 = try engine.allocNode();
+    const rec1 = NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+    try engine.putNodeTxn(n1, rec1, txn);
+
+    const n2 = try engine.allocNode();
+    const rec2 = NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+    try engine.putNodeTxn(n2, rec2, txn);
+
+    // Add an edge within the same transaction
+    const edge_id = try engine.addEdgeTxn(n1, n2, 42, txn);
+
+    // Commit the single transaction covering all three mutations
+    try engine.commitTxn(txn);
+
+    // Verify all data is present
+    const got1 = try engine.getNode(n1);
+    try testing.expect(got1 != null);
+
+    const got2 = try engine.getNode(n2);
+    try testing.expect(got2 != null);
+
+    const edges = try engine.expandOut(n1, null, testing.allocator);
+    defer testing.allocator.free(edges);
+    try testing.expectEqual(@as(usize, 1), edges.len);
+    try testing.expectEqual(edge_id, edges[0].edge_id);
+    try testing.expectEqual(@as(u32, 42), edges[0].rel_type);
 }
 
 test {
