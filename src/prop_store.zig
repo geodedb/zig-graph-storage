@@ -473,7 +473,7 @@ pub const PropStore = struct {
             current_page = next_page;
         }
 
-        unreachable;
+        return error.DataCorruption;
     }
 
     /// Remove a property by key. Scans all pages in the chain.
