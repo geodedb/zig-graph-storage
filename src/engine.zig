@@ -30,6 +30,7 @@ const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
 const engine_edge_props = @import("engine_edge_props.zig");
 const engine_integrity = @import("engine_integrity.zig");
+const engine_index = @import("engine_index.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -63,7 +64,7 @@ const EdgeEntry = edge_mod.EdgeEntry;
 const owner_only_file_mode = 0o600;
 
 /// In-memory index entry for O(1) edge lookup by EdgeId.
-const EdgeIndexEntry = struct {
+pub const EdgeIndexEntry = struct {
     from: NodeId,
     neighbor: NodeId,
     rel_type: u32,
@@ -419,27 +420,7 @@ pub const GraphEngine = struct {
         }
     }
 
-    /// Rebuild the in-memory label index by reading each live node's labels
-    /// from the LabelStore (var.store-backed). Called during open() after all
-    /// subsystems and free-space bitmaps are initialized.
-    fn rebuildLabelIndex(self: *GraphEngine) !void {
-        self.label_index.clear();
-
-        // Iterate all allocated node IDs and populate the index from LabelStore.
-        var id: u64 = 1;
-        while (id < self.manifest.next_node_id) : (id += 1) {
-            const rec = self.node_store.getNode(id) catch continue orelse continue;
-            if (node_mod.isDeleted(&rec) or node_mod.isEmpty(&rec)) continue;
-            if (rec.label_head == 0) continue;
-
-            const labels = self.label_store.getLabels(rec.label_head, self.allocator) catch continue;
-            defer self.allocator.free(labels);
-
-            for (labels) |label_id| {
-                try self.label_index.addNode(label_id, id);
-            }
-        }
-    }
+    // ── Index operations (delegated to engine_index.zig) ──────────────
 
     pub fn refreshPropertyChainIndex(self: *GraphEngine, prop_head: u64) !void {
         if (prop_head == 0) {
@@ -451,82 +432,20 @@ pub const GraphEngine = struct {
         try self.property_index.refreshFromIterator(prop_head, &iter);
     }
 
-    fn rebuildPropertyIndex(self: *GraphEngine) !void {
-        self.property_index.clear();
-
-        var id: u64 = 1;
-        while (id < self.manifest.next_node_id) : (id += 1) {
-            const rec = self.node_store.getNode(id) catch continue orelse continue;
-            if (node_mod.isDeleted(&rec) or node_mod.isEmpty(&rec)) continue;
-
-            try self.refreshPropertyChainIndex(rec.prop_head);
-
-            if (rec.out_head == 0) continue;
-            var iter = self.adj_out.expand(rec.out_head, null);
-            defer iter.deinit();
-            while (try iter.next()) |entry| {
-                try self.refreshPropertyChainIndex(entry.prop_head);
-            }
-        }
-    }
-
-    /// Rebuild the in-memory edge index by scanning each live node's outgoing
-    /// adjacency list. Called during open() so getEdge works after restart.
-    fn rebuildEdgeIndex(self: *GraphEngine) !void {
-        self.edge_index.clearAndFree();
-
-        var id: u64 = 1;
-        while (id < self.manifest.next_node_id) : (id += 1) {
-            const rec = self.node_store.getNode(id) catch continue orelse continue;
-            if (node_mod.isDeleted(&rec) or node_mod.isEmpty(&rec)) continue;
-            if (rec.out_head == 0) continue;
-
-            var iter = self.adj_out.expand(rec.out_head, null);
-            defer iter.deinit();
-            while (try iter.next()) |entry| {
-                try self.edge_index.put(entry.edge_id, .{
-                    .from = id,
-                    .neighbor = entry.neighbor,
-                    .rel_type = entry.rel_type,
-                    .prop_head = entry.prop_head,
-                });
-            }
-        }
-    }
-
     fn rebuildDerivedIndexes(self: *GraphEngine) !void {
-        try self.rebuildLabelIndex();
-        try self.rebuildPropertyIndex();
-        try self.rebuildEdgeIndex();
+        return engine_index.rebuildDerivedIndexes(self);
+    }
+
+    fn rebuildEdgeIndex(self: *GraphEngine) !void {
+        return engine_index.rebuildEdgeIndex(self);
     }
 
     fn tryLoadDerivedIndexes(self: *GraphEngine) !bool {
-        const label_file = self.file_manager.getFile(.label_idx) orelse return false;
-        const prop_file = self.file_manager.getFile(.prop_idx) orelse return false;
-
-        self.label_index.clear();
-        self.property_index.clear();
-        errdefer {
-            self.label_index.clear();
-            self.property_index.clear();
-        }
-
-        const label_counter = try self.label_index.loadFromFile(label_file) orelse return false;
-        const prop_counter = try self.property_index.loadFromFile(prop_file) orelse return false;
-        if (label_counter != self.manifest.counter or prop_counter != self.manifest.counter) {
-            self.label_index.clear();
-            self.property_index.clear();
-            return false;
-        }
-
-        return true;
+        return engine_index.tryLoadDerivedIndexes(self);
     }
 
     fn saveDerivedIndexes(self: *GraphEngine) !void {
-        const label_file = self.file_manager.getFile(.label_idx) orelse return error.LabelIndexFileNotOpen;
-        const prop_file = self.file_manager.getFile(.prop_idx) orelse return error.PropertyIndexFileNotOpen;
-        try self.label_index.saveToFile(label_file, self.manifest.counter);
-        try self.property_index.saveToFile(prop_file, self.manifest.counter);
+        return engine_index.saveDerivedIndexes(self);
     }
 
     fn saveLabelDictionary(self: *GraphEngine) !void {
