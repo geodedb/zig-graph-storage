@@ -60,6 +60,14 @@ const NodeRec = node_mod.NodeRec;
 const EdgeEntry = edge_mod.EdgeEntry;
 const owner_only_file_mode = 0o600;
 
+/// In-memory index entry for O(1) edge lookup by EdgeId.
+const EdgeIndexEntry = struct {
+    from: NodeId,
+    neighbor: NodeId,
+    rel_type: u32,
+    prop_head: u32,
+};
+
 /// The central GraphEngine that wires everything together and implements
 /// the GraphStorage vtable.
 ///
@@ -88,6 +96,7 @@ pub const GraphEngine = struct {
     label_store: LabelStore,
     label_index: LabelIndex,
     property_index: PropertyChainIndex,
+    edge_index: std.AutoHashMap(EdgeId, EdgeIndexEntry),
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.fs.Dir,
@@ -235,6 +244,9 @@ pub const GraphEngine = struct {
         const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
         if (!loaded_indexes) {
             try self.rebuildDerivedIndexes();
+        } else {
+            // Edge index is in-memory only (no persistence) so always rebuild
+            try self.rebuildEdgeIndex();
         }
 
         // 8. Wire metrics and thread pool into buffer pool
@@ -295,6 +307,8 @@ pub const GraphEngine = struct {
         errdefer self.label_index.deinit();
         self.property_index = PropertyChainIndex.init(allocator);
         errdefer self.property_index.deinit();
+        self.edge_index = std.AutoHashMap(EdgeId, EdgeIndexEntry).init(allocator);
+        errdefer self.edge_index.deinit();
 
         // Checkpointer
         self.checkpointer = Checkpointer.init(
@@ -454,9 +468,34 @@ pub const GraphEngine = struct {
         }
     }
 
+    /// Rebuild the in-memory edge index by scanning each live node's outgoing
+    /// adjacency list. Called during open() so getEdge works after restart.
+    fn rebuildEdgeIndex(self: *GraphEngine) !void {
+        self.edge_index.clearAndFree();
+
+        var id: u64 = 1;
+        while (id < self.manifest.next_node_id) : (id += 1) {
+            const rec = self.node_store.getNode(id) catch continue orelse continue;
+            if (node_mod.isDeleted(&rec) or node_mod.isEmpty(&rec)) continue;
+            if (rec.out_head == 0) continue;
+
+            var iter = self.adj_out.expand(rec.out_head, null);
+            defer iter.deinit();
+            while (try iter.next()) |entry| {
+                try self.edge_index.put(entry.edge_id, .{
+                    .from = id,
+                    .neighbor = entry.neighbor,
+                    .rel_type = entry.rel_type,
+                    .prop_head = entry.prop_head,
+                });
+            }
+        }
+    }
+
     fn rebuildDerivedIndexes(self: *GraphEngine) !void {
         try self.rebuildLabelIndex();
         try self.rebuildPropertyIndex();
+        try self.rebuildEdgeIndex();
     }
 
     fn tryLoadDerivedIndexes(self: *GraphEngine) !bool {
@@ -555,6 +594,7 @@ pub const GraphEngine = struct {
         self.label_dict.deinit();
         self.label_index.deinit();
         self.property_index.deinit();
+        self.edge_index.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
@@ -734,15 +774,16 @@ pub const GraphEngine = struct {
         try self.txn_manager.commit(txn);
     }
 
-    /// Look up an edge by its ID.
-    ///
-    /// QUAL-0006: Returns error.EdgeIndexNotImplemented instead of silently
-    /// returning null. A dedicated edge-ID index is required for efficient
-    /// lookup; the current storage layout does not maintain one.
+    /// Look up an edge by its ID using the in-memory edge index.
+    /// Returns the EdgeEntry if found, null otherwise.
     pub fn getEdge(self: *GraphEngine, edge_id: EdgeId) anyerror!?EdgeEntry {
-        _ = self;
-        _ = edge_id;
-        return error.EdgeIndexNotImplemented;
+        const entry = self.edge_index.get(edge_id) orelse return null;
+        return EdgeEntry{
+            .neighbor = entry.neighbor,
+            .edge_id = edge_id,
+            .rel_type = entry.rel_type,
+            .prop_head = entry.prop_head,
+        };
     }
 
     pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
@@ -809,6 +850,14 @@ pub const GraphEngine = struct {
             try self.logPage(txn, .nodes, to_page);
         }
 
+        // Maintain in-memory edge index for O(1) getEdge lookups
+        try self.edge_index.put(edge_id, .{
+            .from = from,
+            .neighbor = to,
+            .rel_type = rel_type,
+            .prop_head = 0,
+        });
+
         self.manifest.edge_count += 1;
         self.metrics.edges_created += 1;
 
@@ -840,6 +889,9 @@ pub const GraphEngine = struct {
         // Log dirty adjacency pages
         if (from_rec.out_head != 0) try self.logPage(txn, .adj_out, from_rec.out_head);
         if (to_rec.in_head != 0) try self.logPage(txn, .adj_in, to_rec.in_head);
+
+        // Remove from in-memory edge index
+        _ = self.edge_index.remove(edge_id);
 
         if (self.manifest.edge_count > 0) {
             self.manifest.edge_count -= 1;
@@ -1049,11 +1101,16 @@ pub const GraphEngine = struct {
         const new_head_u64 = try self.putProperty(@as(u64, found_prop_head), key, value);
         const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
 
-        // 4. If prop_head changed, update BOTH adjacency copies
+        // 4. If prop_head changed, update BOTH adjacency copies and edge index
         if (new_head != found_prop_head) {
             _ = try self.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head);
             const to_rec = (try self.node_store.getNode(to)) orelse return error.NodeNotFound;
             _ = try self.adj_in.updateEdgePropHead(to_rec.in_head, edge_id, new_head);
+
+            // Keep edge index prop_head in sync
+            if (self.edge_index.getPtr(edge_id)) |idx_entry| {
+                idx_entry.prop_head = new_head;
+            }
         }
 
         if (found_prop_head != 0 and found_prop_head != new_head) {
@@ -1436,7 +1493,7 @@ test "SEC-0010: open rejects page_size mismatch" {
     }
 }
 
-test "QUAL-0006: getEdge returns EdgeIndexNotImplemented error" {
+test "QUAL-0006: getEdge returns null for nonexistent edge" {
     var td = try testDataDir();
     defer {
         testing.allocator.free(td.path);
@@ -1447,9 +1504,59 @@ test "QUAL-0006: getEdge returns EdgeIndexNotImplemented error" {
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
     defer engine.close() catch {};
 
-    // getEdge should return an explicit error, not silent null
-    const result = engine.getEdge(1);
-    try testing.expectError(error.EdgeIndexNotImplemented, result);
+    // getEdge should return null for an edge that does not exist
+    const result = try engine.getEdge(999);
+    try testing.expect(result == null);
+}
+
+test "GAP-0021: getEdge returns edge after addEdge" {
+    var td = try testDataDir();
+    defer {
+        testing.allocator.free(td.path);
+        td.tmp_dir.cleanup();
+    }
+
+    const uuid = [_]u8{0x21} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Create two nodes
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    // Add an edge and look it up by ID
+    const edge_id = try engine.addEdge(n1, n2, 42);
+    const edge = try engine.getEdge(edge_id);
+    try testing.expect(edge != null);
+    try testing.expectEqual(n2, edge.?.neighbor);
+    try testing.expectEqual(edge_id, edge.?.edge_id);
+    try testing.expectEqual(@as(u32, 42), edge.?.rel_type);
+    try testing.expectEqual(@as(u32, 0), edge.?.prop_head);
+
+    // Remove the edge, getEdge should return null
+    try engine.removeEdge(n1, n2, edge_id);
+    const removed = try engine.getEdge(edge_id);
+    try testing.expect(removed == null);
 }
 
 test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
