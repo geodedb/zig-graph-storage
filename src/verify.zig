@@ -38,6 +38,20 @@ pub const VerifyResult = struct {
         try self.errors.append(self.allocator, msg);
     }
 
+    /// Write the result as a JSON object to the provided writer.
+    pub fn writeJson(self: *const VerifyResult, writer: anytype) !void {
+        try writer.print(
+            "{{\"total_pages_checked\":{d},\"corrupted_pages\":{d},\"manifest_valid\":{},\"is_clean\":{},\"error_count\":{d}}}",
+            .{
+                self.total_pages_checked,
+                self.corrupted_pages,
+                self.manifest_valid,
+                self.isClean(),
+                self.errors.items.len,
+            },
+        );
+    }
+
     pub fn deinit(self: *VerifyResult) void {
         for (self.errors.items) |msg| {
             self.allocator.free(msg);
@@ -339,6 +353,48 @@ test "no manifest fails verification" {
 
     try testing.expect(!result.isClean());
     try testing.expect(!result.manifest_valid);
+}
+
+test "VerifyResult writeJson produces valid structured output" {
+    const allocator = testing.allocator;
+    var result = VerifyResult.init(allocator);
+    defer result.deinit();
+
+    result.total_pages_checked = 42;
+    result.corrupted_pages = 0;
+    result.manifest_valid = true;
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+
+    try result.writeJson(buf.writer(allocator));
+    const json = buf.items;
+
+    // Verify key fields present
+    try testing.expect(std.mem.indexOf(u8, json, "\"total_pages_checked\":42") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"corrupted_pages\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"manifest_valid\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"is_clean\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"error_count\":0") != null);
+}
+
+test "VerifyResult writeJson reports unclean state" {
+    const allocator = testing.allocator;
+    var result = VerifyResult.init(allocator);
+    defer result.deinit();
+
+    result.total_pages_checked = 10;
+    result.corrupted_pages = 2;
+    result.manifest_valid = false;
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+
+    try result.writeJson(buf.writer(allocator));
+    const json = buf.items;
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"is_clean\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"corrupted_pages\":2") != null);
 }
 
 test {

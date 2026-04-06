@@ -57,6 +57,18 @@ pub const BackupResult = struct {
     graph_uuid: [16]u8,
     files_backed_up: u32,
     total_bytes: u64,
+
+    /// Write the result as a JSON object to the provided writer.
+    pub fn writeJson(self: *const BackupResult, writer: anytype) !void {
+        try writer.writeAll("{\"graph_uuid\":\"");
+        for (self.graph_uuid) |byte| {
+            try writer.print("{x:0>2}", .{byte});
+        }
+        try writer.print("\",\"files_backed_up\":{d},\"total_bytes\":{d}}}", .{
+            self.files_backed_up,
+            self.total_bytes,
+        });
+    }
 };
 
 /// Per-graph backup and restore.
@@ -921,6 +933,24 @@ test "SEC-0005: no-key backup still works as version 1" {
 
     const valid = try backup.validateBackup(backup_path);
     try testing.expect(valid);
+}
+
+test "BackupResult writeJson produces valid structured output" {
+    const result = BackupResult{
+        .graph_uuid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD } ++ [_]u8{0x00} ** 12,
+        .files_backed_up = 7,
+        .total_bytes = 123456,
+    };
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(testing.allocator);
+
+    try result.writeJson(buf.writer(testing.allocator));
+    const json = buf.items;
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"files_backed_up\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"total_bytes\":123456") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"graph_uuid\":\"aabbccdd") != null);
 }
 
 test {
