@@ -484,26 +484,7 @@ pub const GraphEngine = struct {
 
     /// Clean up the graph engine and its storage resources.
     pub fn deinit(self: *GraphEngine) void {
-        self.thread_pool.deinit();
-        self.txn_manager.deinit();
-        self.wal.deinit();
-        self.wal_dir_handle.close();
-        self.free_space_nodes.deinit();
-        self.free_space_adj_out.deinit();
-        self.free_space_adj_in.deinit();
-        self.free_space_props.deinit();
-        self.free_space_var.deinit();
-        self.label_dict.deinit();
-        self.label_index.deinit();
-        self.property_index.deinit();
-        self.buffer_pool.deinit();
-        self.file_manager.deinit();
-        self.graph_dir.deinit();
-
-        // SEC-0003: Zero encryption key material before freeing memory
-        self.config.zeroKey();
-
-        self.allocator.destroy(self);
+        self.cleanupResources(self.allocator);
     }
 
     /// Close the engine (flush, checkpoint, close files).
