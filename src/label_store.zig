@@ -61,7 +61,7 @@ pub const LabelStore = struct {
         defer allocator.free(new_list);
         @memcpy(new_list[0..existing.len], existing);
         new_list[existing.len] = label_id;
-        if (label_head != 0) self.var_store.free(label_head) catch {};
+        if (label_head != 0) try self.var_store.free(label_head);
         const new_head = try self.putLabels(new_list, allocator);
         return .{ .head = new_head, .count = @intCast(new_list.len) };
     }
@@ -75,7 +75,7 @@ pub const LabelStore = struct {
         for (existing) |id| {
             if (id != label_id) try new_list.append(allocator, id);
         }
-        if (label_head != 0) self.var_store.free(label_head) catch {};
+        if (label_head != 0) try self.var_store.free(label_head);
         if (new_list.items.len == 0) return .{ .head = 0, .count = 0 };
         const new_head = try self.putLabels(new_list.items, allocator);
         return .{ .head = new_head, .count = @intCast(new_list.items.len) };
