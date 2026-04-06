@@ -1178,6 +1178,100 @@ test "recovery records duration in metrics when wired" {
     try testing.expect(m.recovery_duration_ns > 0);
 }
 
+test "uncommitted transaction not applied during recovery" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Write initial manifest
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    // Open WAL directory and create WAL manager
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+    defer wal_dir.close();
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+
+    // BEGIN txn 42
+    var begin_rec = WalRecord{
+        .lsn = 0,
+        .txn_id = 42,
+        .record_type = .begin_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
+    };
+    _ = try wal.appendRecord(&begin_rec);
+
+    // PAGE_UPDATE for txn 42 -- write a page full of 0xAA
+    var page_data: [4096]u8 = undefined;
+    @memset(&page_data, 0xAA);
+    var update_rec = WalRecord{
+        .lsn = 0,
+        .txn_id = 42,
+        .record_type = .page_update,
+        .file_id = 0, // nodes
+        .page_id = 1,
+        .payload = &page_data,
+        .checksum = 0,
+    };
+    _ = try wal.appendRecord(&update_rec);
+
+    // NO commit record -- simulate crash before commit
+    try wal.sync();
+    wal.deinit();
+
+    // Run recovery
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    const m = try recovery.recover(&setup.graph_dir, &pool, &fm);
+    _ = m;
+
+    // The uncommitted page_update must NOT have been applied.
+    // Pin the page and verify it is NOT filled with 0xAA.
+    // Since the page was never written to the store, pinNew will give a
+    // zero-initialized frame (no store file backing for page 1).
+    // If recovery incorrectly replayed the uncommitted txn, the page would
+    // contain 0xAA bytes.
+    const page_mod = @import("page.zig");
+    _ = try fm.openFile(.nodes);
+    pool.registerPager(.nodes, &fm.pagers[@intFromEnum(FileId.nodes)].?);
+
+    const frame = try pool.pinNew(.nodes, 1);
+    const frame_idx = pool.frameIndex(frame);
+    defer pool.unpin(frame_idx, false);
+    const data = frame.dataSlice();
+
+    // Verify the page is NOT filled with 0xAA (uncommitted data not applied)
+    var found_aa = false;
+    for (data[page_mod.PAGE_HEADER_SIZE..]) |byte| {
+        if (byte == 0xAA) {
+            found_aa = true;
+            break;
+        }
+    }
+    try testing.expect(!found_aa);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
