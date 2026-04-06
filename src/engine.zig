@@ -254,25 +254,33 @@ pub const GraphEngine = struct {
     fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]u8, cfg: GraphConfig, wal_start_lsn: u64) !void {
         // Free space managers for each store
         self.free_space_nodes = try FreeSpaceManager.init(allocator, &self.buffer_pool, .nodes);
+        errdefer self.free_space_nodes.deinit();
         self.free_space_adj_out = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_out);
+        errdefer self.free_space_adj_out.deinit();
         self.free_space_adj_in = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_in);
+        errdefer self.free_space_adj_in.deinit();
         self.free_space_props = try FreeSpaceManager.init(allocator, &self.buffer_pool, .props);
+        errdefer self.free_space_props.deinit();
         self.free_space_var = try FreeSpaceManager.init(allocator, &self.buffer_pool, .var_store);
+        errdefer self.free_space_var.deinit();
 
         // WAL directory + WalManager
         const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{self.graph_dir.path});
         defer allocator.free(wal_dir_path);
         try std.fs.cwd().makePath(wal_dir_path);
         self.wal_dir_handle = try std.fs.cwd().openDir(wal_dir_path, .{});
+        errdefer self.wal_dir_handle.close();
 
         self.wal = try WalManager.init(allocator, self.wal_dir_handle, graph_uuid, wal_start_lsn, .{
             .encryption_key = cfg.encryption_key,
         });
+        errdefer self.wal.deinit();
 
         // Transaction manager
         self.txn_manager = TxnManager.init(allocator, &self.wal, self.manifest.next_txn_id);
+        errdefer self.txn_manager.deinit();
 
-        // Data stores
+        // Data stores (non-fallible but clean up if a later init fails)
         self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);
         self.adj_out = AdjStore.init(&self.buffer_pool, &self.free_space_adj_out, .adj_out, cfg.page_size);
         self.adj_in = AdjStore.init(&self.buffer_pool, &self.free_space_adj_in, .adj_in, cfg.page_size);
@@ -281,9 +289,12 @@ pub const GraphEngine = struct {
 
         // Label dictionary, label store, and label index
         self.label_dict = LabelDictionary.init(allocator);
+        errdefer self.label_dict.deinit();
         self.label_store = LabelStore.init(&self.var_store);
         self.label_index = LabelIndex.init(allocator, &self.buffer_pool, &self.free_space_nodes, cfg.page_size);
+        errdefer self.label_index.deinit();
         self.property_index = PropertyChainIndex.init(allocator);
+        errdefer self.property_index.deinit();
 
         // Checkpointer
         self.checkpointer = Checkpointer.init(
