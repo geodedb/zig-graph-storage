@@ -225,8 +225,9 @@ pub const Backup = struct {
                     return error.HmacMismatch;
                 }
             } else {
-                // Version 2 backup but no key provided -- HMAC cannot be verified.
-                // Allow restore (CRC already verified) but this is a reduced security mode.
+                // Version 2 backup requires a key for HMAC verification.
+                // Refusing to restore without integrity proof.
+                return error.EncryptionKeyRequired;
             }
         }
 
@@ -858,6 +859,37 @@ test "SEC-0005: HMAC backup rejects tampered data with recalculated CRC" {
     // Validation with the correct key should fail due to HMAC mismatch
     const valid = try backup.validateBackup(backup_path);
     try testing.expect(!valid);
+}
+
+test "SEC-0017: V2 restore without key returns EncryptionKeyRequired" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v2.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    // Create V2 backup with a key
+    const key = [_]u8{0xCC} ** 32;
+    var backup_with_key = Backup.initWithKey(allocator, key);
+    _ = try backup_with_key.createBackup(&env.graph_dir, backup_path);
+
+    // Try to restore without a key -- should fail
+    var backup_no_key = Backup.init(allocator);
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored_nokey", .{out_path_base});
+    defer allocator.free(restore_path);
+
+    const result = backup_no_key.restoreBackup(backup_path, restore_path);
+    try testing.expectError(error.EncryptionKeyRequired, result);
 }
 
 test "SEC-0005: no-key backup still works as version 1" {
