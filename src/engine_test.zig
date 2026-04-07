@@ -11,6 +11,7 @@ const config_mod = @import("config.zig");
 const manifest_mod = @import("manifest.zig");
 const graph_dir_mod = @import("graph_dir.zig");
 const node_mod = @import("node.zig");
+const test_support = @import("test_support.zig");
 const engine_mod = @import("engine.zig");
 
 const NodeId = types.NodeId;
@@ -19,28 +20,20 @@ const GraphConfig = config_mod.GraphConfig;
 const Manifest = manifest_mod.Manifest;
 const GraphDir = graph_dir_mod.GraphDir;
 const NodeRec = node_mod.NodeRec;
+const TestDataDir = test_support.TestDataDir;
 const GraphEngine = engine_mod.GraphEngine;
 
-fn testDataDir() !struct { tmp_dir: testing.TmpDir, path: []const u8 } {
-    var tmp_dir = testing.tmpDir(.{});
-    const path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
-    return .{ .tmp_dir = tmp_dir, .path = path };
+fn testDataDir() !TestDataDir {
+    return TestDataDir.init(testing.allocator);
 }
 
 fn testConfig() GraphConfig {
-    return .{
-        .page_size = 4096,
-        .buffer_pool_pages = 64,
-        .data_dir = "data",
-    };
+    return test_support.testConfig();
 }
 
 test "create engine, allocNode, putNode, getNode round-trip" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x01} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -71,10 +64,7 @@ test "create engine, allocNode, putNode, getNode round-trip" {
 
 test "create engine, addEdge, expandOut returns edge" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x02} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -128,10 +118,7 @@ test "create engine, addEdge, expandOut returns edge" {
 
 test "create engine, checkpoint, close, open again, data persists" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x03} ** 16;
     const cfg = testConfig();
@@ -172,10 +159,7 @@ test "create engine, checkpoint, close, open again, data persists" {
 
 test "checkpoint persists labels.dict, labels.idx and props.idx snapshots" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x11} ** 16;
     const cfg = testConfig();
@@ -212,23 +196,24 @@ test "checkpoint persists labels.dict, labels.idx and props.idx snapshots" {
     defer testing.allocator.free(labels_idx_path);
     const props_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/props.idx", .{graph_dir.path});
     defer testing.allocator.free(props_idx_path);
+    const edges_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges.idx", .{graph_dir.path});
+    defer testing.allocator.free(edges_idx_path);
     const labels_dict_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.dict", .{graph_dir.path});
     defer testing.allocator.free(labels_dict_path);
 
     const labels_dict_stat = try std.fs.cwd().statFile(labels_dict_path);
     const labels_stat = try std.fs.cwd().statFile(labels_idx_path);
     const props_stat = try std.fs.cwd().statFile(props_idx_path);
+    const edges_stat = try std.fs.cwd().statFile(edges_idx_path);
     try testing.expect(labels_dict_stat.size > 0);
     try testing.expect(labels_stat.size > 0);
     try testing.expect(props_stat.size > 0);
+    try testing.expect(edges_stat.size > 0);
 }
 
 test "open rebuilds derived indexes when snapshot files are stale" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x12} ** 16;
     const cfg = testConfig();
@@ -286,10 +271,7 @@ test "open rebuilds derived indexes when snapshot files are stale" {
 
 test "GraphStorage vtable interface works" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x04} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -322,10 +304,7 @@ test "GraphStorage vtable interface works" {
 test "GAP-0006: close returns error union, not void" {
     // Verify that close() returns !void by calling try on it
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x06} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -336,10 +315,7 @@ test "GAP-0006: close returns error union, not void" {
 
 test "SEC-0010: open rejects page_size mismatch" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x10} ** 16;
     const cfg = testConfig(); // page_size = 4096
@@ -362,10 +338,7 @@ test "SEC-0010: open rejects page_size mismatch" {
 
 test "QUAL-0006: getEdge returns null for nonexistent edge" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x07} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -378,10 +351,7 @@ test "QUAL-0006: getEdge returns null for nonexistent edge" {
 
 test "GAP-0021: getEdge returns edge after addEdge" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x21} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -426,12 +396,137 @@ test "GAP-0021: getEdge returns edge after addEdge" {
     try testing.expect(removed == null);
 }
 
+test "GAP-0071: open loads the persisted edge index without rescanning adjacency" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x71} ** 16;
+    const cfg = testConfig();
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        const n1 = try engine.allocNode();
+        try engine.putNode(n1, NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        });
+        const n2 = try engine.allocNode();
+        try engine.putNode(n2, NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        });
+
+        _ = try engine.addEdge(n1, n2, 17);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    const graph_dir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&graph_dir).deinit();
+
+    const adj_out_path = try std.fmt.allocPrint(testing.allocator, "{s}/adj_out.store", .{graph_dir.path});
+    defer testing.allocator.free(adj_out_path);
+    const edges_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges.idx", .{graph_dir.path});
+    defer testing.allocator.free(edges_idx_path);
+
+    try testing.expect((try std.fs.cwd().statFile(edges_idx_path)).size > 0);
+
+    {
+        const file = try std.fs.cwd().openFile(adj_out_path, .{ .mode = .write_only });
+        defer file.close();
+
+        var buf: [4096]u8 = undefined;
+        @memset(&buf, 0xFF);
+        try file.writeAll(&buf);
+    }
+
+    const reopened = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer reopened.close() catch {};
+
+    const edge = try reopened.getEdge(1);
+    try testing.expect(edge != null);
+    try testing.expectEqual(@as(NodeId, 2), edge.?.neighbor);
+    try testing.expectEqual(@as(u32, 17), edge.?.rel_type);
+}
+
+test "GAP-0088: GraphStorage iterators do not require result-sized allocations" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x88} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    const hub = try engine.allocNode();
+    try engine.putNode(hub, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    const label_id: u32 = 7;
+    for (0..24) |i| {
+        const node_id = try engine.allocNode();
+        try engine.putNode(node_id, NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        });
+        try engine.addLabel(node_id, label_id);
+        _ = try engine.addEdge(hub, node_id, @intCast(i % 3));
+    }
+
+    const storage = engine.storage();
+
+    var edge_iter_buf: [96]u8 = undefined;
+    var edge_iter_alloc = std.heap.FixedBufferAllocator.init(&edge_iter_buf);
+    var edge_iter = try storage.expandOut(hub, null, edge_iter_alloc.allocator());
+    defer edge_iter.deinit();
+
+    var edge_count: usize = 0;
+    while (try edge_iter.next()) |_| {
+        edge_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 24), edge_count);
+
+    var label_iter_buf: [96]u8 = undefined;
+    var label_iter_alloc = std.heap.FixedBufferAllocator.init(&label_iter_buf);
+    var label_iter = try storage.scanLabelIter(label_id, label_iter_alloc.allocator());
+    defer label_iter.deinit();
+
+    var label_count: usize = 0;
+    while (try label_iter.next()) |_| {
+        label_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 24), label_count);
+}
+
 test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x50} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -490,10 +585,7 @@ test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {
 
 test "PERF-0008: open auto-sizes buffer pool from manifest" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x08} ** 16;
 
@@ -520,10 +612,7 @@ test "PERF-0008: open auto-sizes buffer pool from manifest" {
 
 test "PERF-0008: open respects buffer_pool_auto_size=false" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x09} ** 16;
 
@@ -548,10 +637,7 @@ test "PERF-0008: open respects buffer_pool_auto_size=false" {
 
 test "getStorageStats returns correct counters" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x71} ** 16;
     const cfg = testConfig();
@@ -584,10 +670,7 @@ test "getStorageStats returns correct counters" {
 
 test "checkIntegrity reports consistent state" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x72} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
@@ -641,10 +724,7 @@ test "checkIntegrity reports consistent state" {
 
 test "V1 format detection returns V1FormatRequiresRecreation" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x61} ** 16;
     const cfg = testConfig();
@@ -682,10 +762,7 @@ test "V1 format detection returns V1FormatRequiresRecreation" {
 
 test "GAP-0022: multi-op transaction groups mutations" {
     var td = try testDataDir();
-    defer {
-        testing.allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const uuid = [_]u8{0x70} ** 16;
     const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());

@@ -247,8 +247,9 @@ fn benchExpandOut(data_dir: []const u8) !BenchResult {
     var timer = try std.time.Timer.start();
 
     for (0..iterations) |_| {
-        const edges = try engine.expandOut(hub, null, std.heap.page_allocator);
-        defer std.heap.page_allocator.free(edges);
+        var iter = try engine.expandOutIter(hub, null);
+        while (try iter.next()) |_| {}
+        iter.deinit();
     }
 
     const elapsed = timer.read();
@@ -275,8 +276,9 @@ fn benchLabelScan(data_dir: []const u8) !BenchResult {
     var timer = try std.time.Timer.start();
 
     for (0..iterations) |_| {
-        const nodes = try engine.scanLabel(label_id, allocator);
-        allocator.free(nodes);
+        var iter = try engine.scanLabelIter(label_id);
+        while (try iter.next()) |_| {}
+        iter.deinit();
     }
 
     const elapsed = timer.read();

@@ -14,6 +14,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
+const operation_result_mod = @import("operation_result.zig");
+const GraphOperationSummary = operation_result_mod.GraphOperationSummary;
 
 /// Magic bytes for the per-graph file header.
 pub const PER_GRAPH_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'D', 'G', 'R', 'F', '1' };
@@ -40,6 +42,23 @@ pub const MigrationResult = struct {
     graphs_migrated: u64 = 0,
     total_nodes: u64 = 0,
     total_edges: u64 = 0,
+
+    pub fn writeJson(self: *const MigrationResult, writer: anytype) !void {
+        const summary = GraphOperationSummary{
+            .operation = .migration,
+            .status = .ok,
+            .items_processed = self.graphs_migrated,
+            .bytes_processed = 0,
+            .issue_count = 0,
+            .changed = self.graphs_migrated > 0,
+        };
+        try writer.writeByte('{');
+        try summary.writeJsonFields(writer);
+        try writer.print(
+            ",\"graphs_migrated\":{d},\"total_nodes\":{d},\"total_edges\":{d}}}",
+            .{ self.graphs_migrated, self.total_nodes, self.total_edges },
+        );
+    }
 };
 
 /// Parsed per-graph file header.
@@ -407,6 +426,26 @@ test "migrate: fresh directory returns zero result" {
     try std.testing.expectEqual(@as(u64, 0), result.graphs_migrated);
     try std.testing.expectEqual(@as(u64, 0), result.total_nodes);
     try std.testing.expectEqual(@as(u64, 0), result.total_edges);
+}
+
+test "MigrationResult writeJson produces valid structured output" {
+    const result = MigrationResult{
+        .graphs_migrated = 2,
+        .total_nodes = 15,
+        .total_edges = 27,
+    };
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+
+    try result.writeJson(buf.writer(std.testing.allocator));
+    const json = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"migration\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"graphs_migrated\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_nodes\":15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_edges\":27") != null);
 }
 
 test {

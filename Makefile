@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2024-2025 CodePros
 
-.PHONY: all build test test-unit test-integration clean check fmt help dev ci bench
+.PHONY: all build test test-unit test-integration fuzz-regression clean check fmt help dev ci bench
 .PHONY: test-release-safe test-release-fast test-release-small test-all-optimizations
 .PHONY: pre-commit-install pre-commit pre-commit-run
 .PHONY: scale-bench bench-save bench-compare bench-baseline
@@ -17,7 +17,7 @@ build:
 	@zig build
 
 # Run all tests
-test: test-unit test-integration
+test: test-unit test-integration fuzz-regression
 	@echo "✅ All tests completed"
 
 # Run unit tests only
@@ -29,6 +29,11 @@ test-unit:
 test-integration:
 	@echo "🔗 Running integration tests..."
 	@zig build test-integration --summary all
+
+# Run deterministic fuzz-regression tests
+fuzz-regression:
+	@echo "🧪 Running deterministic fuzz regressions..."
+	@zig build test-fuzz-regression --summary all
 
 # Run performance benchmarks
 bench:
@@ -48,15 +53,15 @@ bench-save:
 
 # Compare current results against baseline
 bench-compare:
-	@echo "Running scale benchmark and comparing against baseline..."
-	@zig build scale-bench 2>/dev/null > /tmp/current-bench.json
-	@zig build compare-bench -- benchmarks/results/baseline.json /tmp/current-bench.json
+	@echo "Running CI-sized scale benchmark and comparing against baseline..."
+	@zig build scale-bench -- 1K 2>/dev/null > /tmp/current-bench.json
+	@zig build compare-bench -- benchmarks/results/ci-baseline.json /tmp/current-bench.json
 
 # Save current results as the baseline
 bench-baseline:
-	@echo "Running scale benchmark and saving as baseline..."
-	@zig build scale-bench 2>/dev/null > benchmarks/results/baseline.json
-	@echo "Saved to benchmarks/results/baseline.json"
+	@echo "Running CI-sized scale benchmark and saving as baseline..."
+	@zig build scale-bench -- 1K 2>/dev/null > benchmarks/results/ci-baseline.json
+	@echo "Saved to benchmarks/results/ci-baseline.json"
 
 # Clean build artifacts
 clean:
@@ -126,6 +131,7 @@ help:
 	@echo "  test                 Run all tests"
 	@echo "  test-unit            Run unit tests only"
 	@echo "  test-integration     Run integration tests only"
+	@echo "  fuzz-regression      Run deterministic fuzz regressions"
 	@echo "  test-release-safe    Test with ReleaseSafe"
 	@echo "  test-release-fast    Test with ReleaseFast"
 	@echo "  test-release-small   Test with ReleaseSmall"

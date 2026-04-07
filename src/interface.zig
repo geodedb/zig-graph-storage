@@ -43,6 +43,24 @@ pub const EdgeIterator = struct {
     }
 };
 
+pub const NodeIterator = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        next: *const fn (ptr: *anyopaque) anyerror!?NodeId,
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn next(self: NodeIterator) anyerror!?NodeId {
+        return self.vtable.next(self.ptr);
+    }
+
+    pub fn deinit(self: NodeIterator) void {
+        self.vtable.deinit(self.ptr);
+    }
+};
+
 pub const PropertyIterator = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -91,6 +109,7 @@ pub const GraphStorage = struct {
         addLabel: *const fn (ptr: *anyopaque, node_id: NodeId, label: LabelId) anyerror!void,
         removeLabel: *const fn (ptr: *anyopaque, node_id: NodeId, label: LabelId) anyerror!void,
         scanLabel: *const fn (ptr: *anyopaque, label: LabelId, allocator: Allocator) anyerror![]NodeId,
+        scanLabelIter: *const fn (ptr: *anyopaque, label: LabelId, allocator: Allocator) anyerror!NodeIterator,
         // Transactions
         beginTxn: *const fn (ptr: *anyopaque) anyerror!TxnId,
         commitTxn: *const fn (ptr: *anyopaque, txn: TxnId) anyerror!void,
@@ -166,6 +185,9 @@ pub const GraphStorage = struct {
     pub fn scanLabel(self: GraphStorage, label: LabelId, allocator: Allocator) anyerror![]NodeId {
         return self.vtable.scanLabel(self.ptr, label, allocator);
     }
+    pub fn scanLabelIter(self: GraphStorage, label: LabelId, allocator: Allocator) anyerror!NodeIterator {
+        return self.vtable.scanLabelIter(self.ptr, label, allocator);
+    }
     pub fn beginTxn(self: GraphStorage) anyerror!TxnId {
         return self.vtable.beginTxn(self.ptr);
     }
@@ -217,6 +239,7 @@ pub const GraphStorage = struct {
                 .addLabel = typeErasedFn(T, "addLabel"),
                 .removeLabel = typeErasedFn(T, "removeLabel"),
                 .scanLabel = typeErasedFn(T, "scanLabel"),
+                .scanLabelIter = typeErasedFn(T, "scanLabelIter"),
                 .beginTxn = typeErasedFn(T, "beginTxn"),
                 .commitTxn = typeErasedFn(T, "commitTxn"),
                 .abortTxn = typeErasedFn(T, "abortTxn"),
@@ -263,13 +286,21 @@ pub const GraphStorage = struct {
             }
             fn expandOutFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                const slice = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
-                return sliceToEdgeIterator(slice, allocator);
+                if (@hasDecl(T, "expandOutIter")) {
+                    const concrete_iter = try @call(.auto, @field(T, "expandOutIter"), .{ self, id, rel_type });
+                    return wrapEdgeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
+                }
+                const result = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
+                return adaptEdgeResult(@TypeOf(result), result, allocator);
             }
             fn expandInFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                const slice = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
-                return sliceToEdgeIterator(slice, allocator);
+                if (@hasDecl(T, "expandInIter")) {
+                    const concrete_iter = try @call(.auto, @field(T, "expandInIter"), .{ self, id, rel_type });
+                    return wrapEdgeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
+                }
+                const result = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
+                return adaptEdgeResult(@TypeOf(result), result, allocator);
             }
             fn addEdgeFn(ptr: *anyopaque, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
                 const self: *T = @ptrCast(@alignCast(ptr));
@@ -325,6 +356,15 @@ pub const GraphStorage = struct {
             fn scanLabelFn(ptr: *anyopaque, label: LabelId, allocator: Allocator) anyerror![]NodeId {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{ self, label, allocator });
+            }
+            fn scanLabelIterFn(ptr: *anyopaque, label: LabelId, allocator: Allocator) anyerror!NodeIterator {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                if (@hasDecl(T, "scanLabelIter")) {
+                    const concrete_iter = try @call(.auto, @field(T, "scanLabelIter"), .{ self, label });
+                    return wrapNodeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
+                }
+                const slice = try @call(.auto, @field(T, "scanLabel"), .{ self, label, allocator });
+                return sliceToNodeIterator(slice, allocator);
             }
             fn beginTxnFn(ptr: *anyopaque) anyerror!TxnId {
                 const self: *T = @ptrCast(@alignCast(ptr));
@@ -382,6 +422,7 @@ pub const GraphStorage = struct {
             .{ "addLabel", Wrapper.addLabelFn },
             .{ "removeLabel", Wrapper.removeLabelFn },
             .{ "scanLabel", Wrapper.scanLabelFn },
+            .{ "scanLabelIter", Wrapper.scanLabelIterFn },
             .{ "beginTxn", Wrapper.beginTxnFn },
             .{ "commitTxn", Wrapper.commitTxnFn },
             .{ "abortTxn", Wrapper.abortTxnFn },
@@ -400,6 +441,50 @@ pub const GraphStorage = struct {
         @compileError("Unknown vtable method: " ++ method_name);
     }
 };
+
+fn adaptEdgeResult(comptime ResultType: type, result: ResultType, allocator: Allocator) anyerror!EdgeIterator {
+    return switch (@typeInfo(ResultType)) {
+        .pointer => |ptr_info| if (ptr_info.size == .slice and ptr_info.child == EdgeEntry)
+            sliceToEdgeIterator(result, allocator)
+        else
+            @compileError("unsupported edge result type"),
+        else => wrapEdgeIterator(ResultType, result, allocator),
+    };
+}
+
+fn wrapEdgeIterator(comptime RealIter: type, concrete_iter: RealIter, allocator: Allocator) anyerror!EdgeIterator {
+    if (RealIter == EdgeIterator) return concrete_iter;
+
+    const State = struct {
+        iter: RealIter,
+        alloc: Allocator,
+
+        fn next(vp: *anyopaque) anyerror!?EdgeEntry {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            return try self.iter.next();
+        }
+
+        fn deinit(vp: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            self.iter.deinit();
+            self.alloc.destroy(self);
+        }
+    };
+
+    const state = try allocator.create(State);
+    state.* = .{
+        .iter = concrete_iter,
+        .alloc = allocator,
+    };
+
+    return EdgeIterator{
+        .ptr = @ptrCast(state),
+        .vtable = &.{
+            .next = State.next,
+            .deinit = State.deinit,
+        },
+    };
+}
 
 /// Wrap a concrete PropIterator (or similar) into a type-erased PropertyIterator.
 /// The caller-provided allocator is used both to heap-allocate the iterator state
@@ -435,6 +520,40 @@ fn wrapPropIterator(comptime RealIter: type, concrete_iter: RealIter, allocator:
     };
 
     return PropertyIterator{
+        .ptr = @ptrCast(state),
+        .vtable = &.{
+            .next = State.next,
+            .deinit = State.deinit,
+        },
+    };
+}
+
+fn wrapNodeIterator(comptime RealIter: type, concrete_iter: RealIter, allocator: Allocator) anyerror!NodeIterator {
+    if (RealIter == NodeIterator) return concrete_iter;
+
+    const State = struct {
+        iter: RealIter,
+        alloc: Allocator,
+
+        fn next(vp: *anyopaque) anyerror!?NodeId {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            return try self.iter.next();
+        }
+
+        fn deinit(vp: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            self.iter.deinit();
+            self.alloc.destroy(self);
+        }
+    };
+
+    const state = try allocator.create(State);
+    state.* = .{
+        .iter = concrete_iter,
+        .alloc = allocator,
+    };
+
+    return NodeIterator{
         .ptr = @ptrCast(state),
         .vtable = &.{
             .next = State.next,
@@ -482,13 +601,50 @@ fn sliceToEdgeIterator(slice: []EdgeEntry, allocator: Allocator) anyerror!EdgeIt
     };
 }
 
+fn sliceToNodeIterator(slice: []NodeId, allocator: Allocator) anyerror!NodeIterator {
+    const State = struct {
+        entries: []NodeId,
+        index: usize,
+        alloc: Allocator,
+
+        fn next(vp: *anyopaque) anyerror!?NodeId {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            if (self.index >= self.entries.len) return null;
+            const entry = self.entries[self.index];
+            self.index += 1;
+            return entry;
+        }
+
+        fn deinit(vp: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            self.alloc.free(self.entries);
+            self.alloc.destroy(self);
+        }
+    };
+
+    const state = try allocator.create(State);
+    state.* = .{
+        .entries = slice,
+        .index = 0,
+        .alloc = allocator,
+    };
+
+    return NodeIterator{
+        .ptr = @ptrCast(state),
+        .vtable = &.{
+            .next = State.next,
+            .deinit = State.deinit,
+        },
+    };
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
 
-test "VTable has exactly 28 method fields" {
+test "VTable has exactly 29 method fields" {
     const fields = std.meta.fields(GraphStorage.VTable);
-    try std.testing.expectEqual(@as(usize, 28), fields.len);
+    try std.testing.expectEqual(@as(usize, 29), fields.len);
 }
 
 test "PropertyEntry can be constructed" {
@@ -531,6 +687,7 @@ test "GraphStorage with mock vtable dispatches close" {
         .addLabel = undefined,
         .removeLabel = undefined,
         .scanLabel = undefined,
+        .scanLabelIter = undefined,
         .beginTxn = undefined,
         .commitTxn = undefined,
         .abortTxn = undefined,

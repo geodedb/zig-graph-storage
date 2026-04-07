@@ -145,6 +145,7 @@ pub const GraphEngine = struct {
         _ = try self.file_manager.openFile(.free);
         _ = try self.file_manager.openFile(.label_idx);
         _ = try self.file_manager.openFile(.prop_idx);
+        _ = try self.file_manager.openFile(.edge_idx);
 
         // 5. Create buffer pool, register pagers
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
@@ -198,6 +199,7 @@ pub const GraphEngine = struct {
 
         _ = try self.file_manager.openFile(.label_idx);
         _ = try self.file_manager.openFile(.prop_idx);
+        _ = try self.file_manager.openFile(.edge_idx);
 
         // SEC-0010: Validate page_size matches manifest after recovery
         if (cfg.page_size != self.manifest.page_size) {
@@ -248,9 +250,6 @@ pub const GraphEngine = struct {
         const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
         if (!loaded_indexes) {
             try self.rebuildDerivedIndexes();
-        } else {
-            // Edge index is in-memory only (no persistence) so always rebuild
-            try self.rebuildEdgeIndex();
         }
 
         // 8. Wire metrics and thread pool into buffer pool
@@ -515,16 +514,24 @@ pub const GraphEngine = struct {
         };
     }
 
-    pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+    pub fn expandOutIter(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
         const rec = try self.node_store.getNode(id);
-        var iter = self.adj_out.expand(if (rec) |r| r.out_head else 0, rel_type);
+        return self.adj_out.expand(if (rec) |r| r.out_head else 0, rel_type);
+    }
+
+    pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        var iter = try self.expandOutIter(id, rel_type);
         defer iter.deinit();
         return drainEdgeIterator(&iter, allocator);
     }
 
-    pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+    pub fn expandInIter(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
         const rec = try self.node_store.getNode(id);
-        var iter = self.adj_in.expand(if (rec) |r| r.in_head else 0, rel_type);
+        return self.adj_in.expand(if (rec) |r| r.in_head else 0, rel_type);
+    }
+
+    pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        var iter = try self.expandInIter(id, rel_type);
         defer iter.deinit();
         return drainEdgeIterator(&iter, allocator);
     }
@@ -746,6 +753,10 @@ pub const GraphEngine = struct {
     pub fn scanLabel(self: *GraphEngine, label: LabelId, alloc: Allocator) anyerror![]NodeId {
         // Delegate to label index for O(1) lookup instead of O(N) scan
         return self.label_index.scan(label, alloc);
+    }
+
+    pub fn scanLabelIter(self: *GraphEngine, label: LabelId) !LabelIndex.Iterator {
+        return self.label_index.iterator(label);
     }
 
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {

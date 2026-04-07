@@ -202,8 +202,9 @@ fn benchAdjacencyTraversal(
     var timer = try std.time.Timer.start();
     for (0..iterations) |_| {
         const uid = random.intRangeAtMost(NodeId, sr.users.start, sr.users.end - 1);
-        const edges = try engine.expandOut(uid, null, std.heap.page_allocator);
-        defer std.heap.page_allocator.free(edges);
+        var iter = try engine.expandOutIter(uid, null);
+        while (try iter.next()) |_| {}
+        iter.deinit();
     }
     const elapsed = timer.read();
 
@@ -224,8 +225,9 @@ fn benchLabelScan(
 
     var timer = try std.time.Timer.start();
     for (0..iterations) |_| {
-        const users = try engine.scanLabel(sr.labels.user, allocator);
-        allocator.free(users);
+        var iter = try engine.scanLabelIter(sr.labels.user);
+        while (try iter.next()) |_| {}
+        iter.deinit();
     }
     const elapsed = timer.read();
 

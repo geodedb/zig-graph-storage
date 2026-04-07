@@ -16,6 +16,7 @@ pub const PageFrame = struct {
     page_size: u32, // so we know the slice length
     pin_count: u32 = 0,
     dirty: bool = false,
+    loading: bool = false,
     valid: bool = false, // true if frame contains actual page data (not empty slot)
     lsn: Lsn = 0,
     // LRU doubly-linked list pointers (index-based, not pointer-based)
@@ -29,7 +30,7 @@ pub const PageFrame = struct {
 
     /// Check if this frame can be evicted (unpinned).
     pub fn isEvictable(self: *const PageFrame) bool {
-        return self.pin_count == 0 and self.valid;
+        return self.pin_count == 0 and self.valid and !self.loading;
     }
 };
 
@@ -109,6 +110,7 @@ test "PageFrame default values" {
 
     try testing.expectEqual(@as(u32, 0), frame.pin_count);
     try testing.expect(!frame.dirty);
+    try testing.expect(!frame.loading);
     try testing.expect(!frame.valid);
     try testing.expectEqual(@as(Lsn, 0), frame.lsn);
     try testing.expectEqual(@as(?u32, null), frame.lru_prev);

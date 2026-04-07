@@ -15,6 +15,7 @@ const Metrics = metrics_mod.Metrics;
 const PageId = types.PageId;
 const FileId = types.FileId;
 const Lsn = types.Lsn;
+const FILE_COUNT = @typeInfo(FileId).@"enum".fields.len;
 
 pub const BufferPoolError = error{
     BufferPoolFull,
@@ -40,11 +41,12 @@ pub const BufferPool = struct {
     // Free list
     free_list: std.ArrayList(u32),
     // Pagers: one per FileId
-    pagers: [8]?*Pager, // indexed by @intFromEnum(FileId)
+    pagers: [FILE_COUNT]?*Pager, // indexed by @intFromEnum(FileId)
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
     // Concurrency protection for multi-threaded access
     mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
     // Optional spice thread pool for parallel page flushes
     thread_pool: ?*spice.ThreadPool = null,
 
@@ -91,8 +93,9 @@ pub const BufferPool = struct {
             .lru_head = null,
             .lru_tail = null,
             .free_list = free_list,
-            .pagers = .{ null, null, null, null, null, null, null, null },
+            .pagers = [_]?*Pager{null} ** FILE_COUNT,
             .mutex = .{},
+            .cond = .{},
         };
     }
 
@@ -124,46 +127,71 @@ pub const BufferPool = struct {
     /// Otherwise, allocates a frame (evicting LRU if necessary) and reads from disk.
     pub fn pin(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
         self.mutex.lock();
-        defer self.mutex.unlock();
-
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
+        while (true) {
+            if (self.page_table.get(key)) |frame_idx| {
+                const frame = &self.frames[frame_idx];
+                if (frame.loading) {
+                    self.cond.wait(&self.mutex);
+                    continue;
+                }
+                frame.pin_count += 1;
+                self.moveToHead(frame_idx);
+                if (self.metrics) |m| m.buffer_hits += 1;
+                self.mutex.unlock();
+                return frame;
+            }
 
-        // Cache hit
-        if (self.page_table.get(key)) |frame_idx| {
+            if (self.metrics) |m| m.buffer_misses += 1;
+            const frame_idx = try self.getFrame();
             const frame = &self.frames[frame_idx];
-            frame.pin_count += 1;
+            const pager = self.pagers[@intFromEnum(file_id)] orelse {
+                self.free_list.appendAssumeCapacity(frame_idx);
+                self.mutex.unlock();
+                return error.NoPagerRegistered;
+            };
+
+            frame.file_id = file_id;
+            frame.page_id = page_id;
+            frame.pin_count = 1;
+            frame.dirty = false;
+            frame.loading = true;
+            frame.valid = false;
+            frame.lsn = 0;
+
+            try self.page_table.put(key, frame_idx);
             self.moveToHead(frame_idx);
-            if (self.metrics) |m| m.buffer_hits += 1;
+
+            self.mutex.unlock();
+
+            var read_err: ?anyerror = null;
+            pager.readPage(page_id, frame.dataSlice()) catch |err| switch (err) {
+                error.PageNotFound => @memset(frame.dataSlice(), 0),
+                else => read_err = err,
+            };
+
+            self.mutex.lock();
+            if (read_err) |err| {
+                frame.pin_count = 0;
+                frame.dirty = false;
+                frame.loading = false;
+                frame.valid = false;
+                frame.lsn = 0;
+                self.removeFromLru(frame_idx);
+                _ = self.page_table.remove(key);
+                self.free_list.appendAssumeCapacity(frame_idx);
+                self.cond.broadcast();
+                self.mutex.unlock();
+                return err;
+            }
+
+            frame.loading = false;
+            frame.valid = true;
+            if (self.metrics) |m| m.page_reads += 1;
+            self.cond.broadcast();
+            self.mutex.unlock();
             return frame;
         }
-
-        // Cache miss: get a free frame
-        if (self.metrics) |m| m.buffer_misses += 1;
-        const frame_idx = try self.getFrame();
-        const frame = &self.frames[frame_idx];
-
-        // Read page from disk
-        const p = self.pagers[@intFromEnum(file_id)] orelse return error.NoPagerRegistered;
-        p.readPage(page_id, frame.dataSlice()) catch |err| switch (err) {
-            error.PageNotFound => {
-                // Page doesn't exist on disk yet - zero it out
-                @memset(frame.dataSlice(), 0);
-            },
-            else => return err,
-        };
-        if (self.metrics) |m| m.page_reads += 1;
-
-        frame.file_id = file_id;
-        frame.page_id = page_id;
-        frame.pin_count = 1;
-        frame.dirty = false;
-        frame.valid = true;
-        frame.lsn = 0;
-
-        try self.page_table.put(key, frame_idx);
-        self.moveToHead(frame_idx);
-
-        return frame;
     }
 
     /// Pin a new page without reading from disk. Used when creating a new page.
@@ -192,6 +220,7 @@ pub const BufferPool = struct {
         frame.page_id = page_id;
         frame.pin_count = 1;
         frame.dirty = false;
+        frame.loading = false;
         frame.valid = true;
         frame.lsn = 0;
 
@@ -211,6 +240,9 @@ pub const BufferPool = struct {
         frame.pin_count -= 1;
         if (dirty) {
             frame.dirty = true;
+        }
+        if (frame.pin_count == 0) {
+            self.cond.broadcast();
         }
     }
 
@@ -433,6 +465,7 @@ pub const BufferPool = struct {
                 frame.valid = false;
                 frame.pin_count = 0;
                 frame.dirty = false;
+                frame.loading = false;
                 frame.lsn = 0;
 
                 return idx;
@@ -919,6 +952,46 @@ test "flushDirtyPages returns 0 when no dirty pages" {
 
     const flushed = try pool.flushDirtyPages(10);
     try testing.expectEqual(@as(u32, 0), flushed);
+}
+
+test "GAP-0089: pin waits for an in-flight page load" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 2);
+    defer pool.deinit();
+
+    const reserved = pool.free_list.pop() orelse unreachable;
+    try testing.expectEqual(@as(u32, 0), reserved);
+
+    pool.frames[reserved].file_id = .nodes;
+    pool.frames[reserved].page_id = 7;
+    pool.frames[reserved].pin_count = 1;
+    pool.frames[reserved].dirty = false;
+    pool.frames[reserved].loading = true;
+    pool.frames[reserved].valid = false;
+    try pool.page_table.put(.{ .file_id = .nodes, .page_id = 7 }, reserved);
+    pool.moveToHead(reserved);
+
+    const Loader = struct {
+        fn finish(p: *BufferPool) void {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            p.mutex.lock();
+            defer p.mutex.unlock();
+            p.frames[0].loading = false;
+            p.frames[0].valid = true;
+            p.cond.broadcast();
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, Loader.finish, .{&pool});
+    defer thread.join();
+
+    const frame = try pool.pin(.nodes, 7);
+    const frame_idx = pool.frameIndex(frame);
+    try testing.expectEqual(@as(u32, 0), frame_idx);
+    try testing.expect(!frame.loading);
+    try testing.expect(frame.valid);
+    try testing.expectEqual(@as(u32, 2), frame.pin_count);
+
+    pool.unpin(frame_idx, false);
 }
 
 test {

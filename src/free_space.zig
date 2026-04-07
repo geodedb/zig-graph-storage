@@ -167,10 +167,20 @@ pub const FreeSpaceManager = struct {
 
     /// Deserialize bitmap state from `buf`. Returns the number of bytes consumed.
     pub fn deserialize(self: *FreeSpaceManager, buf: []const u8) !usize {
+        return self.deserializeBounded(buf, std.math.maxInt(u64));
+    }
+
+    /// Deserialize bitmap state from `buf`, rejecting metadata that would
+    /// expand the in-memory bitmap beyond `max_total_pages`.
+    pub fn deserializeBounded(self: *FreeSpaceManager, buf: []const u8, max_total_pages: u64) !usize {
         if (buf.len < header_size) return error.UnexpectedEof;
 
         const total_pages = std.mem.readInt(u64, buf[0..8], .little);
         const next_free_hint = std.mem.readInt(u64, buf[8..16], .little);
+        const effective_max_pages = @max(@as(u64, 64), max_total_pages);
+
+        if (total_pages < 64 or total_pages > effective_max_pages) return error.InvalidData;
+        if (next_free_hint == 0 or next_free_hint > total_pages) return error.InvalidData;
 
         const mc = maskCount(total_pages);
         const needed = header_size + mc * @sizeOf(usize);
@@ -185,6 +195,7 @@ pub const FreeSpaceManager = struct {
             const dst = std.mem.sliceAsBytes(masks);
             @memcpy(dst, buf[header_size .. header_size + dst.len]);
         }
+        if (!self.bitmap.isSet(0)) return error.InvalidData;
         return needed;
     }
 };
@@ -461,6 +472,40 @@ test "deserialize rejects truncated input" {
     // Too short for header
     const short: [4]u8 = .{ 0, 0, 0, 0 };
     try testing.expectError(error.UnexpectedEof, fsm.deserialize(&short));
+}
+
+test "GAP-0035: deserializeBounded rejects oversized total_pages before resizing" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    var source = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer source.deinit();
+    try source.ensureCapacity(256);
+
+    var buf: [512]u8 = undefined;
+    const written = try source.serialize(&buf);
+
+    var loaded = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer loaded.deinit();
+
+    try testing.expectError(error.InvalidData, loaded.deserializeBounded(buf[0..written], 64));
+}
+
+test "GAP-0035: deserializeBounded rejects invalid next_free_hint" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+
+    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm.deinit();
+
+    var buf: [256]u8 = undefined;
+    const written = try fsm.serialize(&buf);
+    std.mem.writeInt(u64, buf[8..16], 65, .little);
+
+    var loaded = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer loaded.deinit();
+
+    try testing.expectError(error.InvalidData, loaded.deserializeBounded(buf[0..written], 64));
 }
 
 test {

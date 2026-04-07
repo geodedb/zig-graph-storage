@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "timestamp": "2026-04-07T17:10:50Z",
+  "git_commit": "unknown",
+  "system": { "os": "linux", "arch": "x86_64" },
+  "page_size": 8192,
+  "buffer_pool_pages": 4096,
+  "tiers": [
+    {
+      "name": "1K",
+      "node_count": 1000,
+      "edge_count": 1500,
+      "seed_ops_sec": 36,
+      "seed_ops_sec_stats": { "samples": 3, "avg": 36.336, "p50": 33.537, "p95": 42.375, "p99": 42.375, "stddev": 4.275 },
+      "point_lookup_ns": 96,
+      "point_lookup_ns_stats": { "samples": 3, "avg": 95.718, "p50": 95.460, "p95": 105.420, "p99": 105.420, "stddev": 7.818 },
+      "prop_read_ns": 15584,
+      "prop_read_ns_stats": { "samples": 3, "avg": 15583.523, "p50": 15480.230, "p95": 16039.990, "p99": 16039.990, "stddev": 338.508 },
+      "expand_out_ns": 350,
+      "expand_out_ns_stats": { "samples": 3, "avg": 350.267, "p50": 341.850, "p95": 372.610, "p99": 372.610, "stddev": 15.958 },
+      "label_scan_ns": 0,
+      "label_scan_ns_stats": { "samples": 3, "avg": 0.142, "p50": 0.146, "p95": 0.160, "p99": 0.160, "stddev": 0.017 },
+      "checkpoint_ms": 336.7,
+      "checkpoint_ms_stats": { "samples": 3, "avg": 336.689, "p50": 337.245, "p95": 343.460, "p99": 343.460, "stddev": 5.770 },
+      "open_ms": 186.9,
+      "open_ms_stats": { "samples": 3, "avg": 186.893, "p50": 188.903, "p95": 190.231, "p99": 190.231, "stddev": 3.820 },
+      "mixed_ops_sec": 479,
+      "mixed_ops_sec_stats": { "samples": 3, "avg": 479.156, "p50": 486.822, "p95": 486.955, "p99": 486.955, "stddev": 10.936 }
+    }
+  ]
+}

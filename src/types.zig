@@ -21,6 +21,7 @@ pub const FileId = enum(u8) {
     free = 5,
     label_idx = 6,
     prop_idx = 7,
+    edge_idx = 8,
 };
 
 pub const PropertyValue = union(enum) {
@@ -49,6 +50,7 @@ test "FileId values are correct" {
     try std.testing.expectEqual(@as(u8, 5), @intFromEnum(FileId.free));
     try std.testing.expectEqual(@as(u8, 6), @intFromEnum(FileId.label_idx));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(FileId.prop_idx));
+    try std.testing.expectEqual(@as(u8, 8), @intFromEnum(FileId.edge_idx));
 }
 
 test "PropertyValue can be constructed for all 7 variants" {

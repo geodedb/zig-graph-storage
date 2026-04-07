@@ -106,8 +106,15 @@ pub fn loadFreeStore(engine: *GraphEngine) !bool {
         &engine.free_space_props,
         &engine.free_space_var,
     };
-    for (&managers) |fsm| {
-        const consumed = try fsm.deserialize(buf[offset..]);
+    const max_pages = [_]u64{
+        try maxPersistedPagesForStore(engine, .nodes),
+        try maxPersistedPagesForStore(engine, .adj_out),
+        try maxPersistedPagesForStore(engine, .adj_in),
+        try maxPersistedPagesForStore(engine, .props),
+        try maxPersistedPagesForStore(engine, .var_store),
+    };
+    for (&managers, max_pages) |fsm, max_total_pages| {
+        const consumed = try fsm.deserializeBounded(buf[offset..], max_total_pages);
         offset += consumed;
     }
 
@@ -137,6 +144,13 @@ pub fn rebuildFreeSpaceFromDisk(engine: *GraphEngine) !void {
             pair.fsm.bitmap.set(i);
         }
     }
+}
+
+fn maxPersistedPagesForStore(engine: *GraphEngine, fid: types.FileId) !u64 {
+    const pager = engine.file_manager.getPager(fid) orelse return 64;
+    const page_count = try pager.pageCount();
+    if (page_count >= std.math.maxInt(u64) / 2) return std.math.maxInt(u64);
+    return @max(@as(u64, 64), page_count * 2);
 }
 
 /// Persist the label dictionary to a `labels.dict` file.

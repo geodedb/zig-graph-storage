@@ -9,11 +9,13 @@ const manifest_mod = @import("manifest.zig");
 const graph_dir_mod = @import("graph_dir.zig");
 const file_manager_mod = @import("file_manager.zig");
 const integrity_mod = @import("integrity.zig");
+const operation_result_mod = @import("operation_result.zig");
 const types = @import("types.zig");
 
 const Manifest = manifest_mod.Manifest;
 const GraphDir = graph_dir_mod.GraphDir;
 const Integrity = integrity_mod.Integrity;
+const GraphOperationSummary = operation_result_mod.GraphOperationSummary;
 const FileId = types.FileId;
 const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
 
@@ -40,8 +42,18 @@ pub const VerifyResult = struct {
 
     /// Write the result as a JSON object to the provided writer.
     pub fn writeJson(self: *const VerifyResult, writer: anytype) !void {
+        const summary = GraphOperationSummary{
+            .operation = .verify,
+            .status = if (self.isClean()) .ok else .warning,
+            .items_processed = self.total_pages_checked,
+            .bytes_processed = 0,
+            .issue_count = self.corrupted_pages + self.errors.items.len,
+            .changed = false,
+        };
+        try writer.writeByte('{');
+        try summary.writeJsonFields(writer);
         try writer.print(
-            "{{\"total_pages_checked\":{d},\"corrupted_pages\":{d},\"manifest_valid\":{},\"is_clean\":{},\"error_count\":{d}}}",
+            ",\"total_pages_checked\":{d},\"corrupted_pages\":{d},\"manifest_valid\":{},\"is_clean\":{},\"error_count\":{d}}}",
             .{
                 self.total_pages_checked,
                 self.corrupted_pages,
@@ -95,7 +107,10 @@ pub const VerifyTool = struct {
         defer self.allocator.free(path_a);
 
         if (Manifest.readFromFile(self.allocator, path_a) catch null) |m| {
-            if (Integrity.verifyManifest(&m, self.allocator)) {
+            if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
+                const msg = try std.fmt.allocPrint(self.allocator, "manifest.a: graph UUID mismatch", .{});
+                try result.addError(msg);
+            } else if (Integrity.verifyManifest(&m, self.allocator)) {
                 any_valid = true;
             } else {
                 const msg = try std.fmt.allocPrint(self.allocator, "manifest.a: checksum invalid", .{});
@@ -108,7 +123,10 @@ pub const VerifyTool = struct {
         defer self.allocator.free(path_b);
 
         if (Manifest.readFromFile(self.allocator, path_b) catch null) |m| {
-            if (Integrity.verifyManifest(&m, self.allocator)) {
+            if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
+                const msg = try std.fmt.allocPrint(self.allocator, "manifest.b: graph UUID mismatch", .{});
+                try result.addError(msg);
+            } else if (Integrity.verifyManifest(&m, self.allocator)) {
                 any_valid = true;
             } else {
                 const msg = try std.fmt.allocPrint(self.allocator, "manifest.b: checksum invalid", .{});
@@ -395,6 +413,42 @@ test "VerifyResult writeJson reports unclean state" {
 
     try testing.expect(std.mem.indexOf(u8, json, "\"is_clean\":false") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"corrupted_pages\":2") != null);
+}
+
+test "GAP-0032: verifyGraph reports a manifest UUID mismatch" {
+    const allocator = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var graph_uuid: [16]u8 = undefined;
+    @memset(&graph_uuid, 0xAA);
+    var manifest_uuid: [16]u8 = undefined;
+    @memset(&manifest_uuid, 0xBB);
+
+    var gd = try GraphDir.create(allocator, tmp_path, graph_uuid);
+    defer gd.deinit();
+
+    const m = Manifest{
+        .graph_uuid = manifest_uuid,
+        .page_size = 4096,
+        .counter = 1,
+    };
+    const path_a = try gd.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try m.writeToFile(allocator, path_a);
+
+    var tool = VerifyTool.init(allocator);
+    var result = try tool.verifyGraph(&gd, 4096);
+    defer result.deinit();
+
+    try testing.expect(!result.manifest_valid);
+    try testing.expect(!result.isClean());
+    try testing.expect(result.errors.items.len > 0);
+    try testing.expect(std.mem.indexOf(u8, result.errors.items[0], "graph UUID mismatch") != null);
 }
 
 test {

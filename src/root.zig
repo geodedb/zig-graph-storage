@@ -83,6 +83,7 @@ pub const btree = @import("btree.zig");
 pub const property_index = @import("property_index.zig");
 pub const property_chain_index = @import("property_chain_index.zig");
 pub const index_catalog = @import("index_catalog.zig");
+pub const index_snapshot = @import("index_snapshot.zig");
 
 // Encryption and integrity
 pub const encryption = @import("encryption.zig");
@@ -93,11 +94,14 @@ pub const verify = @import("verify.zig");
 pub const migration = @import("migration.zig");
 pub const backup = @import("backup.zig");
 pub const maintenance = @import("maintenance.zig");
+pub const operation_result = @import("operation_result.zig");
+pub const test_support = @import("test_support.zig");
 
 pub const GraphEngine = engine.GraphEngine;
 
 // Re-export key types for convenience
 pub const GraphStorage = interface.GraphStorage;
+pub const NodeIterator = interface.NodeIterator;
 pub const PropertyEntry = interface.PropertyEntry;
 pub const NodeId = types.NodeId;
 pub const EdgeId = types.EdgeId;

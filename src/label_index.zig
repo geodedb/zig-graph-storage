@@ -5,6 +5,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
 const free_space_mod = @import("free_space.zig");
+const index_snapshot_mod = @import("index_snapshot.zig");
 const node_store_mod = @import("node_store.zig");
 const node_mod = @import("node.zig");
 
@@ -29,6 +30,19 @@ pub const LabelIndex = struct {
 
     /// In-memory index: LabelId -> list of NodeId
     index: std.AutoHashMap(LabelId, NodeList),
+
+    pub const Iterator = struct {
+        items: []const NodeId,
+        index: usize = 0,
+
+        pub fn next(self: *Iterator) !?NodeId {
+            if (self.index >= self.items.len) return null;
+            defer self.index += 1;
+            return self.items[self.index];
+        }
+
+        pub fn deinit(_: *Iterator) void {}
+    };
 
     pub fn init(
         allocator: Allocator,
@@ -108,6 +122,15 @@ pub const LabelIndex = struct {
         return result;
     }
 
+    /// Iterate node IDs for a label without copying the posting list.
+    pub fn iterator(self: *const LabelIndex, label_id: LabelId) Iterator {
+        const empty = &[_]NodeId{};
+        const list = self.index.getPtr(label_id);
+        return .{
+            .items = if (list) |posting| posting.items else empty,
+        };
+    }
+
     /// Number of nodes with a given label.
     pub fn count(self: *const LabelIndex, label_id: LabelId) u64 {
         const list = self.index.getPtr(label_id) orelse return 0;
@@ -127,23 +150,16 @@ pub const LabelIndex = struct {
 
     /// Persist the in-memory posting lists to labels.idx.
     /// Format:
-    ///   [8 bytes magic][u64 checkpoint_counter][u32 label_count]
+    ///   [8 bytes magic][u64 checkpoint_counter][u64 label_count]
     ///   repeated label_count times:
     ///     [u32 label_id][u64 node_count][node_count * u64 node_id]
     pub fn saveToFile(self: *const LabelIndex, file: *std.fs.File, checkpoint_counter: u64) !void {
         try file.setEndPos(0);
         try file.seekTo(0);
-        try file.writeAll(SNAPSHOT_MAGIC);
+        try index_snapshot_mod.writeHeader(file, SNAPSHOT_MAGIC, checkpoint_counter, self.index.count());
 
-        var u64_buf: [8]u8 = undefined;
         var u32_buf: [4]u8 = undefined;
-
-        std.mem.writeInt(u64, &u64_buf, checkpoint_counter, .little);
-        try file.writeAll(&u64_buf);
-
-        const label_count: u32 = @intCast(self.index.count());
-        std.mem.writeInt(u32, &u32_buf, label_count, .little);
-        try file.writeAll(&u32_buf);
+        var u64_buf: [8]u8 = undefined;
 
         var it = self.index.iterator();
         while (it.next()) |entry| {
@@ -164,39 +180,24 @@ pub const LabelIndex = struct {
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
     pub fn loadFromFile(self: *LabelIndex, file: *std.fs.File) !?u64 {
-        const stat = try file.stat();
-        if (stat.size == 0) return null;
-
-        const size: usize = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
-        const data = try self.allocator.alloc(u8, size);
-        defer self.allocator.free(data);
-
-        try file.seekTo(0);
-        const bytes_read = try file.readAll(data);
-        if (bytes_read != size) return error.UnexpectedEndOfFile;
-        if (size < SNAPSHOT_MAGIC.len + 12) return error.InvalidFormat;
-        if (!std.mem.eql(u8, data[0..SNAPSHOT_MAGIC.len], SNAPSHOT_MAGIC)) {
-            return error.InvalidFormat;
-        }
+        var snapshot = (try index_snapshot_mod.loadFile(self.allocator, file, SNAPSHOT_MAGIC)) orelse return null;
+        defer snapshot.deinit();
 
         self.clear();
         errdefer self.clear();
 
-        var offset: usize = SNAPSHOT_MAGIC.len;
-        const checkpoint_counter = std.mem.readInt(u64, data[offset..][0..8], .little);
-        offset += 8;
+        const payload = snapshot.payload();
+        var offset: usize = 0;
 
-        const label_count = std.mem.readInt(u32, data[offset..][0..4], .little);
-        offset += 4;
-
-        var i: u32 = 0;
+        var i: u64 = 0;
+        const label_count = snapshot.item_count;
         while (i < label_count) : (i += 1) {
-            if (offset + 12 > data.len) return error.InvalidFormat;
+            if (offset + 12 > payload.len) return error.InvalidFormat;
 
-            const label_id = std.mem.readInt(u32, data[offset..][0..4], .little);
+            const label_id = std.mem.readInt(u32, payload[offset..][0..4], .little);
             offset += 4;
 
-            const node_count = std.mem.readInt(u64, data[offset..][0..8], .little);
+            const node_count = std.mem.readInt(u64, payload[offset..][0..8], .little);
             offset += 8;
 
             const gop = try self.index.getOrPut(label_id);
@@ -208,15 +209,15 @@ pub const LabelIndex = struct {
 
             var j: u64 = 0;
             while (j < node_count) : (j += 1) {
-                if (offset + 8 > data.len) return error.InvalidFormat;
-                const node_id = std.mem.readInt(u64, data[offset..][0..8], .little);
+                if (offset + 8 > payload.len) return error.InvalidFormat;
+                const node_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
                 offset += 8;
                 gop.value_ptr.appendAssumeCapacity(node_id);
             }
         }
 
-        if (offset != data.len) return error.InvalidFormat;
-        return checkpoint_counter;
+        if (offset != payload.len) return error.InvalidFormat;
+        return snapshot.checkpoint_counter;
     }
 
     fn rebuildCallback(_: *LabelIndex, _: NodeId, _: node_mod.NodeRec) void {

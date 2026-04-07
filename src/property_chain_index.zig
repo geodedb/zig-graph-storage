@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const index_snapshot_mod = @import("index_snapshot.zig");
 
 const Allocator = std.mem.Allocator;
 const SNAPSHOT_MAGIC = "GSPIDX1\x00";
@@ -126,17 +127,11 @@ pub const PropertyChainIndex = struct {
     pub fn saveToFile(self: *const PropertyChainIndex, file: *std.fs.File, checkpoint_counter: u64) !void {
         try file.setEndPos(0);
         try file.seekTo(0);
-        try file.writeAll(SNAPSHOT_MAGIC);
+        try index_snapshot_mod.writeHeader(file, SNAPSHOT_MAGIC, checkpoint_counter, self.chains.count());
 
         var u64_buf: [8]u8 = undefined;
         var u32_buf: [4]u8 = undefined;
         var u16_buf: [2]u8 = undefined;
-
-        std.mem.writeInt(u64, &u64_buf, checkpoint_counter, .little);
-        try file.writeAll(&u64_buf);
-
-        std.mem.writeInt(u64, &u64_buf, self.chains.count(), .little);
-        try file.writeAll(&u64_buf);
 
         var it = self.chains.iterator();
         while (it.next()) |entry| {
@@ -161,39 +156,24 @@ pub const PropertyChainIndex = struct {
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
     pub fn loadFromFile(self: *PropertyChainIndex, file: *std.fs.File) !?u64 {
-        const stat = try file.stat();
-        if (stat.size == 0) return null;
-
-        const size: usize = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
-        const data = try self.allocator.alloc(u8, size);
-        defer self.allocator.free(data);
-
-        try file.seekTo(0);
-        const bytes_read = try file.readAll(data);
-        if (bytes_read != size) return error.UnexpectedEndOfFile;
-        if (size < SNAPSHOT_MAGIC.len + 16) return error.InvalidFormat;
-        if (!std.mem.eql(u8, data[0..SNAPSHOT_MAGIC.len], SNAPSHOT_MAGIC)) {
-            return error.InvalidFormat;
-        }
+        var snapshot = (try index_snapshot_mod.loadFile(self.allocator, file, SNAPSHOT_MAGIC)) orelse return null;
+        defer snapshot.deinit();
 
         self.clear();
         errdefer self.clear();
 
-        var offset: usize = SNAPSHOT_MAGIC.len;
-        const checkpoint_counter = std.mem.readInt(u64, data[offset..][0..8], .little);
-        offset += 8;
-
-        const chain_count = std.mem.readInt(u64, data[offset..][0..8], .little);
-        offset += 8;
+        const payload = snapshot.payload();
+        var offset: usize = 0;
+        const chain_count = snapshot.item_count;
 
         var i: u64 = 0;
         while (i < chain_count) : (i += 1) {
-            if (offset + 12 > data.len) return error.InvalidFormat;
+            if (offset + 12 > payload.len) return error.InvalidFormat;
 
-            const prop_head = std.mem.readInt(u64, data[offset..][0..8], .little);
+            const prop_head = std.mem.readInt(u64, payload[offset..][0..8], .little);
             offset += 8;
 
-            const entry_count = std.mem.readInt(u32, data[offset..][0..4], .little);
+            const entry_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
             offset += 4;
 
             const gop = try self.chains.getOrPut(prop_head);
@@ -205,15 +185,15 @@ pub const PropertyChainIndex = struct {
 
             var j: u32 = 0;
             while (j < entry_count) : (j += 1) {
-                if (offset + 2 > data.len) return error.InvalidFormat;
-                const key_len = std.mem.readInt(u16, data[offset..][0..2], .little);
+                if (offset + 2 > payload.len) return error.InvalidFormat;
+                const key_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
                 offset += 2;
 
-                if (offset + key_len + 8 > data.len) return error.InvalidFormat;
-                const key_copy = try self.allocator.dupe(u8, data[offset .. offset + key_len]);
+                if (offset + key_len + 8 > payload.len) return error.InvalidFormat;
+                const key_copy = try self.allocator.dupe(u8, payload[offset .. offset + key_len]);
                 offset += key_len;
 
-                const value_hash = std.mem.readInt(u64, data[offset..][0..8], .little);
+                const value_hash = std.mem.readInt(u64, payload[offset..][0..8], .little);
                 offset += 8;
 
                 gop.value_ptr.entries.appendAssumeCapacity(.{
@@ -223,8 +203,8 @@ pub const PropertyChainIndex = struct {
             }
         }
 
-        if (offset != data.len) return error.InvalidFormat;
-        return checkpoint_counter;
+        if (offset != payload.len) return error.InvalidFormat;
+        return snapshot.checkpoint_counter;
     }
 };
 

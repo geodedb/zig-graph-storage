@@ -17,6 +17,7 @@ pub const PagerError = error{
     PageNotFound,
     InvalidBufferSize,
     DecryptionFailed,
+    WriteCountExhausted,
 };
 
 pub const Pager = struct {
@@ -78,7 +79,8 @@ pub const Pager = struct {
         if (self.encryption) |enc| {
             // Increment write_count to ensure unique AES-GCM nonce per write
             const current_wc = page_mod.readWriteCount(buf);
-            const new_wc = current_wc +| 1; // saturating add to avoid overflow
+            if (current_wc == std.math.maxInt(u24)) return error.WriteCountExhausted;
+            const new_wc = current_wc + 1;
             page_mod.writeWriteCount(buf, new_wc);
             enc.encryptPage(buf, page_id, @intFromEnum(self.file_id), new_wc);
         } else {
@@ -345,6 +347,26 @@ test "SEC-0015: encrypted page writes produce different ciphertexts (no nonce re
     try pager.readPage(0, &read_buf);
 
     _ = &enc;
+}
+
+test "GAP-0036: encrypted writes fail closed when the per-page nonce counter is exhausted" {
+    const file = try createTempFile();
+    defer cleanupTempFile(file);
+
+    const page_size: u32 = 4096;
+    const key = [_]u8{0x24} ** 32;
+
+    var pager = Pager.init(file, page_size);
+    pager.encryption = encryption_mod.PageEncryption.init(key);
+
+    var write_buf: [4096]u8 = undefined;
+    @memset(&write_buf, 0);
+    const header = page_mod.initHeader(0, .node_data, page_size);
+    const header_bytes = page_mod.headerToBytes(&header);
+    @memcpy(write_buf[0..PAGE_HEADER_SIZE], header_bytes);
+    page_mod.writeWriteCount(&write_buf, std.math.maxInt(u24));
+
+    try testing.expectError(error.WriteCountExhausted, pager.writePage(0, &write_buf));
 }
 
 test {

@@ -1,6 +1,6 @@
 # Security Gap Analysis
 
-**Last updated:** 2026-04-06 (gap closure pass)
+**Last updated:** 2026-04-07 (gap closure pass)
 **Source:** Full Codebase Audit (docs/AUDIT_REPORT.md), Phase 4 review
 
 ## Summary
@@ -8,16 +8,16 @@
 | Status | Count |
 |--------|-------|
 | Open | 0 |
-| Closed | 34 |
+| Closed | 35 |
 | Won't Do | 1 |
 | Blocked | 0 |
-| Deferred | 1 |
+| Deferred | 0 |
 
-**Known residual risk:** SEC-0015 (nonce reuse) is closed but u24 write_count uses saturating add (`+| 1`) at `pager.zig:81`. After 16,777,215 writes to a single page the nonce stops incrementing, re-enabling nonce reuse. This is a long-horizon risk; tracking under SEC-0015 residual note.
+**Known residual risk:** No open cryptographic or storage-integrity gaps remain from this review pass. The previous SEC-0015 residual note was closed once pager writes began failing closed at counter exhaustion.
 
-### Top 5 Open Risks
+### Top Remaining Notes
 
-No open items remain. All security findings are Closed, Won't Do, or Deferred.
+No open items remain. All security findings are Closed or Won't Do.
 
 ### Stack-Ranked Findings
 
@@ -30,7 +30,7 @@ No open items remain. All security findings are Closed, Won't Do, or Deferred.
 | 5 | High | 64 | SEC-0019: @intCast on stat.size | engine.zig, label_index.zig, property_chain_index.zig | CWE-681 / A03:2021 | engine.zig:347, label_index.zig:170, property_chain_index.zig:167 | std.math.cast at all 3 sites | Closed |
 | 6 | Medium | 48 | SEC-0020: AdjStore trusts bh.count | adj_store.zig | CWE-125 / A03:2021 | adj_store.zig:172-174 | count validation added | Closed |
 | 7 | Medium | 48 | SEC-0021: Index catalog no integrity check | index_catalog.zig | CWE-354 / A08:2021 | index_catalog.zig:94-181 | magic+version+CRC32 added | Closed |
-| 8 | Medium | 48 | SEC-0022: Free space unbounded total_pages | free_space.zig | CWE-400 / A05:2021 | free_space.zig:172-181 | Policy decision needed | Deferred |
+| 8 | Medium | 48 | SEC-0022: Free space unbounded total_pages | free_space.zig | CWE-400 / A05:2021 | free_space.zig:172-181 | bounded deserialization tied to persisted page-count limits | Closed |
 | 9 | Medium | 48 | SEC-0032: VarStore.read infinite loop on circular page chain | var_store.zig | CWE-835 / A05:2021 | var_store.zig:107-124 | Cycle detection with max-hop limit | Closed |
 | 10 | Medium | 48 | SEC-0033: prop_store chain traversals have no cycle detection | prop_store.zig | CWE-835 / A05:2021 | prop_store.zig:117,317,401,485 | Cycle detection at all 4 traversal sites | Closed |
 | 11 | Medium | 36 | SEC-0023: Encryption key not zeroed in Recovery/Backup | recovery.zig, backup.zig | CWE-316 / A02:2021 | recovery.zig:43, backup.zig:66 | Recovery.deinit with secureZero | Closed |
@@ -48,10 +48,7 @@ No open items remain. All security findings are Closed, Won't Do, or Deferred.
 
 ### Roadmap
 
-All quick win and medium items have been closed. Only deferred items remain:
-
-**Deferred:**
-- SEC-0022: Add maximum total_pages bound and validate before bitmap resize (policy decision needed).
+All tracked items in this pass are now closed except the user-directed Won't Do item for repo-local Docker digest pinning.
 
 ---
 
@@ -172,7 +169,7 @@ All quick win and medium items have been closed. Only deferred items remain:
 
 ## SEC-0022: Free space unbounded total_pages
 
-- **Status:** Deferred
+- **Status:** Closed
 - **Severity:** Medium
 - **Risk Score:** 48 (Impact 3 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -184,7 +181,7 @@ All quick win and medium items have been closed. Only deferred items remain:
 - **Fix Guidance:** Add a maximum bound check (e.g., based on available file size or a configured limit) before calling `bitmap.resize`.
 - **Acceptance Criteria:** Oversized total_pages returns error instead of allocating unbounded memory.
 - **SLA:** 90 days (Medium)
-- **Deferral Reason:** Requires policy decision on maximum database size and coordination with config layer. Needs design discussion before implementation.
+- **Resolution:** `FreeSpaceManager.deserializeBounded()` now validates `total_pages`, `next_free_hint`, and page-0 invariants against a caller-supplied upper bound, and `engine_persist.zig` derives that bound from persisted store page counts before allocating the bitmap. Unit coverage rejects oversized metadata and invalid free-space hints.
 
 ## SEC-0023: Encryption key not zeroed in Recovery/Backup
 
@@ -379,22 +376,22 @@ All quick win and medium items have been closed. Only deferred items remain:
 
 - **Status:** Won't Do
 - **Severity:** Low
-- **Resolution:** The user explicitly stated this is out of scope since CI/CD is managed downstream via GitLab orchestration. Image pinning will not be enforced at the repository level. Avoids unnecessary merge conflict overhead for security patches on tags.
+- **Resolution:** The user explicitly directed that repo-local Docker digest pinning remain out of scope. Downstream GitLab orchestration and shared catalog controls own that policy. Future agents should not reopen this item unless the platform control model changes.
 
 ## SEC-0015: Residual Risk -- u24 write_count nonce exhaustion
 
-- **Status:** Closed (residual risk noted)
-- **Severity:** Medium (residual)
-- **Risk Score:** 24 (Impact 4 x Likelihood 1.5 x 4, rounded)
+- **Status:** Closed
+- **Severity:** Medium
+- **Risk Score:** 24
 - **Confidence:** `confidence::confirmed`
 - **CWE:** CWE-323 (Reusing a Nonce, Key Pair in Encryption)
 - **OWASP:** A02:2021 Cryptographic Failures
 - **Exploit Surface:** Requires 16,777,215+ overwrites of a single page
-- **Summary:** The SEC-0015 fix uses a u24 write_count with saturating add (`+| 1`) at `pager.zig:81`. After 16,777,215 writes to a single page, the counter saturates and the nonce stops changing, re-enabling nonce reuse for that page. This is a long-horizon risk: normal workloads are unlikely to hit this limit, but a pathological write loop could reach it.
-- **Evidence:** `pager.zig:81` -- `const new_wc = current_wc +| 1;` saturates at `maxInt(u24)` = 16,777,215.
-- **How to Verify:** Write a test that sets write_count to `maxInt(u24) - 1`, performs two writes, and checks whether the nonce differs on the second write.
-- **Fix Guidance:** Monitor or log when write_count approaches saturation. Consider widening to u32 or implementing page re-keying when saturation is imminent.
-- **Acceptance Criteria:** Either (a) write_count is widened, or (b) saturation triggers an error/warning rather than silent nonce reuse.
+- **Summary:** The follow-up fix replaced saturating increment behavior with a fail-closed guard. Pager writes now return `error.WriteCountExhausted` before nonce reuse can occur.
+- **Evidence:** `pager.zig` now rejects `write_count == maxInt(u24)` instead of reusing the final nonce.
+- **How to Verify:** The unit test sets `write_count` to `maxInt(u24)` and verifies that an encrypted write fails with `error.WriteCountExhausted`.
+- **Fix Guidance:** None further required for this tracked gap.
+- **Acceptance Criteria:** Saturation triggers an error rather than silent nonce reuse.
 
 ---
 

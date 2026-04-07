@@ -24,9 +24,12 @@ const Crc32 = std.hash.crc.Crc32Iscsi;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const timing_safe = std.crypto.timing_safe;
 const owner_only_file_mode = 0o600;
+const BACKUP_STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 const graph_dir_mod = @import("graph_dir.zig");
+const operation_result_mod = @import("operation_result.zig");
 const GraphDir = graph_dir_mod.GraphDir;
+const GraphOperationSummary = operation_result_mod.GraphOperationSummary;
 
 pub const BACKUP_MAGIC: [4]u8 = .{ 'G', 'E', 'O', 'B' };
 pub const BACKUP_VERSION: u16 = 1;
@@ -45,6 +48,7 @@ const BACKUP_FILES = [_][]const u8{
     "labels.dict",
     "labels.idx",
     "props.idx",
+    "edges.idx",
 };
 
 /// Optional files that may or may not exist.
@@ -60,14 +64,47 @@ pub const BackupResult = struct {
 
     /// Write the result as a JSON object to the provided writer.
     pub fn writeJson(self: *const BackupResult, writer: anytype) !void {
-        try writer.writeAll("{\"graph_uuid\":\"");
-        for (self.graph_uuid) |byte| {
-            try writer.print("{x:0>2}", .{byte});
-        }
-        try writer.print("\",\"files_backed_up\":{d},\"total_bytes\":{d}}}", .{
-            self.files_backed_up,
-            self.total_bytes,
-        });
+        const summary = GraphOperationSummary{
+            .operation = .backup,
+            .status = .ok,
+            .graph_uuid = self.graph_uuid,
+            .items_processed = self.files_backed_up,
+            .bytes_processed = self.total_bytes,
+            .issue_count = 0,
+            .changed = false,
+        };
+        try writer.writeByte('{');
+        try summary.writeJsonFields(writer);
+        try writer.writeAll(",\"files_backed_up\":");
+        try writer.print("{d}", .{self.files_backed_up});
+        try writer.writeAll(",\"total_bytes\":");
+        try writer.print("{d}", .{self.total_bytes});
+        try writer.writeByte('}');
+    }
+};
+
+pub const RestoreResult = struct {
+    graph_uuid: [16]u8,
+    files_restored: u32,
+    total_bytes: u64,
+
+    pub fn writeJson(self: *const RestoreResult, writer: anytype) !void {
+        const summary = GraphOperationSummary{
+            .operation = .restore,
+            .status = .ok,
+            .graph_uuid = self.graph_uuid,
+            .items_processed = self.files_restored,
+            .bytes_processed = self.total_bytes,
+            .issue_count = 0,
+            .changed = true,
+        };
+        try writer.writeByte('{');
+        try summary.writeJsonFields(writer);
+        try writer.writeAll(",\"files_restored\":");
+        try writer.print("{d}", .{self.files_restored});
+        try writer.writeAll(",\"total_bytes\":");
+        try writer.print("{d}", .{self.total_bytes});
+        try writer.writeByte('}');
     }
 };
 
@@ -109,31 +146,21 @@ pub const Backup = struct {
         var total_bytes: u64 = 0;
         var files_backed_up: u32 = 0;
 
-        // Collect files that exist
         const FileEntry = struct {
             name: []const u8,
-            data: []const u8,
+            size: u64,
         };
         var entries: std.ArrayList(FileEntry) = .{};
-        defer {
-            for (entries.items) |entry| {
-                self.allocator.free(entry.data);
-            }
-            entries.deinit(self.allocator);
-        }
+        defer entries.deinit(self.allocator);
 
         // Try required files
         for (BACKUP_FILES) |name| {
-            if (try self.readGraphFile(graph_dir.path, name)) |data| {
-                try entries.append(self.allocator, .{ .name = name, .data = data });
-            }
+            try self.appendBackupEntryIfPresent(&entries, graph_dir.path, name);
         }
 
         // Try optional files
         for (OPTIONAL_BACKUP_FILES) |name| {
-            if (try self.readGraphFile(graph_dir.path, name)) |data| {
-                try entries.append(self.allocator, .{ .name = name, .data = data });
-            }
+            try self.appendBackupEntryIfPresent(&entries, graph_dir.path, name);
         }
 
         // Write header: magic(4) + version(2) + uuid(16) + file_count(4)
@@ -166,17 +193,13 @@ pub const Backup = struct {
 
             // file_size (8 bytes)
             var size_buf: [8]u8 = undefined;
-            @memcpy(&size_buf, &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, @intCast(entry.data.len)))));
+            @memcpy(&size_buf, &std.mem.toBytes(std.mem.nativeToLittle(u64, entry.size)));
             try out_file.writeAll(&size_buf);
             crc.update(&size_buf);
             if (hmac_ctx) |*h| h.update(&size_buf);
             total_bytes += 8;
 
-            // file_data
-            try out_file.writeAll(entry.data);
-            crc.update(entry.data);
-            if (hmac_ctx) |*h| h.update(entry.data);
-            total_bytes += entry.data.len;
+            try self.streamGraphFile(graph_dir.path, entry.name, entry.size, out_file, &crc, &hmac_ctx, &total_bytes);
 
             files_backed_up += 1;
         }
@@ -205,6 +228,11 @@ pub const Backup = struct {
 
     /// Restore a backup to a target directory.
     pub fn restoreBackup(self: *Backup, backup_path: []const u8, target_dir: []const u8) !void {
+        _ = try self.restoreBackupResult(backup_path, target_dir);
+    }
+
+    /// Restore a backup and return a structured result for automation.
+    pub fn restoreBackupResult(self: *Backup, backup_path: []const u8, target_dir: []const u8) !RestoreResult {
         const data = try self.readFileAlloc(backup_path);
         defer self.allocator.free(data);
 
@@ -254,10 +282,20 @@ pub const Backup = struct {
         var pos: usize = 4; // skip magic
         _ = readU16(data, pos); // version
         pos += 2;
-        pos += 16; // uuid
+        var backup_uuid: [16]u8 = undefined;
+        @memcpy(&backup_uuid, data[pos..][0..16]);
+        pos += 16;
+
+        if (expectedGraphUuidFromPath(target_dir)) |expected_uuid| {
+            if (!std.mem.eql(u8, &backup_uuid, &expected_uuid)) {
+                return error.UuidMismatch;
+            }
+        }
 
         const file_count = readU32(data, pos);
         pos += 4;
+        var files_restored: u32 = 0;
+        var total_bytes: u64 = 0;
 
         // Ensure target directory exists with restricted permissions
         try std.fs.cwd().makePath(target_dir);
@@ -306,7 +344,16 @@ pub const Backup = struct {
             const file = try std.fs.cwd().createFile(file_path, .{ .mode = owner_only_file_mode });
             defer file.close();
             try file.writeAll(file_data);
+
+            files_restored += 1;
+            total_bytes += file_size;
         }
+
+        return .{
+            .graph_uuid = backup_uuid,
+            .files_restored = files_restored,
+            .total_bytes = total_bytes,
+        };
     }
 
     /// Validate a backup file's integrity (check header, CRC, and HMAC if applicable).
@@ -336,13 +383,16 @@ pub const Backup = struct {
         const computed_crc = Crc32.hash(data[0..crc_offset]);
         if (stored_crc != computed_crc) return false;
 
-        // SEC-0005: Verify HMAC when version >= 2 and key is available
-        if (version >= BACKUP_VERSION_HMAC and self.encryption_key != null) {
+        // SEC-0005: Version 2 backups require a key for HMAC validation.
+        if (version >= BACKUP_VERSION_HMAC) {
+            const key = self.encryption_key orelse return false;
+            if (data.len < HmacSha256.mac_length + 4) return false;
+
             const integrity_end = data.len - HmacSha256.mac_length;
             const stored_hmac = data[integrity_end..][0..HmacSha256.mac_length];
             const hmac_input = data[0..integrity_end];
             var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
-            HmacSha256.create(&computed_hmac, hmac_input, &self.encryption_key.?);
+            HmacSha256.create(&computed_hmac, hmac_input, &key);
             if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac.*, computed_hmac)) return false;
         }
 
@@ -353,27 +403,58 @@ pub const Backup = struct {
     // Internal helpers
     // ========================================================================
 
-    fn readGraphFile(self: *Backup, graph_path: []const u8, name: []const u8) !?[]const u8 {
+    fn appendBackupEntryIfPresent(
+        self: *Backup,
+        entries: anytype,
+        graph_path: []const u8,
+        name: []const u8,
+    ) !void {
         const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ graph_path, name });
         defer self.allocator.free(file_path);
 
         const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
-            if (err == error.FileNotFound) return null;
+            if (err == error.FileNotFound) return;
             return err;
         };
         defer file.close();
 
         const stat = try file.stat();
-        const data = try self.allocator.alloc(u8, stat.size);
-        errdefer self.allocator.free(data);
+        try entries.append(self.allocator, .{
+            .name = name,
+            .size = stat.size,
+        });
+    }
 
-        const bytes_read = try file.readAll(data);
-        if (bytes_read != stat.size) {
-            self.allocator.free(data);
-            return error.InvalidData;
+    fn streamGraphFile(
+        self: *Backup,
+        graph_path: []const u8,
+        name: []const u8,
+        file_size: u64,
+        out_file: std.fs.File,
+        crc: *Crc32,
+        hmac_ctx: *?HmacSha256,
+        total_bytes: *u64,
+    ) !void {
+        const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ graph_path, name });
+        defer self.allocator.free(file_path);
+
+        const file = try std.fs.cwd().openFile(file_path, .{});
+        defer file.close();
+
+        var buf: [BACKUP_STREAM_CHUNK_SIZE]u8 = undefined;
+        var remaining = file_size;
+        while (remaining > 0) {
+            const want = @min(buf.len, std.math.cast(usize, remaining) orelse buf.len);
+            const bytes_read = try file.read(buf[0..want]);
+            if (bytes_read == 0) return error.InvalidData;
+
+            const chunk = buf[0..bytes_read];
+            try out_file.writeAll(chunk);
+            crc.update(chunk);
+            if (hmac_ctx.*) |*h| h.update(chunk);
+            total_bytes.* += chunk.len;
+            remaining -= bytes_read;
         }
-
-        return data;
     }
 
     fn readFileAlloc(self: *Backup, path: []const u8) ![]u8 {
@@ -436,6 +517,20 @@ fn readU32(data: []const u8, offset: usize) u32 {
 
 fn readU64(data: []const u8, offset: usize) u64 {
     return std.mem.littleToNative(u64, @bitCast(data[offset..][0..8].*));
+}
+
+fn expectedGraphUuidFromPath(path: []const u8) ?[16]u8 {
+    const base = std.fs.path.basename(path);
+    if (base.len != 32) return null;
+
+    var uuid: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < uuid.len) : (i += 1) {
+        const hi = std.fmt.charToDigit(base[i * 2], 16) catch return null;
+        const lo = std.fmt.charToDigit(base[i * 2 + 1], 16) catch return null;
+        uuid[i] = @intCast((hi << 4) | lo);
+    }
+    return uuid;
 }
 
 // ============================================================================
@@ -555,7 +650,10 @@ test "restoreBackup restores files to new directory" {
     const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
     defer allocator.free(restore_path);
 
-    try backup.restoreBackup(backup_path, restore_path);
+    const restore_result = try backup.restoreBackupResult(backup_path, restore_path);
+    try testing.expectEqual(env.graph_dir.graph_uuid, restore_result.graph_uuid);
+    try testing.expect(restore_result.files_restored >= 4);
+    try testing.expect(restore_result.total_bytes >= "test node data".len + "Person:1".len + "label index snapshot".len + "property index snapshot".len);
 
     // Verify files were restored with correct content and permissions.
     const restored_nodes = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{restore_path});
@@ -601,6 +699,32 @@ test "validateBackup returns true for valid backup" {
 
     const valid = try backup.validateBackup(backup_path);
     try testing.expect(valid);
+}
+
+test "GAP-0034: validateBackup rejects version 2 backups without the HMAC key" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v2.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    const key = [_]u8{0xAA} ** 32;
+    var backup_with_key = Backup.initWithKey(allocator, key);
+    _ = try backup_with_key.createBackup(&env.graph_dir, backup_path);
+
+    var backup_no_key = Backup.init(allocator);
+    const valid = try backup_no_key.validateBackup(backup_path);
+    try testing.expect(!valid);
 }
 
 test "validateBackup returns false for corrupted file" {
@@ -915,6 +1039,78 @@ test "SEC-0017: V2 restore without key returns EncryptionKeyRequired" {
     try testing.expectError(error.EncryptionKeyRequired, result);
 }
 
+test "GAP-0032: restoreBackup rejects a target graph path whose UUID mismatches the archive" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v1.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    var backup = Backup.init(allocator);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+
+    const wrong_uuid_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/graphs/11111111111111111111111111111111",
+        .{out_path_base},
+    );
+    defer allocator.free(wrong_uuid_dir);
+
+    const result = backup.restoreBackup(backup_path, wrong_uuid_dir);
+    try testing.expectError(error.UuidMismatch, result);
+}
+
+test "GAP-0037: createBackup streams large files without buffering them fully in memory" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
+    defer allocator.free(nodes_path);
+    {
+        const file = try std.fs.cwd().createFile(nodes_path, .{ .mode = owner_only_file_mode });
+        defer file.close();
+
+        var chunk: [32 * 1024]u8 = undefined;
+        @memset(&chunk, 0xAB);
+        var remaining: usize = 2 * 1024 * 1024;
+        while (remaining > 0) {
+            const to_write = @min(chunk.len, remaining);
+            try file.writeAll(chunk[0..to_write]);
+            remaining -= to_write;
+        }
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_streamed.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var backup = Backup.init(fba.allocator());
+    const result = try backup.createBackup(&env.graph_dir, backup_path);
+
+    try testing.expect(result.total_bytes >= 2 * 1024 * 1024);
+}
+
 test "SEC-0005: no-key backup still works as version 1" {
     const allocator = testing.allocator;
 
@@ -963,6 +1159,25 @@ test "BackupResult writeJson produces valid structured output" {
     try testing.expect(std.mem.indexOf(u8, json, "\"files_backed_up\":7") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"total_bytes\":123456") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"graph_uuid\":\"aabbccdd") != null);
+}
+
+test "RestoreResult writeJson produces valid structured output" {
+    const result = RestoreResult{
+        .graph_uuid = [_]u8{ 0x11, 0x22, 0x33, 0x44 } ++ [_]u8{0x00} ** 12,
+        .files_restored = 5,
+        .total_bytes = 654321,
+    };
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(testing.allocator);
+
+    try result.writeJson(buf.writer(testing.allocator));
+    const json = buf.items;
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"restore\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"files_restored\":5") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"total_bytes\":654321") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"graph_uuid\":\"11223344") != null);
 }
 
 test {

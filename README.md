@@ -28,7 +28,7 @@ graph TB
 
         subgraph Caching["Buffer Pool & Paging"]
             BP["BufferPool<br/>LRU page cache<br/>pin/unpin + dirty tracking"]
-            FM["FileManager<br/>8 Pagers (one per FileId)"]
+            FM["FileManager<br/>store + snapshot files"]
             FS["FreeSpaceManager<br/>bitmap per store"]
         end
 
@@ -46,7 +46,7 @@ graph TB
         end
 
         TXN["TxnManager<br/>begin / commit / abort"]
-        ENC["Encryption<br/>AES-256-CTR per page"]
+        ENC["Encryption<br/>AES-256-GCM per page"]
         MET["Metrics<br/>counters & histograms"]
     end
 
@@ -154,13 +154,14 @@ flowchart TD
     SelectManifest -->|"Valid manifest found"| CheckVersion{"format_version == 2?"}
     CheckVersion -->|"v1"| MigrationError["Return version error<br/>(requires recreation)"]
     CheckVersion -->|"v2"| OpenFiles["Open all store files<br/>via FileManager"]
-    OpenFiles --> ReadWAL["Read WAL from<br/>last_checkpoint_lsn"]
+    OpenFiles --> LoadIndexes["Load labels.idx / props.idx / edges.idx<br/>(rebuild only if stale)"]
+    LoadIndexes --> ReadWAL["Stream WAL from<br/>last_checkpoint_lsn"]
     ReadWAL --> ClassifyTxn["Classify transactions<br/>BEGIN/COMMIT/ABORT"]
     ClassifyTxn --> Replay["Replay committed<br/>page_update records"]
     Replay --> DiscardUncommitted["Discard uncommitted<br/>transaction data"]
     DiscardUncommitted --> FlushBP["Flush buffer pool"]
     FlushBP --> FreshCheckpoint["Write fresh checkpoint<br/>(new baseline)"]
-    FreshCheckpoint --> RebuildIndexes["Rebuild label index<br/>from LabelStore"]
+    FreshCheckpoint --> RebuildIndexes["Refresh derived indexes<br/>only when needed"]
     RebuildIndexes --> Ready["Engine ready"]
 ```
 
@@ -176,8 +177,12 @@ graph LR
         AI["adj_in.store<br/>edge blocks"]
         PS["props.store<br/>slotted TLV pages"]
         VS["var.store<br/>overflow pages"]
+        FR["free.store<br/>free-page bitmap"]
         LD["labels.dict<br/>LabelId ↔ name"]
-        WAL["graph.wal/<br/>segment-0, segment-1, ..."]
+        LI["labels.idx<br/>label postings"]
+        PI["props.idx<br/>property chains"]
+        EI["edges.idx<br/>edge-id snapshot"]
+        WAL["graph.wal/<br/>segment-0, segment-1, ...<br/>graph.uuid"]
     end
 ```
 
@@ -201,18 +206,18 @@ graph LR
 
 ## Features
 
-- **Page-Based Storage**: 8KB pages with CRC32C integrity, LRU buffer pool
+- **Page-Based Storage**: Configurable page sizes with CRC32C integrity and an LRU buffer pool
 - **WAL Durability**: Write-ahead logging with real transaction boundaries (BEGIN/COMMIT/ABORT)
-- **Crash Recovery**: Replay committed transactions from last checkpoint LSN
+- **Crash Recovery**: Stream committed WAL replay from the last checkpoint LSN
 - **Incremental Checkpointing**: Flush only dirty pages, A/B manifest switching
 - **Locality-Friendly Adjacency**: Edge blocks with 339 entries per page, overflow chaining
 - **Typed Properties**: TLV encoding for null, bool, int, float, string, decimal, ext
-- **Label Dictionary**: Bidirectional LabelId-to-string mapping, persisted to `labels.dict`
-- **Secondary Indexes**: Label posting lists, optional B+tree property indexes
-- **Optional Encryption**: AES-256-CTR per-page encryption with key zeroization
+- **Derived Snapshots**: Persisted `labels.idx`, `props.idx`, and `edges.idx` accelerate reopen paths
+- **Optional Encryption**: AES-256-GCM per-page encryption with key zeroization
 - **Authenticated Backup**: Self-contained archives with CRC32C + optional HMAC-SHA256
 - **Free Space Reuse**: Bitmap-based page allocation with O(1) amortized alloc
-- **Minimal Dependencies**: Only [wal](https://gitlab.com/devnw/zig/wal) and [uuid](https://gitlab.com/devnw/zig/uuid)
+- **Iterator Hot Paths**: `expandOutIter`, `expandInIter`, and `scanLabelIter` avoid result-sized allocations
+- **Minimal Dependencies**: [wal](https://gitlab.com/devnw/zig/wal), [uuid](https://gitlab.com/devnw/zig/uuid), and [spice](https://gitlab.com/devnw/zig/spice)
 - **Cross-Platform**: Linux, macOS, Windows support
 
 ## Installation
@@ -224,7 +229,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .graph_storage = .{
-        .url = "https://gitlab.com/devnw/zig/graph_storage/-/archive/v0.1.0/graph_storage-v0.1.0.tar.gz",
+        .url = "https://gitlab.com/devnw/zig/graph-storage/-/archive/v0.1.0/graph-storage-v0.1.0.tar.gz",
         .hash = "...",
     },
 },
@@ -258,48 +263,64 @@ pub fn main() !void {
     const engine = try gs.GraphEngine.create(allocator, "data", graph_uuid, cfg);
     defer engine.close() catch {};
 
-    // Allocate a node and add a label
-    const node_id = try engine.allocNode();
-    const label_id = engine.labelDict().getOrAssign("Person");
-    try engine.addLabel(node_id, label_id);
+    const empty_node = gs.node.NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
 
-    // Set a property
-    _ = try engine.putProperty(node_id, "name", .{ .string = "Alice" });
+    const alice = try engine.allocNode();
+    try engine.putNode(alice, empty_node);
+    const bob = try engine.allocNode();
+    try engine.putNode(bob, empty_node);
 
-    // Add an edge
-    const other = try engine.allocNode();
-    const knows = engine.labelDict().getOrAssign("KNOWS");
-    _ = try engine.addEdge(node_id, other, knows);
+    try engine.addLabel(alice, 1);
+    _ = try engine.addEdge(alice, bob, 10);
 
-    // Traverse outgoing edges
-    var iter = try engine.expandOut(node_id, null);
-    defer iter.deinit();
-    while (try iter.next()) |entry| {
-        std.debug.print("edge {} -> neighbor {}\n", .{ entry.edge_id, entry.neighbor });
+    var alice_rec = (try engine.getNode(alice)).?;
+    alice_rec.prop_head = try engine.putProperty(alice_rec.prop_head, "name", .{ .string = "Alice" });
+    try engine.putNode(alice, alice_rec);
+
+    var edge_iter = try engine.expandOutIter(alice, null);
+    defer edge_iter.deinit();
+    while (try edge_iter.next()) |edge| {
+        std.debug.print("edge {} -> neighbor {}\n", .{ edge.edge_id, edge.neighbor });
     }
 
-    // Checkpoint to persist
+    var label_iter = try engine.scanLabelIter(1);
+    defer label_iter.deinit();
+    while (try label_iter.next()) |node_id| {
+        std.debug.print("label 1 contains node {}\n", .{node_id});
+    }
+
     try engine.checkpoint();
 }
 ```
+
+See [examples/basic.zig](examples/basic.zig) for a larger end-to-end example that is built by `zig build`.
 
 ## Configuration
 
 ```zig
 const cfg = gs.GraphConfig{
-    .page_size = 8192,                          // bytes per page
-    .buffer_pool_pages = 1024,                  // frames in LRU cache
-    .buffer_pool_auto_size = true,              // auto-size from manifest
-    .wal_segment_size = 16 * 1024 * 1024,       // 16 MB WAL segments
+    .page_size = 4096,                      // bytes per page
+    .buffer_pool_pages = 64,                // frames in LRU cache
+    .buffer_pool_auto_size = true,          // auto-size from manifest on open
+    .wal_segment_size = 16 * 1024 * 1024,   // 16 MB WAL segments
     .checkpoint_byte_threshold = 16 * 1024 * 1024, // checkpoint after 16 MB WAL
-    .checkpoint_time_threshold_ms = 60_000,     // checkpoint every 60s
-    .encryption_key = null,                     // optional 32-byte AES key
+    .checkpoint_time_threshold_ms = 60_000, // or checkpoint every 60 seconds
+    .encryption_key = null,                 // optional 32-byte AES-256-GCM key
 };
 ```
 
 ## Requirements
 
-- Zig 0.15.1 or later
+- Zig 0.15.1 or later (`build.zig.zon` minimum); CI currently validates with Zig 0.15.2
 
 ## Building
 

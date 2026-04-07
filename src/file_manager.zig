@@ -11,7 +11,7 @@ const Pager = pager_mod.Pager;
 const Allocator = std.mem.Allocator;
 
 /// Number of distinct file types managed.
-const FILE_COUNT = 8;
+pub const FILE_COUNT = @typeInfo(FileId).@"enum".fields.len;
 
 /// File name for each FileId.
 pub const FILE_NAMES = [FILE_COUNT][]const u8{
@@ -23,6 +23,7 @@ pub const FILE_NAMES = [FILE_COUNT][]const u8{
     "free.store", // free
     "labels.idx", // label_idx
     "props.idx", // prop_idx
+    "edges.idx", // edge_idx
 };
 
 pub const FileManager = struct {
@@ -285,7 +286,7 @@ test "openFile is idempotent — returns same pager on second call" {
 }
 
 test "FILE_NAMES has correct count and entries" {
-    try testing.expectEqual(@as(usize, 8), FILE_NAMES.len);
+    try testing.expectEqual(@as(usize, 9), FILE_NAMES.len);
     try testing.expectEqualStrings("nodes.store", FILE_NAMES[@intFromEnum(FileId.nodes)]);
     try testing.expectEqualStrings("adj_out.store", FILE_NAMES[@intFromEnum(FileId.adj_out)]);
     try testing.expectEqualStrings("adj_in.store", FILE_NAMES[@intFromEnum(FileId.adj_in)]);
@@ -294,6 +295,7 @@ test "FILE_NAMES has correct count and entries" {
     try testing.expectEqualStrings("free.store", FILE_NAMES[@intFromEnum(FileId.free)]);
     try testing.expectEqualStrings("labels.idx", FILE_NAMES[@intFromEnum(FileId.label_idx)]);
     try testing.expectEqualStrings("props.idx", FILE_NAMES[@intFromEnum(FileId.prop_idx)]);
+    try testing.expectEqualStrings("edges.idx", FILE_NAMES[@intFromEnum(FileId.edge_idx)]);
 }
 
 test "created files have mode 0o600" {

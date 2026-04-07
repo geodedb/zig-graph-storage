@@ -15,7 +15,6 @@ const graph_storage = @import("graph_storage");
 const GraphEngine = graph_storage.GraphEngine;
 const GraphConfig = graph_storage.GraphConfig;
 const NodeRec = graph_storage.node.NodeRec;
-const PropertyValue = graph_storage.PropertyValue;
 
 const print = std.debug.print;
 
@@ -134,26 +133,36 @@ pub fn main() !void {
     // -- 7. Query adjacency (expand outgoing edges) -----------------------
     print("[7] Querying outgoing edges from Alice...\n", .{});
 
-    const alice_edges = try engine.expandOut(alice_id, null, allocator);
-    defer allocator.free(alice_edges);
+    var alice_edges = try engine.expandOutIter(alice_id, null);
+    defer alice_edges.deinit();
 
-    print("  Alice has {d} outgoing edge(s):\n", .{alice_edges.len});
-    for (alice_edges) |edge| {
+    var alice_edge_count: usize = 0;
+    while (try alice_edges.next()) |edge| {
+        alice_edge_count += 1;
         print("    -> node {d} (edge_id={d}, rel_type={d})\n", .{ edge.neighbor, edge.edge_id, edge.rel_type });
     }
+    print("  Alice has {d} outgoing edge(s).\n", .{alice_edge_count});
 
     // -- 8. Scan by label -------------------------------------------------
     print("[8] Scanning for all 'Person' nodes (label={d})...\n", .{label_person});
 
-    const persons = try engine.scanLabel(label_person, allocator);
-    defer allocator.free(persons);
+    var persons = try engine.scanLabelIter(label_person);
+    defer persons.deinit();
 
-    print("  Found {d} person node(s): ", .{persons.len});
-    for (persons, 0..) |nid, i| {
-        if (i > 0) print(", ", .{});
+    var person_count: usize = 0;
+    while (try persons.next()) |nid| {
+        if (person_count == 0) {
+            print("  Found person node(s): ", .{});
+        } else {
+            print(", ", .{});
+        }
+        person_count += 1;
         print("{d}", .{nid});
     }
-    print("\n", .{});
+    if (person_count == 0) {
+        print("  Found 0 person node(s)", .{});
+    }
+    print(" ({d} total)\n", .{person_count});
 
     // -- 9. Transactions --------------------------------------------------
     print("[9] Demonstrating transactions...\n", .{});

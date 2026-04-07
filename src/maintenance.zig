@@ -13,11 +13,13 @@ const manifest_mod = @import("manifest.zig");
 const label_index_mod = @import("label_index.zig");
 const node_store_mod = @import("node_store.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
+const operation_result_mod = @import("operation_result.zig");
 
 const Manifest = manifest_mod.Manifest;
 const LabelIndex = label_index_mod.LabelIndex;
 const NodeStore = node_store_mod.NodeStore;
 const BufferPool = buffer_pool_mod.BufferPool;
+const GraphOperationSummary = operation_result_mod.GraphOperationSummary;
 
 /// Types of maintenance operations.
 pub const MaintenanceOp = enum {
@@ -39,6 +41,33 @@ pub const StorageStats = struct {
     var_pages: u64,
 };
 
+pub const MaintenanceResult = struct {
+    summary: GraphOperationSummary,
+    flushed_pages: u32 = 0,
+    stats: ?StorageStats = null,
+
+    pub fn writeJson(self: *const MaintenanceResult, writer: anytype) !void {
+        try writer.writeByte('{');
+        try self.summary.writeJsonFields(writer);
+        try writer.print(",\"flushed_pages\":{d}", .{self.flushed_pages});
+        if (self.stats) |stats| {
+            try writer.writeAll(",\"stats\":{");
+            try writer.print("\"next_node_id\":{d}", .{stats.next_node_id});
+            try writer.print(",\"next_edge_id\":{d}", .{stats.next_edge_id});
+            try writer.print(",\"last_checkpoint_lsn\":{d}", .{stats.last_checkpoint_lsn});
+            try writer.print(",\"nodes_pages\":{d}", .{stats.nodes_pages});
+            try writer.print(",\"adj_out_pages\":{d}", .{stats.adj_out_pages});
+            try writer.print(",\"adj_in_pages\":{d}", .{stats.adj_in_pages});
+            try writer.print(",\"props_pages\":{d}", .{stats.props_pages});
+            try writer.print(",\"var_pages\":{d}", .{stats.var_pages});
+            try writer.writeByte('}');
+            try writer.writeByte('}');
+        } else {
+            try writer.writeByte('}');
+        }
+    }
+};
+
 /// Graph maintenance operations.
 pub const Maintenance = struct {
     allocator: Allocator,
@@ -57,8 +86,26 @@ pub const Maintenance = struct {
         engine_ptr: *anyopaque,
         checkpoint_fn: *const fn (*anyopaque) anyerror!void,
     ) !void {
+        _ = try self.forceCheckpointResult(engine_ptr, checkpoint_fn);
+    }
+
+    pub fn forceCheckpointResult(
+        self: *Maintenance,
+        engine_ptr: *anyopaque,
+        checkpoint_fn: *const fn (*anyopaque) anyerror!void,
+    ) !MaintenanceResult {
         _ = self;
         try checkpoint_fn(engine_ptr);
+        return .{
+            .summary = .{
+                .operation = .force_checkpoint,
+                .status = .ok,
+                .items_processed = 1,
+                .bytes_processed = 0,
+                .issue_count = 0,
+                .changed = true,
+            },
+        };
     }
 
     /// Rebuild label indexes from the node store.
@@ -70,8 +117,27 @@ pub const Maintenance = struct {
         node_store: *NodeStore,
         max_node_id: u64,
     ) !void {
+        _ = try self.rebuildLabelIndexResult(label_index, node_store, max_node_id);
+    }
+
+    pub fn rebuildLabelIndexResult(
+        self: *Maintenance,
+        label_index: *LabelIndex,
+        node_store: *NodeStore,
+        max_node_id: u64,
+    ) !MaintenanceResult {
         _ = self;
         try label_index.rebuild(node_store, max_node_id);
+        return .{
+            .summary = .{
+                .operation = .rebuild_indexes,
+                .status = .ok,
+                .items_processed = max_node_id,
+                .bytes_processed = 0,
+                .issue_count = 0,
+                .changed = true,
+            },
+        };
     }
 
     /// Pre-flush dirty pages to reduce eviction stalls.
@@ -79,14 +145,33 @@ pub const Maintenance = struct {
     /// Delegates to `BufferPool.flushDirtyPages`, which walks the LRU list
     /// from the tail and flushes up to `max_count` dirty unpinned frames.
     /// Returns the number of pages actually flushed.
-    pub fn flushDirtyPages(_: *Maintenance, buffer_pool: *BufferPool, max_count: u32) !u32 {
-        return buffer_pool.flushDirtyPages(max_count);
+    pub fn flushDirtyPages(self: *Maintenance, buffer_pool: *BufferPool, max_count: u32) !u32 {
+        return (try self.flushDirtyPagesResult(buffer_pool, max_count)).flushed_pages;
+    }
+
+    pub fn flushDirtyPagesResult(_: *Maintenance, buffer_pool: *BufferPool, max_count: u32) !MaintenanceResult {
+        const flushed = try buffer_pool.flushDirtyPages(max_count);
+        return .{
+            .summary = .{
+                .operation = .flush_dirty_pages,
+                .status = .ok,
+                .items_processed = flushed,
+                .bytes_processed = 0,
+                .issue_count = 0,
+                .changed = flushed > 0,
+            },
+            .flushed_pages = flushed,
+        };
     }
 
     /// Get storage statistics from a manifest.
     pub fn getStats(self: *Maintenance, m: *const Manifest) StorageStats {
+        return self.getStatsResult(m).stats.?;
+    }
+
+    pub fn getStatsResult(self: *Maintenance, m: *const Manifest) MaintenanceResult {
         _ = self;
-        return .{
+        const stats: StorageStats = .{
             .next_node_id = m.next_node_id,
             .next_edge_id = m.next_edge_id,
             .last_checkpoint_lsn = m.last_checkpoint_lsn,
@@ -95,6 +180,17 @@ pub const Maintenance = struct {
             .adj_in_pages = m.adj_in_pages,
             .props_pages = m.props_pages,
             .var_pages = m.var_pages,
+        };
+        return .{
+            .summary = .{
+                .operation = .storage_stats,
+                .status = .ok,
+                .items_processed = stats.nodes_pages + stats.adj_out_pages + stats.adj_in_pages + stats.props_pages + stats.var_pages,
+                .bytes_processed = 0,
+                .issue_count = 0,
+                .changed = false,
+            },
+            .stats = stats,
         };
     }
 };
@@ -260,6 +356,64 @@ test "flushDirtyPages delegates to buffer pool" {
         if (frame.dirty and frame.valid) dirty_count += 1;
     }
     try testing.expectEqual(@as(u32, 1), dirty_count);
+}
+
+test "MaintenanceResult writeJson includes stats when present" {
+    const result = MaintenanceResult{
+        .summary = .{
+            .operation = .storage_stats,
+            .status = .ok,
+            .items_processed = 5,
+            .bytes_processed = 0,
+            .issue_count = 0,
+            .changed = false,
+        },
+        .stats = .{
+            .next_node_id = 10,
+            .next_edge_id = 20,
+            .last_checkpoint_lsn = 30,
+            .nodes_pages = 1,
+            .adj_out_pages = 2,
+            .adj_in_pages = 3,
+            .props_pages = 4,
+            .var_pages = 5,
+        },
+    };
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(testing.allocator);
+
+    try result.writeJson(buf.writer(testing.allocator));
+    const json = buf.items;
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"storage_stats\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"flushed_pages\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"stats\":{\"next_node_id\":10") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"var_pages\":5") != null);
+}
+
+test "MaintenanceResult writeJson omits stats when absent" {
+    const result = MaintenanceResult{
+        .summary = .{
+            .operation = .flush_dirty_pages,
+            .status = .ok,
+            .items_processed = 2,
+            .bytes_processed = 0,
+            .issue_count = 0,
+            .changed = true,
+        },
+        .flushed_pages = 2,
+    };
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(testing.allocator);
+
+    try result.writeJson(buf.writer(testing.allocator));
+    const json = buf.items;
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"flush_dirty_pages\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"flushed_pages\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"stats\"") == null);
 }
 
 test {

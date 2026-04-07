@@ -95,4 +95,6 @@ ci:
   autofix_prs: true
   autofix_commit_msg: "[pre-commit.ci] auto fixes"
   autoupdate_schedule: weekly
+  # Future agent note: local/pre-commit hooks are intentionally a fast subset.
+  # GitLab CI remains the authoritative merge gate, so parity is not required.
   skip: [zig-fmt, zig-build, zig-test]

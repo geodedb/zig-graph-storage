@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const wal_lib = @import("wal");
 const wal_record = @import("wal_record.zig");
 const WalRecord = wal_record.WalRecord;
+const GRAPH_IDENTITY_FILE = "graph.uuid";
 
 /// Configuration for the WAL manager.
 pub const WalConfig = struct {
@@ -35,7 +36,7 @@ pub const WalManager = struct {
         start_lsn: u64,
         config: WalConfig,
     ) !WalManager {
-        _ = graph_uuid;
+        try ensureGraphIdentity(wal_dir, graph_uuid);
 
         const inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, "graph.wal", .{
             .encryption_key = config.encryption_key,
@@ -119,6 +120,33 @@ pub const WalManager = struct {
         return all_records.toOwnedSlice(allocator);
     }
 
+    /// Stream WAL records with LSN >= start_lsn through `callback`.
+    /// Each deserialized record is deinitialized before the next record is read,
+    /// keeping replay memory bounded by one record at a time.
+    pub fn forEachFrom(
+        self: *WalManager,
+        start_lsn: u64,
+        allocator: Allocator,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), *const WalRecord) anyerror!void,
+    ) !void {
+        const iter_from = if (start_lsn > 0) start_lsn - 1 else 0;
+        var iter = try self.inner.iterator(iter_from);
+        defer iter.deinit();
+
+        while (try iter.next()) |entry_val| {
+            var entry = entry_val;
+            defer entry.deinit();
+
+            const result = WalRecord.deserialize(allocator, entry.payload) catch continue;
+            defer result.record.deinit(allocator);
+
+            if (result.record.lsn >= start_lsn) {
+                try callback(ctx, &result.record);
+            }
+        }
+    }
+
     /// Truncate WAL: compact entries up to the given LSN.
     pub fn truncate(self: *WalManager, up_to_lsn: u64) !void {
         try self.inner.compact(up_to_lsn);
@@ -134,6 +162,27 @@ pub const WalManager = struct {
         return self.inner.bytesSinceCompact();
     }
 };
+
+fn ensureGraphIdentity(wal_dir: std.fs.Dir, graph_uuid: [16]u8) !void {
+    const file = wal_dir.openFile(GRAPH_IDENTITY_FILE, .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const new_file = try wal_dir.createFile(GRAPH_IDENTITY_FILE, .{ .read = true, .mode = 0o600 });
+            break :blk new_file;
+        },
+        else => return err,
+    };
+    defer file.close();
+
+    var stored_uuid: [16]u8 = undefined;
+    const bytes_read = try file.readAll(&stored_uuid);
+    if (bytes_read == 0) {
+        try file.writeAll(&graph_uuid);
+        try file.sync();
+        return;
+    }
+    if (bytes_read != stored_uuid.len) return error.InvalidData;
+    if (!std.mem.eql(u8, &stored_uuid, &graph_uuid)) return error.UuidMismatch;
+}
 
 // ============================================================================
 // Unit Tests
@@ -271,6 +320,59 @@ test "truncate compacts old entries" {
         try std.testing.expect(rec.lsn >= 6);
     }
     try std.testing.expectEqual(@as(usize, 5), records.len);
+}
+
+test "GAP-0032: init rejects a WAL directory bound to a different graph UUID" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const uuid_a = [_]u8{0xAA} ** 16;
+    const uuid_b = [_]u8{0xBB} ** 16;
+
+    var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid_a, 0, .{});
+    mgr.deinit();
+
+    try std.testing.expectError(error.UuidMismatch, WalManager.init(allocator, tmp_dir.dir, uuid_b, 0, .{}));
+}
+
+test "forEachFrom streams records in order" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const uuid = [_]u8{0xEE} ** 16;
+    var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
+    defer mgr.deinit();
+
+    for (0..4) |i| {
+        var rec = WalRecord{
+            .lsn = 0,
+            .txn_id = 1,
+            .record_type = .page_update,
+            .file_id = 0,
+            .page_id = i,
+            .payload = "data",
+            .checksum = 0,
+        };
+        _ = try mgr.appendRecord(&rec);
+    }
+
+    const Ctx = struct {
+        count: usize = 0,
+        last_lsn: u64 = 0,
+
+        fn visit(self: *@This(), rec: *const WalRecord) !void {
+            self.count += 1;
+            try std.testing.expect(rec.lsn > self.last_lsn);
+            self.last_lsn = rec.lsn;
+        }
+    };
+
+    var ctx = Ctx{};
+    try mgr.forEachFrom(2, allocator, &ctx, Ctx.visit);
+    try std.testing.expectEqual(@as(usize, 3), ctx.count);
+    try std.testing.expectEqual(@as(u64, 4), ctx.last_lsn);
 }
 
 test {

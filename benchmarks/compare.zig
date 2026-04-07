@@ -3,35 +3,43 @@
 
 //! Benchmark comparison tool for graph-storage.
 //!
-//! Reads two JSON result files (baseline and current), compares each metric
-//! at each tier, and prints a table showing delta% and pass/fail.
-//!
-//! Usage: zig build compare-bench -- baseline.json current.json
-//! Optional: zig build compare-bench -- baseline.json current.json 25
-//!           (last arg is the regression threshold percentage, default 20)
-//!
-//! Exit code 0 if all pass, 1 if any regression exceeds threshold.
+//! Reads two JSON result files (baseline and current), compares every tier and
+//! every tracked percentile/variance field, and exits non-zero when a tier is
+//! missing, skipped, or regressed beyond the configured threshold.
 
 const std = @import("std");
 
 const print = std.debug.print;
 
-// ---------------------------------------------------------------------------
-// JSON parsing types
-// ---------------------------------------------------------------------------
+const MetricStats = struct {
+    samples: f64 = 0,
+    avg: f64 = 0,
+    p50: f64 = 0,
+    p95: f64 = 0,
+    p99: f64 = 0,
+    stddev: f64 = 0,
+};
 
 const TierData = struct {
     name: []const u8 = "",
     node_count: f64 = 0,
     edge_count: f64 = 0,
     seed_ops_sec: f64 = 0,
+    seed_ops_sec_stats: ?MetricStats = null,
     point_lookup_ns: f64 = 0,
+    point_lookup_ns_stats: ?MetricStats = null,
     prop_read_ns: f64 = 0,
+    prop_read_ns_stats: ?MetricStats = null,
     expand_out_ns: f64 = 0,
+    expand_out_ns_stats: ?MetricStats = null,
     label_scan_ns: f64 = 0,
+    label_scan_ns_stats: ?MetricStats = null,
     checkpoint_ms: f64 = 0,
+    checkpoint_ms_stats: ?MetricStats = null,
     open_ms: f64 = 0,
+    open_ms_stats: ?MetricStats = null,
     mixed_ops_sec: f64 = 0,
+    mixed_ops_sec_stats: ?MetricStats = null,
     skipped: bool = false,
 };
 
@@ -40,14 +48,8 @@ const BenchResult = struct {
     tiers: []TierData = &[_]TierData{},
 };
 
-// ---------------------------------------------------------------------------
-// Metric definitions
-// ---------------------------------------------------------------------------
-
 const MetricKind = enum {
-    /// Higher is better (throughput metrics). A decrease is a regression.
     higher_is_better,
-    /// Lower is better (latency metrics). An increase is a regression.
     lower_is_better,
 };
 
@@ -57,45 +59,159 @@ const Metric = struct {
     get: *const fn (TierData) f64,
 };
 
-fn getSeedOps(t: TierData) f64 {
-    return t.seed_ops_sec;
+fn resolvedStats(flat: f64, maybe_stats: ?MetricStats) MetricStats {
+    if (maybe_stats) |stats| {
+        return .{
+            .samples = if (stats.samples != 0) stats.samples else if (flat != 0) 1 else 0,
+            .avg = if (stats.avg != 0) stats.avg else flat,
+            .p50 = if (stats.p50 != 0) stats.p50 else flat,
+            .p95 = if (stats.p95 != 0) stats.p95 else flat,
+            .p99 = if (stats.p99 != 0) stats.p99 else flat,
+            .stddev = stats.stddev,
+        };
+    }
+
+    return .{
+        .samples = if (flat != 0) 1 else 0,
+        .avg = flat,
+        .p50 = flat,
+        .p95 = flat,
+        .p99 = flat,
+        .stddev = 0,
+    };
 }
-fn getPointLookup(t: TierData) f64 {
-    return t.point_lookup_ns;
+
+fn getSeedAvg(t: TierData) f64 {
+    return resolvedStats(t.seed_ops_sec, t.seed_ops_sec_stats).avg;
 }
-fn getPropRead(t: TierData) f64 {
-    return t.prop_read_ns;
+fn getSeedP95(t: TierData) f64 {
+    return resolvedStats(t.seed_ops_sec, t.seed_ops_sec_stats).p95;
 }
-fn getExpandOut(t: TierData) f64 {
-    return t.expand_out_ns;
+fn getSeedP99(t: TierData) f64 {
+    return resolvedStats(t.seed_ops_sec, t.seed_ops_sec_stats).p99;
 }
-fn getLabelScan(t: TierData) f64 {
-    return t.label_scan_ns;
+fn getSeedStdDev(t: TierData) f64 {
+    return resolvedStats(t.seed_ops_sec, t.seed_ops_sec_stats).stddev;
 }
-fn getCheckpoint(t: TierData) f64 {
-    return t.checkpoint_ms;
+fn getPointLookupAvg(t: TierData) f64 {
+    return resolvedStats(t.point_lookup_ns, t.point_lookup_ns_stats).avg;
 }
-fn getOpen(t: TierData) f64 {
-    return t.open_ms;
+fn getPointLookupP95(t: TierData) f64 {
+    return resolvedStats(t.point_lookup_ns, t.point_lookup_ns_stats).p95;
 }
-fn getMixedOps(t: TierData) f64 {
-    return t.mixed_ops_sec;
+fn getPointLookupP99(t: TierData) f64 {
+    return resolvedStats(t.point_lookup_ns, t.point_lookup_ns_stats).p99;
+}
+fn getPointLookupStdDev(t: TierData) f64 {
+    return resolvedStats(t.point_lookup_ns, t.point_lookup_ns_stats).stddev;
+}
+fn getPropReadAvg(t: TierData) f64 {
+    return resolvedStats(t.prop_read_ns, t.prop_read_ns_stats).avg;
+}
+fn getPropReadP95(t: TierData) f64 {
+    return resolvedStats(t.prop_read_ns, t.prop_read_ns_stats).p95;
+}
+fn getPropReadP99(t: TierData) f64 {
+    return resolvedStats(t.prop_read_ns, t.prop_read_ns_stats).p99;
+}
+fn getPropReadStdDev(t: TierData) f64 {
+    return resolvedStats(t.prop_read_ns, t.prop_read_ns_stats).stddev;
+}
+fn getExpandOutAvg(t: TierData) f64 {
+    return resolvedStats(t.expand_out_ns, t.expand_out_ns_stats).avg;
+}
+fn getExpandOutP95(t: TierData) f64 {
+    return resolvedStats(t.expand_out_ns, t.expand_out_ns_stats).p95;
+}
+fn getExpandOutP99(t: TierData) f64 {
+    return resolvedStats(t.expand_out_ns, t.expand_out_ns_stats).p99;
+}
+fn getExpandOutStdDev(t: TierData) f64 {
+    return resolvedStats(t.expand_out_ns, t.expand_out_ns_stats).stddev;
+}
+fn getLabelScanAvg(t: TierData) f64 {
+    return resolvedStats(t.label_scan_ns, t.label_scan_ns_stats).avg;
+}
+fn getLabelScanP95(t: TierData) f64 {
+    return resolvedStats(t.label_scan_ns, t.label_scan_ns_stats).p95;
+}
+fn getLabelScanP99(t: TierData) f64 {
+    return resolvedStats(t.label_scan_ns, t.label_scan_ns_stats).p99;
+}
+fn getLabelScanStdDev(t: TierData) f64 {
+    return resolvedStats(t.label_scan_ns, t.label_scan_ns_stats).stddev;
+}
+fn getCheckpointAvg(t: TierData) f64 {
+    return resolvedStats(t.checkpoint_ms, t.checkpoint_ms_stats).avg;
+}
+fn getCheckpointP95(t: TierData) f64 {
+    return resolvedStats(t.checkpoint_ms, t.checkpoint_ms_stats).p95;
+}
+fn getCheckpointP99(t: TierData) f64 {
+    return resolvedStats(t.checkpoint_ms, t.checkpoint_ms_stats).p99;
+}
+fn getCheckpointStdDev(t: TierData) f64 {
+    return resolvedStats(t.checkpoint_ms, t.checkpoint_ms_stats).stddev;
+}
+fn getOpenAvg(t: TierData) f64 {
+    return resolvedStats(t.open_ms, t.open_ms_stats).avg;
+}
+fn getOpenP95(t: TierData) f64 {
+    return resolvedStats(t.open_ms, t.open_ms_stats).p95;
+}
+fn getOpenP99(t: TierData) f64 {
+    return resolvedStats(t.open_ms, t.open_ms_stats).p99;
+}
+fn getOpenStdDev(t: TierData) f64 {
+    return resolvedStats(t.open_ms, t.open_ms_stats).stddev;
+}
+fn getMixedAvg(t: TierData) f64 {
+    return resolvedStats(t.mixed_ops_sec, t.mixed_ops_sec_stats).avg;
+}
+fn getMixedP95(t: TierData) f64 {
+    return resolvedStats(t.mixed_ops_sec, t.mixed_ops_sec_stats).p95;
+}
+fn getMixedP99(t: TierData) f64 {
+    return resolvedStats(t.mixed_ops_sec, t.mixed_ops_sec_stats).p99;
+}
+fn getMixedStdDev(t: TierData) f64 {
+    return resolvedStats(t.mixed_ops_sec, t.mixed_ops_sec_stats).stddev;
 }
 
 const metrics = [_]Metric{
-    .{ .name = "seed_ops_sec", .kind = .higher_is_better, .get = getSeedOps },
-    .{ .name = "point_lookup_ns", .kind = .lower_is_better, .get = getPointLookup },
-    .{ .name = "prop_read_ns", .kind = .lower_is_better, .get = getPropRead },
-    .{ .name = "expand_out_ns", .kind = .lower_is_better, .get = getExpandOut },
-    .{ .name = "label_scan_ns", .kind = .lower_is_better, .get = getLabelScan },
-    .{ .name = "checkpoint_ms", .kind = .lower_is_better, .get = getCheckpoint },
-    .{ .name = "open_ms", .kind = .lower_is_better, .get = getOpen },
-    .{ .name = "mixed_ops_sec", .kind = .higher_is_better, .get = getMixedOps },
+    .{ .name = "seed.avg", .kind = .higher_is_better, .get = getSeedAvg },
+    .{ .name = "seed.p95", .kind = .higher_is_better, .get = getSeedP95 },
+    .{ .name = "seed.p99", .kind = .higher_is_better, .get = getSeedP99 },
+    .{ .name = "seed.stddev", .kind = .lower_is_better, .get = getSeedStdDev },
+    .{ .name = "lookup.avg", .kind = .lower_is_better, .get = getPointLookupAvg },
+    .{ .name = "lookup.p95", .kind = .lower_is_better, .get = getPointLookupP95 },
+    .{ .name = "lookup.p99", .kind = .lower_is_better, .get = getPointLookupP99 },
+    .{ .name = "lookup.stddev", .kind = .lower_is_better, .get = getPointLookupStdDev },
+    .{ .name = "prop.avg", .kind = .lower_is_better, .get = getPropReadAvg },
+    .{ .name = "prop.p95", .kind = .lower_is_better, .get = getPropReadP95 },
+    .{ .name = "prop.p99", .kind = .lower_is_better, .get = getPropReadP99 },
+    .{ .name = "prop.stddev", .kind = .lower_is_better, .get = getPropReadStdDev },
+    .{ .name = "expand.avg", .kind = .lower_is_better, .get = getExpandOutAvg },
+    .{ .name = "expand.p95", .kind = .lower_is_better, .get = getExpandOutP95 },
+    .{ .name = "expand.p99", .kind = .lower_is_better, .get = getExpandOutP99 },
+    .{ .name = "expand.stddev", .kind = .lower_is_better, .get = getExpandOutStdDev },
+    .{ .name = "label.avg", .kind = .lower_is_better, .get = getLabelScanAvg },
+    .{ .name = "label.p95", .kind = .lower_is_better, .get = getLabelScanP95 },
+    .{ .name = "label.p99", .kind = .lower_is_better, .get = getLabelScanP99 },
+    .{ .name = "label.stddev", .kind = .lower_is_better, .get = getLabelScanStdDev },
+    .{ .name = "checkpoint.avg", .kind = .lower_is_better, .get = getCheckpointAvg },
+    .{ .name = "checkpoint.p95", .kind = .lower_is_better, .get = getCheckpointP95 },
+    .{ .name = "checkpoint.p99", .kind = .lower_is_better, .get = getCheckpointP99 },
+    .{ .name = "checkpoint.stddev", .kind = .lower_is_better, .get = getCheckpointStdDev },
+    .{ .name = "open.avg", .kind = .lower_is_better, .get = getOpenAvg },
+    .{ .name = "open.p95", .kind = .lower_is_better, .get = getOpenP95 },
+    .{ .name = "open.p99", .kind = .lower_is_better, .get = getOpenP99 },
+    .{ .name = "open.stddev", .kind = .lower_is_better, .get = getOpenStdDev },
+    .{ .name = "mixed.avg", .kind = .higher_is_better, .get = getMixedAvg },
+    .{ .name = "mixed.p95", .kind = .higher_is_better, .get = getMixedP95 },
+    .{ .name = "mixed.p99", .kind = .higher_is_better, .get = getMixedP99 },
+    .{ .name = "mixed.stddev", .kind = .lower_is_better, .get = getMixedStdDev },
 };
-
-// ---------------------------------------------------------------------------
-// File reading and parsing
-// ---------------------------------------------------------------------------
 
 fn readJsonFile(allocator: std.mem.Allocator, path: []const u8) !BenchResult {
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -114,19 +230,13 @@ fn readJsonFile(allocator: std.mem.Allocator, path: []const u8) !BenchResult {
         print("Error: failed to parse '{s}': {s}\n", .{ path, @errorName(err) });
         return err;
     };
-    // We intentionally leak the parsed data since the program exits shortly.
     _ = &parsed;
-
     return parsed.value;
 }
 
-// ---------------------------------------------------------------------------
-// Comparison
-// ---------------------------------------------------------------------------
-
 fn findTier(result: BenchResult, name: []const u8) ?TierData {
-    for (result.tiers) |t| {
-        if (std.mem.eql(u8, t.name, name)) return t;
+    for (result.tiers) |tier| {
+        if (std.mem.eql(u8, tier.name, name)) return tier;
     }
     return null;
 }
@@ -143,15 +253,47 @@ fn isRegression(delta_pct: f64, kind: MetricKind, threshold: f64) bool {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+fn validateTierSets(baseline: BenchResult, current: BenchResult) bool {
+    var ok = true;
+
+    if (baseline.tiers.len != current.tiers.len) {
+        print("Tier count mismatch: baseline has {d}, current has {d}\n", .{ baseline.tiers.len, current.tiers.len });
+        ok = false;
+    }
+
+    for (baseline.tiers) |tier| {
+        if (findTier(current, tier.name) == null) {
+            print("Missing tier in current results: {s}\n", .{tier.name});
+            ok = false;
+        }
+    }
+
+    for (current.tiers) |tier| {
+        if (findTier(baseline, tier.name) == null) {
+            print("Unexpected extra tier in current results: {s}\n", .{tier.name});
+            ok = false;
+        }
+    }
+
+    return ok;
+}
+
+fn validateNoSkippedTiers(result: BenchResult, label: []const u8) bool {
+    var ok = true;
+    for (result.tiers) |tier| {
+        if (tier.skipped) {
+            print("{s} tier skipped and cannot be compared: {s}\n", .{ label, tier.name });
+            ok = false;
+        }
+    }
+    return ok;
+}
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     var args = std.process.args();
-    _ = args.next(); // program name
+    _ = args.next();
 
     const baseline_path = args.next() orelse {
         print("Usage: compare-bench <baseline.json> <current.json> [threshold%]\n", .{});
@@ -167,67 +309,58 @@ pub fn main() !void {
         threshold = std.fmt.parseFloat(f64, thr_str) catch 20.0;
     }
 
-    const baseline = readJsonFile(allocator, baseline_path) catch {
-        std.process.exit(2);
-    };
-    const current = readJsonFile(allocator, current_path) catch {
-        std.process.exit(2);
-    };
+    const baseline = readJsonFile(allocator, baseline_path) catch std.process.exit(2);
+    const current = readJsonFile(allocator, current_path) catch std.process.exit(2);
 
-    // Print header
-    print("\n{s}\n", .{"=" ** 90});
+    if (!validateTierSets(baseline, current) or !validateNoSkippedTiers(baseline, "Baseline") or !validateNoSkippedTiers(current, "Current")) {
+        std.process.exit(1);
+    }
+
+    print("\n{s}\n", .{"=" ** 96});
     print("  Benchmark Comparison\n", .{});
     print("  Baseline: {s}\n", .{baseline_path});
     print("  Current:  {s}\n", .{current_path});
     print("  Threshold: {d:.0}%\n", .{threshold});
-    print("{s}\n\n", .{"=" ** 90});
+    print("{s}\n\n", .{"=" ** 96});
 
-    print("  {s:<6} {s:<18} {s:>14} {s:>14} {s:>10} {s:>6}\n", .{
+    print("  {s:<6} {s:<20} {s:>12} {s:>12} {s:>10} {s:>6}\n", .{
         "Tier", "Metric", "Baseline", "Current", "Delta%", "Status",
     });
-    print("  {s:<6} {s:<18} {s:>14} {s:>14} {s:>10} {s:>6}\n", .{
-        "-" ** 6, "-" ** 18, "-" ** 14, "-" ** 14, "-" ** 10, "-" ** 6,
+    print("  {s:<6} {s:<20} {s:>12} {s:>12} {s:>10} {s:>6}\n", .{
+        "-" ** 6, "-" ** 20, "-" ** 12, "-" ** 12, "-" ** 10, "-" ** 6,
     });
 
     var any_regression = false;
 
     for (baseline.tiers) |base_tier| {
-        if (base_tier.skipped) continue;
-
         const cur_tier = findTier(current, base_tier.name) orelse continue;
-        if (cur_tier.skipped) continue;
 
-        for (metrics) |m| {
-            const base_val = m.get(base_tier);
-            const cur_val = m.get(cur_tier);
+        for (metrics) |metric| {
+            const base_val = metric.get(base_tier);
+            const cur_val = metric.get(cur_tier);
             const delta = computeDeltaPct(base_val, cur_val);
-            const regressed = isRegression(delta, m.kind, threshold);
-
+            const regressed = isRegression(delta, metric.kind, threshold);
             if (regressed) any_regression = true;
 
-            const status: []const u8 = if (regressed) "FAIL" else "PASS";
-
-            const sign: []const u8 = if (delta >= 0) "+" else "";
-            print("  {s:<6} {s:<18} {d:>14.1} {d:>14.1} {s}{d:>8.1}% {s:>6}\n", .{
+            const sign = if (delta >= 0) "+" else "";
+            print("  {s:<6} {s:<20} {d:>12.2} {d:>12.2} {s}{d:>8.1}% {s:>6}\n", .{
                 base_tier.name,
-                m.name,
+                metric.name,
                 base_val,
                 cur_val,
                 sign,
                 delta,
-                status,
+                if (regressed) "FAIL" else "PASS",
             });
         }
 
         print("\n", .{});
     }
 
-    print("{s}\n", .{"=" ** 90});
-
+    print("{s}\n", .{"=" ** 96});
     if (any_regression) {
         print("  RESULT: FAIL -- regression(s) detected above threshold\n\n", .{});
         std.process.exit(1);
-    } else {
-        print("  RESULT: PASS -- all metrics within threshold\n\n", .{});
     }
+    print("  RESULT: PASS -- all metrics within threshold\n\n", .{});
 }

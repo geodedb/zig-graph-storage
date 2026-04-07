@@ -108,6 +108,9 @@ pub const Recovery = struct {
         const manifest_b = Manifest.readFromFile(self.allocator, path_b) catch null;
 
         var m = try Manifest.selectManifest(manifest_a, manifest_b);
+        if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
+            return error.UuidMismatch;
+        }
 
         // Validate manifest format version compatibility
         if (m.format_version != manifest_mod.MANIFEST_VERSION) {
@@ -161,69 +164,77 @@ pub const Recovery = struct {
         defer wal.deinit();
 
         const start_lsn = if (m.last_checkpoint_lsn > 0) m.last_checkpoint_lsn + 1 else 1;
-        const records = try wal.readFrom(start_lsn, self.allocator);
-        defer {
-            for (records) |*r| r.deinit(self.allocator);
-            self.allocator.free(records);
-        }
+        var saw_records = false;
 
-        if (records.len == 0) {
+        // 4. Classify transactions (skip records with checksum failures).
+        var txn_states = std.AutoHashMap(u64, TxnRecoveryState).init(self.allocator);
+        defer txn_states.deinit();
+
+        const ClassifyCtx = struct {
+            recovery: *Recovery,
+            txn_states: *std.AutoHashMap(u64, TxnRecoveryState),
+            saw_records: *bool,
+
+            fn visit(ctx: *@This(), rec: *const WalRecord) !void {
+                ctx.saw_records.* = true;
+
+                if (rec.checksum != rec.computeChecksum()) {
+                    ctx.recovery.skipped_checksum_failures += 1;
+                    return;
+                }
+
+                switch (rec.record_type) {
+                    .begin_txn => try ctx.txn_states.put(rec.txn_id, .active),
+                    .commit_txn => try ctx.txn_states.put(rec.txn_id, .committed),
+                    .abort_txn => try ctx.txn_states.put(rec.txn_id, .aborted),
+                    .page_update, .checkpoint_marker => {},
+                }
+            }
+        };
+
+        var classify_ctx = ClassifyCtx{
+            .recovery = self,
+            .txn_states = &txn_states,
+            .saw_records = &saw_records,
+        };
+        try wal.forEachFrom(start_lsn, self.allocator, &classify_ctx, ClassifyCtx.visit);
+
+        if (!saw_records) {
             // Clean recovery: no WAL records to replay
             return m;
         }
 
-        // 4. Classify transactions (skip records with checksum failures)
-        var txn_states = std.AutoHashMap(u64, TxnRecoveryState).init(self.allocator);
-        defer txn_states.deinit();
+        // 5. Replay committed page_update records into buffer pool.
+        const ReplayCtx = struct {
+            txn_states: *const std.AutoHashMap(u64, TxnRecoveryState),
+            buffer_pool: *BufferPool,
 
-        for (records) |rec| {
-            // Verify checksum before trusting the record
-            if (rec.checksum != rec.computeChecksum()) {
-                self.skipped_checksum_failures += 1;
-                continue;
+            fn visit(ctx: *@This(), rec: *const WalRecord) !void {
+                if (rec.record_type != .page_update) return;
+                if (rec.checksum != rec.computeChecksum()) return;
+
+                const state = ctx.txn_states.get(rec.txn_id) orelse return;
+                if (state != .committed) return;
+
+                const file_id: FileId = std.meta.intToEnum(FileId, rec.file_id) catch return error.InvalidFormat;
+                const frame = try ctx.buffer_pool.pinNew(file_id, rec.page_id);
+                const frame_idx = ctx.buffer_pool.frameIndex(frame);
+                const data = frame.dataSlice();
+
+                const copy_len = @min(rec.payload.len, data.len);
+                if (copy_len > 0) {
+                    @memcpy(data[0..copy_len], rec.payload[0..copy_len]);
+                }
+
+                ctx.buffer_pool.unpin(frame_idx, true);
             }
+        };
 
-            switch (rec.record_type) {
-                .begin_txn => {
-                    try txn_states.put(rec.txn_id, .active);
-                },
-                .commit_txn => {
-                    try txn_states.put(rec.txn_id, .committed);
-                },
-                .abort_txn => {
-                    try txn_states.put(rec.txn_id, .aborted);
-                },
-                .page_update, .checkpoint_marker => {},
-            }
-        }
-
-        // 5. Replay committed page_update records into buffer pool
-        for (records) |rec| {
-            if (rec.record_type != .page_update) continue;
-
-            // Verify checksum before applying record
-            if (rec.checksum != rec.computeChecksum()) {
-                // Already counted in step 4; skip silently here
-                continue;
-            }
-
-            const state = txn_states.get(rec.txn_id) orelse continue;
-            if (state != .committed) continue;
-
-            // Apply the page image to the buffer pool
-            const file_id: FileId = std.meta.intToEnum(FileId, rec.file_id) catch return error.InvalidFormat;
-            const frame = try buffer_pool.pinNew(file_id, rec.page_id);
-            const frame_idx = buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
-
-            // Copy the page image from the WAL record payload
-            const copy_len = @min(rec.payload.len, data.len);
-            if (copy_len > 0) {
-                @memcpy(data[0..copy_len], rec.payload[0..copy_len]);
-            }
-
-            buffer_pool.unpin(frame_idx, true);
-        }
+        var replay_ctx = ReplayCtx{
+            .txn_states = &txn_states,
+            .buffer_pool = buffer_pool,
+        };
+        try wal.forEachFrom(start_lsn, self.allocator, &replay_ctx, ReplayCtx.visit);
 
         // 7. Flush buffer pool to disk
         try buffer_pool.flushAll();
@@ -309,6 +320,33 @@ test "clean recovery: no WAL records, manifest loaded correctly" {
     // because there are no records to replay)
     try testing.expectEqual(@as(u64, 10), recovered.next_node_id);
     try testing.expectEqual([_]u8{0xBB} ** 16, recovered.graph_uuid);
+}
+
+test "GAP-0032: recovery rejects manifests whose graph UUID mismatches the graph directory" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xAA} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    try testing.expectError(error.UuidMismatch, recovery.recover(&setup.graph_dir, &pool, &fm));
 }
 
 test "recovery with committed transaction: changes visible after recovery" {
@@ -413,6 +451,85 @@ test "recovery with committed transaction: changes visible after recovery" {
     }
     // The data should match since we wrote the full page
     try testing.expect(all_match);
+}
+
+test "GAP-0030: recovery replays a large committed WAL tail" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+    defer wal_dir.close();
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+    defer wal.deinit();
+
+    var begin_rec = WalRecord{
+        .lsn = 0,
+        .txn_id = 7,
+        .record_type = .begin_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
+    };
+    _ = try wal.appendRecord(&begin_rec);
+
+    var payload: [4096]u8 = undefined;
+    for (0..payload.len) |i| payload[i] = @intCast(i % 251);
+
+    var page_id: u64 = 1;
+    while (page_id <= 512) : (page_id += 1) {
+        var update_rec = WalRecord{
+            .lsn = 0,
+            .txn_id = 7,
+            .record_type = .page_update,
+            .file_id = @intFromEnum(FileId.nodes),
+            .page_id = page_id,
+            .payload = &payload,
+            .checksum = 0,
+        };
+        _ = try wal.appendRecord(&update_rec);
+    }
+
+    var commit_rec = WalRecord{
+        .lsn = 0,
+        .txn_id = 7,
+        .record_type = .commit_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
+    };
+    _ = try wal.appendRecord(&commit_rec);
+    try wal.sync();
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 64);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    try testing.expect(recovered.counter > initial.counter);
+    try testing.expectEqual(@as(u64, 0), recovery.skipped_checksum_failures);
 }
 
 test "recovery with uncommitted transaction: changes discarded" {

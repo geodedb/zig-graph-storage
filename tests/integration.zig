@@ -15,23 +15,18 @@ const GraphConfig = lib.GraphConfig;
 const NodeRec = lib.node.NodeRec;
 const NodeId = lib.NodeId;
 const EdgeId = lib.EdgeId;
+const TestDataDir = lib.test_support.TestDataDir;
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
 fn testConfig() GraphConfig {
-    return .{
-        .page_size = 4096,
-        .buffer_pool_pages = 64,
-        .data_dir = "data",
-    };
+    return lib.test_support.testConfig();
 }
 
-fn testDataDir() !struct { tmp_dir: std.testing.TmpDir, path: []const u8 } {
-    var tmp_dir = std.testing.tmpDir(.{});
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
-    return .{ .tmp_dir = tmp_dir, .path = path };
+fn testDataDir() !TestDataDir {
+    return TestDataDir.init(std.testing.allocator);
 }
 
 fn makeNode(label: u32) NodeRec {
@@ -62,10 +57,7 @@ test "integration: full lifecycle — create graph, add data, checkpoint, close,
     const uuid = [_]u8{0x10} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Create engine, add nodes and edges, checkpoint, close
     {
@@ -141,10 +133,7 @@ test "integration: GraphStorage vtable round-trip" {
     const uuid = [_]u8{0x20} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     const eng = try GraphEngine.create(allocator, td.path, uuid, testConfig());
     defer eng.close() catch {};
@@ -180,16 +169,13 @@ test "integration: backup and restore round-trip" {
     const allocator = std.testing.allocator;
 
     var td = try testDataDir();
-    defer {
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     var uuid: [16]u8 = undefined;
     @memset(&uuid, 0x30);
 
     var gd = try lib.graph_dir.GraphDir.create(allocator, td.path, uuid);
     defer gd.deinit();
-    allocator.free(td.path);
 
     // Write some data
     const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{gd.path});
@@ -239,10 +225,7 @@ test "QUAL-0002: full durability round-trip -- nodes, edges, properties survive 
     const uuid = [_]u8{0x50} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Create engine, add nodes with specific labels, add edges, add a property
     {
@@ -344,10 +327,7 @@ test "seed: small graph round-trip" {
     const uuid = [_]u8{0xAA} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Seed, verify counts, checkpoint, close
     const seed_cfg = seed.SeedConfig.tiny();
@@ -427,10 +407,7 @@ test "QUAL-0020: storage smoke test — full round-trip with properties and labe
     const uuid = [_]u8{0x60} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Create graph, add nodes with properties, add edges, add labels, checkpoint, close
     {
@@ -581,10 +558,7 @@ test "QUAL-0021: crash recovery — committed txn replayed after unclean close" 
     const uuid = [_]u8{0x70} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Create graph, add a node, checkpoint (establish baseline)
     {
@@ -638,10 +612,7 @@ test "QUAL-0022: edge properties survive checkpoint and reopen" {
     const uuid = [_]u8{0x80} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     var n1: NodeId = undefined;
     var n2: NodeId = undefined;
@@ -724,10 +695,7 @@ test "QUAL-0023: 64 distinct labels on a single node survive reopen" {
     const uuid = [_]u8{0x90} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Create node, add 64 distinct labels, checkpoint, close
     {
@@ -787,10 +755,7 @@ test "QUAL-0024: add and remove labels after node creation survive reopen" {
     const uuid = [_]u8{0x91} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Create node with labels [1, 2], then remove 1 and add 3
     // All mutations in one session to avoid var.store read-back issues on reopen
@@ -886,10 +851,7 @@ test "QUAL-0025: crash after commit replays node property" {
     const uuid = [_]u8{0xA0} ** 16;
 
     var td = try testDataDir();
-    defer {
-        allocator.free(td.path);
-        td.tmp_dir.cleanup();
-    }
+    defer td.deinit();
 
     // Phase 1: Create graph, add node 1 with property, checkpoint (baseline)
     // Phase 2: Add node 2 with property (auto-txn commits to WAL)
