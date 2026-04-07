@@ -3,6 +3,9 @@
 zig-cache/
 zig-out/
 
+.worktrees
+.claude/worktrees
+
 # Editor directories
 .vscode/
 .idea/
