@@ -11,7 +11,7 @@ const config_mod = @import("config.zig");
 const manifest_mod = @import("manifest.zig");
 const graph_dir_mod = @import("graph_dir.zig");
 const node_mod = @import("node.zig");
-const test_support = @import("test_support.zig");
+const test_support = @import("testing_support.zig");
 const engine_mod = @import("engine.zig");
 
 const NodeId = types.NodeId;
