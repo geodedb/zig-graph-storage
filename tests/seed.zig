@@ -24,6 +24,7 @@ const NodeId = gs.NodeId;
 const EdgeId = gs.EdgeId;
 const LabelId = gs.LabelId;
 const PropertyValue = gs.PropertyValue;
+const TxnId = gs.TxnId;
 
 // ============================================================================
 // Configuration
@@ -216,6 +217,47 @@ pub const SeedResult = struct {
     ip_addresses: NodeRange,
 };
 
+const MutationBatch = struct {
+    engine: *GraphEngine,
+    limit: u32,
+    txn: ?TxnId = null,
+    used: u32 = 0,
+
+    fn init(engine: *GraphEngine, limit: u32) MutationBatch {
+        return .{
+            .engine = engine,
+            .limit = limit,
+        };
+    }
+
+    fn acquire(self: *MutationBatch) !TxnId {
+        if (self.txn == null or self.used >= self.limit) {
+            try self.flush();
+            self.txn = try self.engine.beginTxn();
+            self.used = 0;
+        }
+
+        self.used += 1;
+        return self.txn.?;
+    }
+
+    fn flush(self: *MutationBatch) !void {
+        if (self.txn) |txn| {
+            try self.engine.commitTxn(txn);
+            self.txn = null;
+            self.used = 0;
+        }
+    }
+
+    fn deinit(self: *MutationBatch) void {
+        if (self.txn) |txn| {
+            self.engine.abortTxn(txn) catch {};
+            self.txn = null;
+            self.used = 0;
+        }
+    }
+};
+
 // ============================================================================
 // Trust levels and network zones (Geode common properties)
 // ============================================================================
@@ -238,33 +280,36 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
 
     // 1. Register labels via the label dictionary
     const labels = Labels{
-        .user = try engine.label_dict.getOrAssign("User"),
-        .device = try engine.label_dict.getOrAssign("Device"),
-        .application = try engine.label_dict.getOrAssign("Application"),
-        .group = try engine.label_dict.getOrAssign("Group"),
-        .site = try engine.label_dict.getOrAssign("Site"),
-        .location = try engine.label_dict.getOrAssign("Location"),
-        .drive = try engine.label_dict.getOrAssign("Drive"),
-        .drive_item = try engine.label_dict.getOrAssign("DriveItem"),
-        .ip_address = try engine.label_dict.getOrAssign("IPAddress"),
+        .user = try engine.getOrAssignLabel("User"),
+        .device = try engine.getOrAssignLabel("Device"),
+        .application = try engine.getOrAssignLabel("Application"),
+        .group = try engine.getOrAssignLabel("Group"),
+        .site = try engine.getOrAssignLabel("Site"),
+        .location = try engine.getOrAssignLabel("Location"),
+        .drive = try engine.getOrAssignLabel("Drive"),
+        .drive_item = try engine.getOrAssignLabel("DriveItem"),
+        .ip_address = try engine.getOrAssignLabel("IPAddress"),
     };
 
     var total_edges: u64 = 0;
     var total_props: u64 = 0;
+    var node_batch = MutationBatch.init(engine, 128);
+    defer node_batch.deinit();
 
     // 2. Create nodes for each type
     // Track the first NodeId for each type so we can compute ranges.
     // Nodes are allocated sequentially by allocNode().
 
-    const user_start = try createNodes(engine, cfg.users, labels.user, "user", random, &total_props);
-    const device_start = try createNodes(engine, cfg.devices, labels.device, "device", random, &total_props);
-    const app_start = try createNodes(engine, cfg.applications, labels.application, "application", random, &total_props);
-    const group_start = try createNodes(engine, cfg.groups, labels.group, "group", random, &total_props);
-    const site_start = try createNodes(engine, cfg.sites, labels.site, "site", random, &total_props);
-    const location_start = try createNodes(engine, cfg.locations, labels.location, "location", random, &total_props);
-    const drive_start = try createNodes(engine, cfg.drives, labels.drive, "drive", random, &total_props);
-    const drive_item_start = try createNodes(engine, cfg.drive_items, labels.drive_item, "drive_item", random, &total_props);
-    const ip_start = try createNodes(engine, cfg.ip_addresses, labels.ip_address, "ip_address", random, &total_props);
+    const user_start = try createNodes(engine, &node_batch, cfg.users, labels.user, "user", random, &total_props);
+    const device_start = try createNodes(engine, &node_batch, cfg.devices, labels.device, "device", random, &total_props);
+    const app_start = try createNodes(engine, &node_batch, cfg.applications, labels.application, "application", random, &total_props);
+    const group_start = try createNodes(engine, &node_batch, cfg.groups, labels.group, "group", random, &total_props);
+    const site_start = try createNodes(engine, &node_batch, cfg.sites, labels.site, "site", random, &total_props);
+    const location_start = try createNodes(engine, &node_batch, cfg.locations, labels.location, "location", random, &total_props);
+    const drive_start = try createNodes(engine, &node_batch, cfg.drives, labels.drive, "drive", random, &total_props);
+    const drive_item_start = try createNodes(engine, &node_batch, cfg.drive_items, labels.drive_item, "drive_item", random, &total_props);
+    const ip_start = try createNodes(engine, &node_batch, cfg.ip_addresses, labels.ip_address, "ip_address", random, &total_props);
+    try node_batch.flush();
 
     // Compute end markers (exclusive)
     const user_end = user_start + @as(u64, cfg.users);
@@ -277,6 +322,8 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
     const ip_end = ip_start + @as(u64, cfg.ip_addresses);
 
     // 3. Create edges following realistic patterns
+    var edge_batch = MutationBatch.init(engine, 256);
+    defer edge_batch.deinit();
 
     // MEMBER_OF: User -> Group
     if (cfg.groups > 0) {
@@ -285,7 +332,8 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
             for (0..cfg.memberships_per_user) |j| {
                 const group_idx = (i + j) % cfg.groups;
                 const group_id = group_start + @as(u64, @intCast(group_idx));
-                _ = try engine.addEdge(user_id, group_id, RelType.MEMBER_OF);
+                const txn = try edge_batch.acquire();
+                _ = try engine.addEdgeTxn(user_id, group_id, RelType.MEMBER_OF, txn);
                 total_edges += 1;
             }
         }
@@ -298,7 +346,8 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
             for (0..cfg.devices_per_user) |j| {
                 const dev_idx = (i * 2 + j) % cfg.devices;
                 const dev_id = device_start + @as(u64, @intCast(dev_idx));
-                _ = try engine.addEdge(user_id, dev_id, RelType.LOGGED_INTO);
+                const txn = try edge_batch.acquire();
+                _ = try engine.addEdgeTxn(user_id, dev_id, RelType.LOGGED_INTO, txn);
                 total_edges += 1;
             }
         }
@@ -315,14 +364,16 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
             for (0..from_count) |j| {
                 const ip_idx = (i + j * 3) % cfg.ip_addresses;
                 const ip_id = ip_start + @as(u64, @intCast(ip_idx));
-                _ = try engine.addEdge(user_id, ip_id, RelType.SIGNED_IN_FROM);
+                const txn = try edge_batch.acquire();
+                _ = try engine.addEdgeTxn(user_id, ip_id, RelType.SIGNED_IN_FROM, txn);
                 total_edges += 1;
             }
 
             for (0..to_count) |j| {
                 const app_idx = (i + j * 7) % cfg.applications;
                 const app_id = app_start + @as(u64, @intCast(app_idx));
-                _ = try engine.addEdge(user_id, app_id, RelType.SIGNED_IN_TO);
+                const txn = try edge_batch.acquire();
+                _ = try engine.addEdgeTxn(user_id, app_id, RelType.SIGNED_IN_TO, txn);
                 total_edges += 1;
             }
         }
@@ -336,7 +387,8 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
             for (0..cfg.items_per_drive) |_| {
                 if (item_cursor >= cfg.drive_items) break;
                 const item_id = drive_item_start + @as(u64, item_cursor);
-                _ = try engine.addEdge(drive_id, item_id, RelType.CONTAINS);
+                const txn = try edge_batch.acquire();
+                _ = try engine.addEdgeTxn(drive_id, item_id, RelType.CONTAINS, txn);
                 total_edges += 1;
                 item_cursor += 1;
             }
@@ -349,10 +401,12 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
             const dev_id = device_start + @as(u64, @intCast(i));
             const loc_idx = i % cfg.locations;
             const loc_id = location_start + @as(u64, @intCast(loc_idx));
-            _ = try engine.addEdge(dev_id, loc_id, RelType.LOCATED_AT);
+            const txn = try edge_batch.acquire();
+            _ = try engine.addEdgeTxn(dev_id, loc_id, RelType.LOCATED_AT, txn);
             total_edges += 1;
         }
     }
+    try edge_batch.flush();
 
     const total_nodes = cfg.totalNodes();
 
@@ -379,6 +433,7 @@ pub fn populate(engine: *GraphEngine, cfg: SeedConfig) !SeedResult {
 /// Returns the NodeId of the first allocated node.
 fn createNodes(
     engine: *GraphEngine,
+    batch: *MutationBatch,
     count: u32,
     label: LabelId,
     kind: []const u8,
@@ -387,20 +442,32 @@ fn createNodes(
 ) !NodeId {
     if (count == 0) return engine.manifest.next_node_id;
 
-    const first_id = try engine.allocNode();
-    try engine.putNode(first_id, makeNode(label));
-    try engine.addLabel(first_id, label);
-    try setNodeProperties(engine, first_id, kind, 0, random, total_props);
+    const first_id = try createNode(engine, batch, label, kind, 0, random, total_props);
 
     var i: u32 = 1;
     while (i < count) : (i += 1) {
-        const nid = try engine.allocNode();
-        try engine.putNode(nid, makeNode(label));
-        try engine.addLabel(nid, label);
-        try setNodeProperties(engine, nid, kind, i, random, total_props);
+        _ = try createNode(engine, batch, label, kind, i, random, total_props);
     }
 
     return first_id;
+}
+
+fn createNode(
+    engine: *GraphEngine,
+    batch: *MutationBatch,
+    label: LabelId,
+    kind: []const u8,
+    index: u32,
+    random: std.Random,
+    total_props: *u64,
+) !NodeId {
+    const txn = try batch.acquire();
+    const node_id = try engine.allocNode();
+    var rec = makeNode(label);
+    try engine.putNodeTxn(node_id, rec, txn);
+    try engine.addLabelTxn(node_id, label, txn);
+    try setNodePropertiesTxn(engine, node_id, &rec, kind, index, random, total_props, txn);
+    return node_id;
 }
 
 /// Create a NodeRec with no labels (labels are added via engine.addLabel).
@@ -419,44 +486,43 @@ fn makeNode(label: LabelId) NodeRec {
 }
 
 /// Set common properties on a node: display_name, node_kind, trust_level, net_zone.
-fn setNodeProperties(
+fn setNodePropertiesTxn(
     engine: *GraphEngine,
     node_id: NodeId,
+    rec: *NodeRec,
     kind: []const u8,
     index: u32,
     random: std.Random,
     total_props: *u64,
+    txn: TxnId,
 ) !void {
     // Build display_name like "user_0042"
     var name_buf: [64]u8 = undefined;
     const display_name = std.fmt.bufPrint(&name_buf, "{s}_{d:0>4}", .{ kind, index }) catch "unknown";
 
-    // Get current prop_head from the node
-    var rec = (try engine.getNode(node_id)) orelse return;
-
     var prop_head = rec.prop_head;
 
     // display_name
-    prop_head = try engine.putProperty(prop_head, "display_name", PropertyValue{ .string = display_name });
+    prop_head = try engine.putPropertyTxn(prop_head, "display_name", PropertyValue{ .string = display_name }, txn);
     total_props.* += 1;
 
     // node_kind
-    prop_head = try engine.putProperty(prop_head, "node_kind", PropertyValue{ .string = kind });
+    prop_head = try engine.putPropertyTxn(prop_head, "node_kind", PropertyValue{ .string = kind }, txn);
     total_props.* += 1;
 
     // trust_level
     const tl = trust_levels[random.intRangeAtMost(usize, 0, trust_levels.len - 1)];
-    prop_head = try engine.putProperty(prop_head, "trust_level", PropertyValue{ .string = tl });
+    prop_head = try engine.putPropertyTxn(prop_head, "trust_level", PropertyValue{ .string = tl }, txn);
     total_props.* += 1;
 
     // net_zone
     const nz = net_zones[random.intRangeAtMost(usize, 0, net_zones.len - 1)];
-    prop_head = try engine.putProperty(prop_head, "net_zone", PropertyValue{ .string = nz });
+    prop_head = try engine.putPropertyTxn(prop_head, "net_zone", PropertyValue{ .string = nz }, txn);
     total_props.* += 1;
 
     // Write back prop_head
     rec.prop_head = prop_head;
-    try engine.putNode(node_id, rec);
+    try engine.putNodeTxn(node_id, rec.*, txn);
 }
 
 // ============================================================================

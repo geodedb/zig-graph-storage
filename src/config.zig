@@ -60,6 +60,9 @@ pub const GraphConfig = struct {
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
     /// Policy for handling legacy (V1) graph formats during recovery.
     legacy_policy: LegacyPolicy = .reject,
+    /// Bootstrap paths may create missing on-disk artifacts. Steady-state
+    /// open/recovery flows must leave this disabled so damage fails closed.
+    allow_create_missing_artifacts: bool = false,
 
     /// Compute the effective buffer pool size, applying auto-sizing when enabled.
     ///

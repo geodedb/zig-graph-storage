@@ -88,11 +88,21 @@ the backup uses version 2 with an HMAC-SHA256 integrity tag.
 ### Restoring from backup
 
 ```zig
+backup.setExpectedGraphUuid(graph_uuid);
 try backup.restoreBackup("/backups/graph.geob", "/var/data/restored");
 ```
 
 Restore extracts all files to the target directory. After restore, open the
 graph normally with `GraphEngine.open()`.
+
+For legacy CRC-only version-1 archives, restore is disabled by default. Opt in
+explicitly only when you are handling a known-trusted historical archive:
+
+```zig
+backup.setExpectedGraphUuid(graph_uuid);
+backup.enableLegacyV1Restore();
+try backup.restoreBackup("/backups/legacy-v1.geob", "/var/data/restored");
+```
 
 **Important:** Always checkpoint before creating a backup to ensure the backup
 reflects the latest committed state.
@@ -111,8 +121,9 @@ Recovery is automatic during `GraphEngine.open()`. The process:
 6. Discard uncommitted transactions
 7. Flush the buffer pool and write a fresh checkpoint
 
-If WAL records have checksum mismatches they are skipped. The count of skipped
-records is available in `Recovery.skipped_checksum_failures`.
+If WAL records fail decode or checksum validation, open now fails closed and
+`Recovery.last_failure` identifies the offending `wal/graph.wal` LSN and
+failure kind.
 
 ### Metrics
 
@@ -126,7 +137,7 @@ When a `Metrics` struct is wired into the `Recovery` instance,
 ### Setting a key
 
 Pass a 32-byte key via `GraphConfig.encryption_key` when creating or opening
-the graph. The key is used for AES-256-CTR page encryption and optionally for
+the graph. The key is used for AES-256-GCM page encryption and optionally for
 HMAC-SHA256 backup integrity.
 
 ### Key zeroing
@@ -195,6 +206,8 @@ if (!result.isClean()) {
 ```
 
 Verification checks manifest validity and page checksums across all store files.
+It also validates required metadata snapshots, the label dictionary, and the
+`wal/graph.uuid` plus `wal/graph.wal` artifacts for the target graph UUID.
 
 ---
 

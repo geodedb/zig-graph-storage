@@ -134,7 +134,7 @@ const TestEnv = struct {
         const wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
 
         var fm = FileManager.init(allocator, gd.path, 4096);
-        _ = try fm.openFile(.nodes);
+        _ = try fm.openFile(.nodes, .create_if_missing);
 
         const pool = try BufferPool.init(allocator, 4096, 16);
 

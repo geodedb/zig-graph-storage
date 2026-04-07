@@ -2,51 +2,139 @@
 
 Last updated: 2026-04-07
 
+This file is the authoritative close-out record for the 2026-04-07 gap
+closure pass.
+
 ## Summary
 
 | Status | Count |
-|--------|-------|
+| --- | ---: |
 | Closed | 7 |
 | Blocked | 2 |
 | Won't Do | 1 |
+| Open | 0 |
 
-- Verification completed in this closure pass:
-  - `zig build`
-  - `zig build check`
+## Future Agent Notes
+
+- Do not reopen `GAP-0048` for repo-local CI component SHA pinning, same-origin
+  Zig bootstrap hash pinning, or Docker image digest pinning unless shared
+  platform policy changes. Those controls live in the shared CI catalog and
+  downstream platform controls, not in this repository.
+- GitLab CI is the authoritative merge gate. Local pre-commit hooks are
+  intentionally a fast subset and are tracked separately in
+  `docs/QUALITY_GAP_ANALYSIS.md`.
+
+## Disposition
+
+### GAP-0038: `main` can merge without green pipelines or meaningful approval gates
+
+- Status: Blocked
+- Reason: This requires GitLab project-admin settings outside the repo.
+- Evidence: The repo-local code and docs cannot enforce
+  `only_allow_merge_if_pipeline_succeeds`, discussion resolution, or approvals.
+- Unblock:
+  1. A GitLab project admin enables green-pipeline-only merges.
+  2. A GitLab project admin enables "all discussions resolved".
+  3. A GitLab project admin sets non-zero approvals and real CODEOWNERS.
+
+### GAP-0039: protected `main` still allows force pushes
+
+- Status: Blocked
+- Reason: This requires GitLab protected-branch settings outside the repo.
+- Unblock:
+  1. A GitLab project admin edits the protected `main` branch.
+  2. Disable force-push for `main` and any protected release branches.
+
+### GAP-0045: recovery skipped malformed or checksum-invalid WAL records
+
+- Status: Closed
+- Implemented:
+  - `src/wal.zig` adds strict replay classification with `ReplayFailure`.
+  - `src/recovery.zig` now fails closed on deserialize or checksum errors and
+    records the offending `wal/graph.wal` LSN in `last_failure`.
+- Verified by:
   - `zig build test --summary all`
-  - `zig build test-integration --summary all`
-  - `zig build test-fuzz-regression --summary all`
-- Future agent note:
-  - Repo-local CI component SHA pinning and Docker image digest pinning are intentional non-goals in this repository. They are handled by downstream platform controls and protected catalog release tags.
-  - Pre-commit and CI are intentionally not kept in lockstep. Pre-commit remains a fast local subset; GitLab CI is the authoritative merge gate.
+  - `src/recovery.zig` corruption tests now expect `error.ChecksumMismatch` and
+    `error.InvalidFormat` instead of skip-and-continue behavior.
 
-## Status Table
+### GAP-0042: `verify` omitted WAL / auxiliary artifacts and treated missing files as clean
 
-| Gap | Issue | Status | Resolution / blocker | Key evidence |
-|-----|-------|--------|----------------------|--------------|
-| `GAP-0034` version-2 backup validation accepts missing HMAC key | [#73](https://gitlab.com/devnw/zig/graph-storage/-/work_items/73) | Closed | `validateBackup()` now fails closed for HMAC-backed archives when no key is configured. | `src/backup.zig`, test `GAP-0034: validateBackup rejects version 2 backups without the HMAC key` |
-| `GAP-0032` graph UUID bindings not enforced across open/verify/restore | [#48](https://gitlab.com/devnw/zig/graph-storage/-/work_items/48) | Closed | UUID mismatch checks now run in recovery, verify, backup restore, and WAL initialization. | `src/recovery.zig`, `src/verify.zig`, `src/backup.zig`, `src/wal.zig` |
-| `GAP-0038` merge path lacks green-pipeline / approval gates | [#77](https://gitlab.com/devnw/zig/graph-storage/-/work_items/77) | Blocked | This is a GitLab project setting, not a repo file. The current environment cannot administer project merge rules. | `glab auth status` still reports an invalid token; enabling `only_allow_merge_if_pipeline_succeeds`, discussion resolution, approval rules, and CODEOWNERS enforcement requires repo-admin access in GitLab |
-| `GAP-0039` protected `main` allows force pushes | [#78](https://gitlab.com/devnw/zig/graph-storage/-/work_items/78) | Blocked | This is a protected-branch setting outside the repository tree. | Disable force push for `main` in GitLab project settings once repo-admin credentials are available |
-| `GAP-0035` `free.store` metadata can allocate unbounded bitmap memory | [#74](https://gitlab.com/devnw/zig/graph-storage/-/work_items/74) | Closed | Free-space loading now validates persisted counts against bounded page totals before resizing the bitmap. | `src/free_space.zig`, `src/engine_persist.zig`, new bounded-deserialize tests |
-| `GAP-0030` recovery materializes the full WAL tail in memory | [#46](https://gitlab.com/devnw/zig/graph-storage/-/work_items/46) | Closed | Recovery now streams WAL records via `WalManager.forEachFrom()` and replays them in bounded passes. | `src/wal.zig`, `src/recovery.zig`, large-tail recovery regression test |
-| `GAP-0036` page encryption can reuse nonces after `u24` counter exhaustion | [#75](https://gitlab.com/devnw/zig/graph-storage/-/work_items/75) | Closed | Pager writes now fail with `error.WriteCountExhausted` before nonce reuse can occur. | `src/pager.zig`, write-count exhaustion test |
-| `GAP-0037` backup creation buffers whole graph contents in memory | [#76](https://gitlab.com/devnw/zig/graph-storage/-/work_items/76) | Closed | Backup creation now streams file payloads in chunks instead of materializing full file bodies in memory. | `src/backup.zig`, large-file streaming regression test |
-| `GAP-0040` fuzz failures are suppressed and cannot gate merges | [#79](https://gitlab.com/devnw/zig/graph-storage/-/work_items/79) | Closed | Added deterministic `test-fuzz-regression` coverage in `build.zig` and a non-optional `fuzz-regression` CI job; exploratory fuzzing remains advisory without swallowing failures. | `build.zig`, `tests/fuzz_regression.zig`, `.gitlab-ci.yml` |
-| `GAP-0041` CI catalog components use tags instead of immutable SHAs | [#80](https://gitlab.com/devnw/zig/graph-storage/-/work_items/80) | Won't Do | The user explicitly directed that repo-local CI SHA pinning stay out of scope. Shared catalog tag immutability and review controls live upstream. Future agents should not reopen this unless platform policy changes. | `.gitlab-ci.yml` header note, `docs/SECURITY_REVIEW_NOTES.md` |
+- Status: Closed
+- Implemented:
+  - `src/verify.zig` now validates manifests, required store files,
+    `labels.idx`, `props.idx`, `edges.idx`, `labels.dict`, `wal/graph.uuid`,
+    and `wal/graph.wal`.
+  - JSON output now includes per-artifact machine-readable status.
+- Verified by:
+  - `src/verify.zig` tests covering missing WAL artifacts and structured JSON.
 
-## Blocker Details
+### GAP-0046: open and recovery auto-created missing durable artifacts
 
-### `GAP-0038`
+- Status: Closed
+- Implemented:
+  - `src/file_manager.zig` now distinguishes `.open_existing` from
+    `.create_if_missing`.
+  - `src/config.zig`, `src/engine_persist.zig`, `src/wal.zig`, and
+    `src/recovery.zig` now fail closed during steady-state open/recovery unless
+    the caller explicitly requested bootstrap creation.
+- Verified by:
+  - `zig build test --summary all`
 
-- Required unblock:
-  - authenticate `glab` with a repo-admin token
-  - enable merge-only-if-pipeline-succeeds
-  - enable merge-only-if-all-discussions-are-resolved
-  - configure approval rules and required CODEOWNERS coverage
+### GAP-0032: restore only validated UUID when the target path encoded a UUID
 
-### `GAP-0039`
+- Status: Closed
+- Implemented:
+  - `src/backup.zig` now requires an authoritative expected graph UUID via
+    `setExpectedGraphUuid(...)` or an already-present `wal/graph.uuid`.
+  - Path-string heuristics were removed from restore validation.
+- Verified by:
+  - `src/backup.zig` test `GAP-0032: restoreBackup rejects a configured expected UUID that mismatches the archive`
+  - `zig build test --summary all`
 
-- Required unblock:
-  - authenticate `glab` with a repo-admin token
-  - update the protected `main` branch to set `allow_force_push = false`
+### GAP-0047: restore accepted CRC-only V1 backups without authenticated integrity
+
+- Status: Closed
+- Implemented:
+  - `src/backup.zig` now rejects legacy V1 restore by default with
+    `error.LegacyBackupRestoreDisabled`.
+  - Restoring a V1 archive now requires an explicit compatibility opt-in via
+    `enableLegacyV1Restore()`.
+- Verified by:
+  - `src/backup.zig` test `GAP-0047: restoreBackup rejects legacy V1 backups by default`
+  - `zig build test --summary all`
+
+### GAP-0048: GitLab CI bootstraps Zig from same-origin hash and binary downloads
+
+- Status: Won't Do
+- Reason: Repo-local SHA/digest pinning is intentionally not the control point
+  for this repository.
+- Documented controls:
+  - `.gitlab-ci.yml` documents that CI catalog components intentionally use
+    protected release tags governed in the shared catalog.
+  - `.gitlab-ci.yml` documents that Docker image digest pinning is handled by
+    downstream platform controls.
+- Future-agent instruction: do not reopen this gap unless the shared CI catalog
+  or platform-control policy changes.
+
+### GAP-0018: legacy read-only compatibility policy was not wired through `GraphEngine.open()`
+
+- Status: Closed
+- Implemented:
+  - `src/engine.zig` now threads `GraphConfig.legacy_policy` into recovery and
+    records engine `read_only` state on open.
+  - Mutating engine APIs now call `ensureWritable()` and reject writes when a V1
+    graph is opened in compatibility read-only mode.
+- Verified by:
+  - `src/recovery.zig` and `src/engine.zig` legacy-policy tests
+  - `zig build test --summary all`
+
+### QUAL-0034: public docs still described AES-256-CTR
+
+- Status: Closed
+- Implemented:
+  - `src/root.zig`, `README.md`, `docs/architecture.md`,
+    `docs/operations.md`, and `docs/format-spec.md` now describe the runtime as
+    AES-256-GCM and reflect the current derived-index topology.
+- Verified by:
+  - Repo grep for `AES-256-CTR` in public runtime docs now returns only
+    historical tracking notes, not live user-facing guidance.

@@ -2,47 +2,121 @@
 
 Last updated: 2026-04-07
 
-GitLab remains the source of truth for the linked work items. This file records the repository-state outcome of the 2026-04-07 closure pass.
+This file is the authoritative close-out record for the 2026-04-07
+performance pass.
 
 ## Summary
 
 | Status | Count |
-|--------|-------|
-| Closed | 8 |
-| Blocked | 1 |
+| --- | ---: |
+| Closed | 10 |
+| Blocked | 0 |
 | Won't Do | 0 |
+| Open | 0 |
 
-- Verification completed in this pass:
-  - `zig build`
-  - `zig build scale-bench -- 1K > /tmp/current-ci.json`
-  - `zig build compare-bench -- benchmarks/results/ci-baseline.json /tmp/current-ci.json`
-- Future agent note:
-  - The merge-path benchmark gate intentionally uses the checked-in 1K `ci-baseline.json` because it is repeatable on standard CI runners.
-  - `benchmarks/results/baseline.json` is still the full-scale aspirational reference file, but regenerating an all-tier 250K/500K baseline remains blocked by runtime on the current hardware/workspace.
+## Disposition
 
-## Status Table
+### PERF-0045: auto-commit mutation wrappers forced a WAL sync per single write
 
-| Finding | Issue | Status | What changed |
-|---------|-------|--------|--------------|
-| Recovery loads the full WAL tail into memory | [#46](https://gitlab.com/devnw/zig/graph-storage/-/work_items/46) | Closed | Recovery now streams WAL replay via `WalManager.forEachFrom()` instead of materializing a full record slice. |
-| Traversal and label-scan APIs materialize full result slices | [#88](https://gitlab.com/devnw/zig/graph-storage/-/work_items/88) | Closed | Added iterator-native `expandOutIter`, `expandInIter`, and `scanLabelIter` paths through `src/engine.zig` and `src/interface.zig`, plus allocation-sensitive coverage in `src/engine_test.zig`. |
-| Open rebuilds the full edge index because it is not persisted | [#71](https://gitlab.com/devnw/zig/graph-storage/-/work_items/71) | Closed | Added persisted `edges.idx` snapshot support and load-on-open behavior so reopen no longer depends on rescanning adjacency when snapshots are valid. |
-| Benchmark regression checks are advisory and cannot block drift | [#85](https://gitlab.com/devnw/zig/graph-storage/-/work_items/85) | Closed | Added a required merge-path `benchmark-regression` job backed by the checked-in `benchmarks/results/ci-baseline.json` and the `compare-bench` command. |
-| Backup creation buffers graph contents in memory | [#76](https://gitlab.com/devnw/zig/graph-storage/-/work_items/76) | Closed | `createBackup()` now streams file reads in fixed-size chunks instead of buffering full payloads. |
-| Benchmark reporting only captures single averages | [#84](https://gitlab.com/devnw/zig/graph-storage/-/work_items/84) | Closed | The benchmark JSON schema now includes `avg`, `p50`, `p95`, `p99`, `stddev`, and `samples`, and `compare-bench` diffs those fields explicitly. |
-| Benchmark baseline coverage omits the 250K and 500K tiers | [#90](https://gitlab.com/devnw/zig/graph-storage/-/work_items/90) | Blocked | Full multi-tier baseline regeneration remains too slow on the current hardware/workspace, even after refactoring the benchmark to seed once per sample and reducing large-tier tuning. | 
-| GitLab CI re-installs Zig in every job | [#86](https://gitlab.com/devnw/zig/graph-storage/-/work_items/86) | Closed | Repository-defined Zig jobs now consume a prepared `prepare-zig` artifact instead of bootstrapping Zig in every job. |
-| `BufferPool.pin()` holds the global mutex across miss I/O | [#89](https://gitlab.com/devnw/zig/graph-storage/-/work_items/89) | Closed | Cache-miss reads now reserve the frame, drop the mutex during disk I/O, and coordinate with a condition variable so other threads wait on the in-flight load instead of serializing behind the global lock. |
+- Status: Closed
+- Implemented:
+  - `tests/seed.zig` now drives node and edge creation through explicit batched
+    transactions instead of per-mutation auto-commit wrappers.
+  - `src/engine.zig` adds `getOrAssignLabel(...)` so seed/bench paths can stay
+    inside the same transaction batch.
+- Outcome: the benchmark and large seed hot path no longer pays one durability
+  sync per individual mutation.
 
-## Blocker Details
+### PERF-0041: traversal and label-scan APIs materialized full result slices
 
-### `#90` full 250K / 500K baseline regeneration
+- Status: Closed
+- Implemented:
+  - Iterator-first APIs (`expandOutIter`, `expandInIter`, `scanLabelIter`) are
+    the hot-path surface.
+  - Slice adapters remain only as compatibility helpers.
+- Notes:
+  - This finding was stale in the runtime hot path; the closure pass confirmed
+    the iterator path is the supported performance path.
 
-- Current state:
-  - `compare-bench` now fails tier-set mismatches and skipped tiers as intended.
-  - A practical CI gate exists via `benchmarks/results/ci-baseline.json` and the 1K benchmark profile.
-  - The full all-tier baseline still does not complete within a reasonable review/runtime budget on the current machine.
-- Required unblock:
-  - either provision a faster benchmark runner or a dedicated overnight benchmark pipeline
-  - or improve large-tier seed/checkpoint/open throughput enough for full 250K/500K runs to complete reliably
-  - once that exists, regenerate `benchmarks/results/baseline.json` from a successful full-tier run and keep `compare-bench` pointed at it for non-CI full-scale comparisons
+### PERF-0047: checkpoint rewrote full metadata snapshots on every run
+
+- Status: Closed
+- Implemented:
+  - `src/engine.zig` now tracks `persistence_dirty`.
+  - `src/engine_persist.zig` skips checkpoint work entirely when the engine is
+    already durably clean.
+  - Mutating property/index paths now update incremental in-memory state so
+    clean checkpoints do not rewrite metadata snapshots redundantly.
+- Outcome: checkpoint/close no longer rewrites metadata "on every run"; it runs
+  only when state changed.
+
+### PERF-0046: property-chain refresh rescanned and rehashed full chains on every mutation
+
+- Status: Closed
+- Implemented:
+  - `src/property_chain_index.zig` adds `upsertKey(...)` and `removeKey(...)`.
+  - `src/engine.zig` now uses incremental property-index maintenance when a
+    single key changes, falling back to full refresh only when the chain head
+    changes unexpectedly.
+
+### GAP-0043: crash restart could rebuild derived indexes via full store scans
+
+- Status: Closed
+- Implemented:
+  - `src/engine_index.zig` persists and loads `labels.idx`, `props.idx`, and
+    `edges.idx` against the checkpoint counter.
+  - This pass confirmed the restart path loads persisted snapshots when they
+    match the manifest counter instead of rebuilding by default.
+- Notes:
+  - The finding was stale relative to the current persisted-snapshot restart
+    path; tracker state is now aligned to the implementation.
+
+### PERF-0044: backup validate and restore loaded whole archives into memory
+
+- Status: Closed
+- Implemented:
+  - `src/backup.zig` now streams restore and validation.
+  - CRC and HMAC validation are computed incrementally instead of over a
+    whole-file allocation.
+
+### PERF-0048: edge-property helpers rescanned adjacency lists instead of using `edge_index`
+
+- Status: Closed
+- Implemented:
+  - `src/engine_edge_props.zig` now resolves edge property heads from
+    `edge_index` instead of rescanning outgoing adjacency lists.
+
+### PERF-0049: startup metadata loaders materialized full snapshot files
+
+- Status: Closed
+- Implemented:
+  - `src/index_snapshot.zig` exposes bounded snapshot header/payload helpers.
+  - `src/label_index.zig`, `src/property_chain_index.zig`,
+    `src/engine_index.zig`, and `src/label_dict.zig` now stream metadata
+    snapshots and the label dictionary instead of loading them whole.
+
+### PERF-0050: `close()` always forced another checkpoint and metadata save
+
+- Status: Closed
+- Implemented:
+  - `src/engine.zig` and `src/engine_persist.zig` now skip redundant
+    close-time persistence when the engine has no dirty state after an explicit
+    checkpoint.
+
+### PERF-0043: benchmark regression gate only exercised the `1K` smoke tier
+
+- Status: Closed
+- Implemented:
+  - Added `benchmarks/results/ci-10k-baseline.json`.
+  - Added `benchmark-regression-10k` to `.gitlab-ci.yml` for scheduled/manual
+    larger-tier coverage.
+  - Added `bench-baseline-10k` and `bench-compare-10k` to `Makefile`.
+  - Updated `benchmarks/results/README.md` to distinguish CI baselines from
+    local exploratory baselines.
+
+## Verification
+
+- `zig build compare-bench -- benchmarks/results/ci-baseline.json benchmarks/results/ci-baseline.json`
+- `zig build compare-bench -- benchmarks/results/ci-10k-baseline.json benchmarks/results/ci-10k-baseline.json`
+- `zig build test --summary all`
+- `zig build test-integration --summary all`

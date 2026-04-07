@@ -161,47 +161,12 @@ pub const VarStore = struct {
 // ============================================================================
 
 const testing = std.testing;
-const pager_mod = @import("pager.zig");
-const Pager = pager_mod.Pager;
-
-const TestEnv = struct {
-    pool: BufferPool,
-    fsm: FreeSpaceManager,
-    tmp_dir: testing.TmpDir,
-    var_file: std.fs.File,
-    var_pager: Pager,
-
-    fn init() !TestEnv {
-        var tmp_dir = testing.tmpDir(.{});
-        const var_file = tmp_dir.dir.createFile("var.store", .{ .read = true, .truncate = true }) catch unreachable;
-        var pool = try BufferPool.init(testing.allocator, 4096, 32);
-        const fsm = try FreeSpaceManager.init(testing.allocator, &pool, .var_store);
-
-        return .{
-            .pool = pool,
-            .fsm = fsm,
-            .tmp_dir = tmp_dir,
-            .var_file = var_file,
-            .var_pager = Pager.init(var_file, 4096),
-        };
-    }
-
-    fn fixup(self: *TestEnv) void {
-        self.pool.registerPager(.var_store, &self.var_pager);
-        self.fsm.buffer_pool = &self.pool;
-    }
-
-    fn deinit(self: *TestEnv) void {
-        self.fsm.deinit();
-        self.pool.deinit();
-        self.var_file.close();
-        self.tmp_dir.cleanup();
-    }
-};
+const testing_support_mod = @import("testing_support.zig");
+const SingleStoreEnv = testing_support_mod.SingleStoreEnv;
 
 test "write + read round-trip for small data" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
     defer env.deinit();
 
     var store = VarStore.init(&env.pool, &env.fsm, 4096);
@@ -217,8 +182,8 @@ test "write + read round-trip for small data" {
 }
 
 test "write + read for data larger than a page (multi-page)" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
     defer env.deinit();
 
     var store = VarStore.init(&env.pool, &env.fsm, 4096);
@@ -241,8 +206,8 @@ test "write + read for data larger than a page (multi-page)" {
 }
 
 test "free releases pages" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
     defer env.deinit();
 
     var store = VarStore.init(&env.pool, &env.fsm, 4096);

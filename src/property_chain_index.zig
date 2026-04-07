@@ -81,6 +81,45 @@ pub const PropertyChainIndex = struct {
         chain.deinit(self.allocator);
     }
 
+    pub fn upsertKey(self: *PropertyChainIndex, prop_head: u64, key: []const u8, encoded_value: []const u8) !void {
+        if (prop_head == 0) return;
+
+        const gop = try self.chains.getOrPut(prop_head);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = PropertyChain.init();
+        }
+
+        for (gop.value_ptr.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                entry.value_hash = std.hash.Wyhash.hash(0, encoded_value);
+                return;
+            }
+        }
+
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        try gop.value_ptr.entries.append(self.allocator, .{
+            .key = key_copy,
+            .value_hash = std.hash.Wyhash.hash(0, encoded_value),
+        });
+    }
+
+    pub fn removeKey(self: *PropertyChainIndex, prop_head: u64, key: []const u8) void {
+        const chain = self.chains.getPtr(prop_head) orelse return;
+
+        var idx: usize = 0;
+        while (idx < chain.entries.items.len) : (idx += 1) {
+            if (std.mem.eql(u8, chain.entries.items[idx].key, key)) {
+                self.allocator.free(chain.entries.items[idx].key);
+                _ = chain.entries.orderedRemove(idx);
+                if (chain.entries.items.len == 0) {
+                    self.removeChain(prop_head);
+                }
+                return;
+            }
+        }
+    }
+
     pub fn refreshFromIterator(self: *PropertyChainIndex, prop_head: u64, iterator: anytype) !void {
         if (prop_head == 0) {
             self.removeChain(prop_head);
@@ -156,25 +195,25 @@ pub const PropertyChainIndex = struct {
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
     pub fn loadFromFile(self: *PropertyChainIndex, file: *std.fs.File) !?u64 {
-        var snapshot = (try index_snapshot_mod.loadFile(self.allocator, file, SNAPSHOT_MAGIC)) orelse return null;
-        defer snapshot.deinit();
+        const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC)) orelse return null;
 
         self.clear();
         errdefer self.clear();
 
-        const payload = snapshot.payload();
-        var offset: usize = 0;
+        try file.seekTo(SNAPSHOT_MAGIC.len + 16);
+        var remaining = snapshot.payload_size;
         const chain_count = snapshot.item_count;
+        var u16_buf: [2]u8 = undefined;
+        var u32_buf: [4]u8 = undefined;
+        var u64_buf: [8]u8 = undefined;
 
         var i: u64 = 0;
         while (i < chain_count) : (i += 1) {
-            if (offset + 12 > payload.len) return error.InvalidFormat;
+            try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+            const prop_head = std.mem.readInt(u64, &u64_buf, .little);
 
-            const prop_head = std.mem.readInt(u64, payload[offset..][0..8], .little);
-            offset += 8;
-
-            const entry_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
-            offset += 4;
+            try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+            const entry_count = std.mem.readInt(u32, &u32_buf, .little);
 
             const gop = try self.chains.getOrPut(prop_head);
             if (!gop.found_existing) {
@@ -185,16 +224,15 @@ pub const PropertyChainIndex = struct {
 
             var j: u32 = 0;
             while (j < entry_count) : (j += 1) {
-                if (offset + 2 > payload.len) return error.InvalidFormat;
-                const key_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
-                offset += 2;
+                try index_snapshot_mod.readBounded(file, &remaining, &u16_buf);
+                const key_len = std.mem.readInt(u16, &u16_buf, .little);
 
-                if (offset + key_len + 8 > payload.len) return error.InvalidFormat;
-                const key_copy = try self.allocator.dupe(u8, payload[offset .. offset + key_len]);
-                offset += key_len;
+                const key_copy = try self.allocator.alloc(u8, key_len);
+                errdefer self.allocator.free(key_copy);
+                try index_snapshot_mod.readBounded(file, &remaining, key_copy);
 
-                const value_hash = std.mem.readInt(u64, payload[offset..][0..8], .little);
-                offset += 8;
+                try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+                const value_hash = std.mem.readInt(u64, &u64_buf, .little);
 
                 gop.value_ptr.entries.appendAssumeCapacity(.{
                     .key = key_copy,
@@ -203,7 +241,7 @@ pub const PropertyChainIndex = struct {
             }
         }
 
-        if (offset != payload.len) return error.InvalidFormat;
+        if (remaining != 0) return error.InvalidFormat;
         return snapshot.checkpoint_counter;
     }
 };

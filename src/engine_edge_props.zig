@@ -18,27 +18,20 @@ const PropertyValue = types.PropertyValue;
 const PropStore = prop_store_mod.PropStore;
 const GraphEngine = engine_mod.GraphEngine;
 
-/// Scan the outgoing adjacency list of a node for a specific edge_id
-/// and return its prop_head. Returns null if the edge was not found.
-pub fn findEdgePropHead(engine: *GraphEngine, from_out_head: u64, edge_id: EdgeId) anyerror!?u32 {
-    var iter = engine.adj_out.expand(from_out_head, null);
-    defer iter.deinit();
-    while (try iter.next()) |entry| {
-        if (entry.edge_id == edge_id) {
-            return entry.prop_head;
-        }
-    }
-    return null;
+fn edgeIndexEntry(engine: *GraphEngine, from: NodeId, edge_id: EdgeId) !engine_mod.EdgeIndexEntry {
+    const entry = engine.edge_index.get(edge_id) orelse return error.EdgeNotFound;
+    if (entry.from != from) return error.EdgeNotFound;
+    return entry;
 }
 
 /// Set (or overwrite) a property on an edge identified by (from, to, edge_id).
 /// Updates the prop_head in both the outgoing and incoming adjacency lists.
 pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue) anyerror!void {
-    // 1. Look up source node to get out_head
-    const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
+    const edge_entry = try edgeIndexEntry(engine, from, edge_id);
+    if (edge_entry.neighbor != to) return error.EdgeNotFound;
 
-    // 2. Scan outgoing edges to find current prop_head for this edge_id
-    const found_prop_head = (try findEdgePropHead(engine, from_rec.out_head, edge_id)) orelse return error.EdgeNotFound;
+    const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
+    const found_prop_head = edge_entry.prop_head;
 
     // 3. Write property, get new prop_head
     const new_head_u64 = try engine.putProperty(@as(u64, found_prop_head), key, value);
@@ -65,27 +58,21 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
 /// Remove a property from an edge. The removal is in-place so the prop_head
 /// does not change.
 pub fn removeEdgeProperty(engine: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
-    const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
-
-    const prop_head = (try findEdgePropHead(engine, from_rec.out_head, edge_id)) orelse return error.EdgeNotFound;
+    const prop_head = (try edgeIndexEntry(engine, from, edge_id)).prop_head;
     if (prop_head == 0) return; // no properties to remove
     try engine.removeProperty(@as(u64, prop_head), key);
 }
 
 /// Read a single property from an edge.
 pub fn getEdgeProperty(engine: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
-    const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
-
-    const prop_head = (try findEdgePropHead(engine, from_rec.out_head, edge_id)) orelse return null;
+    const prop_head = (try edgeIndexEntry(engine, from, edge_id)).prop_head;
     if (prop_head == 0) return null;
     return engine.getProperty(@as(u64, prop_head), key, allocator);
 }
 
 /// Return an iterator over all properties on an edge.
 pub fn getAllEdgeProperties(engine: *GraphEngine, from: NodeId, edge_id: EdgeId) anyerror!?PropStore.PropIterator {
-    const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
-
-    const prop_head = (try findEdgePropHead(engine, from_rec.out_head, edge_id)) orelse return null;
+    const prop_head = (try edgeIndexEntry(engine, from, edge_id)).prop_head;
     if (prop_head == 0) return null;
     return engine.prop_store.getAllProperties(@as(u64, prop_head));
 }

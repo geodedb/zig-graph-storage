@@ -469,12 +469,18 @@ Required files (always included if present):
 
 Optional files (included if present):
 
-- `indexes/catalog.bin`
+- `labels.idx`, `props.idx`, `edges.idx`
 
 ### 6.6 Integrity: Version 1 (CRC32)
 
 A 4-byte CRC32C checksum follows the last file entry, covering all preceding
 bytes (header + all file entries).
+
+Version 1 archives remain readable for validation, but restore is disabled by
+default. Restoring a V1 archive requires both:
+
+1. An authoritative expected graph UUID supplied by the caller.
+2. An explicit compatibility opt-in (`enableLegacyV1Restore()`).
 
 ### 6.7 Integrity: Version 2 (CRC32 + HMAC-SHA256)
 
@@ -486,6 +492,9 @@ When an encryption key is provided, the backup uses version 2:
 
 The HMAC provides authenticated integrity -- a backup cannot be tampered with
 without knowledge of the key.
+
+Version 2 restore requires the HMAC key. Without it, restore fails rather than
+falling back to CRC-only verification.
 
 ---
 

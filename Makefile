@@ -5,7 +5,7 @@
 .PHONY: all build test test-unit test-integration fuzz-regression clean check fmt help dev ci bench
 .PHONY: test-release-safe test-release-fast test-release-small test-all-optimizations
 .PHONY: pre-commit-install pre-commit pre-commit-run
-.PHONY: scale-bench bench-save bench-compare bench-baseline
+.PHONY: scale-bench bench-save bench-compare bench-baseline bench-compare-10k bench-baseline-10k
 
 # Default target: build and run tests
 all: build test-unit
@@ -63,6 +63,18 @@ bench-baseline:
 	@zig build scale-bench -- 1K 2>/dev/null > benchmarks/results/ci-baseline.json
 	@echo "Saved to benchmarks/results/ci-baseline.json"
 
+# Compare larger scheduled/manual tier results against the 10K baseline.
+bench-compare-10k:
+	@echo "Running scheduled/manual 10K benchmark gate and comparing against baseline..."
+	@zig build scale-bench -- 10K 2>/dev/null > /tmp/current-bench-10k.json
+	@zig build compare-bench -- benchmarks/results/ci-10k-baseline.json /tmp/current-bench-10k.json
+
+# Save the scheduled/manual 10K benchmark baseline.
+bench-baseline-10k:
+	@echo "Running 10K benchmark gate and saving as baseline..."
+	@zig build scale-bench -- 10K 2>/dev/null > benchmarks/results/ci-10k-baseline.json
+	@echo "Saved to benchmarks/results/ci-10k-baseline.json"
+
 # Clean build artifacts
 clean:
 	@echo "🧹 Cleaning build artifacts..."
@@ -103,6 +115,8 @@ test-all-optimizations: test-unit test-release-safe test-release-fast test-relea
 	@echo "✅ All optimization levels passed"
 
 # Pre-commit hook management
+# Future agent note: pre-commit is intentionally a fast local subset.
+# `make ci` and GitLab CI remain the authoritative merge gates.
 pre-commit-install:
 	@echo "📦 Installing pre-commit hooks..."
 	@pre-commit install
@@ -140,7 +154,9 @@ help:
 	@echo "  scale-bench          Run incremental scale benchmark"
 	@echo "  bench-save           Run scale bench and save results"
 	@echo "  bench-baseline       Save current results as baseline"
+	@echo "  bench-baseline-10k   Save the scheduled/manual 10K baseline"
 	@echo "  bench-compare        Compare current against baseline"
+	@echo "  bench-compare-10k    Compare the 10K gate against its baseline"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  fmt                  Format source code"

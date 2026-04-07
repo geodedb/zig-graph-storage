@@ -355,71 +355,33 @@ pub const PropStore = struct {
                 return error.DataCorruption;
             };
 
-            var offset: u32 = PROP_DATA_OFFSET;
-            var i: u32 = 0;
-            while (i < entry_count) : (i += 1) {
-                const entry_start = offset;
-                if (offset + 2 > data.len) return error.DataCorruption;
-                const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
-                offset += 2;
-                if (offset + key_len > data.len) return error.DataCorruption;
-                const entry_key = data[offset..][0..key_len];
-                offset += key_len;
+            if (try self.findEntrySpan(data, entry_count, key)) |span| {
+                const removal = try self.removeEntryAt(data, entry_count, span);
+                entry_count = removal.entry_count;
 
-                const val_size = try encodedSizeFromBytes(data[offset..]);
-                offset += @intCast(val_size);
-
-                if (std.mem.eql(u8, entry_key, key)) {
-                    // Found existing key: compact it out.
-                    var ri: u32 = i + 1;
-                    var scan_end = offset;
-                    while (ri < entry_count) : (ri += 1) {
-                        if (scan_end + 2 > data.len) return error.DataCorruption;
-                        const rkl = std.mem.bytesToValue(u16, data[scan_end..][0..2]);
-                        scan_end += 2;
-                        if (scan_end + rkl > data.len) return error.DataCorruption;
-                        scan_end += rkl;
-                        const rsize = try encodedSizeFromBytes(data[scan_end..]);
-                        scan_end += @intCast(rsize);
-                    }
-
-                    const remaining = scan_end - offset;
-                    if (remaining > 0) {
-                        std.mem.copyForwards(u8, data[entry_start..], data[offset..][0..remaining]);
-                    }
-                    const new_end = entry_start + remaining;
-                    @memset(data[new_end..scan_end], 0);
-
-                    entry_count -= 1;
-
-                    // PERF-0021: Check if freed space is enough for the new entry.
-                    const used_after_remove = new_end - PROP_DATA_OFFSET;
-                    const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
-                    const available = self.dataCapacity() -| (used_after_remove + new_dir_size);
-                    if (available >= entry_size) {
-                        self.writePropertyEntry(data, new_end, key, encoded_val);
-                        writeEntryCount(data, entry_count + 1);
-                        rebuildDirectory(data, entry_count + 1, self.page_size);
-                        self.buffer_pool.unpin(frame_idx, true);
-                        return prop_head;
-                    }
-
-                    writeEntryCount(data, entry_count);
-                    // PERF-0038/PERF-0023: Rebuild directory after removal.
-                    rebuildDirectory(data, entry_count, self.page_size);
+                // PERF-0021: Check if freed space is enough for the new entry.
+                const used_after_remove = removal.new_end - PROP_DATA_OFFSET;
+                const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
+                const available = self.dataCapacity() -| (used_after_remove + new_dir_size);
+                if (available >= entry_size) {
+                    self.writePropertyEntry(data, removal.new_end, key, encoded_val);
+                    writeEntryCount(data, entry_count + 1);
+                    rebuildDirectory(data, entry_count + 1, self.page_size);
                     self.buffer_pool.unpin(frame_idx, true);
-
-                    // Key removed but page too full; caller needs Pass 2.
-                    return null;
+                    return prop_head;
                 }
+
+                writeEntryCount(data, entry_count);
+                rebuildDirectory(data, entry_count, self.page_size);
+                self.buffer_pool.unpin(frame_idx, true);
+
+                // Key removed but page too full; caller needs Pass 2.
+                return null;
             } else {
-                // Key not on this page, move to next.
                 self.buffer_pool.unpin(frame_idx, false);
                 current_page = next_page;
                 continue;
             }
-            // Inner loop broke (key found and removed), stop Pass 1.
-            return null;
         }
         // Key not found anywhere in chain; Pass 2 will insert.
         return null;
@@ -448,22 +410,7 @@ pub const PropStore = struct {
                 return error.DataCorruption;
             };
 
-            // Compute used space inline.
-            var used: u32 = 0;
-            {
-                var scan_off: u32 = PROP_DATA_OFFSET;
-                var ei: u32 = 0;
-                while (ei < entry_count) : (ei += 1) {
-                    if (scan_off + 2 > data.len) return error.DataCorruption;
-                    const kl = std.mem.bytesToValue(u16, data[scan_off..][0..2]);
-                    scan_off += 2;
-                    if (scan_off + kl > data.len) return error.DataCorruption;
-                    scan_off += kl;
-                    const esize = try encodedSizeFromBytes(data[scan_off..]);
-                    scan_off += @intCast(esize);
-                }
-                used = scan_off - PROP_DATA_OFFSET;
-            }
+            const used = try self.usedBytes(data, entry_count);
             const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
             const available = self.dataCapacity() -| (used + new_dir_size);
 
@@ -523,53 +470,17 @@ pub const PropStore = struct {
             const data = frame.dataSlice();
 
             const next_page = readNextPage(data);
-            var entry_count = readEntryCountChecked(data, self.page_size) catch {
+            const entry_count = readEntryCountChecked(data, self.page_size) catch {
                 self.buffer_pool.unpin(frame_idx, false);
                 return error.DataCorruption;
             };
 
-            var offset: u32 = PROP_DATA_OFFSET;
-            var i: u32 = 0;
-            while (i < entry_count) : (i += 1) {
-                const entry_start = offset;
-                if (offset + 2 > data.len) {
-                    self.buffer_pool.unpin(frame_idx, false);
-                    return error.DataCorruption;
-                }
-                const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
-                offset += 2;
-                if (offset + key_len > data.len) {
-                    self.buffer_pool.unpin(frame_idx, false);
-                    return error.DataCorruption;
-                }
-                const entry_key = data[offset..][0..key_len];
-                offset += key_len;
-
-                // Skip value bytes by encoded size (no heap alloc)
-                const val_size = encodedSizeFromBytes(data[offset..]) catch {
-                    self.buffer_pool.unpin(frame_idx, false);
-                    return error.DataCorruption;
-                };
-                offset += @intCast(val_size);
-
-                if (std.mem.eql(u8, entry_key, key)) {
-                    // Found: shift remaining entries
-                    const total_used = PROP_DATA_OFFSET + try self.usedBytes(data, entry_count);
-                    const remaining = total_used - offset;
-                    if (remaining > 0) {
-                        std.mem.copyForwards(u8, data[entry_start..], data[offset..][0..remaining]);
-                    }
-                    // Zero out the freed space
-                    const new_end = entry_start + remaining;
-                    @memset(data[new_end..total_used], 0);
-
-                    entry_count -= 1;
-                    writeEntryCount(data, entry_count);
-                    // PERF-0023: Rebuild directory after removal.
-                    rebuildDirectory(data, entry_count, self.page_size);
-                    self.buffer_pool.unpin(frame_idx, true);
-                    return;
-                }
+            if (try self.findEntrySpan(data, entry_count, key)) |span| {
+                const removal = try self.removeEntryAt(data, entry_count, span);
+                writeEntryCount(data, removal.entry_count);
+                rebuildDirectory(data, removal.entry_count, self.page_size);
+                self.buffer_pool.unpin(frame_idx, true);
+                return;
             }
 
             self.buffer_pool.unpin(frame_idx, false);
@@ -578,6 +489,85 @@ pub const PropStore = struct {
     }
 
     // Internal helpers
+
+    const EntryCursor = struct {
+        offset: u32 = PROP_DATA_OFFSET,
+    };
+
+    const ParsedEntry = struct {
+        key: []const u8,
+        value_offset: u32,
+        value_size: usize,
+    };
+
+    const EntrySpan = struct {
+        index: u32,
+        start: u32,
+        end: u32,
+    };
+
+    const RemovalResult = struct {
+        entry_count: u32,
+        new_end: u32,
+        total_used: u32,
+    };
+
+    fn readEntryAt(_: *const PropStore, data: []const u8, cursor: *EntryCursor) !ParsedEntry {
+        if (cursor.offset + 2 > data.len) return error.DataCorruption;
+        const key_len = std.mem.bytesToValue(u16, data[cursor.offset..][0..2]);
+        cursor.offset += 2;
+        if (cursor.offset + key_len > data.len) return error.DataCorruption;
+        const entry_key = data[cursor.offset..][0..key_len];
+        cursor.offset += key_len;
+
+        const value_offset = cursor.offset;
+        const value_size = try encodedSizeFromBytes(data[value_offset..]);
+        cursor.offset += @intCast(value_size);
+
+        return .{
+            .key = entry_key,
+            .value_offset = value_offset,
+            .value_size = value_size,
+        };
+    }
+
+    fn findEntrySpan(self: *const PropStore, data: []const u8, entry_count: u32, key: []const u8) !?EntrySpan {
+        var cursor: EntryCursor = .{};
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            const entry_start = cursor.offset;
+            const entry = try self.readEntryAt(data, &cursor);
+            if (std.mem.eql(u8, entry.key, key)) {
+                return .{
+                    .index = i,
+                    .start = entry_start,
+                    .end = cursor.offset,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn compactEntryRange(_: *const PropStore, data: []u8, entry_start: u32, entry_end: u32, total_used: u32) u32 {
+        const remaining = total_used - entry_end;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, data[entry_start..], data[entry_end..][0..remaining]);
+        }
+
+        const new_end = entry_start + remaining;
+        @memset(data[new_end..total_used], 0);
+        return new_end;
+    }
+
+    fn removeEntryAt(self: *const PropStore, data: []u8, entry_count: u32, span: EntrySpan) !RemovalResult {
+        const total_used = PROP_DATA_OFFSET + try self.usedBytes(data, entry_count);
+        const new_end = self.compactEntryRange(data, span.start, span.end, total_used);
+        return .{
+            .entry_count = entry_count - 1,
+            .new_end = new_end,
+            .total_used = total_used,
+        };
+    }
 
     fn writePropertyEntry(_: *const PropStore, data: []u8, offset: u32, key: []const u8, encoded_val: []const u8) void {
         var off = offset;
@@ -589,19 +579,13 @@ pub const PropStore = struct {
         @memcpy(data[off..][0..encoded_val.len], encoded_val);
     }
 
-    fn usedBytes(_: *const PropStore, data: []const u8, entry_count: u32) !u32 {
+    fn usedBytes(self: *const PropStore, data: []const u8, entry_count: u32) !u32 {
+        var cursor: EntryCursor = .{};
         var i: u32 = 0;
-        var off: u32 = PROP_DATA_OFFSET;
         while (i < entry_count) : (i += 1) {
-            if (off + 2 > data.len) return error.DataCorruption;
-            const key_len = std.mem.bytesToValue(u16, data[off..][0..2]);
-            off += 2;
-            if (off + key_len > data.len) return error.DataCorruption;
-            off += key_len;
-            const esize = try encodedSizeFromBytes(data[off..]);
-            off += @intCast(esize);
+            _ = try self.readEntryAt(data, &cursor);
         }
-        return off - PROP_DATA_OFFSET;
+        return cursor.offset - PROP_DATA_OFFSET;
     }
 };
 
@@ -707,61 +691,49 @@ fn rebuildDirectory(data: []u8, entry_count: u32, page_size: u32) void {
 // ============================================================================
 
 const testing = std.testing;
-const pager_mod = @import("pager.zig");
-const Pager = pager_mod.Pager;
+const testing_support_mod = @import("testing_support.zig");
+const DualStoreEnv = testing_support_mod.DualStoreEnv;
 
-const TestEnv = struct {
-    pool: BufferPool,
-    fsm: FreeSpaceManager,
+const PropTestEnv = struct {
+    base: DualStoreEnv,
     vs: VarStore,
-    tmp_dir: testing.TmpDir,
-    prop_file: std.fs.File,
-    prop_pager: Pager,
-    var_file: std.fs.File,
-    var_pager: Pager,
 
-    fn init() !TestEnv {
-        var tmp_dir = testing.tmpDir(.{});
-        const prop_file = tmp_dir.dir.createFile("props.store", .{ .read = true, .truncate = true }) catch unreachable;
-        const var_file = tmp_dir.dir.createFile("var.store", .{ .read = true, .truncate = true }) catch unreachable;
-
-        var pool = try BufferPool.init(testing.allocator, 4096, 32);
-        const fsm = try FreeSpaceManager.init(testing.allocator, &pool, .props);
-
+    fn init() !PropTestEnv {
+        var base = try DualStoreEnv.init(
+            testing.allocator,
+            .props,
+            .props,
+            "props.store",
+            .var_store,
+            "var.store",
+            4096,
+            32,
+        );
+        base.register();
         return .{
-            .pool = pool,
-            .fsm = fsm,
-            .vs = undefined, // set in fixup
-            .tmp_dir = tmp_dir,
-            .prop_file = prop_file,
-            .prop_pager = Pager.init(prop_file, 4096),
-            .var_file = var_file,
-            .var_pager = Pager.init(var_file, 4096),
+            .base = base,
+            .vs = VarStore.init(&base.pool, &base.fsm, 4096),
         };
     }
 
-    fn fixup(self: *TestEnv) void {
-        self.pool.registerPager(.props, &self.prop_pager);
-        self.pool.registerPager(.var_store, &self.var_pager);
-        self.fsm.buffer_pool = &self.pool;
-        self.vs = VarStore.init(&self.pool, &self.fsm, 4096);
+    fn pool(self: *PropTestEnv) *BufferPool {
+        return &self.base.pool;
     }
 
-    fn deinit(self: *TestEnv) void {
-        self.fsm.deinit();
-        self.pool.deinit();
-        self.prop_file.close();
-        self.var_file.close();
-        self.tmp_dir.cleanup();
+    fn fsm(self: *PropTestEnv) *FreeSpaceManager {
+        return &self.base.fsm;
+    }
+
+    fn deinit(self: *PropTestEnv) void {
+        self.base.deinit();
     }
 };
 
 test "putProperty + getProperty round-trip: int" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     const head = try store.putProperty(0, "age", .{ .int = 30 });
     try testing.expect(head != 0);
@@ -772,11 +744,10 @@ test "putProperty + getProperty round-trip: int" {
 }
 
 test "putProperty + getProperty round-trip: string" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     const head = try store.putProperty(0, "name", .{ .string = "Alice" });
 
@@ -787,11 +758,10 @@ test "putProperty + getProperty round-trip: string" {
 }
 
 test "putProperty + getProperty round-trip: bool" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     const head = try store.putProperty(0, "active", .{ .bool = true });
     const val = try store.getProperty(head, "active", testing.allocator);
@@ -800,11 +770,10 @@ test "putProperty + getProperty round-trip: bool" {
 }
 
 test "putProperty + getProperty round-trip: float" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     const head = try store.putProperty(0, "score", .{ .float = 3.14 });
     const val = try store.getProperty(head, "score", testing.allocator);
@@ -813,11 +782,10 @@ test "putProperty + getProperty round-trip: float" {
 }
 
 test "putProperty + getProperty round-trip: null" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     const head = try store.putProperty(0, "nothing", PropertyValue.null);
     const val = try store.getProperty(head, "nothing", testing.allocator);
@@ -826,11 +794,10 @@ test "putProperty + getProperty round-trip: null" {
 }
 
 test "getAllProperties returns all stored properties" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     var head = try store.putProperty(0, "name", .{ .string = "Bob" });
     head = try store.putProperty(head, "age", .{ .int = 25 });
@@ -848,11 +815,10 @@ test "getAllProperties returns all stored properties" {
 }
 
 test "removeProperty removes the property" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     var head = try store.putProperty(0, "x", .{ .int = 1 });
     head = try store.putProperty(head, "y", .{ .int = 2 });
@@ -874,11 +840,10 @@ test "removeProperty removes the property" {
 }
 
 test "multiple properties on same entity" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     var head = try store.putProperty(0, "a", .{ .int = 1 });
     head = try store.putProperty(head, "b", .{ .int = 2 });
@@ -893,11 +858,10 @@ test "multiple properties on same entity" {
 }
 
 test "getProperty returns null for nonexistent key" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     const head = try store.putProperty(0, "x", .{ .int = 1 });
     const val = try store.getProperty(head, "nope", testing.allocator);
@@ -905,22 +869,20 @@ test "getProperty returns null for nonexistent key" {
 }
 
 test "getProperty returns null for empty prop_head" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     const val = try store.getProperty(0, "anything", testing.allocator);
     try testing.expect(val == null);
 }
 
 test "putProperty replace-in-place uses single-pass optimization" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     // Write a property then replace it with a value of same or smaller size.
     // This exercises the PERF-0021 in-place replacement path.
@@ -985,11 +947,10 @@ test "readEntryCountChecked accepts valid entry_count" {
 // ============================================================================
 
 test "PERF-0023: directory is created on put and used for lookup" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     // Insert 10 properties and verify each is found via directory.
     var head: u64 = 0;
@@ -1006,20 +967,19 @@ test "PERF-0023: directory is created on put and used for lookup" {
     }
 
     // Verify the directory is present on the page by pinning and reading dir_count.
-    const frame = try env.pool.pin(.props, head);
-    const frame_idx = env.pool.frameIndex(frame);
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
     const data = frame.dataSlice();
     const dir_count = readDirCount(data);
     try testing.expect(dir_count == 10);
-    env.pool.unpin(frame_idx, false);
+    env.pool().unpin(frame_idx, false);
 }
 
 test "PERF-0023: hash collision still finds correct key" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     // Find two keys that produce the same hash to test collision handling.
     // We'll brute-force a collision with the keyHash function.
@@ -1056,22 +1016,21 @@ test "PERF-0023: hash collision still finds correct key" {
 }
 
 test "PERF-0023: legacy page without directory uses linear scan" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     // Create a page with entries but manually zero out the directory.
     var head = try store.putProperty(0, "key1", .{ .int = 10 });
     head = try store.putProperty(head, "key2", .{ .int = 20 });
 
     // Manually set dir_count to 0 to simulate a legacy page.
-    const frame = try env.pool.pin(.props, head);
-    const frame_idx = env.pool.frameIndex(frame);
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
     const data = frame.dataSlice();
     writeDirCount(data, 0);
-    env.pool.unpin(frame_idx, true);
+    env.pool().unpin(frame_idx, true);
 
     // Linear scan fallback should still find both keys.
     const val1 = try store.getProperty(head, "key1", testing.allocator);
@@ -1084,11 +1043,10 @@ test "PERF-0023: legacy page without directory uses linear scan" {
 }
 
 test "PERF-0023: directory survives put-replace cycle" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     var head = try store.putProperty(0, "x", .{ .int = 1 });
     head = try store.putProperty(head, "y", .{ .int = 2 });
@@ -1108,20 +1066,19 @@ test "PERF-0023: directory survives put-replace cycle" {
     try testing.expectEqual(@as(i64, 3), vz.?.int);
 
     // Verify directory count is correct (3 entries, not 4).
-    const frame = try env.pool.pin(.props, head);
-    const frame_idx = env.pool.frameIndex(frame);
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
     const data = frame.dataSlice();
     const dir_count = readDirCount(data);
     try testing.expectEqual(@as(u16, 3), dir_count);
-    env.pool.unpin(frame_idx, false);
+    env.pool().unpin(frame_idx, false);
 }
 
 test "PERF-0023: directory rebuilt after removeProperty" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try PropTestEnv.init();
     defer env.deinit();
 
-    var store = PropStore.init(&env.pool, &env.fsm, &env.vs, 4096);
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
 
     var head = try store.putProperty(0, "a", .{ .int = 1 });
     head = try store.putProperty(head, "b", .{ .int = 2 });
@@ -1141,11 +1098,11 @@ test "PERF-0023: directory rebuilt after removeProperty" {
     try testing.expect(vb == null);
 
     // Directory should have 2 entries.
-    const frame = try env.pool.pin(.props, head);
-    const frame_idx = env.pool.frameIndex(frame);
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
     const data = frame.dataSlice();
     try testing.expectEqual(@as(u16, 2), readDirCount(data));
-    env.pool.unpin(frame_idx, false);
+    env.pool().unpin(frame_idx, false);
 }
 
 test "PERF-0023: keyHash helper produces consistent u16 values" {

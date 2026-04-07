@@ -41,8 +41,8 @@ graph TB
 
         subgraph Indexing["Indexes"]
             LI["LabelIndex<br/>LabelId → sorted NodeId[]"]
-            PI["PropertyIndex<br/>B+tree on hash(value)"]
-            IC["IndexCatalog<br/>persistent index metadata"]
+            PCI["PropertyChainIndex<br/>key/value digest → prop_head"]
+            SNAP["Index Snapshots<br/>labels.idx · props.idx · edges.idx"]
         end
 
         TXN["TxnManager<br/>begin / commit / abort"]
@@ -61,7 +61,9 @@ graph TB
     CK --> BP & FM & MF
     MF --> Disk
     REC --> WAL & BP
-    API --> LI & PI
+    API --> LI & PCI
+    CK --> SNAP
+    REC --> SNAP
     FM -.->|"optional"| ENC
 ```
 
@@ -152,13 +154,17 @@ flowchart TD
     ReadManifest --> SelectManifest{"Select higher counter<br/>(skip corrupt)"}
     SelectManifest -->|"Both corrupt"| Fail["Return NoManifest error"]
     SelectManifest -->|"Valid manifest found"| CheckVersion{"format_version == 2?"}
-    CheckVersion -->|"v1"| MigrationError["Return version error<br/>(requires recreation)"]
+    CheckVersion -->|"v1 + reject"| MigrationError["Return version error<br/>(requires recreation)"]
+    CheckVersion -->|"v1 + read_only"| ReadOnly["Open read-only<br/>mutations rejected"]
     CheckVersion -->|"v2"| OpenFiles["Open all store files<br/>via FileManager"]
+    ReadOnly --> OpenFiles
     OpenFiles --> LoadIndexes["Load labels.idx / props.idx / edges.idx<br/>(rebuild only if stale)"]
     LoadIndexes --> ReadWAL["Stream WAL from<br/>last_checkpoint_lsn"]
     ReadWAL --> ClassifyTxn["Classify transactions<br/>BEGIN/COMMIT/ABORT"]
     ClassifyTxn --> Replay["Replay committed<br/>page_update records"]
-    Replay --> DiscardUncommitted["Discard uncommitted<br/>transaction data"]
+    Replay --> FailClosed{"Decode / checksum error?"}
+    FailClosed -->|"Yes"| ReplayError["Abort open with offending LSN/artifact"]
+    FailClosed -->|"No"| DiscardUncommitted["Discard uncommitted<br/>transaction data"]
     DiscardUncommitted --> FlushBP["Flush buffer pool"]
     FlushBP --> FreshCheckpoint["Write fresh checkpoint<br/>(new baseline)"]
     FreshCheckpoint --> RebuildIndexes["Refresh derived indexes<br/>only when needed"]
@@ -182,7 +188,7 @@ graph LR
         LI["labels.idx<br/>label postings"]
         PI["props.idx<br/>property chains"]
         EI["edges.idx<br/>edge-id snapshot"]
-        WAL["graph.wal/<br/>segment-0, segment-1, ...<br/>graph.uuid"]
+        WAL["wal/<br/>graph.wal<br/>graph.uuid"]
     end
 ```
 

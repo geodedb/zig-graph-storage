@@ -101,54 +101,65 @@ pub const LabelDictionary = struct {
 
     /// Load from file.
     pub fn loadFromFile(self: *LabelDictionary, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
+        var file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
 
-        const data = try file.readToEndAlloc(self.allocator, 64 * 1024 * 1024);
-        defer self.allocator.free(data);
+        const stat = try file.stat();
+        const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
+        if (file_size < 8) return error.InvalidData;
 
-        if (data.len < 8) return error.InvalidData; // at least count(4) + crc(4)
+        var next = LabelDictionary.init(self.allocator);
+        errdefer next.deinit();
 
-        // Validate CRC32
-        const stored_crc = readU32(data, data.len - 4);
-        const computed_crc = Crc32.hash(data[0 .. data.len - 4]);
-        if (stored_crc != computed_crc) return error.ChecksumMismatch;
+        var remaining = file_size - 4;
+        var crc = Crc32.init();
+        var u32_buf: [4]u8 = undefined;
 
-        // Clear existing entries
-        var it = self.name_to_id.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.name_to_id.clearRetainingCapacity();
-        self.id_to_name.clearRetainingCapacity();
-
-        var pos: usize = 0;
-        const entry_count = readU32(data, pos);
-        pos += 4;
+        try readTracked(&file, &remaining, &crc, &u32_buf);
+        const entry_count = std.mem.readInt(u32, &u32_buf, .little);
 
         var max_id: u32 = 0;
         for (0..entry_count) |_| {
-            if (pos + 4 > data.len - 4) return error.InvalidData;
-            const name_len: usize = readU32(data, pos);
-            pos += 4;
+            try readTracked(&file, &remaining, &crc, &u32_buf);
+            const name_len = std.mem.readInt(u32, &u32_buf, .little);
 
-            if (pos + name_len + 4 > data.len - 4) return error.InvalidData;
-            const owned = try self.allocator.dupe(u8, data[pos..][0..name_len]);
+            const owned = try self.allocator.alloc(u8, name_len);
             errdefer self.allocator.free(owned);
-            pos += name_len;
+            try readTracked(&file, &remaining, &crc, owned);
 
-            const id = readU32(data, pos);
-            pos += 4;
+            try readTracked(&file, &remaining, &crc, &u32_buf);
+            const id = std.mem.readInt(u32, &u32_buf, .little);
 
-            try self.name_to_id.put(owned, id);
-            try self.id_to_name.put(id, owned);
-
+            try next.name_to_id.put(owned, id);
+            try next.id_to_name.put(id, owned);
             if (id >= max_id) max_id = id + 1;
         }
 
+        if (remaining != 0) return error.InvalidData;
+
+        const stored_crc = try readU32FromFile(&file);
+        if (stored_crc != crc.final()) return error.ChecksumMismatch;
+
+        self.deinit();
+        self.* = next;
         self.next_id = max_id;
     }
 };
+
+fn readTracked(file: *std.fs.File, remaining: *usize, crc: *Crc32, buf: []u8) !void {
+    if (buf.len > remaining.*) return error.InvalidData;
+    const bytes_read = try file.readAll(buf);
+    if (bytes_read != buf.len) return error.InvalidData;
+    crc.update(buf);
+    remaining.* -= buf.len;
+}
+
+fn readU32FromFile(file: *std.fs.File) !u32 {
+    var buf: [4]u8 = undefined;
+    const bytes_read = try file.readAll(&buf);
+    if (bytes_read != buf.len) return error.InvalidData;
+    return std.mem.readInt(u32, &buf, .little);
+}
 
 fn appendU32(buf: *std.ArrayList(u8), allocator: Allocator, value: u32) !void {
     try buf.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(u32, value)));

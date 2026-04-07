@@ -17,6 +17,7 @@ const txn_mod = @import("txn.zig");
 const node_store_mod = @import("node_store.zig");
 const adj_store_mod = @import("adj_store.zig");
 const prop_store_mod = @import("prop_store.zig");
+const property_mod = @import("property.zig");
 const var_store_mod = @import("var_store.zig");
 const free_space_mod = @import("free_space.zig");
 const label_dict_mod = @import("label_dict.zig");
@@ -104,6 +105,8 @@ pub const GraphEngine = struct {
     wal_dir_handle: std.fs.Dir,
     thread_pool: spice.ThreadPool,
     metrics: Metrics = .{},
+    read_only: bool = false,
+    persistence_dirty: bool = false,
 
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
@@ -113,6 +116,8 @@ pub const GraphEngine = struct {
         self.allocator = allocator;
         self.config = cfg;
         self.graph_uuid = graph_uuid;
+        self.read_only = false;
+        self.persistence_dirty = false;
 
         // 1. Create graph directory
         self.graph_dir = try GraphDir.create(allocator, data_dir, graph_uuid);
@@ -137,15 +142,15 @@ pub const GraphEngine = struct {
         // 4. Open all store files via FileManager
         self.file_manager = FileManager.init(allocator, self.graph_dir.path, cfg.page_size);
         self.file_manager.encryption_key = cfg.encryption_key;
-        _ = try self.file_manager.openFile(.nodes);
-        _ = try self.file_manager.openFile(.adj_out);
-        _ = try self.file_manager.openFile(.adj_in);
-        _ = try self.file_manager.openFile(.props);
-        _ = try self.file_manager.openFile(.var_store);
-        _ = try self.file_manager.openFile(.free);
-        _ = try self.file_manager.openFile(.label_idx);
-        _ = try self.file_manager.openFile(.prop_idx);
-        _ = try self.file_manager.openFile(.edge_idx);
+        _ = try self.file_manager.openFile(.nodes, .create_if_missing);
+        _ = try self.file_manager.openFile(.adj_out, .create_if_missing);
+        _ = try self.file_manager.openFile(.adj_in, .create_if_missing);
+        _ = try self.file_manager.openFile(.props, .create_if_missing);
+        _ = try self.file_manager.openFile(.var_store, .create_if_missing);
+        _ = try self.file_manager.openFile(.free, .create_if_missing);
+        _ = try self.file_manager.openFile(.label_idx, .create_if_missing);
+        _ = try self.file_manager.openFile(.prop_idx, .create_if_missing);
+        _ = try self.file_manager.openFile(.edge_idx, .create_if_missing);
 
         // 5. Create buffer pool, register pagers
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
@@ -158,7 +163,9 @@ pub const GraphEngine = struct {
         if (self.file_manager.getPager(.free)) |p| self.buffer_pool.registerPager(.free, p);
 
         // 6. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
-        try self.initSubsystems(allocator, graph_uuid, cfg, 0);
+        var bootstrap_cfg = cfg;
+        bootstrap_cfg.allow_create_missing_artifacts = true;
+        try self.initSubsystems(allocator, graph_uuid, bootstrap_cfg, 0);
 
         // 7. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
@@ -167,6 +174,7 @@ pub const GraphEngine = struct {
         self.thread_pool = spice.ThreadPool.init(allocator);
         self.thread_pool.start(.{});
         self.buffer_pool.setThreadPool(&self.thread_pool);
+        self.persistence_dirty = false;
 
         return self;
     }
@@ -179,6 +187,8 @@ pub const GraphEngine = struct {
         self.allocator = allocator;
         self.config = cfg;
         self.graph_uuid = graph_uuid;
+        self.read_only = false;
+        self.persistence_dirty = false;
 
         // 1. Open graph directory
         self.graph_dir = try GraphDir.open(allocator, data_dir, graph_uuid);
@@ -194,12 +204,14 @@ pub const GraphEngine = struct {
 
         // 4. Run recovery (loads manifest, replays WAL)
         var recovery = Recovery.init(allocator, cfg.encryption_key);
+        recovery.legacy_policy = cfg.legacy_policy;
         defer recovery.deinit();
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
+        self.read_only = recovery.read_only;
 
-        _ = try self.file_manager.openFile(.label_idx);
-        _ = try self.file_manager.openFile(.prop_idx);
-        _ = try self.file_manager.openFile(.edge_idx);
+        _ = try self.file_manager.openFile(.label_idx, .open_existing);
+        _ = try self.file_manager.openFile(.prop_idx, .open_existing);
+        _ = try self.file_manager.openFile(.edge_idx, .open_existing);
 
         // SEC-0010: Validate page_size matches manifest after recovery
         if (cfg.page_size != self.manifest.page_size) {
@@ -259,6 +271,7 @@ pub const GraphEngine = struct {
         self.thread_pool = spice.ThreadPool.init(allocator);
         self.thread_pool.start(.{});
         self.buffer_pool.setThreadPool(&self.thread_pool);
+        self.persistence_dirty = false;
 
         return self;
     }
@@ -290,6 +303,18 @@ pub const GraphEngine = struct {
 
         // index_rebuild_progress: 10000 = 100% (rebuild complete).
         self.metrics.index_rebuild_progress = 10000;
+    }
+
+    fn ensureWritable(self: *const GraphEngine) !void {
+        if (self.read_only) return error.ReadOnlyMode;
+    }
+
+    fn markDirty(self: *GraphEngine) void {
+        self.persistence_dirty = true;
+    }
+
+    fn markClean(self: *GraphEngine) void {
+        self.persistence_dirty = false;
     }
 
     // ── Persistence helpers (delegated to engine_persist.zig) ─────────
@@ -357,25 +382,29 @@ pub const GraphEngine = struct {
         // Track the first error encountered during close
         var close_err: ?anyerror = null;
 
-        // Run a final synchronous checkpoint -- propagate errors
-        self.checkpointer.doCheckpoint() catch |err| {
-            close_err = err;
-        };
-
-        if (close_err == null) {
-            self.saveFreeStore() catch |err| {
-                if (close_err == null) close_err = err;
+        if (self.persistence_dirty) {
+            // Run a final synchronous checkpoint only when there are writes
+            // that have not already been durably persisted.
+            self.checkpointer.doCheckpoint() catch |err| {
+                close_err = err;
             };
-        }
-        if (close_err == null) {
-            self.saveDerivedIndexes() catch |err| {
-                if (close_err == null) close_err = err;
-            };
-        }
 
-        self.saveLabelDictionary() catch |err| {
-            if (close_err == null) close_err = err;
-        };
+            if (close_err == null) {
+                self.saveFreeStore() catch |err| {
+                    if (close_err == null) close_err = err;
+                };
+            }
+            if (close_err == null) {
+                self.saveDerivedIndexes() catch |err| {
+                    if (close_err == null) close_err = err;
+                };
+            }
+            if (close_err == null) {
+                self.saveLabelDictionary() catch |err| {
+                    if (close_err == null) close_err = err;
+                };
+            }
+        }
 
         // Cleanup all resources (always runs)
         self.cleanupResources(allocator);
@@ -459,8 +488,10 @@ pub const GraphEngine = struct {
 
     /// Put a node within an existing transaction (no auto-commit).
     pub fn putNodeTxn(self: *GraphEngine, id: NodeId, rec: NodeRec, txn: TxnId) anyerror!void {
+        try self.ensureWritable();
         try self.node_store.putNode(id, rec);
         try self.logPage(txn, .nodes, self.nodePageId(id));
+        self.markDirty();
     }
 
     /// Put a node with auto-commit (backward compatible).
@@ -474,15 +505,18 @@ pub const GraphEngine = struct {
     }
 
     pub fn allocNode(self: *GraphEngine) anyerror!NodeId {
+        try self.ensureWritable();
         const id = self.manifest.next_node_id;
         self.manifest.next_node_id += 1;
         self.manifest.node_count += 1;
         self.metrics.nodes_created += 1;
+        self.markDirty();
         return id;
     }
 
     /// Delete a node within an existing transaction (no auto-commit).
     pub fn deleteNodeTxn(self: *GraphEngine, id: NodeId, txn: TxnId) anyerror!void {
+        try self.ensureWritable();
         try self.node_store.deleteNode(id);
         try self.logPage(txn, .nodes, self.nodePageId(id));
 
@@ -490,6 +524,7 @@ pub const GraphEngine = struct {
             self.manifest.node_count -= 1;
         }
         self.metrics.nodes_deleted += 1;
+        self.markDirty();
     }
 
     /// Delete a node with auto-commit (backward compatible).
@@ -548,6 +583,7 @@ pub const GraphEngine = struct {
 
     /// Add an edge within an existing transaction (no auto-commit).
     pub fn addEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
+        try self.ensureWritable();
         const edge_id = self.manifest.next_edge_id;
         self.manifest.next_edge_id += 1;
 
@@ -596,6 +632,7 @@ pub const GraphEngine = struct {
 
         self.manifest.edge_count += 1;
         self.metrics.edges_created += 1;
+        self.markDirty();
 
         return edge_id;
     }
@@ -614,6 +651,7 @@ pub const GraphEngine = struct {
 
     /// Remove an edge within an existing transaction (no auto-commit).
     pub fn removeEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, txn: TxnId) anyerror!void {
+        try self.ensureWritable();
         // Remove from source node's out adjacency list
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         try self.adj_out.removeEdge(from_rec.out_head, edge_id);
@@ -633,6 +671,7 @@ pub const GraphEngine = struct {
             self.manifest.edge_count -= 1;
         }
         self.metrics.edges_removed += 1;
+        self.markDirty();
     }
 
     /// Remove an edge with auto-commit (backward compatible).
@@ -660,6 +699,7 @@ pub const GraphEngine = struct {
 
     /// Put a property within an existing transaction (no auto-commit).
     pub fn putPropertyTxn(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId) anyerror!u64 {
+        try self.ensureWritable();
         const new_head = try self.prop_store.putProperty(owner, key, val);
 
         // Log the property page that was written to
@@ -668,9 +708,16 @@ pub const GraphEngine = struct {
         if (owner != 0 and owner != new_head) {
             self.property_index.removeChain(owner);
         }
-        try self.refreshPropertyChainIndex(new_head);
+        var encoded_buf = try property_indexEncodedValue(self.allocator, val);
+        defer encoded_buf.deinit(self.allocator);
+        if (owner != 0 and new_head == owner and self.property_index.containsChain(owner)) {
+            try self.property_index.upsertKey(owner, key, encoded_buf.items);
+        } else {
+            try self.refreshPropertyChainIndex(new_head);
+        }
 
         self.metrics.properties_written += 1;
+        self.markDirty();
         return new_head;
     }
 
@@ -687,6 +734,7 @@ pub const GraphEngine = struct {
     }
 
     pub fn removeProperty(self: *GraphEngine, owner: u64, key: []const u8) anyerror!void {
+        try self.ensureWritable();
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
@@ -697,11 +745,17 @@ pub const GraphEngine = struct {
 
         try self.txn_manager.commit(txn);
 
-        try self.refreshPropertyChainIndex(owner);
+        if (owner != 0 and self.property_index.containsChain(owner)) {
+            self.property_index.removeKey(owner, key);
+        } else {
+            try self.refreshPropertyChainIndex(owner);
+        }
+        self.markDirty();
     }
 
     /// Add a label within an existing transaction (no auto-commit).
     pub fn addLabelTxn(self: *GraphEngine, node_id: NodeId, label: LabelId, txn: TxnId) anyerror!void {
+        try self.ensureWritable();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
         if (result.count != rec.label_count or result.head != rec.label_head) {
@@ -714,6 +768,7 @@ pub const GraphEngine = struct {
             try self.logPage(txn, .nodes, self.nodePageId(node_id));
         }
         try self.label_index.addNode(label, node_id);
+        self.markDirty();
     }
 
     /// Add a label with auto-commit (backward compatible).
@@ -728,6 +783,7 @@ pub const GraphEngine = struct {
 
     /// Remove a label within an existing transaction (no auto-commit).
     pub fn removeLabelTxn(self: *GraphEngine, node_id: NodeId, label: LabelId, txn: TxnId) anyerror!void {
+        try self.ensureWritable();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
         rec.label_head = result.head;
@@ -738,6 +794,7 @@ pub const GraphEngine = struct {
         // Log dirty pages: var_store page (if any) and node page
         if (result.head != 0) try self.logPage(txn, .var_store, result.head);
         try self.logPage(txn, .nodes, self.nodePageId(node_id));
+        self.markDirty();
     }
 
     /// Remove a label with auto-commit (backward compatible).
@@ -760,6 +817,7 @@ pub const GraphEngine = struct {
     }
 
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {
+        try self.ensureWritable();
         const txn_id = try self.txn_manager.begin();
         self.metrics.txn_begun += 1;
         return txn_id;
@@ -784,16 +842,26 @@ pub const GraphEngine = struct {
     }
 
     pub fn checkpoint(self: *GraphEngine) anyerror!void {
+        try self.ensureWritable();
         return engine_persist.checkpoint(self);
+    }
+
+    pub fn getOrAssignLabel(self: *GraphEngine, label: []const u8) !LabelId {
+        try self.ensureWritable();
+        const id = try self.label_dict.getOrAssign(label);
+        self.markDirty();
+        return id;
     }
 
     // ── Edge property helpers (delegated to engine_edge_props.zig) ─────
 
     pub fn setEdgeProperty(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue) anyerror!void {
+        try self.ensureWritable();
         return engine_edge_props.setEdgeProperty(self, from, to, edge_id, key, value);
     }
 
     pub fn removeEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
+        try self.ensureWritable();
         return engine_edge_props.removeEdgeProperty(self, from, edge_id, key);
     }
 
@@ -805,6 +873,17 @@ pub const GraphEngine = struct {
         return engine_edge_props.getAllEdgeProperties(self, from, edge_id);
     }
 };
+
+fn property_indexEncodedValue(allocator: Allocator, val: PropertyValue) !std.ArrayList(u8) {
+    var encoded: std.ArrayList(u8) = .{};
+    errdefer encoded.deinit(allocator);
+
+    const encoded_len = property_mod.encodedSize(val);
+    try encoded.ensureTotalCapacity(allocator, encoded_len);
+    const dst = try encoded.addManyAsSlice(allocator, encoded_len);
+    _ = try property_mod.encodeInto(dst, val);
+    return encoded;
+}
 
 test {
     std.testing.refAllDecls(@This());

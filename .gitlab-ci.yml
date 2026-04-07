@@ -117,6 +117,16 @@ build:
   script:
     - zig build
 
+precommit-config-validate:
+  stage: lint
+  image: python:3.12-slim
+  script:
+    - pip install --disable-pip-version-check pre-commit
+    - pre-commit validate-config
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
 test-unit:
   <<: *zig-job
   stage: test
@@ -185,6 +195,26 @@ benchmark-regression:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+benchmark-regression-10k:
+  <<: *zig-job
+  stage: performance
+  needs:
+    - job: prepare-zig
+      artifacts: true
+    - test-unit
+  script:
+    - mkdir -p benchmarks/results
+    - zig build scale-bench -- 10K > benchmarks/results/current-ci-10k.json
+    - zig build compare-bench -- benchmarks/results/ci-10k-baseline.json benchmarks/results/current-ci-10k.json
+  artifacts:
+    paths:
+      - benchmarks/results/current-ci-10k.json
+    expire_in: 30 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
 
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.

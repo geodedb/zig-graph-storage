@@ -25,6 +25,8 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const timing_safe = std.crypto.timing_safe;
 const owner_only_file_mode = 0o600;
 const BACKUP_STREAM_CHUNK_SIZE: usize = 64 * 1024;
+const GRAPH_IDENTITY_FILE = "graph.uuid";
+const WAL_FILE = "graph.wal";
 
 const graph_dir_mod = @import("graph_dir.zig");
 const operation_result_mod = @import("operation_result.zig");
@@ -114,6 +116,12 @@ pub const Backup = struct {
     /// Optional encryption key. When present, backups include an HMAC-SHA256
     /// tag for integrity verification that cannot be forged without the key.
     encryption_key: ?[32]u8 = null,
+    /// Authoritative expected UUID for restore. When absent, restore requires
+    /// an existing `wal/graph.uuid` in the target directory.
+    expected_graph_uuid: ?[16]u8 = null,
+    /// CRC-only V1 backups remain readable for validation but are not restored
+    /// unless the caller explicitly opts in.
+    allow_legacy_v1_restore: bool = false,
 
     pub fn init(allocator: Allocator) Backup {
         return .{ .allocator = allocator };
@@ -122,6 +130,14 @@ pub const Backup = struct {
     /// Create a Backup with an encryption key for HMAC integrity protection.
     pub fn initWithKey(allocator: Allocator, key: [32]u8) Backup {
         return .{ .allocator = allocator, .encryption_key = key };
+    }
+
+    pub fn setExpectedGraphUuid(self: *Backup, graph_uuid: [16]u8) void {
+        self.expected_graph_uuid = graph_uuid;
+    }
+
+    pub fn enableLegacyV1Restore(self: *Backup) void {
+        self.allow_legacy_v1_restore = true;
     }
 
     /// Zero sensitive key material.
@@ -233,105 +249,59 @@ pub const Backup = struct {
 
     /// Restore a backup and return a structured result for automation.
     pub fn restoreBackupResult(self: *Backup, backup_path: []const u8, target_dir: []const u8) !RestoreResult {
-        const data = try self.readFileAlloc(backup_path);
-        defer self.allocator.free(data);
+        const file = try std.fs.cwd().openFile(backup_path, .{});
+        defer file.close();
 
-        if (data.len < 30) return error.InvalidData; // header(26) + crc(4) minimum
+        const stat = try file.stat();
+        if (stat.size > MAX_BACKUP_FILE_SIZE) return error.BackupTooLarge;
+        const archive_size = std.math.cast(usize, stat.size) orelse return error.BackupTooLarge;
 
-        // Validate magic
-        if (!std.mem.eql(u8, data[0..4], &BACKUP_MAGIC)) return error.InvalidMagic;
+        var header_buf: [26]u8 = undefined;
+        try readNoEof(&file, &header_buf);
+        const header = try parseArchiveHeader(header_buf);
+        const layout = try archiveLayoutFromFileSize(archive_size, header.version);
 
-        // Parse version
-        const version = readU16(data, 4);
-
-        // SEC-0005: Determine integrity region based on version
-        const integrity_end: usize = if (version >= BACKUP_VERSION_HMAC)
-            data.len - HmacSha256.mac_length
-        else
-            data.len;
-
-        // Validate CRC over data before CRC field
-        const crc_offset = if (version >= BACKUP_VERSION_HMAC)
-            integrity_end - 4
-        else
-            data.len - 4;
-
-        const stored_crc = std.mem.littleToNative(u32, @bitCast(data[crc_offset..][0..4].*));
-        const computed_crc = Crc32.hash(data[0..crc_offset]);
-        if (stored_crc != computed_crc) return error.ChecksumMismatch;
-
-        // SEC-0005: Verify HMAC when version >= 2 and encryption key is available
-        if (version >= BACKUP_VERSION_HMAC) {
-            if (self.encryption_key) |key| {
-                if (data.len < integrity_end + HmacSha256.mac_length) return error.InvalidData;
-                const stored_hmac = data[integrity_end..][0..HmacSha256.mac_length];
-                const hmac_input = data[0..integrity_end];
-                var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
-                HmacSha256.create(&computed_hmac, hmac_input, &key);
-                if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac.*, computed_hmac)) {
-                    return error.HmacMismatch;
-                }
-            } else {
-                // Version 2 backup requires a key for HMAC verification.
-                // Refusing to restore without integrity proof.
-                return error.EncryptionKeyRequired;
-            }
+        if (header.version == BACKUP_VERSION and !self.allow_legacy_v1_restore) {
+            return error.LegacyBackupRestoreDisabled;
+        }
+        if (header.version >= BACKUP_VERSION_HMAC and self.encryption_key == null) {
+            return error.EncryptionKeyRequired;
         }
 
-        // Parse header
-        var pos: usize = 4; // skip magic
-        _ = readU16(data, pos); // version
-        pos += 2;
-        var backup_uuid: [16]u8 = undefined;
-        @memcpy(&backup_uuid, data[pos..][0..16]);
-        pos += 16;
-
-        if (expectedGraphUuidFromPath(target_dir)) |expected_uuid| {
-            if (!std.mem.eql(u8, &backup_uuid, &expected_uuid)) {
-                return error.UuidMismatch;
-            }
+        const expected_uuid = try self.resolveExpectedGraphUuid(target_dir);
+        if (!std.mem.eql(u8, &expected_uuid, &header.graph_uuid)) {
+            return error.UuidMismatch;
         }
 
-        const file_count = readU32(data, pos);
-        pos += 4;
+        try ensureDirectoryMode(target_dir, 0o700);
+        try self.ensureRestoreWalArtifacts(target_dir, header.graph_uuid);
+
+        var crc = Crc32.init();
+        var hmac_ctx: ?HmacSha256 = if (self.encryption_key) |key|
+            if (header.version >= BACKUP_VERSION_HMAC) HmacSha256.init(&key) else null
+        else
+            null;
+        updateIntegrityBytes(0, &header_buf, layout, &crc, &hmac_ctx);
+
+        var pos: usize = header_buf.len;
         var files_restored: u32 = 0;
         var total_bytes: u64 = 0;
 
-        // Ensure target directory exists with restricted permissions
-        try std.fs.cwd().makePath(target_dir);
-        {
-            var dir = try std.fs.cwd().openDir(target_dir, .{ .iterate = true });
-            defer dir.close();
-            dir.chmod(0o700) catch {};
-        }
-
-        // Extract files
         var i: u32 = 0;
-        while (i < file_count) : (i += 1) {
-            if (pos + 2 > crc_offset) return error.InvalidData;
-            const name_len = readU16(data, pos);
-            pos += 2;
+        while (i < header.file_count) : (i += 1) {
+            var name_len_buf: [2]u8 = undefined;
+            try readTrackedExact(&file, &pos, &name_len_buf, layout, &crc, &hmac_ctx);
+            const name_len = std.mem.readInt(u16, &name_len_buf, .little);
 
-            if (pos + name_len > crc_offset) return error.InvalidData;
-            const name = data[pos..][0..name_len];
-            pos += name_len;
-
-            // SEC-0002: Validate filename to prevent path traversal.
-            // Reject absolute paths, null bytes, backslashes, and ".." components.
+            const name = try self.allocator.alloc(u8, name_len);
+            defer self.allocator.free(name);
+            try readTrackedExact(&file, &pos, name, layout, &crc, &hmac_ctx);
             if (!isValidBackupFilename(name)) return error.InvalidBackupFilename;
 
-            if (pos + 8 > crc_offset) return error.InvalidData;
-            const file_size = readU64(data, pos);
-            pos += 8;
+            var size_buf: [8]u8 = undefined;
+            try readTrackedExact(&file, &pos, &size_buf, layout, &crc, &hmac_ctx);
+            const file_size = std.mem.readInt(u64, &size_buf, .little);
 
-            // SEC-0013: Guard against integer truncation on 32-bit targets.
-            const file_size_usize = std.math.cast(usize, file_size) orelse return error.BackupTooLarge;
-
-            if (pos + file_size_usize > crc_offset) return error.InvalidData;
-            const file_data = data[pos..][0..file_size_usize];
-            pos += file_size_usize;
-
-            // Create subdirectories if needed (only forward slashes in validated names)
             if (std.mem.lastIndexOfScalar(u8, name, '/')) |sep| {
                 const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name[0..sep] });
                 defer self.allocator.free(subdir_path);
@@ -341,16 +311,37 @@ pub const Backup = struct {
             const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name });
             defer self.allocator.free(file_path);
 
-            const file = try std.fs.cwd().createFile(file_path, .{ .mode = owner_only_file_mode });
-            defer file.close();
-            try file.writeAll(file_data);
+            const out_file = try std.fs.cwd().createFile(file_path, .{ .mode = owner_only_file_mode });
+            defer out_file.close();
+            _ = try copyTrackedToFile(&file, &out_file, &pos, file_size, layout, &crc, &hmac_ctx);
 
             files_restored += 1;
             total_bytes += file_size;
         }
 
+        if (pos != layout.crc_offset) return error.InvalidData;
+
+        var stored_crc_buf: [4]u8 = undefined;
+        try readTrackedExact(&file, &pos, &stored_crc_buf, layout, &crc, &hmac_ctx);
+        const stored_crc = std.mem.readInt(u32, &stored_crc_buf, .little);
+        if (stored_crc != crc.final()) return error.ChecksumMismatch;
+
+        if (layout.hmac_offset) |_| {
+            var stored_hmac: [HmacSha256.mac_length]u8 = undefined;
+            try readNoEof(&file, &stored_hmac);
+            pos += stored_hmac.len;
+
+            var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
+            hmac_ctx.?.final(&computed_hmac);
+            if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac, computed_hmac)) {
+                return error.HmacMismatch;
+            }
+        }
+
+        if (pos != archive_size) return error.InvalidData;
+
         return .{
-            .graph_uuid = backup_uuid,
+            .graph_uuid = header.graph_uuid,
             .files_restored = files_restored,
             .total_bytes = total_bytes,
         };
@@ -358,45 +349,65 @@ pub const Backup = struct {
 
     /// Validate a backup file's integrity (check header, CRC, and HMAC if applicable).
     pub fn validateBackup(self: *Backup, backup_path: []const u8) !bool {
-        const data = self.readFileAlloc(backup_path) catch return false;
-        defer self.allocator.free(data);
+        const file = std.fs.cwd().openFile(backup_path, .{}) catch return false;
+        defer file.close();
 
-        if (data.len < 30) return false;
+        const stat = file.stat() catch return false;
+        if (stat.size > MAX_BACKUP_FILE_SIZE) return false;
+        const archive_size = std.math.cast(usize, stat.size) orelse return false;
 
-        // Check magic
-        if (!std.mem.eql(u8, data[0..4], &BACKUP_MAGIC)) return false;
+        var header_buf: [26]u8 = undefined;
+        readNoEof(&file, &header_buf) catch return false;
+        const header = parseArchiveHeader(header_buf) catch return false;
+        const layout = archiveLayoutFromFileSize(archive_size, header.version) catch return false;
 
-        // Check version
-        const version = readU16(data, 4);
-        if (version != BACKUP_VERSION and version != BACKUP_VERSION_HMAC) return false;
-
-        // Determine CRC position based on version
-        const crc_offset: usize = if (version >= BACKUP_VERSION_HMAC)
-            data.len - HmacSha256.mac_length - 4
+        var crc = Crc32.init();
+        var hmac_ctx: ?HmacSha256 = if (self.encryption_key) |key|
+            if (header.version >= BACKUP_VERSION_HMAC) HmacSha256.init(&key) else null
         else
-            data.len - 4;
+            null;
 
-        if (crc_offset > data.len - 4) return false;
+        if (header.version >= BACKUP_VERSION_HMAC and hmac_ctx == null) return false;
 
-        // Check CRC
-        const stored_crc = std.mem.littleToNative(u32, @bitCast(data[crc_offset..][0..4].*));
-        const computed_crc = Crc32.hash(data[0..crc_offset]);
-        if (stored_crc != computed_crc) return false;
+        updateIntegrityBytes(0, &header_buf, layout, &crc, &hmac_ctx);
 
-        // SEC-0005: Version 2 backups require a key for HMAC validation.
-        if (version >= BACKUP_VERSION_HMAC) {
-            const key = self.encryption_key orelse return false;
-            if (data.len < HmacSha256.mac_length + 4) return false;
+        var pos: usize = header_buf.len;
+        var i: u32 = 0;
+        while (i < header.file_count) : (i += 1) {
+            var name_len_buf: [2]u8 = undefined;
+            readTrackedExact(&file, &pos, &name_len_buf, layout, &crc, &hmac_ctx) catch return false;
+            const name_len = std.mem.readInt(u16, &name_len_buf, .little);
 
-            const integrity_end = data.len - HmacSha256.mac_length;
-            const stored_hmac = data[integrity_end..][0..HmacSha256.mac_length];
-            const hmac_input = data[0..integrity_end];
-            var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
-            HmacSha256.create(&computed_hmac, hmac_input, &key);
-            if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac.*, computed_hmac)) return false;
+            const name = self.allocator.alloc(u8, name_len) catch return false;
+            defer self.allocator.free(name);
+            readTrackedExact(&file, &pos, name, layout, &crc, &hmac_ctx) catch return false;
+            if (!isValidBackupFilename(name)) return false;
+
+            var size_buf: [8]u8 = undefined;
+            readTrackedExact(&file, &pos, &size_buf, layout, &crc, &hmac_ctx) catch return false;
+            const file_size = std.mem.readInt(u64, &size_buf, .little);
+
+            skipTracked(&file, &pos, file_size, layout, &crc, &hmac_ctx) catch return false;
         }
 
-        return true;
+        if (pos != layout.crc_offset) return false;
+
+        var stored_crc_buf: [4]u8 = undefined;
+        readTrackedExact(&file, &pos, &stored_crc_buf, layout, &crc, &hmac_ctx) catch return false;
+        const stored_crc = std.mem.readInt(u32, &stored_crc_buf, .little);
+        if (stored_crc != crc.final()) return false;
+
+        if (layout.hmac_offset) |_| {
+            var stored_hmac: [HmacSha256.mac_length]u8 = undefined;
+            readNoEof(&file, &stored_hmac) catch return false;
+            pos += stored_hmac.len;
+
+            var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
+            hmac_ctx.?.final(&computed_hmac);
+            if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac, computed_hmac)) return false;
+        }
+
+        return pos == archive_size;
     }
 
     // ========================================================================
@@ -457,6 +468,53 @@ pub const Backup = struct {
         }
     }
 
+    fn ensureRestoreWalArtifacts(self: *Backup, target_dir: []const u8, graph_uuid: [16]u8) !void {
+        const wal_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/wal", .{target_dir});
+        defer self.allocator.free(wal_dir_path);
+        try ensureDirectoryMode(wal_dir_path, 0o700);
+
+        const graph_uuid_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ wal_dir_path, GRAPH_IDENTITY_FILE });
+        defer self.allocator.free(graph_uuid_path);
+        const uuid_file = try std.fs.cwd().createFile(graph_uuid_path, .{
+            .read = true,
+            .truncate = false,
+            .mode = owner_only_file_mode,
+        });
+        defer uuid_file.close();
+        try uuid_file.setEndPos(0);
+        try uuid_file.seekTo(0);
+        try uuid_file.writeAll(&graph_uuid);
+        try uuid_file.sync();
+
+        const wal_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ wal_dir_path, WAL_FILE });
+        defer self.allocator.free(wal_path);
+        const wal_file = try std.fs.cwd().createFile(wal_path, .{
+            .read = true,
+            .truncate = false,
+            .mode = owner_only_file_mode,
+        });
+        wal_file.close();
+    }
+
+    fn resolveExpectedGraphUuid(self: *const Backup, target_dir: []const u8) ![16]u8 {
+        if (self.expected_graph_uuid) |graph_uuid| {
+            return graph_uuid;
+        }
+
+        const wal_uuid_path = try std.fmt.allocPrint(self.allocator, "{s}/wal/{s}", .{ target_dir, GRAPH_IDENTITY_FILE });
+        defer self.allocator.free(wal_uuid_path);
+
+        const file = std.fs.cwd().openFile(wal_uuid_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.ExpectedGraphUuidRequired,
+            else => return err,
+        };
+        defer file.close();
+
+        var graph_uuid: [16]u8 = undefined;
+        try readNoEof(&file, &graph_uuid);
+        return graph_uuid;
+    }
+
     fn readFileAlloc(self: *Backup, path: []const u8) ![]u8 {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
@@ -481,6 +539,18 @@ pub const Backup = struct {
 
 /// Maximum backup file size: 1 GiB (SEC-0007).
 pub const MAX_BACKUP_FILE_SIZE: u64 = 1 << 30;
+
+const ArchiveHeader = struct {
+    version: u16,
+    graph_uuid: [16]u8,
+    file_count: u32,
+};
+
+const ArchiveLayout = struct {
+    file_size: usize,
+    crc_offset: usize,
+    hmac_offset: ?usize,
+};
 
 /// Validate that a filename from a backup archive is safe to extract.
 /// Rejects absolute paths, null bytes, backslashes, and ".." path components.
@@ -519,18 +589,124 @@ fn readU64(data: []const u8, offset: usize) u64 {
     return std.mem.littleToNative(u64, @bitCast(data[offset..][0..8].*));
 }
 
-fn expectedGraphUuidFromPath(path: []const u8) ?[16]u8 {
-    const base = std.fs.path.basename(path);
-    if (base.len != 32) return null;
+fn parseArchiveHeader(header_buf: [26]u8) !ArchiveHeader {
+    if (!std.mem.eql(u8, header_buf[0..4], &BACKUP_MAGIC)) return error.InvalidMagic;
 
-    var uuid: [16]u8 = undefined;
-    var i: usize = 0;
-    while (i < uuid.len) : (i += 1) {
-        const hi = std.fmt.charToDigit(base[i * 2], 16) catch return null;
-        const lo = std.fmt.charToDigit(base[i * 2 + 1], 16) catch return null;
-        uuid[i] = @intCast((hi << 4) | lo);
+    const version = readU16(&header_buf, 4);
+    if (version != BACKUP_VERSION and version != BACKUP_VERSION_HMAC) {
+        return error.InvalidFormat;
     }
-    return uuid;
+
+    var graph_uuid: [16]u8 = undefined;
+    @memcpy(&graph_uuid, header_buf[6..22]);
+
+    return .{
+        .version = version,
+        .graph_uuid = graph_uuid,
+        .file_count = readU32(&header_buf, 22),
+    };
+}
+
+fn archiveLayoutFromFileSize(file_size: usize, version: u16) !ArchiveLayout {
+    const min_size: usize = if (version >= BACKUP_VERSION_HMAC)
+        @as(usize, 26 + 4 + HmacSha256.mac_length)
+    else
+        @as(usize, 26 + 4);
+    if (file_size < min_size) return error.InvalidData;
+
+    if (version >= BACKUP_VERSION_HMAC) {
+        return .{
+            .file_size = file_size,
+            .crc_offset = file_size - HmacSha256.mac_length - 4,
+            .hmac_offset = file_size - HmacSha256.mac_length,
+        };
+    }
+
+    return .{
+        .file_size = file_size,
+        .crc_offset = file_size - 4,
+        .hmac_offset = null,
+    };
+}
+
+fn ensureDirectoryMode(path: []const u8, mode: u32) !void {
+    try std.fs.cwd().makePath(path);
+    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
+    dir.chmod(mode) catch {};
+}
+
+fn readNoEof(file: *const std.fs.File, buf: []u8) !void {
+    const bytes_read = try file.readAll(buf);
+    if (bytes_read != buf.len) return error.InvalidData;
+}
+
+fn updateIntegrityBytes(pos: usize, bytes: []const u8, layout: ArchiveLayout, crc: *Crc32, hmac_ctx: *?HmacSha256) void {
+    if (pos < layout.crc_offset) {
+        const crc_end = @min(pos + bytes.len, layout.crc_offset);
+        crc.update(bytes[0 .. crc_end - pos]);
+    }
+
+    if (hmac_ctx.*) |*h| {
+        const hmac_end = layout.hmac_offset orelse layout.file_size;
+        if (pos < hmac_end) {
+            const tracked_end = @min(pos + bytes.len, hmac_end);
+            h.update(bytes[0 .. tracked_end - pos]);
+        }
+    }
+}
+
+fn readTrackedExact(
+    file: *const std.fs.File,
+    pos: *usize,
+    buf: []u8,
+    layout: ArchiveLayout,
+    crc: *Crc32,
+    hmac_ctx: *?HmacSha256,
+) !void {
+    if (pos.* + buf.len > layout.file_size) return error.InvalidData;
+    try readNoEof(file, buf);
+    updateIntegrityBytes(pos.*, buf, layout, crc, hmac_ctx);
+    pos.* += buf.len;
+}
+
+fn skipTracked(
+    file: *const std.fs.File,
+    pos: *usize,
+    byte_count: u64,
+    layout: ArchiveLayout,
+    crc: *Crc32,
+    hmac_ctx: *?HmacSha256,
+) !void {
+    var remaining = byte_count;
+    var buf: [BACKUP_STREAM_CHUNK_SIZE]u8 = undefined;
+    while (remaining > 0) {
+        const want = @min(buf.len, std.math.cast(usize, remaining) orelse return error.BackupTooLarge);
+        try readTrackedExact(file, pos, buf[0..want], layout, crc, hmac_ctx);
+        remaining -= want;
+    }
+}
+
+fn copyTrackedToFile(
+    file: *const std.fs.File,
+    out_file: *const std.fs.File,
+    pos: *usize,
+    byte_count: u64,
+    layout: ArchiveLayout,
+    crc: *Crc32,
+    hmac_ctx: *?HmacSha256,
+) !u64 {
+    var copied: u64 = 0;
+    var remaining = byte_count;
+    var buf: [BACKUP_STREAM_CHUNK_SIZE]u8 = undefined;
+    while (remaining > 0) {
+        const want = @min(buf.len, std.math.cast(usize, remaining) orelse return error.BackupTooLarge);
+        try readTrackedExact(file, pos, buf[0..want], layout, crc, hmac_ctx);
+        try out_file.writeAll(buf[0..want]);
+        copied += want;
+        remaining -= want;
+    }
+    return copied;
 }
 
 // ============================================================================
@@ -645,6 +821,8 @@ test "restoreBackup restores files to new directory" {
 
     var backup = Backup.init(allocator);
     _ = try backup.createBackup(&env.graph_dir, backup_path);
+    backup.setExpectedGraphUuid(env.graph_dir.graph_uuid);
+    backup.enableLegacyV1Restore();
 
     // Restore to new directory
     const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
@@ -850,6 +1028,8 @@ test "SEC-0002: restoreBackup rejects malicious filename with path traversal" {
     defer allocator.free(restore_path);
 
     var backup = Backup.init(allocator);
+    backup.setExpectedGraphUuid([_]u8{0x42} ** 16);
+    backup.enableLegacyV1Restore();
     const result = backup.restoreBackup(backup_path, restore_path);
     try testing.expectError(error.InvalidBackupFilename, result);
 }
@@ -907,6 +1087,8 @@ test "SEC-0013: integer truncation guard in restoreBackup" {
     defer allocator.free(restore_path);
 
     var backup = Backup.init(allocator);
+    backup.setExpectedGraphUuid([_]u8{0x42} ** 16);
+    backup.enableLegacyV1Restore();
     const result = backup.restoreBackup(backup_path, restore_path);
     // On 64-bit: file_size is valid usize but exceeds data.len => InvalidData
     // On 32-bit: cast fails => BackupTooLarge
@@ -1039,7 +1221,7 @@ test "SEC-0017: V2 restore without key returns EncryptionKeyRequired" {
     try testing.expectError(error.EncryptionKeyRequired, result);
 }
 
-test "GAP-0032: restoreBackup rejects a target graph path whose UUID mismatches the archive" {
+test "GAP-0047: restoreBackup rejects legacy V1 backups by default" {
     const allocator = testing.allocator;
 
     var env = try createTestGraphDir(allocator);
@@ -1058,15 +1240,41 @@ test "GAP-0032: restoreBackup rejects a target graph path whose UUID mismatches 
 
     var backup = Backup.init(allocator);
     _ = try backup.createBackup(&env.graph_dir, backup_path);
+    backup.setExpectedGraphUuid(env.graph_dir.graph_uuid);
 
-    const wrong_uuid_dir = try std.fmt.allocPrint(
-        allocator,
-        "{s}/graphs/11111111111111111111111111111111",
-        .{out_path_base},
-    );
-    defer allocator.free(wrong_uuid_dir);
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
+    defer allocator.free(restore_path);
 
-    const result = backup.restoreBackup(backup_path, wrong_uuid_dir);
+    const result = backup.restoreBackup(backup_path, restore_path);
+    try testing.expectError(error.LegacyBackupRestoreDisabled, result);
+}
+
+test "GAP-0032: restoreBackup rejects a configured expected UUID that mismatches the archive" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v1.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    var backup = Backup.init(allocator);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+    backup.setExpectedGraphUuid([_]u8{0x11} ** 16);
+    backup.enableLegacyV1Restore();
+
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
+    defer allocator.free(restore_path);
+
+    const result = backup.restoreBackup(backup_path, restore_path);
     try testing.expectError(error.UuidMismatch, result);
 }
 

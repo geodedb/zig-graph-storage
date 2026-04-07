@@ -21,6 +21,12 @@ pub const LoadedSnapshot = struct {
     }
 };
 
+pub const SnapshotHeader = struct {
+    checkpoint_counter: u64,
+    item_count: u64,
+    payload_size: usize,
+};
+
 pub fn writeHeader(writer: anytype, magic: []const u8, checkpoint_counter: u64, item_count: u64) !void {
     if (magic.len != 8) return error.InvalidMagicLength;
 
@@ -36,6 +42,26 @@ pub fn writeHeader(writer: anytype, magic: []const u8, checkpoint_counter: u64, 
 }
 
 pub fn loadFile(allocator: Allocator, file: *std.fs.File, expected_magic: []const u8) !?LoadedSnapshot {
+    const header = (try loadHeader(file, expected_magic)) orelse return null;
+
+    const total_size = expected_magic.len + 16 + header.payload_size;
+    const data = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(data);
+
+    try file.seekTo(0);
+    const bytes_read = try file.readAll(data);
+    if (bytes_read != total_size) return error.UnexpectedEndOfFile;
+
+    return .{
+        .allocator = allocator,
+        .data = data,
+        .checkpoint_counter = header.checkpoint_counter,
+        .item_count = header.item_count,
+        .payload_offset = expected_magic.len + 16,
+    };
+}
+
+pub fn loadHeader(file: *std.fs.File, expected_magic: []const u8) !?SnapshotHeader {
     if (expected_magic.len != 8) return error.InvalidMagicLength;
 
     const stat = try file.stat();
@@ -44,26 +70,26 @@ pub fn loadFile(allocator: Allocator, file: *std.fs.File, expected_magic: []cons
     const size: usize = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
     if (size < expected_magic.len + 16) return error.InvalidFormat;
 
-    const data = try allocator.alloc(u8, size);
-    errdefer allocator.free(data);
-
     try file.seekTo(0);
-    const bytes_read = try file.readAll(data);
-    if (bytes_read != size) return error.UnexpectedEndOfFile;
-    if (!std.mem.eql(u8, data[0..expected_magic.len], expected_magic)) {
+    var header_buf: [24]u8 = undefined;
+    const bytes_read = try file.readAll(&header_buf);
+    if (bytes_read != header_buf.len) return error.UnexpectedEndOfFile;
+    if (!std.mem.eql(u8, header_buf[0..expected_magic.len], expected_magic)) {
         return error.InvalidFormat;
     }
 
-    const checkpoint_counter = std.mem.readInt(u64, data[expected_magic.len..][0..8], .little);
-    const item_count = std.mem.readInt(u64, data[expected_magic.len + 8 ..][0..8], .little);
-
     return .{
-        .allocator = allocator,
-        .data = data,
-        .checkpoint_counter = checkpoint_counter,
-        .item_count = item_count,
-        .payload_offset = expected_magic.len + 16,
+        .checkpoint_counter = std.mem.readInt(u64, header_buf[expected_magic.len..][0..8], .little),
+        .item_count = std.mem.readInt(u64, header_buf[expected_magic.len + 8 ..][0..8], .little),
+        .payload_size = size - (expected_magic.len + 16),
     };
+}
+
+pub fn readBounded(file: *std.fs.File, remaining: *usize, buf: []u8) !void {
+    if (buf.len > remaining.*) return error.InvalidFormat;
+    const bytes_read = try file.readAll(buf);
+    if (bytes_read != buf.len) return error.UnexpectedEndOfFile;
+    remaining.* -= buf.len;
 }
 
 test "writeHeader and loadFile round-trip checkpoint metadata" {

@@ -2,44 +2,128 @@
 
 Last updated: 2026-04-07
 
-GitLab remains the source of truth for the linked work items. This file records the repository-state outcome of the 2026-04-07 closure pass.
+This file is the authoritative close-out record for the 2026-04-07 quality and
+maintainability pass.
 
 ## Summary
 
 | Status | Count |
-|--------|-------|
-| Closed | 12 |
-| Won't Do | 1 |
+| --- | ---: |
+| Closed | 9 |
 | Blocked | 0 |
+| Won't Do | 1 |
+| Open | 0 |
 
-- Verification completed in this pass:
-  - `zig build`
-  - `zig build check`
-  - `zig build test --summary all`
-  - `zig build test-integration --summary all`
-  - `zig build test-fuzz-regression --summary all`
-- Future agent note:
-  - `#83` is intentionally `Won't Do`. Pre-commit is a fast local subset, not the authoritative merge gate. Keep GitLab CI as the canonical enforcement layer unless repository policy changes.
+## Future Agent Notes
 
-## Status Table
+- GitLab CI is the authoritative merge gate.
+- Repo-local pre-commit hooks are intentionally a fast subset. Do not reopen
+  parity work unless repository governance changes and explicitly requires it.
 
-| Finding | Issue | Status | What changed |
-|---------|-------|--------|--------------|
-| Recovery loads the full WAL tail into memory | [#46](https://gitlab.com/devnw/zig/graph-storage/-/work_items/46) | Closed | Added streaming WAL iteration in `src/wal.zig` and two-pass bounded replay in `src/recovery.zig`, with a large-tail replay regression test. |
-| High-churn core modules remain oversized and multi-responsibility | [#72](https://gitlab.com/devnw/zig/graph-storage/-/work_items/72) | Closed | Extracted shared responsibilities into dedicated modules: `src/index_snapshot.zig`, `src/operation_result.zig`, and `src/testing_support.zig`; moved edge-index persistence into the indexing path; moved WAL-tail streaming responsibility into `src/wal.zig`. |
-| Backup creation buffers graph contents in memory | [#76](https://gitlab.com/devnw/zig/graph-storage/-/work_items/76) | Closed | `createBackup()` now streams file contents with bounded chunk buffers and regression coverage for large files. |
-| Quality checks are fragmented across local hooks and CI | [#83](https://gitlab.com/devnw/zig/graph-storage/-/work_items/83) | Won't Do | The user explicitly directed that pre-commit parity remain out of scope. CI now documents itself as the authoritative gate; pre-commit remains intentionally lighter weight. |
-| Benchmark regression checks are advisory and cannot block drift | [#85](https://gitlab.com/devnw/zig/graph-storage/-/work_items/85) | Closed | `.gitlab-ci.yml` now defines a non-optional `benchmark-regression` job for merge-path pipelines. |
-| GitLab CI re-installs Zig in every job | [#86](https://gitlab.com/devnw/zig/graph-storage/-/work_items/86) | Closed | Added `prepare-zig` plus artifact reuse so repository-defined Zig jobs consume one prepared toolchain per pipeline instead of bootstrapping Zig repeatedly. |
-| Structured maintenance result schemas remain inconsistent | [#44](https://gitlab.com/devnw/zig/graph-storage/-/work_items/44) | Closed | Added shared `GraphOperationSummary`/`OperationKind` in `src/operation_result.zig`; backup, restore, verify, migration, and maintenance flows now expose structured JSON result types with serialization tests. |
-| README drifts from API, dependency, encryption, and toolchain reality | [#56](https://gitlab.com/devnw/zig/graph-storage/-/work_items/56) | Closed | Updated `README.md` and `examples/basic.zig` to match the current API, dependency set, persisted snapshots, AES-256-GCM encryption, and tested Zig versions. |
-| Test setup and fixture scaffolding is duplicated across the suite | [#81](https://gitlab.com/devnw/zig/graph-storage/-/work_items/81) | Closed | Added `src/testing_support.zig` and migrated unit/integration tests onto the shared temp-dir and config helpers. |
-| `build.zig` duplicates dependency and module wiring across targets | [#82](https://gitlab.com/devnw/zig/graph-storage/-/work_items/82) | Closed | Consolidated dependency loading and module creation through `loadDeps`, `createModule`, and the shared build helper functions in `build.zig`. |
-| Benchmark reporting only captures single averages | [#84](https://gitlab.com/devnw/zig/graph-storage/-/work_items/84) | Closed | `benchmarks/scale_bench.zig` now emits `avg`, `p50`, `p95`, `p99`, `stddev`, and sample counts; `benchmarks/compare.zig` compares those fields explicitly. |
-| Derived index snapshot persistence is duplicated across two formats | [#87](https://gitlab.com/devnw/zig/graph-storage/-/work_items/87) | Closed | Added `src/index_snapshot.zig` and switched label/property snapshot persistence to the shared framing/parsing helper. |
-| Fuzz failures are suppressed and cannot block merges | [#79](https://gitlab.com/devnw/zig/graph-storage/-/work_items/79) | Closed | Added the deterministic `test-fuzz-regression` target and a required `fuzz-regression` CI job; exploratory fuzzing remains advisory but no longer swallows real failures. |
+## Disposition
 
-## Notes For Future Agents
+### QUAL-0027: oversized high-churn core modules remained multi-responsibility
 
-- Do not reopen `#83` just because pre-commit and CI are not identical. That divergence is now intentional and documented in `.pre-commit-config.yaml` and `.gitlab-ci.yml`.
-- If repository policy changes and full parity is desired later, treat it as a new policy decision rather than a regression in this closure pass.
+- Status: Closed
+- Implemented:
+  - `src/engine_edge_props.zig` and `src/engine_index.zig` carry more of the
+    engine coordination surface.
+  - `src/backup.zig` now routes archive parsing and restore/validate through
+    focused streaming helpers instead of one whole-file path.
+  - `src/prop_store.zig` now shares page-edit helpers for entry parse/remove
+    flows instead of maintaining separate byte-level implementations.
+- Outcome: the highest-churn logic called out by this review now lives behind
+  narrower modules or shared helpers with direct unit coverage.
+
+### PERF-0041: traversal and label-scan APIs materialized full result slices
+
+- Status: Closed
+- Implemented:
+  - Iterator-first traversal and label-scan paths remain the hot-path API
+    surface; slice-returning helpers are compatibility adapters only.
+
+### QUAL-0033: quality checks were fragmented across Makefile, pre-commit, and GitLab CI
+
+- Status: Won't Do
+- Reason: local and CI parity is intentionally not the repository control
+  model.
+- Documented controls:
+  - `.gitlab-ci.yml` explicitly states that GitLab CI is the authoritative
+    merge gate.
+  - `.pre-commit-config.yaml` explicitly states that local hooks are an
+    intentionally fast subset.
+  - `Makefile` now repeats the same future-agent note near the pre-commit
+    targets.
+- Future-agent instruction: do not reopen parity work unless repository
+  governance changes.
+
+### QUAL-0039: pre-commit configuration was syntactically invalid and unverified
+
+- Status: Closed
+- Implemented:
+  - `.pre-commit-config.yaml` now uses a valid YAML form for `check-todos`.
+  - `.gitlab-ci.yml` adds a `precommit-config-validate` job.
+  - Targeted hooks now pass for config syntax, YAML formatting, JSON validity,
+    trailing whitespace, and end-of-file normalization.
+- Notes:
+  - A full `pre-commit run --all-files` still reports a separate repository-wide
+    markdownlint backlog outside this gap item.
+
+### QUAL-0040: PropStore duplicated slotted-page mutation and compaction logic
+
+- Status: Closed
+- Implemented:
+  - `src/prop_store.zig` now shares entry parsing, span discovery, compaction,
+    and removal helpers across update/delete paths.
+
+### PERF-0044: backup validate and restore paths loaded whole archives into memory
+
+- Status: Closed
+- Implemented:
+  - `src/backup.zig` now streams restore and validation with bounded buffers and
+    incremental integrity checks.
+
+### GAP-0025: structured maintenance results remained incomplete
+
+- Status: Closed
+- Implemented:
+  - `src/operation_result.zig` now exposes a shared operation-artifact schema.
+  - `src/verify.zig` and `src/maintenance.zig` now both emit `artifacts` plus
+    structured `details` JSON payloads.
+  - `src/maintenance.zig` adds per-operation details for checkpoint, rebuild,
+    flush, and storage-stats flows.
+
+### QUAL-0034: public docs drifted from the implemented topology and crypto mode
+
+- Status: Closed
+- Implemented:
+  - Updated `README.md`, `src/root.zig`, `docs/architecture.md`,
+    `docs/operations.md`, and `docs/format-spec.md` to describe
+    `PropertyChainIndex`, derived snapshots, `wal/graph.wal`, and AES-256-GCM.
+
+### PERF-0043: benchmark regression gate only exercised the `1K` smoke tier
+
+- Status: Closed
+- Implemented:
+  - Added `benchmarks/results/ci-10k-baseline.json`.
+  - Added `benchmark-regression-10k` to `.gitlab-ci.yml`.
+  - Added `bench-baseline-10k` and `bench-compare-10k` to `Makefile`.
+
+### QUAL-0031: store-level fixture scaffolding remained duplicated outside `testing_support.zig`
+
+- Status: Closed
+- Implemented:
+  - `src/testing_support.zig` now provides shared `SingleStoreEnv` and
+    `DualStoreEnv` test harnesses.
+  - `src/node_store.zig`, `src/var_store.zig`, `src/label_index.zig`,
+    `src/prop_store.zig`, and `src/maintenance.zig` now consume the shared
+    harness instead of duplicating temp-dir/pager bootstrap code.
+
+## Verification
+
+- `zig build test --summary all`
+- `zig build test-integration --summary all`
+- `zig build test-fuzz-regression --summary all`
+- `pre-commit validate-config`
+- `pre-commit run check-json --all-files`
+- `pre-commit run pretty-format-yaml --all-files`

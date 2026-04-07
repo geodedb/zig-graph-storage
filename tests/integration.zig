@@ -206,6 +206,8 @@ test "integration: backup and restore round-trip" {
     // Restore
     const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_base});
     defer allocator.free(restore_path);
+    bk.setExpectedGraphUuid(gd.graph_uuid);
+    bk.enableLegacyV1Restore();
     try bk.restoreBackup(backup_path, restore_path);
 
     // Verify restored file

@@ -11,6 +11,18 @@ const GRAPH_IDENTITY_FILE = "graph.uuid";
 /// Configuration for the WAL manager.
 pub const WalConfig = struct {
     encryption_key: ?[32]u8 = null,
+    create_identity_if_missing: bool = true,
+};
+
+pub const ReplayFailureKind = enum {
+    deserialize_failed,
+    checksum_mismatch,
+};
+
+pub const ReplayFailure = struct {
+    artifact: []const u8 = "wal/graph.wal",
+    lsn: u64,
+    kind: ReplayFailureKind,
 };
 
 /// Manages WAL record persistence by delegating append-only storage to the
@@ -36,7 +48,7 @@ pub const WalManager = struct {
         start_lsn: u64,
         config: WalConfig,
     ) !WalManager {
-        try ensureGraphIdentity(wal_dir, graph_uuid);
+        try ensureGraphIdentity(wal_dir, graph_uuid, config.create_identity_if_missing);
 
         const inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, "graph.wal", .{
             .encryption_key = config.encryption_key,
@@ -147,6 +159,50 @@ pub const WalManager = struct {
         }
     }
 
+    /// Strict WAL streaming variant used by recovery and verify.
+    /// Returns an error when a deserialized record fails its payload checksum or
+    /// cannot be decoded, and reports the offending LSN through `failure`.
+    pub fn forEachFromStrict(
+        self: *WalManager,
+        start_lsn: u64,
+        allocator: Allocator,
+        failure: *?ReplayFailure,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), *const WalRecord) anyerror!void,
+    ) !void {
+        failure.* = null;
+
+        const iter_from = if (start_lsn > 0) start_lsn - 1 else 0;
+        var iter = try self.inner.iterator(iter_from);
+        defer iter.deinit();
+
+        while (try iter.next()) |entry_val| {
+            var entry = entry_val;
+            defer entry.deinit();
+
+            const result = WalRecord.deserialize(allocator, entry.payload) catch {
+                failure.* = .{
+                    .lsn = entry.lsn,
+                    .kind = .deserialize_failed,
+                };
+                return error.InvalidFormat;
+            };
+            defer result.record.deinit(allocator);
+
+            if (result.record.checksum != result.record.computeChecksum()) {
+                failure.* = .{
+                    .lsn = result.record.lsn,
+                    .kind = .checksum_mismatch,
+                };
+                return error.ChecksumMismatch;
+            }
+
+            if (result.record.lsn >= start_lsn) {
+                try callback(ctx, &result.record);
+            }
+        }
+    }
+
     /// Truncate WAL: compact entries up to the given LSN.
     pub fn truncate(self: *WalManager, up_to_lsn: u64) !void {
         try self.inner.compact(up_to_lsn);
@@ -163,9 +219,11 @@ pub const WalManager = struct {
     }
 };
 
-fn ensureGraphIdentity(wal_dir: std.fs.Dir, graph_uuid: [16]u8) !void {
+fn ensureGraphIdentity(wal_dir: std.fs.Dir, graph_uuid: [16]u8, create_if_missing: bool) !void {
     const file = wal_dir.openFile(GRAPH_IDENTITY_FILE, .{ .mode = .read_write }) catch |err| switch (err) {
-        error.FileNotFound => blk: {
+        error.FileNotFound => if (!create_if_missing) {
+            return error.FileNotFound;
+        } else blk: {
             const new_file = try wal_dir.createFile(GRAPH_IDENTITY_FILE, .{ .read = true, .mode = 0o600 });
             break :blk new_file;
         },

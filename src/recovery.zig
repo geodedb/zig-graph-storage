@@ -24,6 +24,7 @@ const Checkpointer = checkpoint_mod.Checkpointer;
 const WalRecord = wal_record_mod.WalRecord;
 const WalRecordType = wal_record_mod.WalRecordType;
 const FileId = types.FileId;
+const ReplayFailure = wal_mod.ReplayFailure;
 
 /// Transaction state during recovery.
 const TxnRecoveryState = enum {
@@ -51,12 +52,15 @@ pub const Recovery = struct {
     legacy_policy: config_mod.LegacyPolicy = .reject,
     /// Set to true when recovery opened a V1 graph in read-only mode.
     read_only: bool = false,
+    /// Details about the last fail-closed WAL rejection, when present.
+    last_failure: ?ReplayFailure = null,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
             .allocator = allocator,
             .skipped_checksum_failures = 0,
             .encryption_key = encryption_key,
+            .last_failure = null,
         };
     }
 
@@ -129,12 +133,12 @@ pub const Recovery = struct {
         }
 
         // 2. Open store files
-        _ = try file_manager.openFile(.nodes);
-        _ = try file_manager.openFile(.adj_out);
-        _ = try file_manager.openFile(.adj_in);
-        _ = try file_manager.openFile(.props);
-        _ = try file_manager.openFile(.var_store);
-        _ = try file_manager.openFile(.free);
+        _ = try file_manager.openFile(.nodes, .open_existing);
+        _ = try file_manager.openFile(.adj_out, .open_existing);
+        _ = try file_manager.openFile(.adj_in, .open_existing);
+        _ = try file_manager.openFile(.props, .open_existing);
+        _ = try file_manager.openFile(.var_store, .open_existing);
+        _ = try file_manager.openFile(.free, .open_existing);
 
         // Register pagers with buffer pool
         if (file_manager.getPager(.nodes)) |p| buffer_pool.registerPager(.nodes, p);
@@ -147,9 +151,6 @@ pub const Recovery = struct {
         // 3. Open WAL and read from last_checkpoint_lsn
         const wal_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/wal", .{graph_dir.path});
         defer self.allocator.free(wal_dir_path);
-
-        // Ensure WAL directory exists (propagate errors instead of swallowing)
-        try std.fs.cwd().makePath(wal_dir_path);
 
         var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
         defer wal_dir.close();
@@ -165,8 +166,10 @@ pub const Recovery = struct {
 
         const start_lsn = if (m.last_checkpoint_lsn > 0) m.last_checkpoint_lsn + 1 else 1;
         var saw_records = false;
+        self.last_failure = null;
 
-        // 4. Classify transactions (skip records with checksum failures).
+        // 4. Classify transactions. Any malformed or checksum-invalid record
+        // aborts recovery so the operator can inspect the damaged WAL.
         var txn_states = std.AutoHashMap(u64, TxnRecoveryState).init(self.allocator);
         defer txn_states.deinit();
 
@@ -177,11 +180,6 @@ pub const Recovery = struct {
 
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 ctx.saw_records.* = true;
-
-                if (rec.checksum != rec.computeChecksum()) {
-                    ctx.recovery.skipped_checksum_failures += 1;
-                    return;
-                }
 
                 switch (rec.record_type) {
                     .begin_txn => try ctx.txn_states.put(rec.txn_id, .active),
@@ -197,7 +195,7 @@ pub const Recovery = struct {
             .txn_states = &txn_states,
             .saw_records = &saw_records,
         };
-        try wal.forEachFrom(start_lsn, self.allocator, &classify_ctx, ClassifyCtx.visit);
+        try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &classify_ctx, ClassifyCtx.visit);
 
         if (!saw_records) {
             // Clean recovery: no WAL records to replay
@@ -211,7 +209,6 @@ pub const Recovery = struct {
 
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 if (rec.record_type != .page_update) return;
-                if (rec.checksum != rec.computeChecksum()) return;
 
                 const state = ctx.txn_states.get(rec.txn_id) orelse return;
                 if (state != .committed) return;
@@ -234,7 +231,7 @@ pub const Recovery = struct {
             .txn_states = &txn_states,
             .buffer_pool = buffer_pool,
         };
-        try wal.forEachFrom(start_lsn, self.allocator, &replay_ctx, ReplayCtx.visit);
+        try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &replay_ctx, ReplayCtx.visit);
 
         // 7. Flush buffer pool to disk
         try buffer_pool.flushAll();
@@ -529,7 +526,7 @@ test "GAP-0030: recovery replays a large committed WAL tail" {
     const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
 
     try testing.expect(recovered.counter > initial.counter);
-    try testing.expectEqual(@as(u64, 0), recovery.skipped_checksum_failures);
+    try testing.expect(recovery.last_failure == null);
 }
 
 test "recovery with uncommitted transaction: changes discarded" {
@@ -621,7 +618,7 @@ test "recovery with uncommitted transaction: changes discarded" {
     try testing.expect(!has_uncommitted_data);
 }
 
-test "recovery skips WAL records with corrupted checksums" {
+test "recovery rejects WAL records with corrupted checksums" {
     const allocator = testing.allocator;
     var setup = try setupTestGraph(allocator);
     defer {
@@ -704,10 +701,11 @@ test "recovery skips WAL records with corrupted checksums" {
     defer pool.deinit();
 
     var recovery = Recovery.init(allocator, null);
-    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
-
-    // The corrupted page_update record should have been skipped
-    try testing.expect(recovery.skipped_checksum_failures >= 1);
+    const result = recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectError(error.ChecksumMismatch, result);
+    try testing.expect(recovery.last_failure != null);
+    try testing.expectEqual(@as(u64, 2), recovery.last_failure.?.lsn);
+    try testing.expectEqual(wal_mod.ReplayFailureKind.checksum_mismatch, recovery.last_failure.?.kind);
 }
 
 test "recovery rejects manifest with incompatible format_version" {
@@ -743,10 +741,9 @@ test "recovery rejects manifest with incompatible format_version" {
     try testing.expectError(error.IncompatibleVersion, result);
 }
 
-test "GAP-0005a: torn/truncated WAL record is safely skipped during recovery" {
-    // A truncated record at the end of the WAL should not prevent recovery.
-    // The WAL reader (wal.readFrom) skips unparseable entries via `catch continue`
-    // in the deserialize path, and recovery further skips records with bad checksums.
+test "GAP-0005a: torn/truncated WAL record fails recovery closed" {
+    // A truncated record at the end of the WAL must stop recovery so the
+    // operator can inspect the damaged WAL instead of silently dropping data.
     const allocator = testing.allocator;
     var setup = try setupTestGraph(allocator);
     defer {
@@ -819,7 +816,7 @@ test "GAP-0005a: torn/truncated WAL record is safely skipped during recovery" {
     try wal.sync();
     wal.deinit();
 
-    // Run recovery -- should succeed despite the truncated record
+    // Run recovery -- truncated records must fail recovery closed
     var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
     defer fm.deinit();
 
@@ -827,10 +824,10 @@ test "GAP-0005a: torn/truncated WAL record is safely skipped during recovery" {
     defer pool.deinit();
 
     var recovery_inst = Recovery.init(allocator, null);
-    const recovered = try recovery_inst.recover(&setup.graph_dir, &pool, &fm);
-
-    // Recovery succeeded: counter was incremented (WAL had committed records)
-    try testing.expectEqual(@as(u64, 2), recovered.counter);
+    const result = recovery_inst.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectError(error.InvalidFormat, result);
+    try testing.expect(recovery_inst.last_failure != null);
+    try testing.expectEqual(wal_mod.ReplayFailureKind.deserialize_failed, recovery_inst.last_failure.?.kind);
 }
 
 test "GAP-0005b: manifest A corrupt, B valid -- recovery uses B" {
@@ -1370,7 +1367,7 @@ test "uncommitted transaction not applied during recovery" {
     // If recovery incorrectly replayed the uncommitted txn, the page would
     // contain 0xAA bytes.
     const page_mod = @import("page.zig");
-    _ = try fm.openFile(.nodes);
+    _ = try fm.openFile(.nodes, .create_if_missing);
     pool.registerPager(.nodes, &fm.pagers[@intFromEnum(FileId.nodes)].?);
 
     const frame = try pool.pinNew(.nodes, 1);

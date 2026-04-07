@@ -26,6 +26,11 @@ pub const FILE_NAMES = [FILE_COUNT][]const u8{
     "edges.idx", // edge_idx
 };
 
+pub const OpenMode = enum {
+    open_existing,
+    create_if_missing,
+};
+
 pub const FileManager = struct {
     allocator: Allocator,
     graph_dir: []const u8, // path to graph directory
@@ -44,10 +49,10 @@ pub const FileManager = struct {
         };
     }
 
-    /// Open or create a store file for the given FileId.
-    /// Creates the file if it doesn't exist. Opens for read+write.
-    /// When encryption_key is set, the pager will encrypt/decrypt pages.
-    pub fn openFile(self: *FileManager, file_id: FileId) !*Pager {
+    /// Open a store file for the given FileId.
+    /// Steady-state open paths should use `.open_existing` so missing durable
+    /// artifacts fail closed; bootstrap paths may opt in to `.create_if_missing`.
+    pub fn openFile(self: *FileManager, file_id: FileId, mode: OpenMode) !*Pager {
         const idx = @intFromEnum(file_id);
         if (self.pagers[idx] != null) {
             return &self.pagers[idx].?;
@@ -57,12 +62,14 @@ pub const FileManager = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.graph_dir, FILE_NAMES[idx] });
         defer self.allocator.free(path);
 
-        // Open or create with restricted permissions (owner-only read/write)
-        const file = try std.fs.cwd().createFile(path, .{
-            .read = true,
-            .truncate = false, // don't truncate existing files!
-            .mode = 0o600,
-        });
+        const file = switch (mode) {
+            .open_existing => try std.fs.cwd().openFile(path, .{ .mode = .read_write }),
+            .create_if_missing => try std.fs.cwd().createFile(path, .{
+                .read = true,
+                .truncate = false, // don't truncate existing files!
+                .mode = 0o600,
+            }),
+        };
 
         self.files[idx] = file;
         self.pagers[idx] = .{
@@ -143,11 +150,14 @@ test "open and get pager" {
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const pager_ptr = try fm.openFile(.nodes);
+    const file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
+    file.close();
+
+    const pager_ptr = try fm.openFile(.nodes, .open_existing);
     try testing.expect(pager_ptr.page_size == 4096);
 }
 
-test "file created on disk" {
+test "create_if_missing creates file on disk" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -157,7 +167,7 @@ test "file created on disk" {
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    _ = try fm.openFile(.nodes);
+    _ = try fm.openFile(.nodes, .create_if_missing);
 
     // Verify the file exists in the temp dir
     const stat = tmp.dir.statFile("nodes.store") catch |err| {
@@ -177,9 +187,16 @@ test "multiple files each have their own pager" {
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const nodes_pager = try fm.openFile(.nodes);
-    const adj_out_pager = try fm.openFile(.adj_out);
-    const props_pager = try fm.openFile(.props);
+    const nodes_file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
+    nodes_file.close();
+    const adj_out_file = try tmp.dir.createFile("adj_out.store", .{ .read = true, .truncate = true });
+    adj_out_file.close();
+    const props_file = try tmp.dir.createFile("props.store", .{ .read = true, .truncate = true });
+    props_file.close();
+
+    const nodes_pager = try fm.openFile(.nodes, .open_existing);
+    const adj_out_pager = try fm.openFile(.adj_out, .open_existing);
+    const props_pager = try fm.openFile(.props, .open_existing);
 
     // Each pager should be a distinct pointer
     try testing.expect(@intFromPtr(nodes_pager) != @intFromPtr(adj_out_pager));
@@ -217,7 +234,10 @@ test "write through pager and read back" {
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const pager_ptr = try fm.openFile(.nodes);
+    const file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
+    file.close();
+
+    const pager_ptr = try fm.openFile(.nodes, .open_existing);
 
     // Prepare a page buffer with known data
     var write_buf: [4096]u8 = undefined;
@@ -251,8 +271,13 @@ test "deinit closes files and resets pagers" {
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
 
-    _ = try fm.openFile(.nodes);
-    _ = try fm.openFile(.adj_out);
+    const nodes_file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
+    nodes_file.close();
+    const adj_out_file = try tmp.dir.createFile("adj_out.store", .{ .read = true, .truncate = true });
+    adj_out_file.close();
+
+    _ = try fm.openFile(.nodes, .open_existing);
+    _ = try fm.openFile(.adj_out, .open_existing);
 
     // Verify pagers exist before deinit
     try testing.expect(fm.getPager(.nodes) != null);
@@ -280,8 +305,11 @@ test "openFile is idempotent — returns same pager on second call" {
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const p1 = try fm.openFile(.nodes);
-    const p2 = try fm.openFile(.nodes);
+    const file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
+    file.close();
+
+    const p1 = try fm.openFile(.nodes, .open_existing);
+    const p2 = try fm.openFile(.nodes, .open_existing);
     try testing.expect(p1 == p2);
 }
 
@@ -311,7 +339,7 @@ test "created files have mode 0o600" {
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    _ = try fm.openFile(.nodes);
+    _ = try fm.openFile(.nodes, .create_if_missing);
 
     // Stat the file and check permissions
     const stat = try tmp.dir.statFile("nodes.store");

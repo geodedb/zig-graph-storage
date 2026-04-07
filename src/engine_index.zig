@@ -207,32 +207,31 @@ fn saveEdgeIndex(engine: *GraphEngine, file: *std.fs.File) !void {
 }
 
 fn loadEdgeIndex(engine: *GraphEngine, file: *std.fs.File) !?u64 {
-    var snapshot = (try index_snapshot_mod.loadFile(engine.allocator, file, EDGE_SNAPSHOT_MAGIC)) orelse return null;
-    defer snapshot.deinit();
-
-    const payload = snapshot.payload();
-    var offset: usize = 0;
+    const snapshot = (try index_snapshot_mod.loadHeader(file, EDGE_SNAPSHOT_MAGIC)) orelse return null;
+    try file.seekTo(EDGE_SNAPSHOT_MAGIC.len + 16);
+    var remaining = snapshot.payload_size;
 
     try engine.edge_index.ensureTotalCapacity(@intCast(snapshot.item_count));
 
+    var u32_buf: [4]u8 = undefined;
+    var u64_buf: [8]u8 = undefined;
+
     var i: u64 = 0;
     while (i < snapshot.item_count) : (i += 1) {
-        if (offset + 32 > payload.len) return error.InvalidFormat;
+        try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+        const edge_id = std.mem.readInt(u64, &u64_buf, .little);
 
-        const edge_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
-        offset += 8;
+        try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+        const from = std.mem.readInt(u64, &u64_buf, .little);
 
-        const from = std.mem.readInt(u64, payload[offset..][0..8], .little);
-        offset += 8;
+        try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+        const neighbor = std.mem.readInt(u64, &u64_buf, .little);
 
-        const neighbor = std.mem.readInt(u64, payload[offset..][0..8], .little);
-        offset += 8;
+        try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+        const rel_type = std.mem.readInt(u32, &u32_buf, .little);
 
-        const rel_type = std.mem.readInt(u32, payload[offset..][0..4], .little);
-        offset += 4;
-
-        const prop_head = std.mem.readInt(u32, payload[offset..][0..4], .little);
-        offset += 4;
+        try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+        const prop_head = std.mem.readInt(u32, &u32_buf, .little);
 
         try engine.edge_index.put(edge_id, .{
             .from = from,
@@ -242,6 +241,6 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.fs.File) !?u64 {
         });
     }
 
-    if (offset != payload.len) return error.InvalidFormat;
+    if (remaining != 0) return error.InvalidFormat;
     return snapshot.checkpoint_counter;
 }

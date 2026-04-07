@@ -91,6 +91,7 @@ pub fn loadFreeStore(engine: *GraphEngine) !bool {
     defer file.close();
 
     const stat = try file.stat();
+    if (stat.size == 0) return false;
     const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
     const buf = try engine.allocator.alloc(u8, file_size);
     defer engine.allocator.free(buf);
@@ -180,12 +181,15 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     // WAL directory + WalManager
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{self.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    try std.fs.cwd().makePath(wal_dir_path);
+    if (cfg.allow_create_missing_artifacts) {
+        try std.fs.cwd().makePath(wal_dir_path);
+    }
     self.wal_dir_handle = try std.fs.cwd().openDir(wal_dir_path, .{});
     errdefer self.wal_dir_handle.close();
 
     self.wal = try WalManager.init(allocator, self.wal_dir_handle, graph_uuid, wal_start_lsn, .{
         .encryption_key = cfg.encryption_key,
+        .create_identity_if_missing = cfg.allow_create_missing_artifacts,
     });
     errdefer self.wal.deinit();
 
@@ -225,6 +229,10 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
 /// Run a full checkpoint: update manifest counters, flush dirty pages,
 /// persist free space bitmaps, derived indexes, and label dictionary.
 pub fn checkpoint(engine: *GraphEngine) anyerror!void {
+    if (!engine.persistence_dirty) {
+        return;
+    }
+
     // Update manifest counters before checkpoint
     engine.manifest.next_txn_id = engine.txn_manager.next_txn_id;
     engine.manifest.label_count = engine.label_dict.count();
@@ -252,4 +260,5 @@ pub fn checkpoint(engine: *GraphEngine) anyerror!void {
         engine.metrics.last_checkpoint_duration_ns = t.read();
     }
     engine.metrics.checkpoints_completed += 1;
+    engine.persistence_dirty = false;
 }

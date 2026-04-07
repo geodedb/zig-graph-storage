@@ -44,9 +44,8 @@ graph TD
     subgraph Indexes["Indexing"]
         LI["LabelIndex<br/><i>label_index.zig</i>"]
         PCI["PropertyChainIndex<br/><i>property_chain_index.zig</i>"]
-        PI["PropertyIndex<br/><i>property_index.zig</i>"]
-        IC["IndexCatalog<br/><i>index_catalog.zig</i>"]
-        BT["BPlusTree<br/><i>btree.zig</i>"]
+        SNAP["Index Snapshots<br/><i>index_snapshot.zig</i>"]
+        BT["BPlusTree Helpers<br/><i>btree.zig</i>"]
     end
 
     subgraph Txn["Transactions"]
@@ -70,7 +69,7 @@ graph TD
     GE --> NS & AO & AI & PS & VS & LS & LD
     GE --> BP & FM & FSM
     GE --> WM & CK & MN & RC
-    GE --> LI & PI & IC
+    GE --> LI & PCI & SNAP
     GE --> TM
     GE --> EN & ME
     GE --> BK & MT & MG
@@ -226,11 +225,12 @@ flowchart TD
     J --> K["Scan WAL: classify BEGIN/COMMIT/ABORT"]
     K --> L["Build set of committed TxnIds"]
     L --> M["Replay page_update records<br/>for committed transactions only"]
-    M --> N["Discard records for<br/>uncommitted transactions"]
-    N --> O["Flush BufferPool to disk"]
-    O --> P["Write fresh checkpoint<br/>(new manifest + WAL truncate)"]
-    P --> Q["Rebuild LabelIndex from LabelStore"]
-    Q --> R["Load IndexCatalog"]
+    M --> N{"Decode / checksum error?"}
+    N -->|"Yes"| X["Abort open and report WAL failure"]
+    N -->|"No"| O["Discard records for<br/>uncommitted transactions"]
+    O --> P["Flush BufferPool to disk"]
+    P --> Q["Write fresh checkpoint<br/>(new manifest + WAL truncate)"]
+    Q --> R["Load or rebuild derived snapshots<br/>(labels.idx / props.idx / edges.idx)"]
     R --> S["Engine ready for queries"]
 ```
 
@@ -406,11 +406,11 @@ When an encryption key is configured, page I/O is transparently encrypted.
 ```mermaid
 flowchart LR
     subgraph Write["Write Path"]
-        WP["Page data"] --> WE["AES-256-CTR<br/>encrypt"] --> WC["Compute<br/>checksum"] --> WD["Write to disk"]
+        WP["Page data"] --> WE["AES-256-GCM<br/>encrypt"] --> WC["Compute<br/>checksum"] --> WD["Write to disk"]
     end
 
     subgraph Read["Read Path"]
-        RD["Read from disk"] --> RC["Verify<br/>checksum"] --> RE["AES-256-CTR<br/>decrypt"] --> RP["Page data"]
+        RD["Read from disk"] --> RC["Verify<br/>checksum"] --> RE["AES-256-GCM<br/>decrypt"] --> RP["Page data"]
     end
 ```
 
@@ -460,24 +460,12 @@ fast exact-match property lookups without requiring a B+tree on disk.
 Snapshots are persisted to `props.idx` at checkpoint boundaries for faster
 warm restarts.
 
-### PropertyIndex (B+tree)
+### Experimental Secondary-Index Modules
 
-Optional persistent secondary indexes on property values backed by the
-in-memory B+tree (`btree.zig`). Maps `hash(value)` to `NodeId` and supports
-exact-match and range queries.
-
-```mermaid
-graph TD
-    IC["IndexCatalog<br/>(persistent metadata)"]
-    IC -->|"btree_property"| PI["PropertyIndex<br/>B+tree pages"]
-    IC -->|"chain_index"| PCI["PropertyChainIndex<br/>in-memory hash index"]
-    IC -->|"label_posting"| LI["LabelIndex<br/>in-memory posting lists<br/>+ snapshot persistence"]
-
-    PI --> BT["BPlusTree<br/>internal + leaf pages"]
-    BT --> Disk["btree_internal / btree_leaf<br/>page types on disk"]
-```
-
-Index states: `building` -> `active` -> `inactive` / `failed`.
+`property_index.zig`, `index_catalog.zig`, and `btree.zig` remain available as
+standalone building blocks, but they are not part of the current
+`GraphEngine.open()` / query / checkpoint hot path. The live runtime topology
+uses `LabelIndex`, `PropertyChainIndex`, and persisted snapshot files instead.
 
 ---
 
@@ -495,7 +483,7 @@ Index states: `building` -> `active` -> `inactive` / `failed`.
 | WalManager (segmented WAL) | FR-011 (segmented WAL per graph) | storage-research.md §"WAL integration risks" |
 | TxnManager (real txn IDs) | FR-012 (transaction boundaries) | storage-research.md §"WAL integration risks" |
 | Checkpointer (incremental) | FR-013 (incremental checkpoint) | storage-research.md §"Checkpoint cost" |
-| LabelIndex + PropertyChainIndex + PropertyIndex | FR-018+ (index support) | storage-research.md §"LMDB COW B+tree" |
+| LabelIndex + PropertyChainIndex + snapshot persistence | FR-018+ (index support) | storage-research.md §"LMDB COW B+tree" |
 
 ---
 

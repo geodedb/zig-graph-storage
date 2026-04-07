@@ -18,11 +18,12 @@
 //!   with per-transaction isolation.
 //! - **Checkpoint and recovery** (`checkpoint`, `recovery`) — incremental
 //!   checkpoint with A/B manifest switching and crash recovery via WAL replay.
-//! - **Indexing** (`label_index`, `btree`, `property_index`, `index_catalog`) —
-//!   label posting lists, generic B+tree, composite property indexes, and a
-//!   persistent catalog.
+//! - **Indexing** (`label_index`, `property_chain_index`, `index_snapshot`) —
+//!   label posting lists, persisted derived snapshots, and the in-memory
+//!   property-chain digest index used by the runtime engine. Experimental
+//!   B+tree helpers remain available as standalone modules.
 //! - **Encryption and integrity** (`encryption`, `integrity`, `verify`) —
-//!   optional AES-256-CTR page encryption, CRC32C checksums, and full-store
+//!   optional AES-256-GCM page encryption, CRC32C checksums, and full-store
 //!   verification.
 //! - **Migration and operations** (`migration`, `backup`, `maintenance`) —
 //!   legacy format detection, per-graph backup/restore, and administrative

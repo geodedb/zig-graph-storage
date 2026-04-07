@@ -172,47 +172,8 @@ pub const NodeStore = struct {
 // ============================================================================
 
 const testing = std.testing;
-const pager_mod = @import("pager.zig");
-const Pager = pager_mod.Pager;
-
-const TestEnv = struct {
-    pool: BufferPool,
-    fsm: FreeSpaceManager,
-    tmp_dir: testing.TmpDir,
-    node_file: std.fs.File,
-    node_pager: Pager,
-
-    /// Two-phase init: call init(), then fixup() on the result.
-    fn init() !TestEnv {
-        var tmp_dir = testing.tmpDir(.{});
-        const node_file = tmp_dir.dir.createFile("nodes.store", .{ .read = true, .truncate = true }) catch unreachable;
-        var pool = try BufferPool.init(testing.allocator, 4096, 16);
-        // FreeSpaceManager.init only stores the pointer; buffer_pool is not used during init.
-        // We pass &pool here but must fixup after the struct is placed on the caller's stack.
-        const fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
-
-        return .{
-            .pool = pool,
-            .fsm = fsm,
-            .tmp_dir = tmp_dir,
-            .node_file = node_file,
-            .node_pager = Pager.init(node_file, 4096),
-        };
-    }
-
-    /// Fix internal pointers after struct is placed on caller's stack.
-    fn fixup(self: *TestEnv) void {
-        self.pool.registerPager(.nodes, &self.node_pager);
-        self.fsm.buffer_pool = &self.pool;
-    }
-
-    fn deinit(self: *TestEnv) void {
-        self.fsm.deinit();
-        self.pool.deinit();
-        self.node_file.close();
-        self.tmp_dir.cleanup();
-    }
-};
+const testing_support_mod = @import("testing_support.zig");
+const SingleStoreEnv = testing_support_mod.SingleStoreEnv;
 
 fn makeTestNode(_: u32) NodeRec {
     return NodeRec{
@@ -228,8 +189,8 @@ fn makeTestNode(_: u32) NodeRec {
 }
 
 test "putNode + getNode round-trip" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
@@ -244,8 +205,8 @@ test "putNode + getNode round-trip" {
 }
 
 test "getNode on empty slot returns null" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
@@ -255,8 +216,8 @@ test "getNode on empty slot returns null" {
 }
 
 test "deleteNode sets DELETED flag, getNode returns null" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
@@ -270,8 +231,8 @@ test "deleteNode sets DELETED flag, getNode returns null" {
 }
 
 test "multiple nodes on same page" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
@@ -290,8 +251,8 @@ test "multiple nodes on same page" {
 }
 
 test "nodes across multiple pages" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
@@ -312,20 +273,11 @@ test "nodes across multiple pages" {
 }
 
 test "scanNodes visits all live nodes across multiple pages" {
-    // Use a larger buffer pool since we need many pages for 500+ nodes.
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const node_file = tmp_dir.dir.createFile("nodes.store", .{ .read = true, .truncate = true }) catch unreachable;
-    defer node_file.close();
-    var pool = try BufferPool.init(testing.allocator, 4096, 64);
-    defer pool.deinit();
-    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
-    defer fsm.deinit();
-    var node_pager = Pager.init(node_file, 4096);
-    pool.registerPager(.nodes, &node_pager);
-    fsm.buffer_pool = &pool;
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 64);
+    env.register();
+    defer env.deinit();
 
-    var store = NodeStore.init(&pool, &fsm, 4096);
+    var store = NodeStore.init(&env.pool, &env.fsm, 4096);
 
     // nodes_per_page = 84 for 4096-byte pages.
     // 500 nodes spans 5 pages (pages 0..4).
@@ -362,8 +314,8 @@ test "scanNodes visits all live nodes across multiple pages" {
 }
 
 test "scanNodes with zero max_node_id is a no-op" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
@@ -380,8 +332,8 @@ test "scanNodes with zero max_node_id is a no-op" {
 }
 
 test "scanNodes skips unallocated pages" {
-    var env = try TestEnv.init();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);

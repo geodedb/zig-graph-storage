@@ -100,5 +100,7 @@ test "fuzz regression: backup restore rejects path traversal filenames" {
     try file.writeAll(&buf);
 
     var backup = Backup.init(allocator);
+    backup.setExpectedGraphUuid([_]u8{0x42} ** 16);
+    backup.enableLegacyV1Restore();
     try std.testing.expectError(error.InvalidBackupFilename, backup.restoreBackup(backup_path, restore_path));
 }

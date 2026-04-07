@@ -34,7 +34,9 @@ Each file is a JSON document with version, timestamp, system info, and per-tier 
 
 ## Naming Convention
 
-- `baseline.json` -- the current accepted performance baseline
+- `ci-baseline.json` -- authoritative merge-request and default-branch smoke baseline (`1K`)
+- `ci-10k-baseline.json` -- authoritative scheduled/manual larger-tier baseline (`1K` + `10K`)
+- `baseline.json` -- local exploratory multi-tier baseline, not the CI source of truth
 - `<short-sha>.json` -- results saved per commit via `make bench-save`
 
 ## Usage
@@ -42,6 +44,8 @@ Each file is a JSON document with version, timestamp, system info, and per-tier 
 ```bash
 make scale-bench       # Run benchmark, print results
 make bench-save        # Run and save to results/<sha>.json
-make bench-baseline    # Run and save as baseline
-make bench-compare     # Run and compare against baseline
+make bench-baseline    # Save the 1K CI smoke baseline
+make bench-compare     # Compare the 1K CI smoke gate
+make bench-baseline-10k  # Save the scheduled/manual 10K CI baseline
+make bench-compare-10k   # Compare the scheduled/manual 10K CI gate
 ```

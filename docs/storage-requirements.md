@@ -1,17 +1,17 @@
 # Executive Summary
 
-* Confirmed from input: the current implementation persists an in-memory graph built around hash maps and adjacency lists, with durability achieved through full snapshot rewrites; per-graph files exist, but graph state is still duplicated/co-mingled in memory and WAL semantics are not yet fully transactional. 
+* Confirmed from input: the current implementation persists an in-memory graph built around hash maps and adjacency lists, with durability achieved through full snapshot rewrites; per-graph files exist, but graph state is still duplicated/co-mingled in memory and WAL semantics are not yet fully transactional.
 * Goal: implement a per-graph, disk-resident storage engine that uses a page store, buffer pool, transactional WAL, incremental checkpointing, and locality-friendly adjacency storage.
 * Target users: storage/runtime engineers, query/indexing engineers, database operators/SREs, and enterprise users who need graph-level backup, restore, portability, and bounded restart behavior.
 * Key scope guardrail: cross-graph queries remain out of scope by design; a single graph directory is the unit of storage, backup, restore, migration, and operational isolation.
 * Biggest assumption: the file’s recommended “Option B” is the intended target architecture, with an initial bridge phase to introduce a `GraphStorage` abstraction and remove legacy global-map dependencies.
-* Recommended delivery shape: phase the work into storage isolation, page-store foundation, WAL/recovery, core indexes, migration/tooling, and benchmark-driven hardening. Specialist Review Needed: pager/WAL/recovery design should receive independent database-internals review before enterprise durability claims are made. 
+* Recommended delivery shape: phase the work into storage isolation, page-store foundation, WAL/recovery, core indexes, migration/tooling, and benchmark-driven hardening. Specialist Review Needed: pager/WAL/recovery design should receive independent database-internals review before enterprise durability claims are made.
 
 # Requirements Specification
 
 ## Problem Statement
 
-Confirmed from input: the current storage layer is optimized around in-memory hash maps and full-file snapshots, while the docs describe a page-based engine that is not reflected in the actual persistence path. This creates a mismatch between product claims and implementation, and it introduces bottlenecks in traversal locality, checkpoint cost, restart behavior, graph isolation, and operational portability. Proposed interpretation for implementation: replace the current authoritative persistence path with the file’s recommended per-graph page-store architecture, while preserving existing logical graph semantics and keeping cross-graph querying out of scope. 
+Confirmed from input: the current storage layer is optimized around in-memory hash maps and full-file snapshots, while the docs describe a page-based engine that is not reflected in the actual persistence path. This creates a mismatch between product claims and implementation, and it introduces bottlenecks in traversal locality, checkpoint cost, restart behavior, graph isolation, and operational portability. Proposed interpretation for implementation: replace the current authoritative persistence path with the file’s recommended per-graph page-store architecture, while preserving existing logical graph semantics and keeping cross-graph querying out of scope.
 
 ## Objectives
 
@@ -599,7 +599,7 @@ Confirmed from input: the current storage layer is optimized around in-memory ha
 
 ## Recommended Approach
 
-Implement the file’s recommended target architecture as the end state: per-graph directories, versioned manifests, pager/buffer pool, fixed-record node store, adjacency stores, slotted-page property storage, segmented WAL, and dirty-page checkpoints. Use a narrow bridge first: introduce a `GraphStorage` abstraction, route all execution/admin access through it, and remove global-map backfill before cutting over the durable backend. Deliver label posting lists and opt-in B+tree property indexes first; treat full-text, vector, and spatial indexes as modular follow-on work rather than blockers to core storage delivery. 
+Implement the file’s recommended target architecture as the end state: per-graph directories, versioned manifests, pager/buffer pool, fixed-record node store, adjacency stores, slotted-page property storage, segmented WAL, and dirty-page checkpoints. Use a narrow bridge first: introduce a `GraphStorage` abstraction, route all execution/admin access through it, and remove global-map backfill before cutting over the durable backend. Deliver label posting lists and opt-in B+tree property indexes first; treat full-text, vector, and spatial indexes as modular follow-on work rather than blockers to core storage delivery.
 
 ## Architecture / Components
 
@@ -842,7 +842,7 @@ Estimates are relative: S, M, L, XL.
 * Keep legacy backups and documented rollback procedures until cutover is accepted for each graph.
 * Rehearse restore-from-backup and rollback before broad rollout.
 * Publish operator documentation for upgrade, restore, rebuild, verify, and encryption-key handling.
-* Staff support readiness with dashboards, alert thresholds, and named owners for storage, runtime, and operations. 
+* Staff support readiness with dashboards, alert thresholds, and named owners for storage, runtime, and operations.
 
 ## Definition of Done
 
@@ -865,4 +865,3 @@ Estimates are relative: S, M, L, XL.
 4. Start Phase 1 refactoring to remove direct executor/admin dependence on legacy global maps.
 5. Build the migration fixtures and benchmark corpus from current `graph_store.dat` and per-graph `.dat` samples.
 6. Prototype the transaction-integrated WAL + checkpoint + recovery loop before broader implementation proceeds.
-

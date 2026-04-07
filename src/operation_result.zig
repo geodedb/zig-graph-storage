@@ -28,6 +28,48 @@ pub const OperationStatus = enum {
     }
 };
 
+pub const OperationArtifactStatus = enum {
+    ok,
+    warning,
+    blocked,
+    missing,
+    invalid,
+
+    pub fn label(self: OperationArtifactStatus) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const OperationArtifact = struct {
+    name: []const u8,
+    status: OperationArtifactStatus,
+    items_checked: u64 = 0,
+    bytes_checked: u64 = 0,
+    issue_count: u64 = 0,
+
+    pub fn writeJson(self: *const OperationArtifact, writer: anytype) !void {
+        try writer.print(
+            "{{\"name\":\"{s}\",\"status\":\"{s}\",\"items_checked\":{d},\"bytes_checked\":{d},\"issue_count\":{d}}}",
+            .{
+                self.name,
+                self.status.label(),
+                self.items_checked,
+                self.bytes_checked,
+                self.issue_count,
+            },
+        );
+    }
+};
+
+pub fn writeArtifactsJson(writer: anytype, artifacts: []const OperationArtifact) !void {
+    try writer.writeByte('[');
+    for (artifacts, 0..) |artifact, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try artifact.writeJson(writer);
+    }
+    try writer.writeByte(']');
+}
+
 pub const GraphOperationSummary = struct {
     operation: OperationKind,
     status: OperationStatus = .ok,

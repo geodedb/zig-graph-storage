@@ -180,25 +180,24 @@ pub const LabelIndex = struct {
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
     pub fn loadFromFile(self: *LabelIndex, file: *std.fs.File) !?u64 {
-        var snapshot = (try index_snapshot_mod.loadFile(self.allocator, file, SNAPSHOT_MAGIC)) orelse return null;
-        defer snapshot.deinit();
+        const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC)) orelse return null;
 
         self.clear();
         errdefer self.clear();
 
-        const payload = snapshot.payload();
-        var offset: usize = 0;
+        try file.seekTo(SNAPSHOT_MAGIC.len + 16);
+        var remaining = snapshot.payload_size;
 
         var i: u64 = 0;
         const label_count = snapshot.item_count;
+        var u32_buf: [4]u8 = undefined;
+        var u64_buf: [8]u8 = undefined;
         while (i < label_count) : (i += 1) {
-            if (offset + 12 > payload.len) return error.InvalidFormat;
+            try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+            const label_id = std.mem.readInt(u32, &u32_buf, .little);
 
-            const label_id = std.mem.readInt(u32, payload[offset..][0..4], .little);
-            offset += 4;
-
-            const node_count = std.mem.readInt(u64, payload[offset..][0..8], .little);
-            offset += 8;
+            try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+            const node_count = std.mem.readInt(u64, &u64_buf, .little);
 
             const gop = try self.index.getOrPut(label_id);
             if (!gop.found_existing) {
@@ -209,14 +208,13 @@ pub const LabelIndex = struct {
 
             var j: u64 = 0;
             while (j < node_count) : (j += 1) {
-                if (offset + 8 > payload.len) return error.InvalidFormat;
-                const node_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
-                offset += 8;
+                try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+                const node_id = std.mem.readInt(u64, &u64_buf, .little);
                 gop.value_ptr.appendAssumeCapacity(node_id);
             }
         }
 
-        if (offset != payload.len) return error.InvalidFormat;
+        if (remaining != 0) return error.InvalidFormat;
         return snapshot.checkpoint_counter;
     }
 
@@ -233,46 +231,12 @@ pub const LabelIndex = struct {
 // ============================================================================
 
 const testing = std.testing;
-const pager_mod = @import("pager.zig");
-const Pager = pager_mod.Pager;
-
-const TestEnv = struct {
-    pool: BufferPool,
-    fsm: FreeSpaceManager,
-    tmp_dir: testing.TmpDir,
-    node_file: std.fs.File,
-    node_pager: Pager,
-
-    fn create() !TestEnv {
-        var tmp_dir = testing.tmpDir(.{});
-        const node_file = tmp_dir.dir.createFile("nodes.store", .{ .read = true, .truncate = true }) catch unreachable;
-        var pool = try BufferPool.init(testing.allocator, 4096, 16);
-        const fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
-        return .{
-            .pool = pool,
-            .fsm = fsm,
-            .tmp_dir = tmp_dir,
-            .node_file = node_file,
-            .node_pager = Pager.init(node_file, 4096),
-        };
-    }
-
-    fn fixup(self: *TestEnv) void {
-        self.pool.registerPager(.nodes, &self.node_pager);
-        self.fsm.buffer_pool = &self.pool;
-    }
-
-    fn deinit(self: *TestEnv) void {
-        self.fsm.deinit();
-        self.pool.deinit();
-        self.node_file.close();
-        self.tmp_dir.cleanup();
-    }
-};
+const testing_support_mod = @import("testing_support.zig");
+const SingleStoreEnv = testing_support_mod.SingleStoreEnv;
 
 test "addNode + scan returns the node" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
@@ -290,8 +254,8 @@ test "addNode + scan returns the node" {
 }
 
 test "removeNode + scan excludes the node" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
@@ -312,8 +276,8 @@ test "removeNode + scan excludes the node" {
 }
 
 test "large label — add 1000 nodes, scan returns all" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
@@ -336,8 +300,8 @@ test "large label — add 1000 nodes, scan returns all" {
 }
 
 test "saveToFile + loadFromFile round-trip preserves posting lists" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
@@ -369,8 +333,8 @@ test "saveToFile + loadFromFile round-trip preserves posting lists" {
 }
 
 test "count returns correct value" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
@@ -389,8 +353,8 @@ test "count returns correct value" {
 }
 
 test "addNode deduplication" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
@@ -403,8 +367,8 @@ test "addNode deduplication" {
 }
 
 test "scan on unknown label returns empty slice" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
@@ -417,8 +381,8 @@ test "scan on unknown label returns empty slice" {
 }
 
 test "rebuild from node store" {
-    var env = try TestEnv.create();
-    env.fixup();
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
     defer env.deinit();
 
     var store = NodeStore.init(&env.pool, &env.fsm, 4096);
