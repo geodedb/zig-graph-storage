@@ -179,6 +179,27 @@ pub fn saveDerivedIndexes(engine: *GraphEngine) !void {
     try saveEdgeIndex(engine, edge_file);
 }
 
+/// Save only the derived index snapshots whose dirty flag is set.
+pub fn saveDerivedIndexesConditional(
+    engine: *GraphEngine,
+    label_dirty: bool,
+    property_dirty: bool,
+    edge_dirty: bool,
+) !void {
+    if (label_dirty) {
+        const label_file = engine.file_manager.getFile(.label_idx) orelse return error.LabelIndexFileNotOpen;
+        try engine.label_index.saveToFile(label_file, engine.manifest.counter);
+    }
+    if (property_dirty) {
+        const prop_file = engine.file_manager.getFile(.prop_idx) orelse return error.PropertyIndexFileNotOpen;
+        try engine.property_index.saveToFile(prop_file, engine.manifest.counter);
+    }
+    if (edge_dirty) {
+        const edge_file = engine.file_manager.getFile(.edge_idx) orelse return error.EdgeIndexFileNotOpen;
+        try saveEdgeIndex(engine, edge_file);
+    }
+}
+
 fn saveEdgeIndex(engine: *GraphEngine, file: *std.fs.File) !void {
     try file.setEndPos(0);
     try file.seekTo(0);

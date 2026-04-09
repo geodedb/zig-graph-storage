@@ -253,7 +253,15 @@ pub fn checkpoint(engine: *GraphEngine) anyerror!void {
 
     // Persist free space bitmaps so freed pages survive restart.
     try saveFreeStore(engine);
-    try engine_index.saveDerivedIndexes(engine);
+    try engine_index.saveDerivedIndexesConditional(
+        engine,
+        engine.label_index_dirty,
+        engine.property_index_dirty,
+        engine.edge_index_dirty,
+    );
+    engine.label_index_dirty = false;
+    engine.property_index_dirty = false;
+    engine.edge_index_dirty = false;
     try saveLabelDictionary(engine);
 
     if (timer) |*t| {

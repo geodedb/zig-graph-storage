@@ -107,6 +107,9 @@ pub const GraphEngine = struct {
     metrics: Metrics = .{},
     read_only: bool = false,
     persistence_dirty: bool = false,
+    label_index_dirty: bool = true,
+    property_index_dirty: bool = true,
+    edge_index_dirty: bool = true,
 
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
@@ -118,6 +121,9 @@ pub const GraphEngine = struct {
         self.graph_uuid = graph_uuid;
         self.read_only = false;
         self.persistence_dirty = false;
+        self.label_index_dirty = true;
+        self.property_index_dirty = true;
+        self.edge_index_dirty = true;
 
         // 1. Create graph directory
         self.graph_dir = try GraphDir.create(allocator, data_dir, graph_uuid);
@@ -189,6 +195,9 @@ pub const GraphEngine = struct {
         self.graph_uuid = graph_uuid;
         self.read_only = false;
         self.persistence_dirty = false;
+        self.label_index_dirty = false;
+        self.property_index_dirty = false;
+        self.edge_index_dirty = false;
 
         // 1. Open graph directory
         self.graph_dir = try GraphDir.open(allocator, data_dir, graph_uuid);
@@ -262,6 +271,11 @@ pub const GraphEngine = struct {
         const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
         if (!loaded_indexes) {
             try self.rebuildDerivedIndexes();
+            // Rebuilt indexes differ from disk snapshots; mark dirty so the
+            // next checkpoint writes them.
+            self.label_index_dirty = true;
+            self.property_index_dirty = true;
+            self.edge_index_dirty = true;
         }
 
         // 8. Wire metrics and thread pool into buffer pool
@@ -341,6 +355,7 @@ pub const GraphEngine = struct {
         var iter = self.prop_store.getAllProperties(prop_head);
         defer iter.deinit();
         try self.property_index.refreshFromIterator(prop_head, &iter);
+        self.property_index_dirty = true;
     }
 
     fn rebuildDerivedIndexes(self: *GraphEngine) !void {
@@ -629,6 +644,7 @@ pub const GraphEngine = struct {
             .rel_type = rel_type,
             .prop_head = 0,
         });
+        self.edge_index_dirty = true;
 
         self.manifest.edge_count += 1;
         self.metrics.edges_created += 1;
@@ -666,6 +682,7 @@ pub const GraphEngine = struct {
 
         // Remove from in-memory edge index
         _ = self.edge_index.remove(edge_id);
+        self.edge_index_dirty = true;
 
         if (self.manifest.edge_count > 0) {
             self.manifest.edge_count -= 1;
@@ -707,11 +724,13 @@ pub const GraphEngine = struct {
 
         if (owner != 0 and owner != new_head) {
             self.property_index.removeChain(owner);
+            self.property_index_dirty = true;
         }
         var encoded_buf = try property_indexEncodedValue(self.allocator, val);
         defer encoded_buf.deinit(self.allocator);
         if (owner != 0 and new_head == owner and self.property_index.containsChain(owner)) {
             try self.property_index.upsertKey(owner, key, encoded_buf.items);
+            self.property_index_dirty = true;
         } else {
             try self.refreshPropertyChainIndex(new_head);
         }
@@ -747,6 +766,7 @@ pub const GraphEngine = struct {
 
         if (owner != 0 and self.property_index.containsChain(owner)) {
             self.property_index.removeKey(owner, key);
+            self.property_index_dirty = true;
         } else {
             try self.refreshPropertyChainIndex(owner);
         }
@@ -768,6 +788,7 @@ pub const GraphEngine = struct {
             try self.logPage(txn, .nodes, self.nodePageId(node_id));
         }
         try self.label_index.addNode(label, node_id);
+        self.label_index_dirty = true;
         self.markDirty();
     }
 
@@ -790,6 +811,7 @@ pub const GraphEngine = struct {
         rec.label_count = result.count;
         try self.node_store.putNode(node_id, rec);
         self.label_index.removeNode(label, node_id);
+        self.label_index_dirty = true;
 
         // Log dirty pages: var_store page (if any) and node page
         if (result.head != 0) try self.logPage(txn, .var_store, result.head);
