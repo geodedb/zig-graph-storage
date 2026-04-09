@@ -562,6 +562,7 @@ fn wrapPropIterator(comptime RealIter: type, concrete_iter: RealIter, allocator:
 pub fn wrapPropIteratorView(comptime RealIter: type, concrete_iter: RealIter, allocator: Allocator) anyerror!PropertyIteratorView {
     const State = struct {
         iter: RealIter,
+        alloc: Allocator,
 
         fn next(vp: *anyopaque) anyerror!?PropertyEntryView {
             const self: *@This() = @ptrCast(@alignCast(vp));
@@ -578,11 +579,12 @@ pub fn wrapPropIteratorView(comptime RealIter: type, concrete_iter: RealIter, al
         fn deinit(vp: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(vp));
             self.iter.deinit();
+            self.alloc.destroy(self);
         }
     };
 
     const state = try allocator.create(State);
-    state.* = .{ .iter = concrete_iter };
+    state.* = .{ .iter = concrete_iter, .alloc = allocator };
 
     return PropertyIteratorView{
         .ptr = @ptrCast(state),
