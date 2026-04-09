@@ -162,6 +162,74 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !DecodeResult {
     }
 }
 
+/// Zero-copy decode: string and ext slices borrow directly from `bytes`.
+/// Caller must ensure `bytes` remains valid for the lifetime of the returned value.
+/// No allocator needed — no heap allocation occurs.
+pub fn decodeView(bytes: []const u8) error{ UnexpectedEndOfInput, InvalidFormat }!DecodeResult {
+    if (bytes.len < 1) return error.UnexpectedEndOfInput;
+
+    const tag: Tag = std.meta.intToEnum(Tag, bytes[0]) catch return error.InvalidFormat;
+
+    switch (tag) {
+        .null => {
+            return DecodeResult{ .value = PropertyValue.null, .bytes_read = 1 };
+        },
+        .bool => {
+            if (bytes.len < 2) return error.UnexpectedEndOfInput;
+            return DecodeResult{
+                .value = PropertyValue{ .bool = bytes[1] != 0 },
+                .bytes_read = 2,
+            };
+        },
+        .int => {
+            if (bytes.len < 9) return error.UnexpectedEndOfInput;
+            const v = std.mem.littleToNative(i64, @bitCast(bytes[1..9].*));
+            return DecodeResult{
+                .value = PropertyValue{ .int = v },
+                .bytes_read = 9,
+            };
+        },
+        .float => {
+            if (bytes.len < 9) return error.UnexpectedEndOfInput;
+            const v: f64 = @bitCast(std.mem.littleToNative(u64, @bitCast(bytes[1..9].*)));
+            return DecodeResult{
+                .value = PropertyValue{ .float = v },
+                .bytes_read = 9,
+            };
+        },
+        .string => {
+            if (bytes.len < 5) return error.UnexpectedEndOfInput;
+            const len = std.mem.littleToNative(u32, @bitCast(bytes[1..5].*));
+            const total = 5 + @as(usize, len);
+            if (bytes.len < total) return error.UnexpectedEndOfInput;
+            return DecodeResult{
+                .value = PropertyValue{ .string = bytes[5..total] },
+                .bytes_read = total,
+            };
+        },
+        .decimal => {
+            if (bytes.len < 18) return error.UnexpectedEndOfInput;
+            const coeff = std.mem.littleToNative(i128, @bitCast(bytes[1..17].*));
+            const scale = bytes[17];
+            return DecodeResult{
+                .value = PropertyValue{ .decimal = .{ .coeff = coeff, .scale = scale } },
+                .bytes_read = 18,
+            };
+        },
+        .ext => {
+            if (bytes.len < 7) return error.UnexpectedEndOfInput;
+            const type_tag = std.mem.littleToNative(u16, @bitCast(bytes[1..3].*));
+            const data_len = std.mem.littleToNative(u32, @bitCast(bytes[3..7].*));
+            const total = 7 + @as(usize, data_len);
+            if (bytes.len < total) return error.UnexpectedEndOfInput;
+            return DecodeResult{
+                .value = PropertyValue{ .ext = .{ .type_tag = type_tag, .data = bytes[7..total] } },
+                .bytes_read = total,
+            };
+        },
+    }
+}
+
 /// Free the allocator-owned memory inside a decoded PropertyValue.
 pub fn freeDecoded(allocator: Allocator, value: PropertyValue) void {
     switch (value) {
