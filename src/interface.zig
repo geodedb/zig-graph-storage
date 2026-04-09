@@ -25,6 +25,13 @@ pub const PropertyEntry = struct {
     value: PropertyValue,
 };
 
+/// Property entry with values that borrow from pinned page memory.
+/// Valid only while the underlying page frame is pinned (until next next() or deinit()).
+pub const PropertyEntryView = struct {
+    key: []const u8,
+    value: PropertyValue,
+};
+
 pub const EdgeIterator = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -75,6 +82,27 @@ pub const PropertyIterator = struct {
     }
 
     pub fn deinit(self: PropertyIterator) void {
+        self.vtable.deinit(self.ptr);
+    }
+};
+
+/// Like PropertyIterator but yields zero-copy values.
+/// String/ext slices borrow from pinned page memory — valid only until
+/// the next next() call or deinit().
+pub const PropertyIteratorView = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        next: *const fn (ptr: *anyopaque) anyerror!?PropertyEntryView,
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn next(self: PropertyIteratorView) anyerror!?PropertyEntryView {
+        return self.vtable.next(self.ptr);
+    }
+
+    pub fn deinit(self: PropertyIteratorView) void {
         self.vtable.deinit(self.ptr);
     }
 };
@@ -520,6 +548,43 @@ fn wrapPropIterator(comptime RealIter: type, concrete_iter: RealIter, allocator:
     };
 
     return PropertyIterator{
+        .ptr = @ptrCast(state),
+        .vtable = &.{
+            .next = State.next,
+            .deinit = State.deinit,
+        },
+    };
+}
+
+/// Wrap a concrete PropIterator into a type-erased PropertyIteratorView.
+/// Uses decodeView for zero-copy property decoding — string/ext slices
+/// borrow directly from pinned page memory.
+pub fn wrapPropIteratorView(comptime RealIter: type, concrete_iter: RealIter, allocator: Allocator) anyerror!PropertyIteratorView {
+    const State = struct {
+        iter: RealIter,
+
+        fn next(vp: *anyopaque) anyerror!?PropertyEntryView {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            if (try self.iter.next()) |slice| {
+                const val = try property_mod.decodeView(slice.encoded_value);
+                return PropertyEntryView{
+                    .key = slice.key,
+                    .value = val.value,
+                };
+            }
+            return null;
+        }
+
+        fn deinit(vp: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(vp));
+            self.iter.deinit();
+        }
+    };
+
+    const state = try allocator.create(State);
+    state.* = .{ .iter = concrete_iter };
+
+    return PropertyIteratorView{
         .ptr = @ptrCast(state),
         .vtable = &.{
             .next = State.next,
