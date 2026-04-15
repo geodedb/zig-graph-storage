@@ -20,7 +20,7 @@ pub const GraphRegistry = struct {
     allocator: Allocator,
     next_node_id: u64 = 1,
     next_edge_id: u64 = 1,
-    entries: std.ArrayList(GraphEntry) = .{},
+    entries: std.ArrayList(GraphEntry) = .{ .items = &.{}, .capacity = 0, .allocator = undefined },
 
     pub fn init(allocator: Allocator) GraphRegistry {
         return .{
@@ -85,7 +85,7 @@ pub const GraphRegistry = struct {
     /// Entries: name_len(4) + name_bytes + uuid(16) + node_count(8) + edge_count(8)
     /// CRC32 covers header[0..40] + all entry bytes
     pub fn saveToFile(self: *const GraphRegistry, path: []const u8) !void {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0, .allocator = undefined };
         defer buf.deinit(self.allocator);
 
         // Header (without CRC - we'll compute it over everything)
