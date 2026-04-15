@@ -45,8 +45,8 @@ pub const BufferPool = struct {
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
     // Concurrency protection for multi-threaded access
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .{},
+    cond: std.Io.Condition = .{},
     // Optional spice thread pool for parallel page flushes
     thread_pool: ?*spice.ThreadPool = null,
 

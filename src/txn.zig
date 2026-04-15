@@ -19,7 +19,7 @@ pub const TxnState = enum {
 /// Tracks active transactions and coordinates WAL writes.
 pub const TxnManager = struct {
     next_txn_id: u64,
-    txn_id_mutex: std.Thread.Mutex,
+    txn_id_mutex: std.Io.Mutex,
     active_txns: std.AutoHashMap(u64, TxnState),
     wal: *WalManager,
     allocator: Allocator,
