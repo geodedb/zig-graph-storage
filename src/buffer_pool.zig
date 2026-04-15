@@ -45,8 +45,8 @@ pub const BufferPool = struct {
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
     // Concurrency protection for multi-threaded access
-    mutex: std.Io.Mutex = .{},
-    cond: std.Io.Condition = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+    cond: std.Io.Condition = std.Io.Condition.init,
     // Optional spice thread pool for parallel page flushes
     thread_pool: ?*spice.ThreadPool = null,
 
@@ -126,7 +126,7 @@ pub const BufferPool = struct {
     /// If the page is already cached, increments pin_count and moves to LRU head.
     /// Otherwise, allocates a frame (evicting LRU if necessary) and reads from disk.
     pub fn pin(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
         while (true) {
             if (self.page_table.get(key)) |frame_idx| {
@@ -138,7 +138,7 @@ pub const BufferPool = struct {
                 frame.pin_count += 1;
                 self.moveToHead(frame_idx);
                 if (self.metrics) |m| m.buffer_hits += 1;
-                self.mutex.unlock();
+                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
                 return frame;
             }
 
@@ -147,7 +147,7 @@ pub const BufferPool = struct {
             const frame = &self.frames[frame_idx];
             const pager = self.pagers[@intFromEnum(file_id)] orelse {
                 self.free_list.appendAssumeCapacity(frame_idx);
-                self.mutex.unlock();
+                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
                 return error.NoPagerRegistered;
             };
 
@@ -162,7 +162,7 @@ pub const BufferPool = struct {
             try self.page_table.put(key, frame_idx);
             self.moveToHead(frame_idx);
 
-            self.mutex.unlock();
+            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
             var read_err: ?anyerror = null;
             pager.readPage(page_id, frame.dataSlice()) catch |err| switch (err) {
@@ -170,7 +170,7 @@ pub const BufferPool = struct {
                 else => read_err = err,
             };
 
-            self.mutex.lock();
+            self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
             if (read_err) |err| {
                 frame.pin_count = 0;
                 frame.dirty = false;
@@ -181,7 +181,7 @@ pub const BufferPool = struct {
                 _ = self.page_table.remove(key);
                 self.free_list.appendAssumeCapacity(frame_idx);
                 self.cond.broadcast();
-                self.mutex.unlock();
+                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
                 return err;
             }
 
@@ -189,7 +189,7 @@ pub const BufferPool = struct {
             frame.valid = true;
             if (self.metrics) |m| m.page_reads += 1;
             self.cond.broadcast();
-            self.mutex.unlock();
+            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             return frame;
         }
     }
@@ -197,8 +197,8 @@ pub const BufferPool = struct {
     /// Pin a new page without reading from disk. Used when creating a new page.
     /// Zeros the data buffer and inserts into cache.
     pub fn pinNew(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
 
@@ -232,8 +232,8 @@ pub const BufferPool = struct {
 
     /// Unpin a frame. Decrements pin_count and optionally marks dirty.
     pub fn unpin(self: *BufferPool, frame_idx: u32, dirty: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
         const frame = &self.frames[frame_idx];
         std.debug.assert(frame.pin_count > 0);
@@ -248,8 +248,8 @@ pub const BufferPool = struct {
 
     /// Flush all dirty frames with LSN <= up_to_lsn to disk.
     pub fn flushDirty(self: *BufferPool, up_to_lsn: Lsn) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         for (self.frames, 0..) |*frame, i| {
             _ = i;
             if (frame.dirty and frame.valid and frame.lsn <= up_to_lsn) {
@@ -265,8 +265,8 @@ pub const BufferPool = struct {
         if (self.thread_pool) |tp| {
             return self.flushAllParallel(tp);
         }
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         for (self.frames) |*frame| {
             if (frame.dirty and frame.valid) {
                 try self.flushFrame(frame);
@@ -277,7 +277,7 @@ pub const BufferPool = struct {
     /// Parallel flush: collect dirty frames under mutex, copy data, then
     /// write pages concurrently via spice fork/join.
     fn flushAllParallel(self: *BufferPool, tp: *spice.ThreadPool) !void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
 
         // Count dirty frames
         var dirty_count: usize = 0;
@@ -286,19 +286,19 @@ pub const BufferPool = struct {
         }
 
         if (dirty_count == 0) {
-            self.mutex.unlock();
+            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             return;
         }
 
         // Allocate descriptors and a contiguous data buffer for page copies
         const items = self.allocator.alloc(FlushItem, dirty_count) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             return error.OutOfMemory;
         };
         const ps: usize = self.page_size;
         const data_buf = self.allocator.alloc(u8, dirty_count * ps) catch {
             self.allocator.free(items);
-            self.mutex.unlock();
+            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             return error.OutOfMemory;
         };
 
@@ -315,7 +315,7 @@ pub const BufferPool = struct {
                     }
                     self.allocator.free(data_buf);
                     self.allocator.free(items);
-                    self.mutex.unlock();
+                    self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
                     return error.NoPagerRegistered;
                 };
 
@@ -335,7 +335,7 @@ pub const BufferPool = struct {
                 idx += 1;
             }
         }
-        self.mutex.unlock();
+        self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
         // Parallel I/O via spice fork/join
         const ctx = FlushRange{
@@ -346,7 +346,7 @@ pub const BufferPool = struct {
         tp.call(void, parallelFlushFn, ctx);
 
         // Re-acquire mutex to unpin frames and handle errors
-        self.mutex.lock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
         var first_err: ?anyerror = null;
         var write_count: u64 = 0;
         for (items) |*item| {
@@ -359,7 +359,7 @@ pub const BufferPool = struct {
             }
         }
         if (self.metrics) |m| m.page_writes += write_count;
-        self.mutex.unlock();
+        self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
         self.allocator.free(data_buf);
         self.allocator.free(items);
@@ -371,8 +371,8 @@ pub const BufferPool = struct {
     /// Returns the number of pages actually flushed. This is intended to be called
     /// proactively (e.g. during maintenance) to reduce eviction stalls.
     pub fn flushDirtyPages(self: *BufferPool, max_count: u32) !u32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         var flushed: u32 = 0;
         var current = self.lru_tail;
         while (current) |idx| {
@@ -415,15 +415,15 @@ pub const BufferPool = struct {
         std.debug.assert(self.page_size <= buf.len);
         @memcpy(buf[0..self.page_size], frame.dataSlice());
 
-        self.mutex.unlock();
+        self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         p.writePage(pid, buf[0..self.page_size]) catch |err| {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
             frame.pin_count -= 1;
             // Restore dirty state if write failed so we can retry later
             frame.dirty = true;
             return err;
         };
-        self.mutex.lock();
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
 
         // Allowed to be evicted again
         frame.pin_count -= 1;
@@ -973,8 +973,8 @@ test "GAP-0089: pin waits for an in-flight page load" {
     const Loader = struct {
         fn finish(p: *BufferPool) void {
             std.Thread.sleep(20 * std.time.ns_per_ms);
-            p.mutex.lock();
-            defer p.mutex.unlock();
+            p.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+            defer p.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             p.frames[0].loading = false;
             p.frames[0].valid = true;
             p.cond.broadcast();

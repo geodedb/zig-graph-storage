@@ -43,10 +43,10 @@ pub const TxnManager = struct {
     /// Begin a new transaction. Writes a BEGIN record to the WAL.
     /// Returns the new transaction ID.
     pub fn begin(self: *TxnManager) !u64 {
-        self.txn_id_mutex.lock();
+        self.txn_id_mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
         const txn_id = self.next_txn_id;
         self.next_txn_id += 1;
-        self.txn_id_mutex.unlock();
+        self.txn_id_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
         var rec = WalRecord{
             .lsn = 0,
