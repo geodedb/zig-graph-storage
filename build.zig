@@ -9,7 +9,7 @@ const OptimizeMode = std.builtin.OptimizeMode;
 const Deps = struct {
     wal_mod: *std.Build.Module,
     uuid_mod: *std.Build.Module,
-    spice_mod: *std.Build.Module,
+    thread_pool_mod: *std.Build.Module,
 };
 
 pub fn build(b: *std.Build) void {
@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
         .imports = allocImports(b, &.{
             .{ .name = "wal", .module = deps.wal_mod },
             .{ .name = "uuid", .module = deps.uuid_mod },
-            .{ .name = "spice", .module = deps.spice_mod },
+            .{ .name = "thread_pool", .module = deps.thread_pool_mod },
         }),
     });
     const seed_mod = b.addModule("seed", .{
@@ -46,12 +46,12 @@ pub fn build(b: *std.Build) void {
 fn loadDeps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: OptimizeMode) Deps {
     const wal_dep = b.dependency("wal", .{ .target = target, .optimize = optimize });
     const uuid_dep = b.dependency("uuid", .{ .target = target, .optimize = optimize });
-    const spice_dep = b.dependency("spice", .{ .target = target, .optimize = optimize });
+    const thread_pool_dep = b.dependency("thread_pool", .{ .target = target, .optimize = optimize });
 
     return .{
         .wal_mod = wal_dep.module("wal"),
         .uuid_mod = uuid_dep.module("uuid"),
-        .spice_mod = spice_dep.module("spice"),
+        .thread_pool_mod = thread_pool_dep.module("thread_pool"),
     };
 }
 
@@ -80,7 +80,7 @@ fn addUnitTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: Optim
         .root_module = createModule(b, "src/root.zig", target, optimize, &.{
             .{ .name = "wal", .module = deps.wal_mod },
             .{ .name = "uuid", .module = deps.uuid_mod },
-            .{ .name = "spice", .module = deps.spice_mod },
+            .{ .name = "thread_pool", .module = deps.thread_pool_mod },
         }),
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -203,7 +203,7 @@ fn addCheckStep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: Optim
         .root_module = createModule(b, "src/root.zig", target, optimize, &.{
             .{ .name = "wal", .module = deps.wal_mod },
             .{ .name = "uuid", .module = deps.uuid_mod },
-            .{ .name = "spice", .module = deps.spice_mod },
+            .{ .name = "thread_pool", .module = deps.thread_pool_mod },
         }),
     });
     check_step.dependOn(&check.step);

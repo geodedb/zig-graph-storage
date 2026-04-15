@@ -2,7 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
-const spice = @import("spice");
+const tp = @import("thread_pool");
 const types = @import("types.zig");
 const page_frame_mod = @import("page_frame.zig");
 const pager_mod = @import("pager.zig");
@@ -47,8 +47,8 @@ pub const BufferPool = struct {
     // Concurrency protection for multi-threaded access
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     cond: std.Io.Condition = std.Io.Condition.init,
-    // Optional spice thread pool for parallel page flushes
-    thread_pool: ?*spice.ThreadPool = null,
+    // Optional thread pool for parallel page flushes
+    thread_pool: ?*tp.ThreadPool = null,
 
     /// Initialize a buffer pool with the given capacity (number of frames).
     pub fn init(allocator: Allocator, page_size: u32, capacity: u32) !BufferPool {
@@ -117,9 +117,9 @@ pub const BufferPool = struct {
         self.metrics = m;
     }
 
-    /// Attach a spice thread pool for parallel dirty page flushes.
-    pub fn setThreadPool(self: *BufferPool, tp: *spice.ThreadPool) void {
-        self.thread_pool = tp;
+    /// Attach a thread pool for parallel dirty page flushes.
+    pub fn setThreadPool(self: *BufferPool, pool: *tp.ThreadPool) void {
+        self.thread_pool = pool;
     }
 
     /// Pin a page: return it from cache or read it from disk.
@@ -259,11 +259,11 @@ pub const BufferPool = struct {
     }
 
     /// Flush all dirty frames to disk regardless of LSN.
-    /// When a spice ThreadPool is attached, dirty pages are written in parallel
-    /// using fork/join. Otherwise falls back to sequential I/O.
+    /// When a ThreadPool is attached, dirty pages are written in parallel
+    /// using submitBatch + WaitGroup. Otherwise falls back to sequential I/O.
     pub fn flushAll(self: *BufferPool) !void {
-        if (self.thread_pool) |tp| {
-            return self.flushAllParallel(tp);
+        if (self.thread_pool) |pool| {
+            return self.flushAllParallel(pool);
         }
         self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
         defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
@@ -275,8 +275,8 @@ pub const BufferPool = struct {
     }
 
     /// Parallel flush: collect dirty frames under mutex, copy data, then
-    /// write pages concurrently via spice fork/join.
-    fn flushAllParallel(self: *BufferPool, tp: *spice.ThreadPool) !void {
+    /// write pages concurrently via submitBatch + WaitGroup.
+    fn flushAllParallel(self: *BufferPool, pool: *tp.ThreadPool) !void {
         self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
 
         // Count dirty frames
@@ -337,13 +337,45 @@ pub const BufferPool = struct {
         }
         self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
-        // Parallel I/O via spice fork/join
-        const ctx = FlushRange{
-            .items = items,
-            .data_buf = data_buf,
-            .page_size = self.page_size,
-        };
-        tp.call(void, parallelFlushFn, ctx);
+        // Parallel I/O via submitBatch + WaitGroup
+        const MAX_CHUNKS = 64;
+        const n_chunks = @min(dirty_count, MAX_CHUNKS);
+        var flush_ctxs: [MAX_CHUNKS]FlushChunkCtx = undefined;
+        var batch_tasks: [MAX_CHUNKS]tp.BatchTask = undefined;
+        var wg = pool.waitGroup();
+
+        const chunk_size = (dirty_count + n_chunks - 1) / n_chunks;
+        var n_chunks_actual: usize = 0;
+        {
+            var item_i: usize = 0;
+            while (item_i < dirty_count) : (n_chunks_actual += 1) {
+                const end = @min(item_i + chunk_size, dirty_count);
+                flush_ctxs[n_chunks_actual] = .{
+                    .items = items[item_i..end],
+                    .data_buf = data_buf,
+                    .page_size = self.page_size,
+                    .wg = &wg,
+                };
+                batch_tasks[n_chunks_actual] = .{
+                    .task_fn = flushChunkFn,
+                    .ctx = &flush_ctxs[n_chunks_actual],
+                };
+                item_i = end;
+            }
+        }
+
+        // Pre-add all chunks so wg.wait() works regardless of how tasks run.
+        wg.add(@intCast(n_chunks_actual));
+
+        const submitted: usize = if (pool.submitBatch(batch_tasks[0..n_chunks_actual], .{})) |r|
+            r.submitted
+        else |_|
+            0;
+        for (flush_ctxs[submitted..n_chunks_actual]) |*c| {
+            flushChunkFn(c, undefined);
+        }
+
+        wg.wait();
 
         // Re-acquire mutex to unpin frames and handle errors
         self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
@@ -531,7 +563,7 @@ pub const BufferPool = struct {
     }
 
     // ========================================================================
-    // Parallel flush types (used by flushAllParallel via spice fork/join)
+    // Parallel flush types (used by flushAllParallel via submitBatch + WaitGroup)
     // ========================================================================
 
     const FlushItem = struct {
@@ -542,48 +574,23 @@ pub const BufferPool = struct {
         err: ?anyerror,
     };
 
-    const FlushRange = struct {
+    const FlushChunkCtx = struct {
         items: []FlushItem,
         data_buf: []u8,
         page_size: u32,
+        wg: *tp.WaitGroup,
     };
 
-    /// Recursive divide-and-conquer flush: splits the item list in half,
-    /// forks one half to a background worker, processes the other half
-    /// inline, then joins.  If the forked half was not picked up by a
-    /// background worker (join returns null), it is executed inline so
-    /// that no writes are silently dropped.
-    fn parallelFlushFn(task: *spice.Task, range: FlushRange) void {
-        const items = range.items;
-        if (items.len == 0) return;
-
-        if (items.len == 1) {
-            const item = &items[0];
-            const data = range.data_buf[item.data_offset..][0..range.page_size];
+    /// Task function: write all pages in one chunk, record per-item errors,
+    /// then signal the WaitGroup.
+    fn flushChunkFn(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+        const c: *FlushChunkCtx = @ptrCast(@alignCast(ctx_ptr));
+        defer c.wg.done();
+        for (c.items) |*item| {
+            const data = c.data_buf[item.data_offset..][0..c.page_size];
             item.pager.writePage(item.page_id, data) catch |e| {
                 item.err = e;
             };
-            return;
-        }
-
-        const mid = items.len / 2;
-        const right_range = FlushRange{
-            .items = items[mid..],
-            .data_buf = range.data_buf,
-            .page_size = range.page_size,
-        };
-        var future = spice.Future(FlushRange, void).init();
-        future.fork(task, parallelFlushFn, right_range);
-        parallelFlushFn(task, .{
-            .items = items[0..mid],
-            .data_buf = range.data_buf,
-            .page_size = range.page_size,
-        });
-        // If join returns null the forked job was still queued (never
-        // picked up by a background worker).  Execute it inline to
-        // guarantee all pages are flushed.
-        if (future.join(task) == null) {
-            parallelFlushFn(task, right_range);
         }
     }
 };

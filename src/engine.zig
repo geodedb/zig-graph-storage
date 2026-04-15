@@ -2,7 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
-const spice = @import("spice");
+const tp = @import("thread_pool");
 const Allocator = std.mem.Allocator;
 
 const types = @import("types.zig");
@@ -103,7 +103,7 @@ pub const GraphEngine = struct {
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.Io.Dir,
-    thread_pool: spice.ThreadPool,
+    thread_pool: tp.ThreadPool,
     metrics: Metrics = .{},
     read_only: bool = false,
     persistence_dirty: bool = false,
@@ -177,8 +177,7 @@ pub const GraphEngine = struct {
         self.metrics = .{};
         self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
-        self.thread_pool = spice.ThreadPool.init(allocator);
-        self.thread_pool.start(.{});
+        self.thread_pool = tp.ThreadPool.init(allocator, .{}) catch @panic("thread-pool: init failed");
         self.buffer_pool.setThreadPool(&self.thread_pool);
         self.persistence_dirty = false;
 
@@ -282,8 +281,7 @@ pub const GraphEngine = struct {
         self.metrics = .{};
         self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
-        self.thread_pool = spice.ThreadPool.init(allocator);
-        self.thread_pool.start(.{});
+        self.thread_pool = tp.ThreadPool.init(allocator, .{}) catch @panic("thread-pool: init failed");
         self.buffer_pool.setThreadPool(&self.thread_pool);
         self.persistence_dirty = false;
 
