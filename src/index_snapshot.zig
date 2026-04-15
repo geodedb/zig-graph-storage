@@ -41,7 +41,7 @@ pub fn writeHeader(writer: anytype, magic: []const u8, checkpoint_counter: u64, 
     try writer.writeAll(&u64_buf);
 }
 
-pub fn loadFile(allocator: Allocator, file: *std.fs.File, expected_magic: []const u8) !?LoadedSnapshot {
+pub fn loadFile(allocator: Allocator, file: *std.Io.File, expected_magic: []const u8) !?LoadedSnapshot {
     const header = (try loadHeader(file, expected_magic)) orelse return null;
 
     const total_size = expected_magic.len + 16 + header.payload_size;
@@ -61,7 +61,7 @@ pub fn loadFile(allocator: Allocator, file: *std.fs.File, expected_magic: []cons
     };
 }
 
-pub fn loadHeader(file: *std.fs.File, expected_magic: []const u8) !?SnapshotHeader {
+pub fn loadHeader(file: *std.Io.File, expected_magic: []const u8) !?SnapshotHeader {
     if (expected_magic.len != 8) return error.InvalidMagicLength;
 
     const stat = try file.stat();
@@ -85,7 +85,7 @@ pub fn loadHeader(file: *std.fs.File, expected_magic: []const u8) !?SnapshotHead
     };
 }
 
-pub fn readBounded(file: *std.fs.File, remaining: *usize, buf: []u8) !void {
+pub fn readBounded(file: *std.Io.File, remaining: *usize, buf: []u8) !void {
     if (buf.len > remaining.*) return error.InvalidFormat;
     const bytes_read = try file.readAll(buf);
     if (bytes_read != buf.len) return error.UnexpectedEndOfFile;

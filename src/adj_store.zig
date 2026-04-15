@@ -309,7 +309,7 @@ const TestEnv = struct {
     pool: BufferPool,
     fsm: FreeSpaceManager,
     tmp_dir: testing.TmpDir,
-    adj_file: std.fs.File,
+    adj_file: std.Io.File,
     adj_pager: Pager,
 
     fn init() !TestEnv {

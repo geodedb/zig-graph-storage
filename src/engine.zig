@@ -102,7 +102,7 @@ pub const GraphEngine = struct {
     edge_index: std.AutoHashMap(EdgeId, EdgeIndexEntry),
     checkpointer: Checkpointer,
     manifest: Manifest,
-    wal_dir_handle: std.fs.Dir,
+    wal_dir_handle: std.Io.Dir,
     thread_pool: spice.ThreadPool,
     metrics: Metrics = .{},
     read_only: bool = false,

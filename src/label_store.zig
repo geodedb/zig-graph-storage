@@ -99,7 +99,7 @@ const TestEnv = struct {
     pool: BufferPool,
     fsm: FreeSpaceManager,
     tmp_dir: testing.TmpDir,
-    var_file: std.fs.File,
+    var_file: std.Io.File,
     var_pager: Pager,
     vs: VarStoreType,
 

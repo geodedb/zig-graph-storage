@@ -115,7 +115,7 @@ const TestEnv = struct {
     buffer_pool: BufferPool,
     wal: WalManager,
     manifest: Manifest,
-    wal_dir_handle: std.fs.Dir,
+    wal_dir_handle: std.Io.Dir,
 
     fn init() !TestEnv {
         var tmp_dir = testing.tmpDir(.{});

@@ -36,7 +36,7 @@ pub const FileManager = struct {
     graph_dir: []const u8, // path to graph directory
     page_size: u32,
     encryption_key: ?[32]u8 = null, // TDE key for page encryption
-    files: [FILE_COUNT]?std.fs.File, // indexed by @intFromEnum(FileId)
+    files: [FILE_COUNT]?std.Io.File, // indexed by @intFromEnum(FileId)
     pagers: [FILE_COUNT]?Pager, // one Pager per open file
 
     pub fn init(allocator: Allocator, graph_dir: []const u8, page_size: u32) FileManager {
@@ -44,7 +44,7 @@ pub const FileManager = struct {
             .allocator = allocator,
             .graph_dir = graph_dir,
             .page_size = page_size,
-            .files = [_]?std.fs.File{null} ** FILE_COUNT,
+            .files = [_]?std.Io.File{null} ** FILE_COUNT,
             .pagers = [_]?Pager{null} ** FILE_COUNT,
         };
     }
@@ -94,7 +94,7 @@ pub const FileManager = struct {
     }
 
     /// Get the underlying file handle for a file (must already be opened).
-    pub fn getFile(self: *FileManager, file_id: FileId) ?*std.fs.File {
+    pub fn getFile(self: *FileManager, file_id: FileId) ?*std.Io.File {
         const idx = @intFromEnum(file_id);
         if (self.files[idx] != null) {
             return &self.files[idx].?;

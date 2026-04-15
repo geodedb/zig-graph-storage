@@ -193,7 +193,7 @@ fn appendU32(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: u32)
     try buf.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(u32, value)));
 }
 
-fn appendU64(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) !void {
+fn appendU64(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: u64) !void {
     try buf.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(u64, value)));
 }
 

@@ -63,7 +63,7 @@ pub const SingleStoreEnv = struct {
     pool: BufferPool,
     fsm: FreeSpaceManager,
     tmp_dir: std.testing.TmpDir,
-    file: std.fs.File,
+    file: std.Io.File,
     pager: Pager,
     file_id: FileId,
 
@@ -106,10 +106,10 @@ pub const DualStoreEnv = struct {
     pool: BufferPool,
     fsm: FreeSpaceManager,
     tmp_dir: std.testing.TmpDir,
-    primary_file: std.fs.File,
+    primary_file: std.Io.File,
     primary_pager: Pager,
     primary_id: FileId,
-    secondary_file: std.fs.File,
+    secondary_file: std.Io.File,
     secondary_pager: Pager,
     secondary_id: FileId,
 

@@ -146,7 +146,7 @@ pub const LabelDictionary = struct {
     }
 };
 
-fn readTracked(file: *std.fs.File, remaining: *usize, crc: *Crc32, buf: []u8) !void {
+fn readTracked(file: *std.Io.File, remaining: *usize, crc: *Crc32, buf: []u8) !void {
     if (buf.len > remaining.*) return error.InvalidData;
     const bytes_read = try file.readAll(buf);
     if (bytes_read != buf.len) return error.InvalidData;
@@ -154,7 +154,7 @@ fn readTracked(file: *std.fs.File, remaining: *usize, crc: *Crc32, buf: []u8) !v
     remaining.* -= buf.len;
 }
 
-fn readU32FromFile(file: *std.fs.File) !u32 {
+fn readU32FromFile(file: *std.Io.File) !u32 {
     var buf: [4]u8 = undefined;
     const bytes_read = try file.readAll(&buf);
     if (bytes_read != buf.len) return error.InvalidData;

@@ -21,12 +21,12 @@ pub const PagerError = error{
 };
 
 pub const Pager = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     page_size: u32,
     encryption: ?PageEncryption = null,
     file_id: FileId = .nodes,
 
-    pub fn init(file: std.fs.File, page_size: u32) Pager {
+    pub fn init(file: std.Io.File, page_size: u32) Pager {
         return .{ .file = file, .page_size = page_size };
     }
 
@@ -113,14 +113,14 @@ pub const Pager = struct {
 
 const testing = std.testing;
 
-fn createTempFile() !std.fs.File {
+fn createTempFile() !std.Io.File {
     return std.fs.cwd().createFile(".test_pager_tmp", .{
         .read = true,
         .truncate = true,
     });
 }
 
-fn cleanupTempFile(file: std.fs.File) void {
+fn cleanupTempFile(file: std.Io.File) void {
     file.close();
     std.fs.cwd().deleteFile(".test_pager_tmp") catch {};
 }

@@ -163,7 +163,7 @@ pub const PropertyChainIndex = struct {
     ///     [u64 prop_head][u32 entry_count]
     ///     repeated entry_count times:
     ///       [u16 key_len][key bytes][u64 value_hash]
-    pub fn saveToFile(self: *const PropertyChainIndex, file: *std.fs.File, checkpoint_counter: u64) !void {
+    pub fn saveToFile(self: *const PropertyChainIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
         try file.setEndPos(0);
         try file.seekTo(0);
         try index_snapshot_mod.writeHeader(file, SNAPSHOT_MAGIC, checkpoint_counter, self.chains.count());
@@ -194,7 +194,7 @@ pub const PropertyChainIndex = struct {
     /// Load a previously persisted props.idx snapshot.
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
-    pub fn loadFromFile(self: *PropertyChainIndex, file: *std.fs.File) !?u64 {
+    pub fn loadFromFile(self: *PropertyChainIndex, file: *std.Io.File) !?u64 {
         const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC)) orelse return null;
 
         self.clear();

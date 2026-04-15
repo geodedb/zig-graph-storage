@@ -200,7 +200,7 @@ pub fn saveDerivedIndexesConditional(
     }
 }
 
-fn saveEdgeIndex(engine: *GraphEngine, file: *std.fs.File) !void {
+fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
     try file.setEndPos(0);
     try file.seekTo(0);
     try index_snapshot_mod.writeHeader(file, EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_index.count());
@@ -227,7 +227,7 @@ fn saveEdgeIndex(engine: *GraphEngine, file: *std.fs.File) !void {
     }
 }
 
-fn loadEdgeIndex(engine: *GraphEngine, file: *std.fs.File) !?u64 {
+fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
     const snapshot = (try index_snapshot_mod.loadHeader(file, EDGE_SNAPSHOT_MAGIC)) orelse return null;
     try file.seekTo(EDGE_SNAPSHOT_MAGIC.len + 16);
     var remaining = snapshot.payload_size;

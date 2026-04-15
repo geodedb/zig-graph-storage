@@ -441,7 +441,7 @@ pub const Backup = struct {
         graph_path: []const u8,
         name: []const u8,
         file_size: u64,
-        out_file: std.fs.File,
+        out_file: std.Io.File,
         crc: *Crc32,
         hmac_ctx: *?HmacSha256,
         total_bytes: *u64,
@@ -636,7 +636,7 @@ fn ensureDirectoryMode(path: []const u8, mode: u32) !void {
     dir.chmod(mode) catch {};
 }
 
-fn readNoEof(file: *const std.fs.File, buf: []u8) !void {
+fn readNoEof(file: *const std.Io.File, buf: []u8) !void {
     const bytes_read = try file.readAll(buf);
     if (bytes_read != buf.len) return error.InvalidData;
 }
@@ -657,7 +657,7 @@ fn updateIntegrityBytes(pos: usize, bytes: []const u8, layout: ArchiveLayout, cr
 }
 
 fn readTrackedExact(
-    file: *const std.fs.File,
+    file: *const std.Io.File,
     pos: *usize,
     buf: []u8,
     layout: ArchiveLayout,
@@ -671,7 +671,7 @@ fn readTrackedExact(
 }
 
 fn skipTracked(
-    file: *const std.fs.File,
+    file: *const std.Io.File,
     pos: *usize,
     byte_count: u64,
     layout: ArchiveLayout,
@@ -688,8 +688,8 @@ fn skipTracked(
 }
 
 fn copyTrackedToFile(
-    file: *const std.fs.File,
-    out_file: *const std.fs.File,
+    file: *const std.Io.File,
+    out_file: *const std.Io.File,
     pos: *usize,
     byte_count: u64,
     layout: ArchiveLayout,

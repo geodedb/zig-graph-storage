@@ -43,7 +43,7 @@ pub const WalManager = struct {
     /// `config` — optional encryption key and other settings.
     pub fn init(
         allocator: Allocator,
-        wal_dir: std.fs.Dir,
+        wal_dir: std.Io.Dir,
         graph_uuid: [16]u8,
         start_lsn: u64,
         config: WalConfig,
@@ -219,7 +219,7 @@ pub const WalManager = struct {
     }
 };
 
-fn ensureGraphIdentity(wal_dir: std.fs.Dir, graph_uuid: [16]u8, create_if_missing: bool) !void {
+fn ensureGraphIdentity(wal_dir: std.Io.Dir, graph_uuid: [16]u8, create_if_missing: bool) !void {
     const file = wal_dir.openFile(GRAPH_IDENTITY_FILE, .{ .mode = .read_write }) catch |err| switch (err) {
         error.FileNotFound => if (!create_if_missing) {
             return error.FileNotFound;

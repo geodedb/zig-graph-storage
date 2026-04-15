@@ -153,7 +153,7 @@ pub const LabelIndex = struct {
     ///   [8 bytes magic][u64 checkpoint_counter][u64 label_count]
     ///   repeated label_count times:
     ///     [u32 label_id][u64 node_count][node_count * u64 node_id]
-    pub fn saveToFile(self: *const LabelIndex, file: *std.fs.File, checkpoint_counter: u64) !void {
+    pub fn saveToFile(self: *const LabelIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
         try file.setEndPos(0);
         try file.seekTo(0);
         try index_snapshot_mod.writeHeader(file, SNAPSHOT_MAGIC, checkpoint_counter, self.index.count());
@@ -179,7 +179,7 @@ pub const LabelIndex = struct {
     /// Load a previously persisted labels.idx snapshot.
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
-    pub fn loadFromFile(self: *LabelIndex, file: *std.fs.File) !?u64 {
+    pub fn loadFromFile(self: *LabelIndex, file: *std.Io.File) !?u64 {
         const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC)) orelse return null;
 
         self.clear();

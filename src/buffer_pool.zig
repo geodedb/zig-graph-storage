@@ -594,14 +594,14 @@ pub const BufferPool = struct {
 
 const testing = std.testing;
 
-fn createTempFile(name: []const u8) !std.fs.File {
+fn createTempFile(name: []const u8) !std.Io.File {
     return std.fs.cwd().createFile(name, .{
         .read = true,
         .truncate = true,
     });
 }
 
-fn cleanupTempFile(file: std.fs.File, name: []const u8) void {
+fn cleanupTempFile(file: std.Io.File, name: []const u8) void {
     file.close();
     std.fs.cwd().deleteFile(name) catch {};
 }
