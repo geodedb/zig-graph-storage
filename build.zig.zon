@@ -9,8 +9,8 @@
             .hash = "wal-0.1.0-EqPqpofJAwCTcTvn2mCVhPcBvtI_cZiSwVnwq8VuETle",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git#575b501eded35fb430fa715d308ec1c13038cdd6",
-            .hash = "uuid-0.1.0-tL1irsUGDAAoJtbCDOkDGEBPldTTqD9EKSoh4A0U3wlZ",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git#8a476d3f4eaf975dba2eb39f6658aa3f56e500bb",
+            .hash = "uuid-0.1.0-tL1irpURDAAJXTAy9jTkmS6kaFmfkC5AT28kw5rjyVwr",
         },
         .thread_pool = .{
             .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#a572f2c255f6d1d7163bacdad266b3f199854822",
