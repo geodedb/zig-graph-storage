@@ -19,7 +19,7 @@ const NodeRec = graph_storage.node.NodeRec;
 const print = std.debug.print;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -27,9 +27,14 @@ pub fn main() !void {
     print("========================\n\n", .{});
 
     // -- 1. Create a temporary directory for the graph data ----------------
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    var tmp_dir = try cwd.createDirPathOpen(io, ".zig-cache/tmp/basic-example", .{});
+    defer {
+        tmp_dir.close(io);
+        cwd.deleteTree(io, ".zig-cache/tmp/basic-example") catch {};
+    }
+    const data_dir = try tmp_dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(data_dir);
 
     // Use a fixed UUID for the example graph

@@ -12,6 +12,25 @@
 const std = @import("std");
 const gs = @import("graph_storage");
 
+// Zig 0.16 compat: Timer was removed; use monotonic clock directly.
+const Timer = struct {
+    start_ns: i96,
+
+    fn start() error{}!Timer {
+        return .{ .start_ns = nanoTimestamp() };
+    }
+
+    fn read(self: *Timer) u64 {
+        const diff = nanoTimestamp() - self.start_ns;
+        return if (diff > 0) @intCast(diff) else 0;
+    }
+
+    fn nanoTimestamp() i96 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
+    }
+};
+
 const GraphEngine = gs.GraphEngine;
 const GraphConfig = gs.GraphConfig;
 const NodeRec = gs.node.NodeRec;
@@ -116,7 +135,7 @@ fn benchNodeInsert(data_dir: []const u8) !BenchResult {
     const engine = try GraphEngine.create(std.heap.page_allocator, data_dir, graphUuid(0x10), makeConfig());
     defer engine.close() catch {};
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
 
     for (0..NODE_COUNT) |i| {
         const nid = try engine.allocNode();
@@ -133,7 +152,7 @@ fn benchEdgeInsert(data_dir: []const u8) !BenchResult {
     defer engine.close() catch {};
 
     // Create node pairs and add edges (same pattern as expandOut benchmark)
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
 
     for (0..EDGE_COUNT) |i| {
         const from = try engine.allocNode();
@@ -170,7 +189,7 @@ fn benchPropertyWrite(data_dir: []const u8) !BenchResult {
     // We need to update the node's prop_head each time.
     var prop_head: u64 = 0;
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
 
     for (0..PROP_WRITE_COUNT) |i| {
         prop_head = try engine.putProperty(prop_head, keys[i], PropertyValue{ .int = @intCast(i) });
@@ -210,7 +229,7 @@ fn benchPropertyRead(data_dir: []const u8) !BenchResult {
     }
 
     // Now benchmark reads
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
 
     for (0..PROP_READ_COUNT) |i| {
         const val = try engine.getProperty(prop_head, keys[i], allocator);
@@ -244,7 +263,7 @@ fn benchExpandOut(data_dir: []const u8) !BenchResult {
 
     // Benchmark expandOut
     const iterations: usize = 100;
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
 
     for (0..iterations) |_| {
         var iter = try engine.expandOutIter(hub, null);
@@ -273,7 +292,7 @@ fn benchLabelScan(data_dir: []const u8) !BenchResult {
     }
 
     const iterations: usize = 200;
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
 
     for (0..iterations) |_| {
         var iter = try engine.scanLabelIter(label_id);
@@ -295,7 +314,7 @@ fn benchCheckpoint(data_dir: []const u8) !BenchResult {
         try engine.putNode(nid, emptyNode(i));
     }
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     try engine.checkpoint();
     const elapsed = timer.read();
 
@@ -320,7 +339,7 @@ fn benchColdStart(data_dir: []const u8) !BenchResult {
 
     // Benchmark open (includes WAL replay / recovery)
     const iterations: usize = 5;
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
 
     for (0..iterations) |_| {
         const engine = try GraphEngine.open(allocator, data_dir, uuid, cfg);
@@ -341,7 +360,7 @@ fn runBench(base_path: []const u8, comptime suffix: []const u8, comptime func: *
         return;
     };
     defer std.heap.page_allocator.free(sub);
-    std.fs.cwd().makePath(sub) catch |err| {
+    std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), sub) catch |err| {
         print("  FAILED: {s} -- {s}\n", .{ @errorName(err), suffix });
         return;
     };
@@ -354,10 +373,15 @@ fn runBench(base_path: []const u8, comptime suffix: []const u8, comptime func: *
 
 pub fn main() !void {
     // Create a temporary directory for all benchmark data
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    var tmp_dir = try cwd.createDirPathOpen(io, ".zig-cache/tmp/bench", .{});
+    defer {
+        tmp_dir.close(io);
+        cwd.deleteTree(io, ".zig-cache/tmp/bench") catch {};
+    }
 
-    const base_path = try tmp_dir.dir.realpathAlloc(std.heap.page_allocator, ".");
+    const base_path = try tmp_dir.realPathFileAlloc(io, ".", std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_path);
 
     printHeader();

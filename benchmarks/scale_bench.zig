@@ -15,6 +15,25 @@ const gs = @import("graph_storage");
 const seed = @import("seed");
 const builtin = @import("builtin");
 
+// Zig 0.16 compat: Timer was removed; use monotonic clock directly.
+const Timer = struct {
+    start_ns: i96,
+
+    fn start() error{}!Timer {
+        return .{ .start_ns = nanoTimestamp() };
+    }
+
+    fn read(self: *Timer) u64 {
+        const diff = nanoTimestamp() - self.start_ns;
+        return if (diff > 0) @intCast(diff) else 0;
+    }
+
+    fn nanoTimestamp() i96 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
+    }
+};
+
 const GraphEngine = gs.GraphEngine;
 const GraphConfig = gs.GraphConfig;
 const NodeRec = gs.node.NodeRec;
@@ -286,13 +305,14 @@ const TIER_TIMEOUT_NS: u64 = 15 * 60 * std.time.ns_per_s;
 // ---------------------------------------------------------------------------
 
 const StdoutWriter = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     buf: [8192]u8 = undefined,
-    writer: ?std.fs.File.Writer = null,
+    writer: ?std.Io.File.Writer = null,
 
     /// Must be called after the struct is in its final stack location.
     fn open(self: *StdoutWriter) void {
-        self.writer = self.file.writer(&self.buf);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.writer = self.file.writer(io, &self.buf);
     }
 
     fn writeAll(self: *StdoutWriter, data: []const u8) !void {
@@ -320,7 +340,7 @@ fn benchSeed(
     const engine = try GraphEngine.create(allocator, data_dir, graphUuid(0xB0), makeConfig());
     errdefer engine.close() catch {};
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     const sr = try seed.populate(engine, cfg);
     const elapsed = timer.read();
 
@@ -355,7 +375,7 @@ fn benchPointLookup(
         ids[i] = random.intRangeAtMost(NodeId, 1, @intCast(sr.node_count));
     }
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (ids) |id| {
         _ = try engine.getNode(id);
     }
@@ -381,7 +401,7 @@ fn benchPropRead(
     var rng = std.Random.DefaultPrng.init(456);
     const random = rng.random();
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iters) |_| {
         const uid = random.intRangeAtMost(NodeId, sr.users.start, sr.users.end - 1);
         const rec = try engine.getNode(uid);
@@ -419,7 +439,7 @@ fn benchExpandOut(
     var rng = std.Random.DefaultPrng.init(789);
     const random = rng.random();
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iters) |_| {
         const uid = random.intRangeAtMost(NodeId, sr.users.start, sr.users.end - 1);
         var iter = try engine.expandOutIter(uid, null);
@@ -447,7 +467,7 @@ fn benchLabelScan(
     const iters = @min(iterations, 50);
 
     var total_results: usize = 0;
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iters) |_| {
         var iter = try engine.scanLabelIter(sr.labels.user);
         while (try iter.next()) |_| {
@@ -474,7 +494,7 @@ fn benchCheckpointOp(
 
     _ = try seed.populate(engine, cfg);
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     try engine.checkpoint();
     const elapsed = timer.read();
 
@@ -497,7 +517,7 @@ fn benchOpen(
     }
 
     const iterations: usize = 3;
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iterations) |_| {
         const engine = try GraphEngine.open(allocator, data_dir, uuid, gcfg);
         try engine.close();
@@ -522,7 +542,7 @@ fn benchMixed(
     var rng = std.Random.DefaultPrng.init(999);
     const random = rng.random();
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..total_ops) |_| {
         const roll = random.intRangeAtMost(u32, 0, 99);
         if (roll < 80) {
@@ -568,7 +588,7 @@ fn benchPointLookupOnSeeded(
         ids[i] = random.intRangeAtMost(NodeId, 1, @intCast(sr.node_count));
     }
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (ids) |id| {
         _ = try engine.getNode(id);
     }
@@ -587,7 +607,7 @@ fn benchPropReadOnSeeded(
     var rng = std.Random.DefaultPrng.init(456);
     const random = rng.random();
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iters) |_| {
         const uid = random.intRangeAtMost(NodeId, sr.users.start, sr.users.end - 1);
         const rec = try engine.getNode(uid);
@@ -615,7 +635,7 @@ fn benchExpandOutOnSeeded(
     var rng = std.Random.DefaultPrng.init(789);
     const random = rng.random();
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iters) |_| {
         const uid = random.intRangeAtMost(NodeId, sr.users.start, sr.users.end - 1);
         var iter = try engine.expandOutIter(uid, null);
@@ -635,7 +655,7 @@ fn benchLabelScanOnSeeded(
     const iters = @min(iterations, 50);
 
     var total_results: usize = 0;
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iters) |_| {
         var iter = try engine.scanLabelIter(sr.labels.user);
         while (try iter.next()) |_| {
@@ -650,7 +670,7 @@ fn benchLabelScanOnSeeded(
 }
 
 fn benchCheckpointOnSeeded(engine: *GraphEngine) !f64 {
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     try engine.checkpoint();
     return @as(f64, @floatFromInt(timer.read())) / 1_000_000.0;
 }
@@ -662,7 +682,7 @@ fn benchOpenFromCheckpoint(
     cfg: GraphConfig,
 ) !f64 {
     const iterations: usize = 3;
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..iterations) |_| {
         const engine = try GraphEngine.open(allocator, data_dir, graph_uuid, cfg);
         try engine.close();
@@ -679,7 +699,7 @@ fn benchMixedOnSeeded(
     var rng = std.Random.DefaultPrng.init(999);
     const random = rng.random();
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     for (0..total_ops) |_| {
         const roll = random.intRangeAtMost(u32, 0, 99);
         if (roll < 80) {
@@ -719,13 +739,16 @@ fn runTierSample(
 ) !SampleMetrics {
     const sample_dir = try std.fmt.allocPrint(allocator, "{s}/sb_{s}_sample_{d}", .{ base_path, tier.name, sample_idx });
     defer allocator.free(sample_dir);
-    try std.fs.cwd().makePath(sample_dir);
+    {
+        const dir_io = std.Io.Threaded.global_single_threaded.io();
+        try std.Io.Dir.cwd().createDirPath(dir_io, sample_dir);
+    }
 
     const cfg = makeConfig();
     const uuid = sampleGraphUuid(tier, sample_idx);
     const engine = try GraphEngine.create(allocator, sample_dir, uuid, cfg);
 
-    var timer = try std.time.Timer.start();
+    var timer = try Timer.start();
     const sr = try seed.populate(engine, tier.cfg);
     const seed_elapsed = timer.read();
     const seeded_items = @as(f64, @floatFromInt(sr.node_count + sr.edge_count));
@@ -763,7 +786,7 @@ fn runTierSample(
 // ---------------------------------------------------------------------------
 
 fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) TierResult {
-    var tier_start = std.time.Timer.start() catch {
+    var tier_start = Timer.start() catch {
         return skipResult(tier, "timer init failed");
     };
 
@@ -844,7 +867,7 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
     };
 }
 
-fn checkTimeout(tier_start: *std.time.Timer, tier: Tier) ?TierResult {
+fn checkTimeout(tier_start: *Timer, tier: Tier) ?TierResult {
     const elapsed = tier_start.read();
     if (elapsed > TIER_TIMEOUT_NS) {
         return skipResult(tier, "timeout (>15min)");
@@ -903,7 +926,7 @@ fn writeJsonOutput(out: *StdoutWriter, results: []const TierResult) !void {
     try out.writeAll("  \"version\": 1,\n");
 
     // Timestamp
-    const ts = std.time.timestamp();
+    const ts = @divTrunc(Timer.nanoTimestamp(), std.time.ns_per_s);
     const epoch_secs: u64 = @intCast(ts);
     const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
     const day_secs = es.getDaySeconds();
@@ -1016,15 +1039,15 @@ fn writeSummary(results: []const TierResult) void {
 // Main
 // ---------------------------------------------------------------------------
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.page_allocator;
 
     // Parse optional max-tier argument
-    var args = std.process.args();
-    _ = args.next(); // skip program name
+    const argv = try init.args.toSlice(allocator);
 
     var max_tier_count: usize = tiers.len;
-    if (args.next()) |arg| {
+    if (argv.len > 1) {
+        const arg = argv[1];
         for (tiers, 0..) |t, i| {
             if (std.mem.eql(u8, arg, t.name)) {
                 max_tier_count = i + 1;
@@ -1033,14 +1056,17 @@ pub fn main() !void {
         }
     }
 
-    var tmp_dir = std.testing.tmpDir(.{});
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    var bench_dir = try cwd.createDirPathOpen(io, ".zig-cache/tmp/bench-scale", .{});
     defer {
-        print("  Cleaning up tmp_dir...\n", .{});
-        tmp_dir.cleanup();
+        print("  Cleaning up bench dir...\n", .{});
+        bench_dir.close(io);
+        cwd.deleteTree(io, ".zig-cache/tmp/bench-scale") catch {};
         print("  Done cleanup.\n", .{});
     }
 
-    const base_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const base_path = try bench_dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(base_path);
 
     var results: [tiers.len]TierResult = undefined;
@@ -1066,7 +1092,7 @@ pub fn main() !void {
 
     writeSummary(results[0..completed]);
 
-    var out = StdoutWriter{ .file = .{ .handle = std.posix.STDOUT_FILENO } };
+    var out = StdoutWriter{ .file = std.Io.File.stdout() };
     out.open();
     try writeJsonOutput(&out, results[0..completed]);
 }

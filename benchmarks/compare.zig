@@ -214,13 +214,11 @@ const metrics = [_]Metric{
 };
 
 fn readJsonFile(allocator: std.mem.Allocator, path: []const u8) !BenchResult {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const bench_io = std.Io.Threaded.global_single_threaded.io();
+    const content = std.Io.Dir.cwd().readFileAlloc(bench_io, path, allocator, .limited(10 * 1024 * 1024)) catch |err| {
         print("Error: cannot open '{s}': {s}\n", .{ path, @errorName(err) });
         return err;
     };
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
     defer allocator.free(content);
 
     const parsed = std.json.parseFromSlice(BenchResult, allocator, content, .{
@@ -289,24 +287,21 @@ fn validateNoSkippedTiers(result: BenchResult, label: []const u8) bool {
     return ok;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.page_allocator;
 
-    var args = std.process.args();
-    _ = args.next();
+    const argv = try init.args.toSlice(allocator);
 
-    const baseline_path = args.next() orelse {
+    if (argv.len < 3) {
         print("Usage: compare-bench <baseline.json> <current.json> [threshold%]\n", .{});
         std.process.exit(2);
-    };
-    const current_path = args.next() orelse {
-        print("Usage: compare-bench <baseline.json> <current.json> [threshold%]\n", .{});
-        std.process.exit(2);
-    };
+    }
+    const baseline_path = argv[1];
+    const current_path = argv[2];
 
     var threshold: f64 = 20.0;
-    if (args.next()) |thr_str| {
-        threshold = std.fmt.parseFloat(f64, thr_str) catch 20.0;
+    if (argv.len > 3) {
+        threshold = std.fmt.parseFloat(f64, argv[3]) catch 20.0;
     }
 
     const baseline = readJsonFile(allocator, baseline_path) catch std.process.exit(2);
