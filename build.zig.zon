@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#b3513d408c6f2eff1a060109e61f629ce54ffc7f",
-            .hash = "wal-0.1.0-EqPqptbIAwCHdprLpDkWM61AHuQwa4lKcEL--sBuWQly",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#05865e6111eda99ffc05f384417f9490a0bfd67e",
+            .hash = "wal-0.1.0-EqPqpofJAwCTcTvn2mCVhPcBvtI_cZiSwVnwq8VuETle",
         },
         .uuid = .{
             .url = "git+https://gitlab.com/devnw/zig/uuid.git#575b501eded35fb430fa715d308ec1c13038cdd6",
