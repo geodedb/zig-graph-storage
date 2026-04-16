@@ -124,11 +124,15 @@ pub const GraphRegistry = struct {
 
     /// Load from file in GEODREG1 format.
     pub fn loadFromFile(self: *GraphRegistry, path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().openFile(path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
 
-        const data = try file.readToEndAlloc(self.allocator, 64 * 1024 * 1024);
+        const file_len = try file.length(io);
+        if (file_len > 64 * 1024 * 1024) return error.InvalidData;
+        const data = try self.allocator.alloc(u8, @intCast(file_len));
         defer self.allocator.free(data);
+        _ = try file.readPositionalAll(io, data, 0);
 
         if (data.len < 44) return error.InvalidData;
 
