@@ -429,6 +429,9 @@ pub const GraphEngine = struct {
     /// Internal cleanup of all engine resources. Always runs on close,
     /// even when errors have occurred.
     fn cleanupResources(self: *GraphEngine, allocator: Allocator) void {
+        // Drain in-flight parallel flush tasks before tearing down the pool
+        // so worker threads don't observe freed buffer-pool storage.
+        self.thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
         self.thread_pool.deinit();
         self.txn_manager.deinit();
         self.wal.deinit();
