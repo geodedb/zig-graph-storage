@@ -114,17 +114,17 @@ pub const GraphRegistry = struct {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .mode = owner_only_file_mode });
+        const tmp_file = try std.Io.Dir.cwd().createFile(tmp_path, .{ .mode = owner_only_file_mode });
         defer tmp_file.close();
         try tmp_file.writeAll(buf.items);
         try tmp_file.sync();
 
-        try std.fs.cwd().rename(tmp_path, path);
+        try std.Io.Dir.cwd().rename(tmp_path, path);
     }
 
     /// Load from file in GEODREG1 format.
     pub fn loadFromFile(self: *GraphRegistry, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
+        const file = try std.Io.Dir.cwd().openFile(path, .{});
         defer file.close();
 
         const data = try file.readToEndAlloc(self.allocator, 64 * 1024 * 1024);
@@ -284,7 +284,7 @@ test "save/load round-trip" {
 
     try reg.saveToFile(file_path);
 
-    const saved_file = try std.fs.cwd().openFile(file_path, .{});
+    const saved_file = try std.Io.Dir.cwd().openFile(file_path, .{});
     defer saved_file.close();
     const saved_stat = try saved_file.stat();
     try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.mode & 0o777);
