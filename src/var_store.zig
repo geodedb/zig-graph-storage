@@ -101,7 +101,7 @@ pub const VarStore = struct {
         const start_page: PageId = ref >> 16;
         if (start_page == 0) return error.InvalidPageId;
 
-        var result: std.ArrayList(u8) = .{};
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
 
         var current_page = start_page;

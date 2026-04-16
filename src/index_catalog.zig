@@ -39,8 +39,8 @@ pub const IndexCatalog = struct {
     pub fn init(allocator: Allocator) IndexCatalog {
         return .{
             .allocator = allocator,
-            .indexes = .{},
-            .owned_keys = .{},
+            .indexes = .empty,
+            .owned_keys = .empty,
         };
     }
 
@@ -96,11 +96,11 @@ pub const IndexCatalog = struct {
     ///   [u32 label_id] [u8 index_type] [u8 state] [u16 key_len] [key_len bytes]
     /// Followed by [CRC32 4B] over all preceding bytes.
     pub fn saveToFile(self: *const IndexCatalog, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{ .mode = owner_only_file_mode });
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
         // Serialize to an in-memory buffer, then write all at once.
-        var data: std.ArrayList(u8) = .{};
+        var data: std.ArrayList(u8) = .empty;
         defer data.deinit(self.allocator);
 
         // Magic
@@ -146,7 +146,7 @@ pub const IndexCatalog = struct {
             try data.appendSlice(self.allocator, &tmp);
         }
 
-        try file.writeAll(data.items);
+        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), data.items);
     }
 
     /// Load the catalog from a file, replacing any existing entries.
@@ -159,14 +159,14 @@ pub const IndexCatalog = struct {
         self.owned_keys.clearRetainingCapacity();
         self.indexes.clearRetainingCapacity();
 
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
         // Read entire file into memory.
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         const content = try self.allocator.alloc(u8, stat.size);
         defer self.allocator.free(content);
-        const bytes_read = try file.readAll(content);
+        const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), content, 0);
         if (bytes_read != stat.size) return error.UnexpectedEndOfFile;
 
         // Minimum size: magic(8) + version(4) + count(4) + crc(4) = 20
@@ -212,8 +212,8 @@ pub const IndexCatalog = struct {
             try self.owned_keys.append(self.allocator, key_buf);
             errdefer _ = self.owned_keys.pop();
 
-            const index_type = std.meta.intToEnum(IndexType, type_byte) catch return error.InvalidData;
-            const state = std.meta.intToEnum(IndexState, state_byte) catch return error.InvalidData;
+            const index_type = std.enums.fromInt(IndexType, type_byte) orelse return error.InvalidData;
+            const state = std.enums.fromInt(IndexState, state_byte) orelse return error.InvalidData;
 
             try self.indexes.append(self.allocator, .{
                 .label_id = label_id,
@@ -277,7 +277,7 @@ test "saveToFile + loadFromFile round-trip" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
 
     const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/catalog.bin", .{path});
@@ -305,10 +305,10 @@ test "saveToFile + loadFromFile round-trip" {
     }
 
     {
-        const saved_file = try std.fs.cwd().openFile(full_path, .{});
-        defer saved_file.close();
-        const saved_stat = try saved_file.stat();
-        try testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.mode & 0o777);
+        const saved_file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), full_path, .{});
+        defer saved_file.close(std.Io.Threaded.global_single_threaded.io());
+        const saved_stat = try saved_file.stat(std.Io.Threaded.global_single_threaded.io());
+        try testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.permissions.toMode() & 0o7777);
     }
 
     // Load and verify.
@@ -358,7 +358,7 @@ test "loadFromFile rejects invalid index_type byte" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
 
     const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/bad_catalog.bin", .{path});
@@ -396,9 +396,9 @@ test "loadFromFile rejects invalid index_type byte" {
     std.mem.writeInt(u32, buf[pos..][0..4], crc, .little);
     pos += 4;
 
-    const file = try std.fs.cwd().createFile(full_path, .{});
-    try file.writeAll(buf[0..pos]);
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), full_path, .{});
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf[0..pos]);
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     var catalog = IndexCatalog.init(testing.allocator);
     defer catalog.deinit();
@@ -410,7 +410,7 @@ test "loadFromFile rejects invalid state byte" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
 
     const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/bad_state.bin", .{path});
@@ -446,9 +446,9 @@ test "loadFromFile rejects invalid state byte" {
     std.mem.writeInt(u32, buf[pos..][0..4], crc, .little);
     pos += 4;
 
-    const file = try std.fs.cwd().createFile(full_path, .{});
-    try file.writeAll(buf[0..pos]);
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), full_path, .{});
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf[0..pos]);
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     var catalog = IndexCatalog.init(testing.allocator);
     defer catalog.deinit();
@@ -460,7 +460,7 @@ test "loadFromFile rejects corrupted CRC" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
 
     const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/corrupt_crc.bin", .{path});
@@ -481,17 +481,15 @@ test "loadFromFile rejects corrupted CRC" {
 
     // Corrupt a data byte (not the CRC itself).
     {
-        const file = try std.fs.cwd().openFile(full_path, .{ .mode = .read_write });
-        defer file.close();
-        const stat = try file.stat();
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), full_path, .{ .mode = .read_write });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         // Flip a byte in the middle of the payload.
         const corrupt_pos = stat.size / 2;
-        try file.seekTo(corrupt_pos);
         var byte: [1]u8 = undefined;
-        _ = try file.read(&byte);
+        _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &byte, corrupt_pos);
         byte[0] ^= 0xFF;
-        try file.seekTo(corrupt_pos);
-        try file.writeAll(&byte);
+        try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &byte, corrupt_pos);
     }
 
     var catalog = IndexCatalog.init(testing.allocator);
@@ -503,21 +501,21 @@ test "loadFromFile rejects wrong magic" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
 
     const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/bad_magic.bin", .{path});
     defer testing.allocator.free(full_path);
 
     // Write a file with wrong magic but otherwise valid-ish structure.
-    const file = try std.fs.cwd().createFile(full_path, .{});
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), full_path, .{});
     var buf: [20]u8 = undefined;
     @memcpy(buf[0..8], "XXXXXXXX"); // wrong magic
     std.mem.writeInt(u32, buf[8..12], 1, .little); // version
     std.mem.writeInt(u32, buf[12..16], 0, .little); // count = 0
     std.mem.writeInt(u32, buf[16..20], 0, .little); // fake CRC
-    try file.writeAll(&buf);
-    file.close();
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     var catalog = IndexCatalog.init(testing.allocator);
     defer catalog.deinit();
@@ -528,16 +526,16 @@ test "loadFromFile rejects file too small" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
 
     const full_path = try std.fmt.allocPrint(testing.allocator, "{s}/tiny.bin", .{path});
     defer testing.allocator.free(full_path);
 
     // Write a file that's too small (less than 20 bytes minimum).
-    const file = try std.fs.cwd().createFile(full_path, .{});
-    try file.writeAll("short");
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), full_path, .{});
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "short");
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     var catalog = IndexCatalog.init(testing.allocator);
     defer catalog.deinit();

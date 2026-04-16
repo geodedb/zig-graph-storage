@@ -201,9 +201,10 @@ pub fn saveDerivedIndexesConditional(
 }
 
 fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
-    try file.setEndPos(0);
-    try file.seekTo(0);
-    try index_snapshot_mod.writeHeader(file, EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_index.count());
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try file.setLength(io, 0);
+    var write_offset: u64 = 0;
+    try index_snapshot_mod.writeHeader(file.*, &write_offset, EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_index.count());
 
     var u64_buf: [8]u8 = undefined;
     var u32_buf: [4]u8 = undefined;
@@ -211,25 +212,30 @@ fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
     var it = engine.edge_index.iterator();
     while (it.next()) |entry| {
         std.mem.writeInt(u64, &u64_buf, entry.key_ptr.*, .little);
-        try file.writeAll(&u64_buf);
+        try file.writePositionalAll(io, &u64_buf, write_offset);
+        write_offset += 8;
 
         std.mem.writeInt(u64, &u64_buf, entry.value_ptr.from, .little);
-        try file.writeAll(&u64_buf);
+        try file.writePositionalAll(io, &u64_buf, write_offset);
+        write_offset += 8;
 
         std.mem.writeInt(u64, &u64_buf, entry.value_ptr.neighbor, .little);
-        try file.writeAll(&u64_buf);
+        try file.writePositionalAll(io, &u64_buf, write_offset);
+        write_offset += 8;
 
         std.mem.writeInt(u32, &u32_buf, entry.value_ptr.rel_type, .little);
-        try file.writeAll(&u32_buf);
+        try file.writePositionalAll(io, &u32_buf, write_offset);
+        write_offset += 4;
 
         std.mem.writeInt(u32, &u32_buf, entry.value_ptr.prop_head, .little);
-        try file.writeAll(&u32_buf);
+        try file.writePositionalAll(io, &u32_buf, write_offset);
+        write_offset += 4;
     }
 }
 
 fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
     const snapshot = (try index_snapshot_mod.loadHeader(file, EDGE_SNAPSHOT_MAGIC)) orelse return null;
-    try file.seekTo(EDGE_SNAPSHOT_MAGIC.len + 16);
+    var file_offset: u64 = EDGE_SNAPSHOT_MAGIC.len + 16;
     var remaining = snapshot.payload_size;
 
     try engine.edge_index.ensureTotalCapacity(@intCast(snapshot.item_count));
@@ -239,19 +245,19 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
 
     var i: u64 = 0;
     while (i < snapshot.item_count) : (i += 1) {
-        try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
         const edge_id = std.mem.readInt(u64, &u64_buf, .little);
 
-        try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
         const from = std.mem.readInt(u64, &u64_buf, .little);
 
-        try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
         const neighbor = std.mem.readInt(u64, &u64_buf, .little);
 
-        try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
         const rel_type = std.mem.readInt(u32, &u32_buf, .little);
 
-        try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
         const prop_head = std.mem.readInt(u32, &u32_buf, .little);
 
         try engine.edge_index.put(edge_id, .{

@@ -68,7 +68,7 @@ pub const LabelDictionary = struct {
     /// Save to file.
     /// Format: count(4) + repeated [name_len(4) + name_bytes + id(4)] + CRC32(4)
     pub fn saveToFile(self: *const LabelDictionary, path: []const u8) !void {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         const entry_count: u32 = @intCast(self.name_to_id.count());
@@ -91,20 +91,20 @@ pub const LabelDictionary = struct {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .mode = owner_only_file_mode });
-        defer tmp_file.close();
-        try tmp_file.writeAll(buf.items);
-        try tmp_file.sync();
+        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
+        try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf.items);
+        try tmp_file.sync(std.Io.Threaded.global_single_threaded.io());
 
-        try std.fs.cwd().rename(tmp_path, path);
+        try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, std.Io.Threaded.global_single_threaded.io());
     }
 
     /// Load from file.
     pub fn loadFromFile(self: *LabelDictionary, path: []const u8) !void {
-        var file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
         if (file_size < 8) return error.InvalidData;
 
@@ -114,20 +114,21 @@ pub const LabelDictionary = struct {
         var remaining = file_size - 4;
         var crc = Crc32.init();
         var u32_buf: [4]u8 = undefined;
+        var file_offset: u64 = 0;
 
-        try readTracked(&file, &remaining, &crc, &u32_buf);
+        try readTracked(&file, &file_offset, &remaining, &crc, &u32_buf);
         const entry_count = std.mem.readInt(u32, &u32_buf, .little);
 
         var max_id: u32 = 0;
         for (0..entry_count) |_| {
-            try readTracked(&file, &remaining, &crc, &u32_buf);
+            try readTracked(&file, &file_offset, &remaining, &crc, &u32_buf);
             const name_len = std.mem.readInt(u32, &u32_buf, .little);
 
             const owned = try self.allocator.alloc(u8, name_len);
             errdefer self.allocator.free(owned);
-            try readTracked(&file, &remaining, &crc, owned);
+            try readTracked(&file, &file_offset, &remaining, &crc, owned);
 
-            try readTracked(&file, &remaining, &crc, &u32_buf);
+            try readTracked(&file, &file_offset, &remaining, &crc, &u32_buf);
             const id = std.mem.readInt(u32, &u32_buf, .little);
 
             try next.name_to_id.put(owned, id);
@@ -137,7 +138,7 @@ pub const LabelDictionary = struct {
 
         if (remaining != 0) return error.InvalidData;
 
-        const stored_crc = try readU32FromFile(&file);
+        const stored_crc = try readU32FromFile(&file, &file_offset);
         if (stored_crc != crc.final()) return error.ChecksumMismatch;
 
         self.deinit();
@@ -146,18 +147,22 @@ pub const LabelDictionary = struct {
     }
 };
 
-fn readTracked(file: *std.Io.File, remaining: *usize, crc: *Crc32, buf: []u8) !void {
+fn readTracked(file: *std.Io.File, offset: *u64, remaining: *usize, crc: *Crc32, buf: []u8) !void {
     if (buf.len > remaining.*) return error.InvalidData;
-    const bytes_read = try file.readAll(buf);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes_read = try file.readPositionalAll(io, buf, offset.*);
     if (bytes_read != buf.len) return error.InvalidData;
     crc.update(buf);
+    offset.* += buf.len;
     remaining.* -= buf.len;
 }
 
-fn readU32FromFile(file: *std.Io.File) !u32 {
+fn readU32FromFile(file: *std.Io.File, offset: *u64) !u32 {
     var buf: [4]u8 = undefined;
-    const bytes_read = try file.readAll(&buf);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes_read = try file.readPositionalAll(io, &buf, offset.*);
     if (bytes_read != buf.len) return error.InvalidData;
+    offset.* += buf.len;
     return std.mem.readInt(u32, &buf, .little);
 }
 
@@ -218,7 +223,7 @@ test "save/load round-trip preserves all mappings" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const file_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{tmp_path});
@@ -234,10 +239,10 @@ test "save/load round-trip preserves all mappings" {
 
     try dict.saveToFile(file_path);
 
-    const saved_file = try std.fs.cwd().openFile(file_path, .{});
-    defer saved_file.close();
-    const saved_stat = try saved_file.stat();
-    try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.mode & 0o777);
+    const saved_file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+    defer saved_file.close(std.Io.Threaded.global_single_threaded.io());
+    const saved_stat = try saved_file.stat(std.Io.Threaded.global_single_threaded.io());
+    try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.permissions.toMode() & 0o7777);
 
     // Load into new dictionary
     var dict2 = LabelDictionary.init(allocator);

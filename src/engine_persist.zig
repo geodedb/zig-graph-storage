@@ -72,9 +72,9 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
         offset += written;
     }
 
-    const file = try std.fs.cwd().createFile(path, .{ .mode = owner_only_file_mode });
-    defer file.close();
-    try file.writeAll(buf[0..offset]);
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf[0..offset]);
 }
 
 /// Try to load free space bitmaps from a persisted `free.store` file.
@@ -84,19 +84,19 @@ pub fn loadFreeStore(engine: *GraphEngine) !bool {
     const path = try std.fmt.allocPrint(engine.allocator, "{s}/free.store", .{engine.graph_dir.path});
     defer engine.allocator.free(path);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
-    defer file.close();
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const stat = try file.stat();
+    const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
     if (stat.size == 0) return false;
     const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
     const buf = try engine.allocator.alloc(u8, file_size);
     defer engine.allocator.free(buf);
 
-    const bytes_read = try file.readAll(buf);
+    const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, 0);
     if (bytes_read != file_size) return error.UnexpectedEof;
 
     var offset: usize = 0;
@@ -182,10 +182,10 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{self.graph_dir.path});
     defer allocator.free(wal_dir_path);
     if (cfg.allow_create_missing_artifacts) {
-        try std.fs.cwd().makePath(wal_dir_path);
+        try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), wal_dir_path);
     }
-    self.wal_dir_handle = try std.fs.cwd().openDir(wal_dir_path, .{});
-    errdefer self.wal_dir_handle.close();
+    self.wal_dir_handle = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    errdefer self.wal_dir_handle.close(std.Io.Threaded.global_single_threaded.io());
 
     self.wal = try WalManager.init(allocator, self.wal_dir_handle, graph_uuid, wal_start_lsn, .{
         .encryption_key = cfg.encryption_key,
@@ -248,7 +248,7 @@ pub fn checkpoint(engine: *GraphEngine) anyerror!void {
     // Synchronous checkpoint: flush dirty pages, sync files, write
     // manifest.  Previous versions spawned a detached background thread
     // which could silently lose writes and made the timer meaningless.
-    var timer = std.time.Timer.start() catch null;
+    const start_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
     try engine.checkpointer.doCheckpoint();
 
     // Persist free space bitmaps so freed pages survive restart.
@@ -264,9 +264,9 @@ pub fn checkpoint(engine: *GraphEngine) anyerror!void {
     engine.edge_index_dirty = false;
     try saveLabelDictionary(engine);
 
-    if (timer) |*t| {
-        engine.metrics.last_checkpoint_duration_ns = t.read();
-    }
+    const end_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
+    const elapsed = start_ts.durationTo(end_ts);
+    engine.metrics.last_checkpoint_duration_ns = @intCast(elapsed.raw.toNanoseconds());
     engine.metrics.checkpoints_completed += 1;
     engine.persistence_dirty = false;
 }

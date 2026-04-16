@@ -201,10 +201,10 @@ test "checkpoint persists labels.dict, labels.idx and props.idx snapshots" {
     const labels_dict_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.dict", .{graph_dir.path});
     defer testing.allocator.free(labels_dict_path);
 
-    const labels_dict_stat = try std.fs.cwd().statFile(labels_dict_path);
-    const labels_stat = try std.fs.cwd().statFile(labels_idx_path);
-    const props_stat = try std.fs.cwd().statFile(props_idx_path);
-    const edges_stat = try std.fs.cwd().statFile(edges_idx_path);
+    const labels_dict_stat = try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), labels_dict_path, .{});
+    const labels_stat = try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), labels_idx_path, .{});
+    const props_stat = try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), props_idx_path, .{});
+    const edges_stat = try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), edges_idx_path, .{});
     try testing.expect(labels_dict_stat.size > 0);
     try testing.expect(labels_stat.size > 0);
     try testing.expect(props_stat.size > 0);
@@ -248,8 +248,8 @@ test "open rebuilds derived indexes when snapshot files are stale" {
     const labels_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/labels.idx", .{graph_dir.path});
     defer testing.allocator.free(labels_idx_path);
 
-    const labels_file = try std.fs.cwd().createFile(labels_idx_path, .{ .read = true, .truncate = true });
-    labels_file.close();
+    const labels_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), labels_idx_path, .{ .read = true, .truncate = true });
+    labels_file.close(std.Io.Threaded.global_single_threaded.io());
 
     const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     defer engine.close() catch {};
@@ -442,15 +442,15 @@ test "GAP-0071: open loads the persisted edge index without rescanning adjacency
     const edges_idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges.idx", .{graph_dir.path});
     defer testing.allocator.free(edges_idx_path);
 
-    try testing.expect((try std.fs.cwd().statFile(edges_idx_path)).size > 0);
+    try testing.expect((try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), edges_idx_path, .{})).size > 0);
 
     {
-        const file = try std.fs.cwd().openFile(adj_out_path, .{ .mode = .write_only });
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), adj_out_path, .{ .mode = .write_only });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
         var buf: [4096]u8 = undefined;
         @memset(&buf, 0xFF);
-        try file.writeAll(&buf);
+        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
     }
 
     const reopened = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);

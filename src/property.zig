@@ -98,7 +98,7 @@ pub fn encode(allocator: Allocator, value: PropertyValue) ![]u8 {
 pub fn decode(allocator: Allocator, bytes: []const u8) !DecodeResult {
     if (bytes.len < 1) return error.UnexpectedEndOfInput;
 
-    const tag: Tag = std.meta.intToEnum(Tag, bytes[0]) catch return error.InvalidFormat;
+    const tag: Tag = std.enums.fromInt(Tag, bytes[0]) orelse return error.InvalidFormat;
 
     switch (tag) {
         .null => {
@@ -168,7 +168,7 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !DecodeResult {
 pub fn decodeView(bytes: []const u8) error{ UnexpectedEndOfInput, InvalidFormat }!DecodeResult {
     if (bytes.len < 1) return error.UnexpectedEndOfInput;
 
-    const tag: Tag = std.meta.intToEnum(Tag, bytes[0]) catch return error.InvalidFormat;
+    const tag: Tag = std.enums.fromInt(Tag, bytes[0]) orelse return error.InvalidFormat;
 
     switch (tag) {
         .null => {

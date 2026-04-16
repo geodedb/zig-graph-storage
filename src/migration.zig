@@ -105,11 +105,11 @@ pub const Migration = struct {
     pub fn validatePerGraphHeader(self: *const Migration, path: []const u8) !PerGraphHeader {
         _ = self;
 
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
         var buf: [PER_GRAPH_HEADER_SIZE]u8 = undefined;
-        const bytes_read = try file.readAll(&buf);
+        const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &buf, 0);
         if (bytes_read < PER_GRAPH_HEADER_SIZE) return error.InvalidData;
 
         // Validate magic
@@ -192,8 +192,8 @@ fn fileExists(dir_path: []const u8, name: []const u8) bool {
     // Build path on stack using a fixed buffer
     var path_buf: [4096]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, name }) catch return false;
-    const file = std.fs.cwd().openFile(path, .{}) catch return false;
-    file.close();
+    const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    file.close(std.Io.Threaded.global_single_threaded.io());
     return true;
 }
 
@@ -224,7 +224,7 @@ test "detectStorageState: empty dir returns fresh" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const m = Migration.init(allocator);
@@ -237,12 +237,12 @@ test "detectStorageState: graph_registry.dat returns per_graph" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     // Create graph_registry.dat
-    const file = try tmp_dir.dir.createFile("graph_registry.dat", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "graph_registry.dat", .{});
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const m = Migration.init(allocator);
     const state = m.detectStorageState(tmp_path);
@@ -254,12 +254,12 @@ test "detectStorageState: graph_store.dat returns legacy_monolithic" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     // Create graph_store.dat
-    const file = try tmp_dir.dir.createFile("graph_store.dat", .{});
-    file.close();
+    const file = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "graph_store.dat", .{});
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const m = Migration.init(allocator);
     const state = m.detectStorageState(tmp_path);
@@ -271,14 +271,14 @@ test "detectStorageState: both files without migrated marker returns interrupted
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     // Create both files
-    const f1 = try tmp_dir.dir.createFile("graph_store.dat", .{});
-    f1.close();
-    const f2 = try tmp_dir.dir.createFile("graph_registry.dat", .{});
-    f2.close();
+    const f1 = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "graph_store.dat", .{});
+    f1.close(std.Io.Threaded.global_single_threaded.io());
+    const f2 = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "graph_registry.dat", .{});
+    f2.close(std.Io.Threaded.global_single_threaded.io());
 
     const m = Migration.init(allocator);
     const state = m.detectStorageState(tmp_path);
@@ -290,16 +290,16 @@ test "detectStorageState: both files with migrated marker returns per_graph" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     // Create both files + .migrated marker
-    const f1 = try tmp_dir.dir.createFile("graph_store.dat", .{});
-    f1.close();
-    const f2 = try tmp_dir.dir.createFile("graph_registry.dat", .{});
-    f2.close();
-    const f3 = try tmp_dir.dir.createFile("graph_store.dat.migrated", .{});
-    f3.close();
+    const f1 = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "graph_store.dat", .{});
+    f1.close(std.Io.Threaded.global_single_threaded.io());
+    const f2 = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "graph_registry.dat", .{});
+    f2.close(std.Io.Threaded.global_single_threaded.io());
+    const f3 = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "graph_store.dat.migrated", .{});
+    f3.close(std.Io.Threaded.global_single_threaded.io());
 
     const m = Migration.init(allocator);
     const state = m.detectStorageState(tmp_path);
@@ -311,7 +311,7 @@ test "validatePerGraphHeader: valid header" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -331,9 +331,9 @@ test "validatePerGraphHeader: valid header" {
     const file_path = try std.fmt.allocPrint(allocator, "{s}/test_graph.dat", .{tmp_path});
     defer allocator.free(file_path);
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
-    try file.writeAll(&buf);
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const m = Migration.init(allocator);
     const parsed = try m.validatePerGraphHeader(file_path);
@@ -349,7 +349,7 @@ test "validatePerGraphHeader: invalid magic" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -369,9 +369,9 @@ test "validatePerGraphHeader: invalid magic" {
     const file_path = try std.fmt.allocPrint(allocator, "{s}/bad_magic.dat", .{tmp_path});
     defer allocator.free(file_path);
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
-    try file.writeAll(&buf);
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const m = Migration.init(allocator);
     const result = m.validatePerGraphHeader(file_path);
@@ -383,7 +383,7 @@ test "validatePerGraphHeader: corrupted CRC" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -403,9 +403,9 @@ test "validatePerGraphHeader: corrupted CRC" {
     const file_path = try std.fmt.allocPrint(allocator, "{s}/bad_crc.dat", .{tmp_path});
     defer allocator.free(file_path);
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
-    try file.writeAll(&buf);
-    file.close();
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const m = Migration.init(allocator);
     const result = m.validatePerGraphHeader(file_path);
@@ -417,7 +417,7 @@ test "migrate: fresh directory returns zero result" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var m = Migration.init(allocator);
@@ -435,11 +435,11 @@ test "MigrationResult writeJson produces valid structured output" {
         .total_edges = 27,
     };
 
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(std.testing.allocator);
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
 
-    try result.writeJson(buf.writer(std.testing.allocator));
-    const json = buf.items;
+    try result.writeJson(&aw.writer);
+    const json = aw.writer.buffer[0..aw.writer.end];
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"migration\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"ok\"") != null);

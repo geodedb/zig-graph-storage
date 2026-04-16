@@ -23,11 +23,12 @@ pub const GraphDir = struct {
         errdefer allocator.free(path);
 
         // Create directory (including parents) and restrict to owner-only access
-        try std.fs.cwd().makePath(path);
+        try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), path);
+        const io = std.Io.Threaded.global_single_threaded.io();
         {
-            var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-            defer dir.close();
-            dir.chmod(0o700) catch {};
+            var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+            defer dir.close(io);
+            dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
         }
 
         // Create empty store files
@@ -35,8 +36,8 @@ pub const GraphDir = struct {
             const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, file_name });
             defer allocator.free(file_path);
 
-            const file = try std.fs.cwd().createFile(file_path, .{ .mode = 0o600 });
-            file.close();
+            const file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .permissions = std.Io.File.Permissions.fromMode(0o600) });
+            file.close(io);
         }
 
         return .{
@@ -53,8 +54,8 @@ pub const GraphDir = struct {
         errdefer allocator.free(path);
 
         // Verify the directory exists
-        var dir = try std.fs.cwd().openDir(path, .{});
-        dir.close();
+        var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        dir.close(std.Io.Threaded.global_single_threaded.io());
 
         return .{
             .allocator = allocator,
@@ -95,7 +96,7 @@ pub const GraphDir = struct {
         // Validate that the path contains the expected graphs/<uuid> structure
         // before performing the destructive deleteTree operation.
         if (!self.hasExpectedPathStructure()) return error.InvalidGraphPath;
-        try std.fs.cwd().deleteTree(self.path);
+        try std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), self.path);
     }
 
     /// Verify the path contains the expected /graphs/<32-hex-chars> suffix.
@@ -139,7 +140,7 @@ test "create graph dir, verify directory exists on disk" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -149,15 +150,15 @@ test "create graph dir, verify directory exists on disk" {
     defer gd.deinit();
 
     // Verify directory exists
-    var dir = try std.fs.cwd().openDir(gd.path, .{});
-    dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), gd.path, .{});
+    dir.close(std.Io.Threaded.global_single_threaded.io());
 
     // Verify store files exist
     for (file_manager.FILE_NAMES) |file_name| {
         const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ gd.path, file_name });
         defer allocator.free(file_path);
-        var file = try std.fs.cwd().openFile(file_path, .{});
-        file.close();
+        var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+        file.close(std.Io.Threaded.global_single_threaded.io());
     }
 }
 
@@ -167,7 +168,7 @@ test "storePath returns correct paths" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -193,7 +194,7 @@ test "manifestPath returns correct paths" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -217,7 +218,7 @@ test "delete removes directory" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -229,7 +230,7 @@ test "delete removes directory" {
     try gd.delete();
 
     // Verify directory no longer exists
-    const result = std.fs.cwd().openDir(gd.path, .{});
+    const result = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), gd.path, .{});
     try std.testing.expectError(error.FileNotFound, result);
 }
 
@@ -248,7 +249,7 @@ test "created store files have mode 0o600 and directory has mode 0o700" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -259,10 +260,10 @@ test "created store files have mode 0o600 and directory has mode 0o700" {
 
     // Verify directory has 0o700
     {
-        var dir = try std.fs.cwd().openDir(gd.path, .{});
-        defer dir.close();
-        const stat = try dir.stat();
-        const perm = stat.mode & 0o777;
+        var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), gd.path, .{});
+        defer dir.close(std.Io.Threaded.global_single_threaded.io());
+        const stat = try dir.stat(std.Io.Threaded.global_single_threaded.io());
+        const perm = stat.permissions.toMode() & 0o7777;
         try std.testing.expectEqual(@as(u32, 0o700), perm);
     }
 
@@ -271,8 +272,8 @@ test "created store files have mode 0o600 and directory has mode 0o700" {
         const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ gd.path, file_name });
         defer allocator.free(file_path);
 
-        const stat = try std.fs.cwd().statFile(file_path);
-        const perm = stat.mode & 0o777;
+        const stat = try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+        const perm = stat.permissions.toMode() & 0o7777;
         try std.testing.expectEqual(@as(u32, 0o600), perm);
     }
 }

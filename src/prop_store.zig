@@ -594,7 +594,7 @@ pub const PropStore = struct {
 /// Returns error.DataCorruption if the encoded length exceeds available bytes.
 fn encodedSizeFromBytes(bytes: []const u8) error{ InvalidData, DataCorruption }!usize {
     if (bytes.len < 1) return error.DataCorruption;
-    const tag: property_mod.Tag = std.meta.intToEnum(property_mod.Tag, bytes[0]) catch return error.InvalidData;
+    const tag: property_mod.Tag = std.enums.fromInt(property_mod.Tag, bytes[0]) orelse return error.InvalidData;
     const size: usize = switch (tag) {
         .null => 1,
         .bool => 2,

@@ -91,13 +91,13 @@ pub const Recovery = struct {
     ) !Manifest {
         config_mod.emitEvent(self.log_fn, .recovery_start);
 
-        var timer = std.time.Timer.start() catch null;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const start_ts = std.Io.Clock.Timestamp.now(io, .awake);
         defer {
-            if (timer) |*t| {
-                const elapsed_ns: u64 = t.read();
-                if (self.metrics) |m| {
-                    m.recovery_duration_ns = elapsed_ns;
-                }
+            const end_ts = std.Io.Clock.Timestamp.now(io, .awake);
+            const elapsed = start_ts.durationTo(end_ts);
+            if (self.metrics) |m| {
+                m.recovery_duration_ns = @intCast(elapsed.raw.toNanoseconds());
             }
             config_mod.emitEvent(self.log_fn, .recovery_end);
         }
@@ -152,8 +152,8 @@ pub const Recovery = struct {
         const wal_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/wal", .{graph_dir.path});
         defer self.allocator.free(wal_dir_path);
 
-        var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-        defer wal_dir.close();
+        var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+        defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
         var wal = try WalManager.init(
             self.allocator,
@@ -213,7 +213,7 @@ pub const Recovery = struct {
                 const state = ctx.txn_states.get(rec.txn_id) orelse return;
                 if (state != .committed) return;
 
-                const file_id: FileId = std.meta.intToEnum(FileId, rec.file_id) catch return error.InvalidFormat;
+                const file_id: FileId = std.enums.fromInt(FileId, rec.file_id) orelse return error.InvalidFormat;
                 const frame = try ctx.buffer_pool.pinNew(file_id, rec.page_id);
                 const frame_idx = ctx.buffer_pool.frameIndex(frame);
                 const data = frame.dataSlice();
@@ -267,7 +267,7 @@ fn setupTestGraph(allocator: Allocator) !struct {
     graph_dir: GraphDir,
 } {
     var tmp_dir = testing.tmpDir(.{});
-    const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(dir_path);
 
     const uuid = [_]u8{0xBB} ** 16;
@@ -276,7 +276,7 @@ fn setupTestGraph(allocator: Allocator) !struct {
     // Create WAL directory
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{gd.path});
     defer allocator.free(wal_dir_path);
-    try std.fs.cwd().makePath(wal_dir_path);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), wal_dir_path);
 
     return .{
         .tmp_dir = tmp_dir,
@@ -368,8 +368,8 @@ test "recovery with committed transaction: changes visible after recovery" {
     // Write WAL records simulating a committed transaction
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
 
@@ -470,8 +470,8 @@ test "GAP-0030: recovery replays a large committed WAL tail" {
 
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
     defer wal.deinit();
@@ -551,8 +551,8 @@ test "recovery with uncommitted transaction: changes discarded" {
     // Write WAL records: uncommitted transaction (no COMMIT)
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
 
@@ -640,8 +640,8 @@ test "recovery rejects WAL records with corrupted checksums" {
     // Open WAL directory and create WAL
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
 
@@ -765,8 +765,8 @@ test "GAP-0005a: torn/truncated WAL record fails recovery closed" {
     // Create WAL with a valid committed txn followed by a truncated record
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
 
@@ -854,11 +854,11 @@ test "GAP-0005b: manifest A corrupt, B valid -- recovery uses B" {
     const path_a = try setup.graph_dir.manifestPath(allocator, .a);
     defer allocator.free(path_a);
     {
-        const corrupt_file = try std.fs.cwd().createFile(path_a, .{});
-        defer corrupt_file.close();
+        const corrupt_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path_a, .{});
+        defer corrupt_file.close(std.Io.Threaded.global_single_threaded.io());
         var garbage: [148]u8 = undefined;
         @memset(&garbage, 0xFF); // total garbage, invalid magic + CRC
-        try corrupt_file.writeAll(&garbage);
+        try corrupt_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &garbage);
     }
 
     // Run recovery -- should use manifest B
@@ -902,8 +902,8 @@ test "GAP-0005c: multiple concurrent transactions -- only committed data survive
     //   txn 3 = aborted (page 3, data 0xCC)
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
 
@@ -1026,8 +1026,8 @@ test "GAP-0005d: recovery with many pages (>100 page updates in WAL)" {
 
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
 
@@ -1156,8 +1156,8 @@ test "recovery writes manifest to both slots A and B" {
     // Write a committed transaction so recovery writes a fresh manifest
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
     var begin_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
@@ -1314,8 +1314,8 @@ test "uncommitted transaction not applied during recovery" {
     // Open WAL directory and create WAL manager
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
     defer allocator.free(wal_dir_path);
-    var wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
-    defer wal_dir.close();
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
 

@@ -104,7 +104,7 @@ pub const WalManager = struct {
     /// external library's log. Caller owns the returned slice and each
     /// record's payload.
     pub fn readFrom(self: *WalManager, start_lsn: u64, allocator: Allocator) ![]WalRecord {
-        var all_records: std.ArrayList(WalRecord) = .{};
+        var all_records: std.ArrayList(WalRecord) = .empty;
         errdefer {
             for (all_records.items) |*r| r.deinit(allocator);
             all_records.deinit(allocator);
@@ -220,22 +220,23 @@ pub const WalManager = struct {
 };
 
 fn ensureGraphIdentity(wal_dir: std.Io.Dir, graph_uuid: [16]u8, create_if_missing: bool) !void {
-    const file = wal_dir.openFile(GRAPH_IDENTITY_FILE, .{ .mode = .read_write }) catch |err| switch (err) {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = wal_dir.openFile(io, GRAPH_IDENTITY_FILE, .{ .mode = .read_write }) catch |err| switch (err) {
         error.FileNotFound => if (!create_if_missing) {
             return error.FileNotFound;
         } else blk: {
-            const new_file = try wal_dir.createFile(GRAPH_IDENTITY_FILE, .{ .read = true, .mode = 0o600 });
+            const new_file = try wal_dir.createFile(io, GRAPH_IDENTITY_FILE, .{ .read = true, .permissions = std.Io.File.Permissions.fromMode(0o600) });
             break :blk new_file;
         },
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
     var stored_uuid: [16]u8 = undefined;
-    const bytes_read = try file.readAll(&stored_uuid);
+    const bytes_read = try file.readPositionalAll(io, &stored_uuid, 0);
     if (bytes_read == 0) {
-        try file.writeAll(&graph_uuid);
-        try file.sync();
+        try file.writePositionalAll(io, &graph_uuid, 0);
+        try file.sync(io);
         return;
     }
     if (bytes_read != stored_uuid.len) return error.InvalidData;

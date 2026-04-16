@@ -28,7 +28,7 @@ pub const TxnManager = struct {
     pub fn init(allocator: Allocator, wal: *WalManager, start_txn_id: u64) TxnManager {
         return TxnManager{
             .next_txn_id = start_txn_id,
-            .txn_id_mutex = .{},
+            .txn_id_mutex = std.Io.Mutex.init,
             .active_txns = std.AutoHashMap(u64, TxnState).init(allocator),
             .wal = wal,
             .allocator = allocator,

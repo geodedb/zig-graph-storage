@@ -314,7 +314,7 @@ const TestEnv = struct {
 
     fn init() !TestEnv {
         var tmp_dir = testing.tmpDir(.{});
-        const adj_file = tmp_dir.dir.createFile("adj_out.store", .{ .read = true, .truncate = true }) catch unreachable;
+        const adj_file = tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "adj_out.store", .{ .read = true, .truncate = true }) catch unreachable;
         var pool = try BufferPool.init(testing.allocator, 4096, 32);
         const fsm = try FreeSpaceManager.init(testing.allocator, &pool, .adj_out);
 
@@ -335,7 +335,7 @@ const TestEnv = struct {
     fn deinit(self: *TestEnv) void {
         self.fsm.deinit();
         self.pool.deinit();
-        self.adj_file.close();
+        self.adj_file.close(std.Io.Threaded.global_single_threaded.io());
         self.tmp_dir.cleanup();
     }
 };

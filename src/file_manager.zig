@@ -63,11 +63,11 @@ pub const FileManager = struct {
         defer self.allocator.free(path);
 
         const file = switch (mode) {
-            .open_existing => try std.fs.cwd().openFile(path, .{ .mode = .read_write }),
-            .create_if_missing => try std.fs.cwd().createFile(path, .{
+            .open_existing => try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .read_write }),
+            .create_if_missing => try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{
                 .read = true,
                 .truncate = false, // don't truncate existing files!
-                .mode = 0o600,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
             }),
         };
 
@@ -106,7 +106,7 @@ pub const FileManager = struct {
     pub fn deinit(self: *FileManager) void {
         for (&self.files) |*maybe_file| {
             if (maybe_file.*) |*file| {
-                file.close();
+                file.close(std.Io.Threaded.global_single_threaded.io());
                 maybe_file.* = null;
             }
         }
@@ -144,14 +144,14 @@ test "open and get pager" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
-    file.close();
+    const file = try tmp.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "nodes.store", .{ .read = true, .truncate = true });
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const pager_ptr = try fm.openFile(.nodes, .open_existing);
     try testing.expect(pager_ptr.page_size == 4096);
@@ -161,7 +161,7 @@ test "create_if_missing creates file on disk" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
@@ -170,7 +170,7 @@ test "create_if_missing creates file on disk" {
     _ = try fm.openFile(.nodes, .create_if_missing);
 
     // Verify the file exists in the temp dir
-    const stat = tmp.dir.statFile("nodes.store") catch |err| {
+    const stat = tmp.dir.statFile(std.Io.Threaded.global_single_threaded.io(), "nodes.store", .{}) catch |err| {
         std.debug.print("Expected nodes.store to exist, got error: {}\n", .{err});
         return error.TestUnexpectedResult;
     };
@@ -181,18 +181,19 @@ test "multiple files each have their own pager" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const nodes_file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
-    nodes_file.close();
-    const adj_out_file = try tmp.dir.createFile("adj_out.store", .{ .read = true, .truncate = true });
-    adj_out_file.close();
-    const props_file = try tmp.dir.createFile("props.store", .{ .read = true, .truncate = true });
-    props_file.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const nodes_file = try tmp.dir.createFile(io, "nodes.store", .{ .read = true, .truncate = true });
+    nodes_file.close(io);
+    const adj_out_file = try tmp.dir.createFile(io, "adj_out.store", .{ .read = true, .truncate = true });
+    adj_out_file.close(io);
+    const props_file = try tmp.dir.createFile(io, "props.store", .{ .read = true, .truncate = true });
+    props_file.close(io);
 
     const nodes_pager = try fm.openFile(.nodes, .open_existing);
     const adj_out_pager = try fm.openFile(.adj_out, .open_existing);
@@ -204,16 +205,16 @@ test "multiple files each have their own pager" {
     try testing.expect(@intFromPtr(nodes_pager) != @intFromPtr(props_pager));
 
     // Verify all corresponding files exist
-    _ = try tmp.dir.statFile("nodes.store");
-    _ = try tmp.dir.statFile("adj_out.store");
-    _ = try tmp.dir.statFile("props.store");
+    _ = try tmp.dir.statFile(io, "nodes.store", .{});
+    _ = try tmp.dir.statFile(io, "adj_out.store", .{});
+    _ = try tmp.dir.statFile(io, "props.store", .{});
 }
 
 test "getPager before open returns null" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
@@ -228,14 +229,14 @@ test "write through pager and read back" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
-    file.close();
+    const file = try tmp.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "nodes.store", .{ .read = true, .truncate = true });
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const pager_ptr = try fm.openFile(.nodes, .open_existing);
 
@@ -266,15 +267,16 @@ test "deinit closes files and resets pagers" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
 
-    const nodes_file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
-    nodes_file.close();
-    const adj_out_file = try tmp.dir.createFile("adj_out.store", .{ .read = true, .truncate = true });
-    adj_out_file.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const nodes_file = try tmp.dir.createFile(io, "nodes.store", .{ .read = true, .truncate = true });
+    nodes_file.close(io);
+    const adj_out_file = try tmp.dir.createFile(io, "adj_out.store", .{ .read = true, .truncate = true });
+    adj_out_file.close(io);
 
     _ = try fm.openFile(.nodes, .open_existing);
     _ = try fm.openFile(.adj_out, .open_existing);
@@ -299,14 +301,14 @@ test "openFile is idempotent — returns same pager on second call" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
     defer fm.deinit();
 
-    const file = try tmp.dir.createFile("nodes.store", .{ .read = true, .truncate = true });
-    file.close();
+    const file = try tmp.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "nodes.store", .{ .read = true, .truncate = true });
+    file.close(std.Io.Threaded.global_single_threaded.io());
 
     const p1 = try fm.openFile(.nodes, .open_existing);
     const p2 = try fm.openFile(.nodes, .open_existing);
@@ -333,7 +335,7 @@ test "created files have mode 0o600" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
     var fm = FileManager.init(testing.allocator, dir_path, 4096);
@@ -342,9 +344,9 @@ test "created files have mode 0o600" {
     _ = try fm.openFile(.nodes, .create_if_missing);
 
     // Stat the file and check permissions
-    const stat = try tmp.dir.statFile("nodes.store");
+    const stat = try tmp.dir.statFile(std.Io.Threaded.global_single_threaded.io(), "nodes.store", .{});
     // Mask out file type bits, check permission bits
-    const perm = stat.mode & 0o777;
+    const perm = stat.permissions.toMode() & 0o7777;
     try testing.expectEqual(@as(u32, 0o600), perm);
 }
 

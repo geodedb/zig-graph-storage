@@ -76,7 +76,7 @@ pub const LabelIndex = struct {
     pub fn addNode(self: *LabelIndex, label_id: LabelId, node_id: NodeId) !void {
         const gop = try self.index.getOrPut(label_id);
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .empty;
         }
         // Insert in sorted order using binary search; skip duplicates.
         const list = gop.value_ptr;
@@ -154,9 +154,10 @@ pub const LabelIndex = struct {
     ///   repeated label_count times:
     ///     [u32 label_id][u64 node_count][node_count * u64 node_id]
     pub fn saveToFile(self: *const LabelIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
-        try file.setEndPos(0);
-        try file.seekTo(0);
-        try index_snapshot_mod.writeHeader(file, SNAPSHOT_MAGIC, checkpoint_counter, self.index.count());
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try file.setLength(io, 0);
+        var write_offset: u64 = 0;
+        try index_snapshot_mod.writeHeader(file.*, &write_offset, SNAPSHOT_MAGIC, checkpoint_counter, self.index.count());
 
         var u32_buf: [4]u8 = undefined;
         var u64_buf: [8]u8 = undefined;
@@ -164,14 +165,17 @@ pub const LabelIndex = struct {
         var it = self.index.iterator();
         while (it.next()) |entry| {
             std.mem.writeInt(u32, &u32_buf, entry.key_ptr.*, .little);
-            try file.writeAll(&u32_buf);
+            try file.writePositionalAll(io, &u32_buf, write_offset);
+            write_offset += 4;
 
             std.mem.writeInt(u64, &u64_buf, entry.value_ptr.items.len, .little);
-            try file.writeAll(&u64_buf);
+            try file.writePositionalAll(io, &u64_buf, write_offset);
+            write_offset += 8;
 
             for (entry.value_ptr.items) |node_id| {
                 std.mem.writeInt(u64, &u64_buf, node_id, .little);
-                try file.writeAll(&u64_buf);
+                try file.writePositionalAll(io, &u64_buf, write_offset);
+                write_offset += 8;
             }
         }
     }
@@ -185,7 +189,7 @@ pub const LabelIndex = struct {
         self.clear();
         errdefer self.clear();
 
-        try file.seekTo(SNAPSHOT_MAGIC.len + 16);
+        var file_offset: u64 = SNAPSHOT_MAGIC.len + 16;
         var remaining = snapshot.payload_size;
 
         var i: u64 = 0;
@@ -193,22 +197,22 @@ pub const LabelIndex = struct {
         var u32_buf: [4]u8 = undefined;
         var u64_buf: [8]u8 = undefined;
         while (i < label_count) : (i += 1) {
-            try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+            try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
             const label_id = std.mem.readInt(u32, &u32_buf, .little);
 
-            try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+            try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
             const node_count = std.mem.readInt(u64, &u64_buf, .little);
 
             const gop = try self.index.getOrPut(label_id);
             if (!gop.found_existing) {
-                gop.value_ptr.* = .{};
+                gop.value_ptr.* = .empty;
             }
 
             try gop.value_ptr.ensureTotalCapacity(self.allocator, @intCast(node_count));
 
             var j: u64 = 0;
             while (j < node_count) : (j += 1) {
-                try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+                try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
                 const node_id = std.mem.readInt(u64, &u64_buf, .little);
                 gop.value_ptr.appendAssumeCapacity(node_id);
             }
@@ -311,8 +315,8 @@ test "saveToFile + loadFromFile round-trip preserves posting lists" {
     try idx.addNode(1, 20);
     try idx.addNode(2, 99);
 
-    var file = try env.tmp_dir.dir.createFile("labels.idx", .{ .read = true, .truncate = true });
-    defer file.close();
+    var file = try env.tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "labels.idx", .{ .read = true, .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
     try idx.saveToFile(&file, 42);
 

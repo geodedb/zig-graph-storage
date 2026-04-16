@@ -122,7 +122,7 @@ const TestEnv = struct {
         const allocator = testing.allocator;
 
         // Create graph directory structure
-        const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+        const dir_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
         defer allocator.free(dir_path);
 
         const gd = try GraphDir.create(allocator, dir_path, [_]u8{0xAA} ** 16);
@@ -130,8 +130,8 @@ const TestEnv = struct {
         // Create WAL directory
         const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{gd.path});
         defer allocator.free(wal_dir_path);
-        try std.fs.cwd().makePath(wal_dir_path);
-        const wal_dir = try std.fs.cwd().openDir(wal_dir_path, .{});
+        try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), wal_dir_path);
+        const wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
 
         var fm = FileManager.init(allocator, gd.path, 4096);
         _ = try fm.openFile(.nodes, .create_if_missing);
@@ -162,7 +162,7 @@ const TestEnv = struct {
 
     fn deinit(self: *TestEnv) void {
         self.wal.deinit();
-        self.wal_dir_handle.close();
+        self.wal_dir_handle.close(std.Io.Threaded.global_single_threaded.io());
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();

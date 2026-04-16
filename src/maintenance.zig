@@ -457,11 +457,11 @@ test "MaintenanceResult writeJson includes stats when present" {
         .bytes_checked = 160,
     });
 
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
 
-    try result.writeJson(buf.writer(testing.allocator));
-    const json = buf.items;
+    try result.writeJson(&aw.writer);
+    const json = aw.writer.buffer[0..aw.writer.end];
 
     try testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"storage_stats\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"flushed_pages\":0") != null);
@@ -495,11 +495,11 @@ test "MaintenanceResult writeJson omits stats when absent" {
         .items_checked = 2,
     });
 
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
 
-    try result.writeJson(buf.writer(testing.allocator));
-    const json = buf.items;
+    try result.writeJson(&aw.writer);
+    const json = aw.writer.buffer[0..aw.writer.end];
 
     try testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"flush_dirty_pages\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"flushed_pages\":2") != null);

@@ -94,8 +94,8 @@ pub const BufferPool = struct {
             .lru_tail = null,
             .free_list = free_list,
             .pagers = [_]?*Pager{null} ** FILE_COUNT,
-            .mutex = .{},
-            .cond = .{},
+            .mutex = std.Io.Mutex.init,
+            .cond = std.Io.Condition.init,
         };
     }
 
@@ -132,7 +132,7 @@ pub const BufferPool = struct {
             if (self.page_table.get(key)) |frame_idx| {
                 const frame = &self.frames[frame_idx];
                 if (frame.loading) {
-                    self.cond.wait(&self.mutex);
+                    self.cond.waitUncancelable(std.Io.Threaded.global_single_threaded.io(), &self.mutex);
                     continue;
                 }
                 frame.pin_count += 1;
@@ -180,7 +180,7 @@ pub const BufferPool = struct {
                 self.removeFromLru(frame_idx);
                 _ = self.page_table.remove(key);
                 self.free_list.appendAssumeCapacity(frame_idx);
-                self.cond.broadcast();
+                self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
                 self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
                 return err;
             }
@@ -188,7 +188,7 @@ pub const BufferPool = struct {
             frame.loading = false;
             frame.valid = true;
             if (self.metrics) |m| m.page_reads += 1;
-            self.cond.broadcast();
+            self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
             self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             return frame;
         }
@@ -242,7 +242,7 @@ pub const BufferPool = struct {
             frame.dirty = true;
         }
         if (frame.pin_count == 0) {
-            self.cond.broadcast();
+            self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
         }
     }
 
@@ -602,15 +602,15 @@ pub const BufferPool = struct {
 const testing = std.testing;
 
 fn createTempFile(name: []const u8) !std.Io.File {
-    return std.fs.cwd().createFile(name, .{
+    return std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), name, .{
         .read = true,
         .truncate = true,
     });
 }
 
 fn cleanupTempFile(file: std.Io.File, name: []const u8) void {
-    file.close();
-    std.fs.cwd().deleteFile(name) catch {};
+    file.close(std.Io.Threaded.global_single_threaded.io());
+    std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), name) catch {};
 }
 
 /// Write a page with known data pattern to a file via a pager.
@@ -979,12 +979,12 @@ test "GAP-0089: pin waits for an in-flight page load" {
 
     const Loader = struct {
         fn finish(p: *BufferPool) void {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+            std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromMilliseconds(20), .awake) catch {};
             p.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
             defer p.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             p.frames[0].loading = false;
             p.frames[0].valid = true;
-            p.cond.broadcast();
+            p.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
         }
     };
 

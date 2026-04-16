@@ -432,7 +432,7 @@ pub const GraphEngine = struct {
         self.thread_pool.deinit();
         self.txn_manager.deinit();
         self.wal.deinit();
-        self.wal_dir_handle.close();
+        self.wal_dir_handle.close(std.Io.Threaded.global_single_threaded.io());
         self.free_space_nodes.deinit();
         self.free_space_adj_out.deinit();
         self.free_space_adj_in.deinit();
@@ -895,7 +895,7 @@ pub const GraphEngine = struct {
 };
 
 fn property_indexEncodedValue(allocator: Allocator, val: PropertyValue) !std.ArrayList(u8) {
-    var encoded: std.ArrayList(u8) = .{};
+    var encoded: std.ArrayList(u8) = .empty;
     errdefer encoded.deinit(allocator);
 
     const encoded_len = property_mod.encodedSize(val);

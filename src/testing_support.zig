@@ -24,7 +24,7 @@ pub const TestDataDir = struct {
 
     pub fn init(allocator: Allocator) !TestDataDir {
         var tmp_dir = std.testing.tmpDir(.{});
-        const path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+        const path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
         return .{
             .allocator = allocator,
             .tmp_dir = tmp_dir,
@@ -75,7 +75,7 @@ pub const SingleStoreEnv = struct {
         buffer_pool_pages: u32,
     ) !SingleStoreEnv {
         var tmp_dir = std.testing.tmpDir(.{});
-        const file = try tmp_dir.dir.createFile(file_name, .{ .read = true, .truncate = true });
+        const file = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), file_name, .{ .read = true, .truncate = true });
         var pool = try BufferPool.init(allocator, page_size, buffer_pool_pages);
         const fsm = try FreeSpaceManager.init(allocator, &pool, file_id);
 
@@ -97,7 +97,7 @@ pub const SingleStoreEnv = struct {
     pub fn deinit(self: *SingleStoreEnv) void {
         self.fsm.deinit();
         self.pool.deinit();
-        self.file.close();
+        self.file.close(std.Io.Threaded.global_single_threaded.io());
         self.tmp_dir.cleanup();
     }
 };
@@ -124,8 +124,8 @@ pub const DualStoreEnv = struct {
         buffer_pool_pages: u32,
     ) !DualStoreEnv {
         var tmp_dir = std.testing.tmpDir(.{});
-        const primary_file = try tmp_dir.dir.createFile(primary_name, .{ .read = true, .truncate = true });
-        const secondary_file = try tmp_dir.dir.createFile(secondary_name, .{ .read = true, .truncate = true });
+        const primary_file = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), primary_name, .{ .read = true, .truncate = true });
+        const secondary_file = try tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), secondary_name, .{ .read = true, .truncate = true });
         var pool = try BufferPool.init(allocator, page_size, buffer_pool_pages);
         const fsm = try FreeSpaceManager.init(allocator, &pool, fsm_file_id);
 
@@ -151,8 +151,8 @@ pub const DualStoreEnv = struct {
     pub fn deinit(self: *DualStoreEnv) void {
         self.fsm.deinit();
         self.pool.deinit();
-        self.primary_file.close();
-        self.secondary_file.close();
+        self.primary_file.close(std.Io.Threaded.global_single_threaded.io());
+        self.secondary_file.close(std.Io.Threaded.global_single_threaded.io());
         self.tmp_dir.cleanup();
     }
 };

@@ -147,26 +147,31 @@ pub const Manifest = struct {
         defer allocator.free(tmp_path);
 
         // Write to tmp file
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .mode = owner_only_file_mode });
-        defer tmp_file.close();
+        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
 
-        try tmp_file.writeAll(data);
-        try tmp_file.sync();
+        try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), data);
+        try tmp_file.sync(std.Io.Threaded.global_single_threaded.io());
 
         // Atomic rename
-        try std.fs.cwd().rename(tmp_path, path);
+        try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, std.Io.Threaded.global_single_threaded.io());
     }
 
     /// Read file, deserialize. Return null if file doesn't exist.
     pub fn readFromFile(allocator: Allocator, path: []const u8) !?Manifest {
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| {
             if (err == error.FileNotFound) return null;
             return err;
         };
-        defer file.close();
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const data = try file.readToEndAlloc(allocator, SERIALIZED_SIZE * 2);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file_len = try file.length(io);
+        if (file_len > SERIALIZED_SIZE * 2) return error.FileTooLarge;
+        const data = try allocator.alloc(u8, @intCast(file_len));
         defer allocator.free(data);
+        const bytes_read = try file.readPositionalAll(io, data, 0);
+        if (bytes_read != data.len) return error.UnexpectedEndOfFile;
 
         return try deserialize(allocator, data);
     }
@@ -307,7 +312,7 @@ test "writeToFile/readFromFile round-trip" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const file_path = try std.fmt.allocPrint(allocator, "{s}/manifest.test", .{tmp_path});
@@ -324,10 +329,10 @@ test "writeToFile/readFromFile round-trip" {
 
     try m.writeToFile(allocator, file_path);
 
-    const saved_file = try std.fs.cwd().openFile(file_path, .{});
-    defer saved_file.close();
-    const saved_stat = try saved_file.stat();
-    try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.mode & 0o777);
+    const saved_file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+    defer saved_file.close(std.Io.Threaded.global_single_threaded.io());
+    const saved_stat = try saved_file.stat(std.Io.Threaded.global_single_threaded.io());
+    try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.permissions.toMode() & 0o7777);
 
     const loaded = try Manifest.readFromFile(allocator, file_path);
     try std.testing.expect(loaded != null);

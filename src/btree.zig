@@ -20,7 +20,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
         count: usize = 0,
 
         pub const Node = struct {
-            keys: std.ArrayList(K) = .{},
+            keys: std.ArrayList(K) = .empty,
             values: ?std.ArrayList(V) = null, // leaf only
             children: ?std.ArrayList(*Node) = null, // internal only
             is_leaf: bool,
@@ -29,7 +29,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             fn initLeaf(allocator: Allocator) !*Node {
                 const node = try allocator.create(Node);
                 node.* = .{
-                    .values = .{},
+                    .values = .empty,
                     .is_leaf = true,
                 };
                 return node;
@@ -38,7 +38,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             fn initInternal(allocator: Allocator) !*Node {
                 const node = try allocator.create(Node);
                 node.* = .{
-                    .children = .{},
+                    .children = .empty,
                     .is_leaf = false,
                 };
                 return node;
@@ -257,7 +257,7 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
 
         /// Range scan: returns all values where lo <= key <= hi.
         pub fn range(self: *const Self, lo: K, hi: K, allocator: Allocator) ![]V {
-            var result = std.ArrayList(V){};
+            var result: std.ArrayList(V) = .empty;
             errdefer result.deinit(allocator);
 
             const start_leaf = self.findLeaf(lo) orelse
@@ -390,24 +390,24 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             const crc = Crc32.hash(buf[0 .. total_size - 4]);
             std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
 
-            const file = try std.fs.cwd().createFile(path, .{ .mode = 0o600 });
-            defer file.close();
-            try file.writeAll(buf);
+            const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(0o600) });
+            defer file.close(std.Io.Threaded.global_single_threaded.io());
+            try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf);
         }
 
         /// Load a tree from a file written by `saveToFile`.
         pub fn loadFromFile(allocator: Allocator, path: []const u8) !Self {
-            const file = try std.fs.cwd().openFile(path, .{});
-            defer file.close();
+            const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+            defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-            const stat = try file.stat();
+            const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
             const file_size: usize = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
             if (file_size < 8 + 4 + 4 + 4) return error.InvalidFormat; // magic + version + min tree data + crc
 
             const buf = try allocator.alloc(u8, file_size);
             defer allocator.free(buf);
 
-            const bytes_read = try file.readAll(buf);
+            const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, 0);
             if (bytes_read != file_size) return error.UnexpectedEndOfFile;
 
             // Verify magic
@@ -708,7 +708,7 @@ test "saveToFile + loadFromFile — round-trip" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
     const file_path = try std.fmt.allocPrint(testing.allocator, "{s}/btree.snap", .{path});
     defer testing.allocator.free(file_path);
@@ -733,7 +733,7 @@ test "saveToFile + loadFromFile — empty tree round-trip" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
     const file_path = try std.fmt.allocPrint(testing.allocator, "{s}/btree_empty.snap", .{path});
     defer testing.allocator.free(file_path);
@@ -750,16 +750,16 @@ test "loadFromFile — corrupted file returns error" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
     defer testing.allocator.free(path);
     const file_path = try std.fmt.allocPrint(testing.allocator, "{s}/btree_bad.snap", .{path});
     defer testing.allocator.free(file_path);
 
     // Write garbage data
     {
-        const file = try std.fs.cwd().createFile(file_path, .{});
-        defer file.close();
-        try file.writeAll("this is not a valid snapshot file!!");
+        const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "this is not a valid snapshot file!!");
     }
 
     const Tree = BPlusTree(u64, u64);

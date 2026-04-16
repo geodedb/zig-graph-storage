@@ -16,7 +16,7 @@ pub const PropertyChain = struct {
     entries: std.ArrayList(PropertyDigest),
 
     pub fn init() PropertyChain {
-        return .{ .entries = .{} };
+        return .{ .entries = .empty };
     }
 
     pub fn clear(self: *PropertyChain, allocator: Allocator) void {
@@ -164,9 +164,10 @@ pub const PropertyChainIndex = struct {
     ///     repeated entry_count times:
     ///       [u16 key_len][key bytes][u64 value_hash]
     pub fn saveToFile(self: *const PropertyChainIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
-        try file.setEndPos(0);
-        try file.seekTo(0);
-        try index_snapshot_mod.writeHeader(file, SNAPSHOT_MAGIC, checkpoint_counter, self.chains.count());
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try file.setLength(io, 0);
+        var write_offset: u64 = 0;
+        try index_snapshot_mod.writeHeader(file.*, &write_offset, SNAPSHOT_MAGIC, checkpoint_counter, self.chains.count());
 
         var u64_buf: [8]u8 = undefined;
         var u32_buf: [4]u8 = undefined;
@@ -175,18 +176,23 @@ pub const PropertyChainIndex = struct {
         var it = self.chains.iterator();
         while (it.next()) |entry| {
             std.mem.writeInt(u64, &u64_buf, entry.key_ptr.*, .little);
-            try file.writeAll(&u64_buf);
+            try file.writePositionalAll(io, &u64_buf, write_offset);
+            write_offset += 8;
 
             std.mem.writeInt(u32, &u32_buf, @intCast(entry.value_ptr.entries.items.len), .little);
-            try file.writeAll(&u32_buf);
+            try file.writePositionalAll(io, &u32_buf, write_offset);
+            write_offset += 4;
 
             for (entry.value_ptr.entries.items) |digest| {
                 std.mem.writeInt(u16, &u16_buf, @intCast(digest.key.len), .little);
-                try file.writeAll(&u16_buf);
-                try file.writeAll(digest.key);
+                try file.writePositionalAll(io, &u16_buf, write_offset);
+                write_offset += 2;
+                try file.writePositionalAll(io, digest.key, write_offset);
+                write_offset += digest.key.len;
 
                 std.mem.writeInt(u64, &u64_buf, digest.value_hash, .little);
-                try file.writeAll(&u64_buf);
+                try file.writePositionalAll(io, &u64_buf, write_offset);
+                write_offset += 8;
             }
         }
     }
@@ -200,7 +206,7 @@ pub const PropertyChainIndex = struct {
         self.clear();
         errdefer self.clear();
 
-        try file.seekTo(SNAPSHOT_MAGIC.len + 16);
+        var file_offset: u64 = SNAPSHOT_MAGIC.len + 16;
         var remaining = snapshot.payload_size;
         const chain_count = snapshot.item_count;
         var u16_buf: [2]u8 = undefined;
@@ -209,10 +215,10 @@ pub const PropertyChainIndex = struct {
 
         var i: u64 = 0;
         while (i < chain_count) : (i += 1) {
-            try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+            try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
             const prop_head = std.mem.readInt(u64, &u64_buf, .little);
 
-            try index_snapshot_mod.readBounded(file, &remaining, &u32_buf);
+            try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
             const entry_count = std.mem.readInt(u32, &u32_buf, .little);
 
             const gop = try self.chains.getOrPut(prop_head);
@@ -224,14 +230,14 @@ pub const PropertyChainIndex = struct {
 
             var j: u32 = 0;
             while (j < entry_count) : (j += 1) {
-                try index_snapshot_mod.readBounded(file, &remaining, &u16_buf);
+                try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u16_buf);
                 const key_len = std.mem.readInt(u16, &u16_buf, .little);
 
                 const key_copy = try self.allocator.alloc(u8, key_len);
                 errdefer self.allocator.free(key_copy);
-                try index_snapshot_mod.readBounded(file, &remaining, key_copy);
+                try index_snapshot_mod.readBounded(file, &file_offset, &remaining, key_copy);
 
-                try index_snapshot_mod.readBounded(file, &remaining, &u64_buf);
+                try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
                 const value_hash = std.mem.readInt(u64, &u64_buf, .little);
 
                 gop.value_ptr.entries.appendAssumeCapacity(.{
@@ -298,8 +304,8 @@ test "saveToFile + loadFromFile round-trip preserves chain metadata" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var file = try tmp.dir.createFile("props.idx", .{ .read = true, .truncate = true });
-    defer file.close();
+    var file = try tmp.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "props.idx", .{ .read = true, .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
     try idx.saveToFile(&file, 123);
 

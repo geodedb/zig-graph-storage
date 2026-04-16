@@ -151,8 +151,8 @@ pub const Backup = struct {
     /// The backup is a simple archive: header + file entries.
     /// When encryption_key is set, uses version 2 with HMAC-SHA256 tag.
     pub fn createBackup(self: *Backup, graph_dir: *const GraphDir, output_path: []const u8) !BackupResult {
-        const out_file = try std.fs.cwd().createFile(output_path, .{ .mode = owner_only_file_mode });
-        defer out_file.close();
+        const out_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), output_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        defer out_file.close(std.Io.Threaded.global_single_threaded.io());
 
         const version: u16 = if (self.encryption_key != null) BACKUP_VERSION_HMAC else BACKUP_VERSION;
 
@@ -166,7 +166,7 @@ pub const Backup = struct {
             name: []const u8,
             size: u64,
         };
-        var entries: std.ArrayList(FileEntry) = .{};
+        var entries: std.ArrayList(FileEntry) = .empty;
         defer entries.deinit(self.allocator);
 
         // Try required files
@@ -186,7 +186,7 @@ pub const Backup = struct {
         @memcpy(header[6..22], &graph_dir.graph_uuid);
         @memcpy(header[22..26], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(entries.items.len)))));
 
-        try out_file.writeAll(&header);
+        try out_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &header);
         crc.update(&header);
         if (hmac_ctx) |*h| h.update(&header);
         total_bytes += header.len;
@@ -196,13 +196,13 @@ pub const Backup = struct {
             // filename_len (2 bytes)
             var name_len_buf: [2]u8 = undefined;
             @memcpy(&name_len_buf, &std.mem.toBytes(std.mem.nativeToLittle(u16, @as(u16, @intCast(entry.name.len)))));
-            try out_file.writeAll(&name_len_buf);
+            try out_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &name_len_buf);
             crc.update(&name_len_buf);
             if (hmac_ctx) |*h| h.update(&name_len_buf);
             total_bytes += 2;
 
             // filename
-            try out_file.writeAll(entry.name);
+            try out_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), entry.name);
             crc.update(entry.name);
             if (hmac_ctx) |*h| h.update(entry.name);
             total_bytes += entry.name.len;
@@ -210,7 +210,7 @@ pub const Backup = struct {
             // file_size (8 bytes)
             var size_buf: [8]u8 = undefined;
             @memcpy(&size_buf, &std.mem.toBytes(std.mem.nativeToLittle(u64, entry.size)));
-            try out_file.writeAll(&size_buf);
+            try out_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &size_buf);
             crc.update(&size_buf);
             if (hmac_ctx) |*h| h.update(&size_buf);
             total_bytes += 8;
@@ -223,7 +223,7 @@ pub const Backup = struct {
         // Write CRC32
         var crc_buf: [4]u8 = undefined;
         @memcpy(&crc_buf, &std.mem.toBytes(std.mem.nativeToLittle(u32, crc.final())));
-        try out_file.writeAll(&crc_buf);
+        try out_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &crc_buf);
         if (hmac_ctx) |*h| h.update(&crc_buf);
         total_bytes += 4;
 
@@ -231,7 +231,7 @@ pub const Backup = struct {
         if (hmac_ctx) |*h| {
             var hmac_tag: [HmacSha256.mac_length]u8 = undefined;
             h.final(&hmac_tag);
-            try out_file.writeAll(&hmac_tag);
+            try out_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &hmac_tag);
             total_bytes += HmacSha256.mac_length;
         }
 
@@ -249,15 +249,15 @@ pub const Backup = struct {
 
     /// Restore a backup and return a structured result for automation.
     pub fn restoreBackupResult(self: *Backup, backup_path: []const u8, target_dir: []const u8) !RestoreResult {
-        const file = try std.fs.cwd().openFile(backup_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         if (stat.size > MAX_BACKUP_FILE_SIZE) return error.BackupTooLarge;
         const archive_size = std.math.cast(usize, stat.size) orelse return error.BackupTooLarge;
 
         var header_buf: [26]u8 = undefined;
-        try readNoEof(&file, &header_buf);
+        try readNoEof(&file, 0, &header_buf);
         const header = try parseArchiveHeader(header_buf);
         const layout = try archiveLayoutFromFileSize(archive_size, header.version);
 
@@ -305,14 +305,14 @@ pub const Backup = struct {
             if (std.mem.lastIndexOfScalar(u8, name, '/')) |sep| {
                 const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name[0..sep] });
                 defer self.allocator.free(subdir_path);
-                try std.fs.cwd().makePath(subdir_path);
+                try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), subdir_path);
             }
 
             const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name });
             defer self.allocator.free(file_path);
 
-            const out_file = try std.fs.cwd().createFile(file_path, .{ .mode = owner_only_file_mode });
-            defer out_file.close();
+            const out_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+            defer out_file.close(std.Io.Threaded.global_single_threaded.io());
             _ = try copyTrackedToFile(&file, &out_file, &pos, file_size, layout, &crc, &hmac_ctx);
 
             files_restored += 1;
@@ -328,7 +328,7 @@ pub const Backup = struct {
 
         if (layout.hmac_offset) |_| {
             var stored_hmac: [HmacSha256.mac_length]u8 = undefined;
-            try readNoEof(&file, &stored_hmac);
+            try readNoEof(&file, @intCast(pos), &stored_hmac);
             pos += stored_hmac.len;
 
             var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
@@ -349,15 +349,15 @@ pub const Backup = struct {
 
     /// Validate a backup file's integrity (check header, CRC, and HMAC if applicable).
     pub fn validateBackup(self: *Backup, backup_path: []const u8) !bool {
-        const file = std.fs.cwd().openFile(backup_path, .{}) catch return false;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{}) catch return false;
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = file.stat() catch return false;
+        const stat = file.stat(std.Io.Threaded.global_single_threaded.io()) catch return false;
         if (stat.size > MAX_BACKUP_FILE_SIZE) return false;
         const archive_size = std.math.cast(usize, stat.size) orelse return false;
 
         var header_buf: [26]u8 = undefined;
-        readNoEof(&file, &header_buf) catch return false;
+        readNoEof(&file, 0, &header_buf) catch return false;
         const header = parseArchiveHeader(header_buf) catch return false;
         const layout = archiveLayoutFromFileSize(archive_size, header.version) catch return false;
 
@@ -399,7 +399,7 @@ pub const Backup = struct {
 
         if (layout.hmac_offset) |_| {
             var stored_hmac: [HmacSha256.mac_length]u8 = undefined;
-            readNoEof(&file, &stored_hmac) catch return false;
+            readNoEof(&file, @intCast(pos), &stored_hmac) catch return false;
             pos += stored_hmac.len;
 
             var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
@@ -423,13 +423,13 @@ pub const Backup = struct {
         const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ graph_path, name });
         defer self.allocator.free(file_path);
 
-        const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{}) catch |err| {
             if (err == error.FileNotFound) return;
             return err;
         };
-        defer file.close();
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         try entries.append(self.allocator, .{
             .name = name,
             .size = stat.size,
@@ -449,21 +449,24 @@ pub const Backup = struct {
         const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ graph_path, name });
         defer self.allocator.free(file_path);
 
-        const file = try std.fs.cwd().openFile(file_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
+        const io = std.Io.Threaded.global_single_threaded.io();
         var buf: [BACKUP_STREAM_CHUNK_SIZE]u8 = undefined;
         var remaining = file_size;
+        var read_offset: u64 = 0;
         while (remaining > 0) {
             const want = @min(buf.len, std.math.cast(usize, remaining) orelse buf.len);
-            const bytes_read = try file.read(buf[0..want]);
+            const bytes_read = try file.readPositionalAll(io, buf[0..want], read_offset);
             if (bytes_read == 0) return error.InvalidData;
 
             const chunk = buf[0..bytes_read];
-            try out_file.writeAll(chunk);
+            try out_file.writeStreamingAll(io, chunk);
             crc.update(chunk);
             if (hmac_ctx.*) |*h| h.update(chunk);
             total_bytes.* += chunk.len;
+            read_offset += bytes_read;
             remaining -= bytes_read;
         }
     }
@@ -475,25 +478,24 @@ pub const Backup = struct {
 
         const graph_uuid_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ wal_dir_path, GRAPH_IDENTITY_FILE });
         defer self.allocator.free(graph_uuid_path);
-        const uuid_file = try std.fs.cwd().createFile(graph_uuid_path, .{
+        const uuid_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), graph_uuid_path, .{
             .read = true,
             .truncate = false,
-            .mode = owner_only_file_mode,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
         });
-        defer uuid_file.close();
-        try uuid_file.setEndPos(0);
-        try uuid_file.seekTo(0);
-        try uuid_file.writeAll(&graph_uuid);
-        try uuid_file.sync();
+        defer uuid_file.close(std.Io.Threaded.global_single_threaded.io());
+        try uuid_file.setLength(std.Io.Threaded.global_single_threaded.io(), 0);
+        try uuid_file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &graph_uuid, 0);
+        try uuid_file.sync(std.Io.Threaded.global_single_threaded.io());
 
         const wal_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ wal_dir_path, WAL_FILE });
         defer self.allocator.free(wal_path);
-        const wal_file = try std.fs.cwd().createFile(wal_path, .{
+        const wal_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), wal_path, .{
             .read = true,
             .truncate = false,
-            .mode = owner_only_file_mode,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
         });
-        wal_file.close();
+        wal_file.close(std.Io.Threaded.global_single_threaded.io());
     }
 
     fn resolveExpectedGraphUuid(self: *const Backup, target_dir: []const u8) ![16]u8 {
@@ -504,22 +506,22 @@ pub const Backup = struct {
         const wal_uuid_path = try std.fmt.allocPrint(self.allocator, "{s}/wal/{s}", .{ target_dir, GRAPH_IDENTITY_FILE });
         defer self.allocator.free(wal_uuid_path);
 
-        const file = std.fs.cwd().openFile(wal_uuid_path, .{}) catch |err| switch (err) {
+        const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), wal_uuid_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return error.ExpectedGraphUuidRequired,
             else => return err,
         };
-        defer file.close();
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
         var graph_uuid: [16]u8 = undefined;
-        try readNoEof(&file, &graph_uuid);
+        try readNoEof(&file, 0, &graph_uuid);
         return graph_uuid;
     }
 
     fn readFileAlloc(self: *Backup, path: []const u8) ![]u8 {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
 
         // SEC-0007: Reject files exceeding the maximum backup size.
         if (stat.size > MAX_BACKUP_FILE_SIZE) return error.BackupTooLarge;
@@ -527,7 +529,7 @@ pub const Backup = struct {
         const data = try self.allocator.alloc(u8, stat.size);
         errdefer self.allocator.free(data);
 
-        const bytes_read = try file.readAll(data);
+        const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), data, 0);
         if (bytes_read != stat.size) {
             self.allocator.free(data);
             return error.InvalidData;
@@ -630,14 +632,16 @@ fn archiveLayoutFromFileSize(file_size: usize, version: u16) !ArchiveLayout {
 }
 
 fn ensureDirectoryMode(path: []const u8, mode: u32) !void {
-    try std.fs.cwd().makePath(path);
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    defer dir.close();
-    dir.chmod(mode) catch {};
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.Io.Dir.cwd().createDirPath(io, path);
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    dir.setPermissions(io, std.Io.File.Permissions.fromMode(mode)) catch {};
 }
 
-fn readNoEof(file: *const std.Io.File, buf: []u8) !void {
-    const bytes_read = try file.readAll(buf);
+fn readNoEof(file: *const std.Io.File, offset: u64, buf: []u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes_read = try file.readPositionalAll(io, buf, offset);
     if (bytes_read != buf.len) return error.InvalidData;
 }
 
@@ -665,7 +669,7 @@ fn readTrackedExact(
     hmac_ctx: *?HmacSha256,
 ) !void {
     if (pos.* + buf.len > layout.file_size) return error.InvalidData;
-    try readNoEof(file, buf);
+    try readNoEof(file, @intCast(pos.*), buf);
     updateIntegrityBytes(pos.*, buf, layout, crc, hmac_ctx);
     pos.* += buf.len;
 }
@@ -702,7 +706,7 @@ fn copyTrackedToFile(
     while (remaining > 0) {
         const want = @min(buf.len, std.math.cast(usize, remaining) orelse return error.BackupTooLarge);
         try readTrackedExact(file, pos, buf[0..want], layout, crc, hmac_ctx);
-        try out_file.writeAll(buf[0..want]);
+        try out_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf[0..want]);
         copied += want;
         remaining -= want;
     }
@@ -717,7 +721,7 @@ const testing = std.testing;
 
 fn createTestGraphDir(allocator: Allocator) !struct { tmp_dir: testing.TmpDir, graph_dir: GraphDir } {
     var tmp_dir = testing.tmpDir(.{});
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -728,27 +732,30 @@ fn createTestGraphDir(allocator: Allocator) !struct { tmp_dir: testing.TmpDir, g
 }
 
 fn writeTestFile(path: []const u8, data: []const u8) !void {
-    const file = try std.fs.cwd().createFile(path, .{ .mode = owner_only_file_mode });
-    defer file.close();
-    try file.writeAll(data);
+    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), data);
 }
 
 fn expectFileContents(path: []const u8, expected: []const u8) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const data = try file.readToEndAlloc(testing.allocator, expected.len + 16);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file_len = try file.length(io);
+    const data = try testing.allocator.alloc(u8, @intCast(file_len));
     defer testing.allocator.free(data);
+    _ = try file.readPositionalAll(io, data, 0);
 
     try testing.expectEqualStrings(expected, data);
 }
 
 fn expectOwnerOnlyMode(path: []const u8) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const stat = try file.stat();
-    try testing.expectEqual(@as(u32, owner_only_file_mode), stat.mode & 0o777);
+    const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
+    try testing.expectEqual(@as(u32, owner_only_file_mode), stat.permissions.toMode() & 0o7777);
 }
 
 test "createBackup produces file with correct magic" {
@@ -763,7 +770,7 @@ test "createBackup produces file with correct magic" {
     // Create output path
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const out_path = try std.fmt.allocPrint(allocator, "{s}/backup.geob", .{out_path_base});
@@ -777,10 +784,10 @@ test "createBackup produces file with correct magic" {
     try expectOwnerOnlyMode(out_path);
 
     // Verify magic bytes
-    const file = try std.fs.cwd().openFile(out_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), out_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
     var magic: [4]u8 = undefined;
-    _ = try file.readAll(&magic);
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &magic, 0);
     try testing.expectEqual(BACKUP_MAGIC, magic);
 }
 
@@ -813,7 +820,7 @@ test "restoreBackup restores files to new directory" {
     // Create backup
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup.geob", .{out_path_base});
@@ -866,7 +873,7 @@ test "validateBackup returns true for valid backup" {
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup.geob", .{out_path_base});
@@ -890,7 +897,7 @@ test "GAP-0034: validateBackup rejects version 2 backups without the HMAC key" {
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v2.geob", .{out_path_base});
@@ -916,7 +923,7 @@ test "validateBackup returns false for corrupted file" {
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup.geob", .{out_path_base});
@@ -927,10 +934,9 @@ test "validateBackup returns false for corrupted file" {
 
     // Corrupt the file
     {
-        const file = try std.fs.cwd().openFile(backup_path, .{ .mode = .write_only });
-        defer file.close();
-        try file.seekTo(10);
-        try file.writeAll("CORRUPT");
+        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{ .mode = .write_only });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), "CORRUPT", 10);
     }
 
     const valid = try backup.validateBackup(backup_path);
@@ -1013,15 +1019,15 @@ test "SEC-0002: restoreBackup rejects malicious filename with path traversal" {
     // Write to temp file
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/malicious.geob", .{tmp_path});
     defer allocator.free(backup_path);
     {
-        const f = try std.fs.cwd().createFile(backup_path, .{});
-        defer f.close();
-        try f.writeAll(&buf);
+        const f = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{});
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        try f.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
     }
 
     const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{tmp_path});
@@ -1072,15 +1078,15 @@ test "SEC-0013: integer truncation guard in restoreBackup" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/truncation.geob", .{tmp_path});
     defer allocator.free(backup_path);
     {
-        const f = try std.fs.cwd().createFile(backup_path, .{});
-        defer f.close();
-        try f.writeAll(&buf);
+        const f = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{});
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        try f.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
     }
 
     const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{tmp_path});
@@ -1106,7 +1112,7 @@ test "SEC-0005: HMAC backup creates version 2 with tag" {
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_hmac.geob", .{out_path_base});
@@ -1117,10 +1123,10 @@ test "SEC-0005: HMAC backup creates version 2 with tag" {
     _ = try backup.createBackup(&env.graph_dir, backup_path);
 
     // Verify version is 2
-    const file = try std.fs.cwd().openFile(backup_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
     var header: [6]u8 = undefined;
-    _ = try file.readAll(&header);
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &header, 0);
     const version = std.mem.littleToNative(u16, @bitCast(header[4..6].*));
     try testing.expectEqual(@as(u16, BACKUP_VERSION_HMAC), version);
 
@@ -1142,14 +1148,14 @@ test "SEC-0005: HMAC backup rejects tampered data with recalculated CRC" {
     const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
     defer allocator.free(nodes_path);
     {
-        const f = try std.fs.cwd().openFile(nodes_path, .{ .mode = .write_only });
-        defer f.close();
-        try f.writeAll("original data");
+        const f = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), nodes_path, .{ .mode = .write_only });
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        try f.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "original data");
     }
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_tamper.geob", .{out_path_base});
@@ -1179,9 +1185,9 @@ test "SEC-0005: HMAC backup rejects tampered data with recalculated CRC" {
             @memcpy(tampered[crc_offset..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
 
             // Write tampered data (HMAC is now invalid)
-            const f = try std.fs.cwd().createFile(backup_path, .{});
-            defer f.close();
-            try f.writeAll(tampered);
+            const f = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{});
+            defer f.close(std.Io.Threaded.global_single_threaded.io());
+            try f.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), tampered);
         }
     }
 
@@ -1201,7 +1207,7 @@ test "SEC-0017: V2 restore without key returns EncryptionKeyRequired" {
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v2.geob", .{out_path_base});
@@ -1232,7 +1238,7 @@ test "GAP-0047: restoreBackup rejects legacy V1 backups by default" {
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v1.geob", .{out_path_base});
@@ -1260,7 +1266,7 @@ test "GAP-0032: restoreBackup rejects a configured expected UUID that mismatches
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v1.geob", .{out_path_base});
@@ -1290,22 +1296,22 @@ test "GAP-0037: createBackup streams large files without buffering them fully in
     const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
     defer allocator.free(nodes_path);
     {
-        const file = try std.fs.cwd().createFile(nodes_path, .{ .mode = owner_only_file_mode });
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), nodes_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
         var chunk: [32 * 1024]u8 = undefined;
         @memset(&chunk, 0xAB);
         var remaining: usize = 2 * 1024 * 1024;
         while (remaining > 0) {
             const to_write = @min(chunk.len, remaining);
-            try file.writeAll(chunk[0..to_write]);
+            try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), chunk[0..to_write]);
             remaining -= to_write;
         }
     }
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_streamed.geob", .{out_path_base});
@@ -1330,7 +1336,7 @@ test "SEC-0005: no-key backup still works as version 1" {
 
     var out_tmp = testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_path_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(out_path_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_v1.geob", .{out_path_base});
@@ -1340,10 +1346,10 @@ test "SEC-0005: no-key backup still works as version 1" {
     _ = try backup.createBackup(&env.graph_dir, backup_path);
 
     // Check version is 1
-    const file = try std.fs.cwd().openFile(backup_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
     var header: [6]u8 = undefined;
-    _ = try file.readAll(&header);
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &header, 0);
     const version = std.mem.littleToNative(u16, @bitCast(header[4..6].*));
     try testing.expectEqual(@as(u16, BACKUP_VERSION), version);
 
@@ -1358,11 +1364,11 @@ test "BackupResult writeJson produces valid structured output" {
         .total_bytes = 123456,
     };
 
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
 
-    try result.writeJson(buf.writer(testing.allocator));
-    const json = buf.items;
+    try result.writeJson(&aw.writer);
+    const json = aw.writer.buffer[0..aw.writer.end];
 
     try testing.expect(std.mem.indexOf(u8, json, "\"files_backed_up\":7") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"total_bytes\":123456") != null);
@@ -1376,11 +1382,11 @@ test "RestoreResult writeJson produces valid structured output" {
         .total_bytes = 654321,
     };
 
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(testing.allocator);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
 
-    try result.writeJson(buf.writer(testing.allocator));
-    const json = buf.items;
+    try result.writeJson(&aw.writer);
+    const json = aw.writer.buffer[0..aw.writer.end];
 
     try testing.expect(std.mem.indexOf(u8, json, "\"operation\":\"restore\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"files_restored\":5") != null);

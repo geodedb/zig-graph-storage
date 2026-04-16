@@ -130,7 +130,7 @@ pub const WalRecord = struct {
         offset += 8;
 
         const record_type_byte = data[offset];
-        const record_type = std.meta.intToEnum(WalRecordType, record_type_byte) catch return error.InvalidFormat;
+        const record_type = std.enums.fromInt(WalRecordType, record_type_byte) orelse return error.InvalidFormat;
         offset += 1;
 
         const file_id = data[offset];

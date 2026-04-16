@@ -70,7 +70,7 @@ pub const LabelStore = struct {
     pub fn removeLabel(self: *LabelStore, label_head: u64, label_id: u32, allocator: std.mem.Allocator) !struct { head: u64, count: u16 } {
         const existing = try self.getLabels(label_head, allocator);
         defer allocator.free(existing);
-        var new_list: std.ArrayList(u32) = .{};
+        var new_list: std.ArrayList(u32) = .empty;
         defer new_list.deinit(allocator);
         for (existing) |id| {
             if (id != label_id) try new_list.append(allocator, id);
@@ -106,7 +106,7 @@ const TestEnv = struct {
     fn create() !*TestEnv {
         const self = try testing.allocator.create(TestEnv);
         self.tmp_dir = testing.tmpDir(.{});
-        self.var_file = self.tmp_dir.dir.createFile("var.store", .{ .read = true, .truncate = true }) catch unreachable;
+        self.var_file = self.tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "var.store", .{ .read = true, .truncate = true }) catch unreachable;
         self.pool = try BufferPool.init(testing.allocator, 4096, 32);
         self.fsm = try FreeSpaceManager.init(testing.allocator, &self.pool, .var_store);
         self.var_pager = Pager.init(self.var_file, 4096);
@@ -119,7 +119,7 @@ const TestEnv = struct {
     fn deinit(self: *TestEnv) void {
         self.fsm.deinit();
         self.pool.deinit();
-        self.var_file.close();
+        self.var_file.close(std.Io.Threaded.global_single_threaded.io());
         self.tmp_dir.cleanup();
         testing.allocator.destroy(self);
     }

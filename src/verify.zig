@@ -34,8 +34,8 @@ pub const VerifyResult = struct {
     total_pages_checked: u64 = 0,
     corrupted_pages: u64 = 0,
     manifest_valid: bool = false,
-    errors: std.ArrayList([]const u8) = .{},
-    artifacts: std.ArrayList(VerifyArtifact) = .{},
+    errors: std.ArrayList([]const u8) = .empty,
+    artifacts: std.ArrayList(VerifyArtifact) = .empty,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) VerifyResult {
@@ -199,7 +199,7 @@ pub const VerifyTool = struct {
         const store_path = try graph_dir.storePath(self.allocator, file_id);
         defer self.allocator.free(store_path);
 
-        const file = std.fs.cwd().openFile(store_path, .{}) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), store_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 const file_name = file_manager_mod.FILE_NAMES[@intFromEnum(file_id)];
                 const msg = try std.fmt.allocPrint(self.allocator, "{s}: missing", .{file_name});
@@ -209,9 +209,9 @@ pub const VerifyTool = struct {
             }
             return err;
         };
-        defer file.close();
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         const file_name = file_manager_mod.FILE_NAMES[@intFromEnum(file_id)];
         if (stat.size == 0) {
             try result.addArtifact(.{
@@ -241,7 +241,7 @@ pub const VerifyTool = struct {
         var corrupted_pages: u64 = 0;
         while (page_idx < page_count) : (page_idx += 1) {
             const offset = page_idx * @as(u64, page_size);
-            const bytes_read = try file.preadAll(buf, offset);
+            const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, offset);
 
             if (bytes_read < page_size) break;
 
@@ -278,7 +278,7 @@ pub const VerifyTool = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ graph_dir.path, name });
         defer self.allocator.free(path);
 
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 if (required) {
                     const msg = try std.fmt.allocPrint(self.allocator, "{s}: missing", .{name});
@@ -289,9 +289,9 @@ pub const VerifyTool = struct {
             }
             return err;
         };
-        defer file.close();
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         try result.addArtifact(.{
             .name = name,
             .status = .ok,
@@ -303,13 +303,13 @@ pub const VerifyTool = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/labels.dict", .{graph_dir.path});
         defer self.allocator.free(path);
 
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| {
             if (err == error.FileNotFound) return;
             return err;
         };
-        defer file.close();
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = try file.stat();
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         var dict = LabelDictionary.init(self.allocator);
         defer dict.deinit();
         dict.loadFromFile(path) catch |err| {
@@ -335,7 +335,7 @@ pub const VerifyTool = struct {
         _ = self;
         const wal_dir_path = try std.fmt.allocPrint(result.allocator, "{s}/wal", .{graph_dir.path});
         defer result.allocator.free(wal_dir_path);
-        var wal_dir = std.fs.cwd().openDir(wal_dir_path, .{}) catch |err| {
+        var wal_dir = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 const msg = try std.fmt.allocPrint(result.allocator, "wal/: missing", .{});
                 try result.addError(msg);
@@ -344,9 +344,9 @@ pub const VerifyTool = struct {
             }
             return err;
         };
-        defer wal_dir.close();
+        defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
 
-        const identity_file = wal_dir.openFile("graph.uuid", .{}) catch |err| {
+        const identity_file = wal_dir.openFile(std.Io.Threaded.global_single_threaded.io(), "graph.uuid", .{}) catch |err| {
             if (err == error.FileNotFound) {
                 const msg = try std.fmt.allocPrint(result.allocator, "wal/graph.uuid: missing", .{});
                 try result.addError(msg);
@@ -355,11 +355,11 @@ pub const VerifyTool = struct {
             }
             return err;
         };
-        defer identity_file.close();
+        defer identity_file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const identity_stat = try identity_file.stat();
+        const identity_stat = try identity_file.stat(std.Io.Threaded.global_single_threaded.io());
         var identity_buf: [16]u8 = undefined;
-        if (identity_stat.size != identity_buf.len or (try identity_file.readAll(&identity_buf)) != identity_buf.len or !std.mem.eql(u8, &identity_buf, &graph_dir.graph_uuid)) {
+        if (identity_stat.size != identity_buf.len or (try identity_file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &identity_buf, 0)) != identity_buf.len or !std.mem.eql(u8, &identity_buf, &graph_dir.graph_uuid)) {
             const msg = try std.fmt.allocPrint(result.allocator, "wal/graph.uuid: invalid or mismatched", .{});
             try result.addError(msg);
             try result.addArtifact(.{
@@ -376,7 +376,7 @@ pub const VerifyTool = struct {
             .bytes_checked = identity_stat.size,
         });
 
-        const wal_file = wal_dir.openFile("graph.wal", .{}) catch |err| {
+        const wal_file = wal_dir.openFile(std.Io.Threaded.global_single_threaded.io(), "graph.wal", .{}) catch |err| {
             if (err == error.FileNotFound) {
                 const msg = try std.fmt.allocPrint(result.allocator, "wal/graph.wal: missing", .{});
                 try result.addError(msg);
@@ -385,9 +385,9 @@ pub const VerifyTool = struct {
             }
             return err;
         };
-        defer wal_file.close();
+        defer wal_file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const wal_stat = try wal_file.stat();
+        const wal_stat = try wal_file.stat(std.Io.Threaded.global_single_threaded.io());
         var wal_mgr = WalManager.init(result.allocator, wal_dir, graph_dir.graph_uuid, 0, .{
             .create_identity_if_missing = false,
         }) catch |err| {
@@ -445,18 +445,18 @@ const testing = std.testing;
 fn setupWalArtifacts(allocator: Allocator, graph_path: []const u8, uuid: [16]u8) !void {
     const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{graph_path});
     defer allocator.free(wal_dir_path);
-    try std.fs.cwd().makePath(wal_dir_path);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), wal_dir_path);
 
     const uuid_path = try std.fmt.allocPrint(allocator, "{s}/graph.uuid", .{wal_dir_path});
     defer allocator.free(uuid_path);
-    const uuid_file = try std.fs.cwd().createFile(uuid_path, .{ .read = true, .truncate = true });
-    defer uuid_file.close();
-    try uuid_file.writeAll(&uuid);
+    const uuid_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), uuid_path, .{ .read = true, .truncate = true });
+    defer uuid_file.close(std.Io.Threaded.global_single_threaded.io());
+    try uuid_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &uuid);
 
     const wal_path = try std.fmt.allocPrint(allocator, "{s}/graph.wal", .{wal_dir_path});
     defer allocator.free(wal_path);
-    const wal_file = try std.fs.cwd().createFile(wal_path, .{ .read = true, .truncate = true });
-    wal_file.close();
+    const wal_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), wal_path, .{ .read = true, .truncate = true });
+    wal_file.close(std.Io.Threaded.global_single_threaded.io());
 }
 
 test "clean graph passes verification" {
@@ -465,7 +465,7 @@ test "clean graph passes verification" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -494,11 +494,11 @@ test "clean graph passes verification" {
     const store_path = try gd.storePath(allocator, .nodes);
     defer allocator.free(store_path);
 
-    const store_file = try std.fs.cwd().createFile(store_path, .{
+    const store_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), store_path, .{
         .read = true,
         .truncate = true,
     });
-    defer store_file.close();
+    defer store_file.close(std.Io.Threaded.global_single_threaded.io());
 
     var page_buf: [4096]u8 = undefined;
     @memset(&page_buf, 0);
@@ -511,7 +511,7 @@ test "clean graph passes verification" {
     const checksum = page_mod.computeChecksum(page_buf[PAGE_HEADER_SIZE..]);
     std.mem.writeInt(u32, page_buf[16..20], checksum, .little);
 
-    try store_file.pwriteAll(&page_buf, 0);
+    try store_file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &page_buf, 0);
 
     // Verify
     var tool = VerifyTool.init(allocator);
@@ -530,7 +530,7 @@ test "corrupted page detected" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -558,11 +558,11 @@ test "corrupted page detected" {
     const store_path = try gd.storePath(allocator, .nodes);
     defer allocator.free(store_path);
 
-    const store_file = try std.fs.cwd().createFile(store_path, .{
+    const store_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), store_path, .{
         .read = true,
         .truncate = true,
     });
-    defer store_file.close();
+    defer store_file.close(std.Io.Threaded.global_single_threaded.io());
 
     var page_buf: [4096]u8 = undefined;
     @memset(&page_buf, 0);
@@ -578,7 +578,7 @@ test "corrupted page detected" {
     // Now corrupt a body byte AFTER computing checksum
     page_buf[PAGE_HEADER_SIZE + 50] = 0xFF;
 
-    try store_file.pwriteAll(&page_buf, 0);
+    try store_file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &page_buf, 0);
 
     // Verify — should detect corruption
     var tool = VerifyTool.init(allocator);
@@ -596,7 +596,7 @@ test "empty graph with manifest passes" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -633,7 +633,7 @@ test "no manifest fails verification" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var uuid: [16]u8 = undefined;
@@ -661,11 +661,11 @@ test "VerifyResult writeJson produces valid structured output" {
     result.corrupted_pages = 0;
     result.manifest_valid = true;
 
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
 
-    try result.writeJson(buf.writer(allocator));
-    const json = buf.items;
+    try result.writeJson(&aw.writer);
+    const json = aw.writer.buffer[0..aw.writer.end];
 
     // Verify key fields present
     try testing.expect(std.mem.indexOf(u8, json, "\"total_pages_checked\":42") != null);
@@ -684,11 +684,11 @@ test "VerifyResult writeJson reports unclean state" {
     result.corrupted_pages = 2;
     result.manifest_valid = false;
 
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
 
-    try result.writeJson(buf.writer(allocator));
-    const json = buf.items;
+    try result.writeJson(&aw.writer);
+    const json = aw.writer.buffer[0..aw.writer.end];
 
     try testing.expect(std.mem.indexOf(u8, json, "\"is_clean\":false") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"corrupted_pages\":2") != null);
@@ -700,7 +700,7 @@ test "GAP-0032: verifyGraph reports a manifest UUID mismatch" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     var graph_uuid: [16]u8 = undefined;
@@ -740,7 +740,7 @@ test "verifyGraph reports missing WAL artifacts" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const uuid = [_]u8{0xAB} ** 16;

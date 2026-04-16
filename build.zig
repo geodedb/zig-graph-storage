@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = allocImports(b, &.{
             .{ .name = "wal", .module = deps.wal_mod },
             .{ .name = "uuid", .module = deps.uuid_mod },
@@ -70,6 +71,7 @@ fn createModule(
         .root_source_file = b.path(root_source_file),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = allocImports(b, imports),
     });
 }

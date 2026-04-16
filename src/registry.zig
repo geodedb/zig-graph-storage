@@ -114,12 +114,12 @@ pub const GraphRegistry = struct {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
-        const tmp_file = try std.Io.Dir.cwd().createFile(tmp_path, .{ .mode = owner_only_file_mode });
-        defer tmp_file.close();
-        try tmp_file.writeAll(buf.items);
-        try tmp_file.sync();
+        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
+        try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf.items);
+        try tmp_file.sync(std.Io.Threaded.global_single_threaded.io());
 
-        try std.Io.Dir.cwd().rename(tmp_path, path);
+        try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, std.Io.Threaded.global_single_threaded.io());
     }
 
     /// Load from file in GEODREG1 format.
@@ -266,7 +266,7 @@ test "save/load round-trip" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const file_path = try std.fmt.allocPrint(allocator, "{s}/registry.dat", .{tmp_path});
@@ -288,10 +288,10 @@ test "save/load round-trip" {
 
     try reg.saveToFile(file_path);
 
-    const saved_file = try std.Io.Dir.cwd().openFile(file_path, .{});
-    defer saved_file.close();
-    const saved_stat = try saved_file.stat();
-    try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.mode & 0o777);
+    const saved_file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{});
+    defer saved_file.close(std.Io.Threaded.global_single_threaded.io());
+    const saved_stat = try saved_file.stat(std.Io.Threaded.global_single_threaded.io());
+    try std.testing.expectEqual(@as(u32, owner_only_file_mode), saved_stat.permissions.toMode() & 0o7777);
 
     // Load into new registry
     var reg2 = GraphRegistry.init(allocator);
@@ -318,7 +318,7 @@ test "empty registry save/load" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
     defer allocator.free(tmp_path);
 
     const file_path = try std.fmt.allocPrint(allocator, "{s}/empty_registry.dat", .{tmp_path});

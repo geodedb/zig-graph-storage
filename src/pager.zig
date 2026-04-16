@@ -40,7 +40,7 @@ pub const Pager = struct {
         if (buf.len != self.page_size) return error.InvalidBufferSize;
 
         const offset: u64 = page_id * @as(u64, self.page_size);
-        const bytes_read = try self.file.preadAll(buf, offset);
+        const bytes_read = try self.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, offset);
 
         if (bytes_read < self.page_size) return error.PageNotFound;
 
@@ -92,18 +92,18 @@ pub const Pager = struct {
 
         // Write page at the correct offset
         const offset: u64 = page_id * @as(u64, self.page_size);
-        try self.file.pwriteAll(buf, offset);
+        try self.file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, offset);
     }
 
     /// Get the number of pages currently in the file (based on file size).
     pub fn pageCount(self: *const Pager) !u64 {
-        const stat = try self.file.stat();
+        const stat = try self.file.stat(std.Io.Threaded.global_single_threaded.io());
         return stat.size / self.page_size;
     }
 
     /// Sync file to disk (fdatasync).
     pub fn sync(self: *const Pager) !void {
-        try self.file.sync();
+        try self.file.sync(std.Io.Threaded.global_single_threaded.io());
     }
 };
 
@@ -114,15 +114,15 @@ pub const Pager = struct {
 const testing = std.testing;
 
 fn createTempFile() !std.Io.File {
-    return std.fs.cwd().createFile(".test_pager_tmp", .{
+    return std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), ".test_pager_tmp", .{
         .read = true,
         .truncate = true,
     });
 }
 
 fn cleanupTempFile(file: std.Io.File) void {
-    file.close();
-    std.fs.cwd().deleteFile(".test_pager_tmp") catch {};
+    file.close(std.Io.Threaded.global_single_threaded.io());
+    std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), ".test_pager_tmp") catch {};
 }
 
 test "write then read round-trip preserves page contents" {
@@ -183,7 +183,7 @@ test "checksum validation detects corruption" {
     // Corrupt one byte in the body directly on disk
     // (byte at offset PAGE_HEADER_SIZE + 1, which is in the body)
     var corrupt_byte: [1]u8 = .{0xFF};
-    _ = try file.pwriteAll(&corrupt_byte, PAGE_HEADER_SIZE + 1);
+    _ = try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &corrupt_byte, PAGE_HEADER_SIZE + 1);
 
     // Reading should detect corruption
     var read_buf: [4096]u8 = undefined;
@@ -201,7 +201,7 @@ test "empty page (all zeros) is handled gracefully" {
     // Write an all-zero page directly to the file to simulate uninitialized space
     var zero_buf: [4096]u8 = undefined;
     @memset(&zero_buf, 0);
-    _ = try file.pwriteAll(&zero_buf, 0);
+    _ = try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &zero_buf, 0);
 
     // Reading should succeed (all-zero page is treated as empty)
     var read_buf: [4096]u8 = undefined;
@@ -324,7 +324,7 @@ test "SEC-0015: encrypted page writes produce different ciphertexts (no nonce re
 
     // Read the raw ciphertext from disk
     var ct1: [4096]u8 = undefined;
-    _ = try file.preadAll(&ct1, 0);
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &ct1, 0);
 
     // Prepare the same content again (reset write_count to 0 as if fresh page)
     @memset(&write_buf1, 0);
@@ -337,7 +337,7 @@ test "SEC-0015: encrypted page writes produce different ciphertexts (no nonce re
 
     // Read the raw ciphertext from disk again
     var ct2: [4096]u8 = undefined;
-    _ = try file.preadAll(&ct2, 0);
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &ct2, 0);
 
     // The encrypted bodies must differ (different nonce due to incremented write_count)
     try testing.expect(!std.mem.eql(u8, ct1[PAGE_HEADER_SIZE..], ct2[PAGE_HEADER_SIZE..]));
