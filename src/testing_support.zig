@@ -20,7 +20,7 @@ const Pager = pager_mod.Pager;
 pub const TestDataDir = struct {
     allocator: Allocator,
     tmp_dir: std.testing.TmpDir,
-    path: []const u8,
+    path: [:0]const u8,
 
     pub fn init(allocator: Allocator) !TestDataDir {
         var tmp_dir = std.testing.tmpDir(.{});
