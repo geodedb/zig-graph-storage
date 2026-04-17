@@ -354,7 +354,6 @@ pub const BufferPool = struct {
                     .items = items[item_i..end],
                     .data_buf = data_buf,
                     .page_size = self.page_size,
-                    .wg = &wg,
                 };
                 batch_tasks[n_chunks_actual] = .{
                     .task_fn = flushChunkFn,
@@ -364,10 +363,11 @@ pub const BufferPool = struct {
             }
         }
 
-        // Pre-add all chunks so wg.wait() works regardless of how tasks run.
-        wg.add(@intCast(n_chunks_actual));
-
-        const submitted: usize = if (pool.submitBatch(batch_tasks[0..n_chunks_actual], .{})) |r|
+        // Single source of truth for done-counting: SubmitOptions.wait_group
+        // auto-adds on each successful submit and auto-dones on completion.
+        // Unsubmitted chunks run inline below *before* wg.wait(), so they
+        // don't need their own wg accounting.
+        const submitted: usize = if (pool.submitBatch(batch_tasks[0..n_chunks_actual], .{ .wait_group = &wg })) |r|
             r.submitted
         else |_|
             0;
@@ -578,14 +578,17 @@ pub const BufferPool = struct {
         items: []FlushItem,
         data_buf: []u8,
         page_size: u32,
-        wg: *tp.WaitGroup,
     };
 
-    /// Task function: write all pages in one chunk, record per-item errors,
-    /// then signal the WaitGroup.
+    /// Task function: write all pages in one chunk, record per-item errors.
+    /// Per-task WaitGroup accounting is driven by `SubmitOptions.wait_group`
+    /// on the submitBatch call site — thread-pool auto-adds on submit and
+    /// auto-dones on task completion, so this function must NOT call
+    /// `wg.done()` itself. Inline-fallback invocations (for chunks that
+    /// submitBatch did not enqueue) are correct too: they don't touch `wg`
+    /// because they run on the caller thread before `wg.wait()`.
     fn flushChunkFn(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
         const c: *FlushChunkCtx = @ptrCast(@alignCast(ctx_ptr));
-        defer c.wg.done();
         for (c.items) |*item| {
             const data = c.data_buf[item.data_offset..][0..c.page_size];
             item.pager.writePage(item.page_id, data) catch |e| {
