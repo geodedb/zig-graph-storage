@@ -8,6 +8,11 @@
 
 const std = @import("std");
 const lib = @import("graph_storage");
+
+fn gs_io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 const seed = @import("seed");
 
 const GraphEngine = lib.GraphEngine;
@@ -157,7 +162,9 @@ test "integration: migration detects fresh directory" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(gs_io(), &cwd_buf);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buf[0..cwd_len], tmp_dir.sub_path[0..] });
     defer allocator.free(tmp_path);
 
     const m = lib.migration.Migration.init(allocator);
@@ -181,15 +188,18 @@ test "integration: backup and restore round-trip" {
     const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{gd.path});
     defer allocator.free(nodes_path);
     {
-        const f = try std.fs.cwd().openFile(nodes_path, .{ .mode = .write_only });
-        defer f.close();
-        try f.writeAll("integration test data");
+        const io = gs_io();
+        const f = try std.Io.Dir.cwd().openFile(io, nodes_path, .{ .mode = .write_only });
+        defer f.close(io);
+        try f.writePositionalAll(io, "integration test data", 0);
     }
 
     // Backup
     var out_tmp = std.testing.tmpDir(.{});
     defer out_tmp.cleanup();
-    const out_base = try out_tmp.dir.realpathAlloc(allocator, ".");
+    var out_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const out_cwd_len = try std.process.currentPath(gs_io(), &out_cwd_buf);
+    const out_base = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ out_cwd_buf[0..out_cwd_len], out_tmp.sub_path[0..] });
     defer allocator.free(out_base);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/test.geob", .{out_base});
@@ -214,10 +224,11 @@ test "integration: backup and restore round-trip" {
     const restored_nodes = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{restore_path});
     defer allocator.free(restored_nodes);
 
-    const file = try std.fs.cwd().openFile(restored_nodes, .{});
-    defer file.close();
+    const io = gs_io();
+    const file = try std.Io.Dir.cwd().openFile(io, restored_nodes, .{});
+    defer file.close(io);
     var buf: [64]u8 = undefined;
-    const n = try file.readAll(&buf);
+    const n = try file.readPositionalAll(io, &buf, 0);
     try std.testing.expectEqualStrings("integration test data", buf[0..n]);
 }
 
