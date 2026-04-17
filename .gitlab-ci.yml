@@ -87,6 +87,9 @@ stages:
 .zig-job: &zig-job
   image: debian:bookworm-slim
   before_script:
+    # Zig fetches git+https:// dependencies in `zig build`; the slim image has
+    # no CA bundle, so TLS handshake fails with TlsInitializationFailed.
+    - apt-get update && apt-get install -y --no-install-recommends ca-certificates git
     - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
     - zig version
   cache:
@@ -219,6 +222,8 @@ benchmark-regression-10k:
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.
 zig-format:
+  variables:
+    ZIG_VERSION: "0.16.0"
   needs:
     - job: prepare-zig
       artifacts: true
