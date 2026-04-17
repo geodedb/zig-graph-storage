@@ -408,10 +408,20 @@ pub const GraphEngine = struct {
 
     /// Lazily register the calling thread as a submitter. Idempotent at
     /// the Engine level — once `submitter_slot` is populated, repeated
-    /// calls are no-ops. Safe to call from any thread; the first caller
-    /// wins and that thread owns the slot lifecycle for descriptor-cache
-    /// drain purposes. If that thread never calls a submit path again,
-    /// the pool's deinit will drain residual cache entries.
+    /// calls are no-ops.
+    ///
+    /// **Precondition:** callers must hold engine-level write serialization
+    /// (checkpoint path or `close()` dirty-flush branch). The load-then-
+    /// store sequence below is not synchronized, so concurrent entry
+    /// from two threads would race and could leak a slot until pool
+    /// deinit. The existing hot-flush paths (`engine_persist.checkpoint`
+    /// and `close` when `persistence_dirty`) are single-writer by
+    /// construction, which satisfies this.
+    ///
+    /// The first caller wins and that thread owns the slot lifecycle for
+    /// descriptor-cache drain purposes. If that thread never calls a
+    /// submit path again, the pool's deinit will drain residual cache
+    /// entries.
     pub fn ensureSubmitterRegistered(self: *GraphEngine) void {
         if (self.submitter_slot != null) return;
         self.submitter_slot = self.thread_pool.registerSubmitter() catch null;

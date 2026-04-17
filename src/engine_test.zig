@@ -835,4 +835,9 @@ test "GraphEngine auto-registers a submitter slot on first flush" {
 
     try testing.expect(engine.submitter_slot != null);
     try testing.expect(engine.submitter_slot.? < 64);
+
+    // Idempotence: second call must NOT claim a new slot — it's a no-op.
+    const first_slot = engine.submitter_slot.?;
+    engine.ensureSubmitterRegistered();
+    try testing.expectEqual(first_slot, engine.submitter_slot.?);
 }
