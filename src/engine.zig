@@ -177,7 +177,13 @@ pub const GraphEngine = struct {
         self.metrics = .{};
         self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
-        self.thread_pool = tp.ThreadPool.init(allocator, .{}) catch @panic("thread-pool: init failed");
+        // Pin .work_stealing explicitly and propagate init errors instead
+        // of panicking — GraphEngine.create/open already return error
+        // unions, and pool-init failure (OOM, spawn-failure) is a recoverable
+        // condition the caller can retry or surface.
+        self.thread_pool = try tp.ThreadPool.init(allocator, .{
+            .scheduler_variant = .work_stealing,
+        });
         self.buffer_pool.setThreadPool(&self.thread_pool);
         self.persistence_dirty = false;
 
@@ -281,7 +287,13 @@ pub const GraphEngine = struct {
         self.metrics = .{};
         self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
-        self.thread_pool = tp.ThreadPool.init(allocator, .{}) catch @panic("thread-pool: init failed");
+        // Pin .work_stealing explicitly and propagate init errors instead
+        // of panicking — GraphEngine.create/open already return error
+        // unions, and pool-init failure (OOM, spawn-failure) is a recoverable
+        // condition the caller can retry or surface.
+        self.thread_pool = try tp.ThreadPool.init(allocator, .{
+            .scheduler_variant = .work_stealing,
+        });
         self.buffer_pool.setThreadPool(&self.thread_pool);
         self.persistence_dirty = false;
 
