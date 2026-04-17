@@ -249,6 +249,7 @@ pub fn checkpoint(engine: *GraphEngine) anyerror!void {
     // manifest.  Previous versions spawned a detached background thread
     // which could silently lose writes and made the timer meaningless.
     const start_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
+    engine.ensureSubmitterRegistered();
     try engine.checkpointer.doCheckpoint();
 
     // Persist free space bitmaps so freed pages survive restart.

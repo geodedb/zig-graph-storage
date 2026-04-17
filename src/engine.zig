@@ -104,6 +104,12 @@ pub const GraphEngine = struct {
     manifest: Manifest,
     wal_dir_handle: std.Io.Dir,
     thread_pool: tp.ThreadPool,
+    /// Thread-pool submitter slot, lazily registered on first flush. The
+    /// engine owns the pool, so we claim a per-engine slot and release
+    /// it in cleanupResources. Left `null` if registerSubmitter fails —
+    /// the default submit path still works, just without the per-
+    /// submitter descriptor cache.
+    submitter_slot: ?usize = null,
     metrics: Metrics = .{},
     read_only: bool = false,
     persistence_dirty: bool = false,
@@ -124,6 +130,7 @@ pub const GraphEngine = struct {
         self.label_index_dirty = true;
         self.property_index_dirty = true;
         self.edge_index_dirty = true;
+        self.submitter_slot = null;
 
         // 1. Create graph directory
         self.graph_dir = try GraphDir.create(allocator, data_dir, graph_uuid);
@@ -183,6 +190,11 @@ pub const GraphEngine = struct {
         // condition the caller can retry or surface.
         self.thread_pool = try tp.ThreadPool.init(allocator, .{
             .scheduler_variant = .work_stealing,
+            // Enable one submitter slot for the per-engine registerSubmitter
+            // adoption (GraphEngine.ensureSubmitterRegistered). Without this,
+            // registerSubmitter returns error.NoSubmitterSlots because the
+            // library's default is 0.
+            .max_submitter_queues = 1,
         });
         self.buffer_pool.setThreadPool(&self.thread_pool);
         self.persistence_dirty = false;
@@ -203,6 +215,7 @@ pub const GraphEngine = struct {
         self.label_index_dirty = false;
         self.property_index_dirty = false;
         self.edge_index_dirty = false;
+        self.submitter_slot = null;
 
         // 1. Open graph directory
         self.graph_dir = try GraphDir.open(allocator, data_dir, graph_uuid);
@@ -293,6 +306,11 @@ pub const GraphEngine = struct {
         // condition the caller can retry or surface.
         self.thread_pool = try tp.ThreadPool.init(allocator, .{
             .scheduler_variant = .work_stealing,
+            // Enable one submitter slot for the per-engine registerSubmitter
+            // adoption (GraphEngine.ensureSubmitterRegistered). Without this,
+            // registerSubmitter returns error.NoSubmitterSlots because the
+            // library's default is 0.
+            .max_submitter_queues = 1,
         });
         self.buffer_pool.setThreadPool(&self.thread_pool);
         self.persistence_dirty = false;
@@ -388,6 +406,17 @@ pub const GraphEngine = struct {
         return engine_persist.saveLabelDictionary(self);
     }
 
+    /// Lazily register the calling thread as a submitter. Idempotent at
+    /// the Engine level — once `submitter_slot` is populated, repeated
+    /// calls are no-ops. Safe to call from any thread; the first caller
+    /// wins and that thread owns the slot lifecycle for descriptor-cache
+    /// drain purposes. If that thread never calls a submit path again,
+    /// the pool's deinit will drain residual cache entries.
+    pub fn ensureSubmitterRegistered(self: *GraphEngine) void {
+        if (self.submitter_slot != null) return;
+        self.submitter_slot = self.thread_pool.registerSubmitter() catch null;
+    }
+
     /// Clean up the graph engine and its storage resources.
     pub fn deinit(self: *GraphEngine) void {
         self.cleanupResources(self.allocator);
@@ -410,6 +439,7 @@ pub const GraphEngine = struct {
         if (self.persistence_dirty) {
             // Run a final synchronous checkpoint only when there are writes
             // that have not already been durably persisted.
+            self.ensureSubmitterRegistered();
             self.checkpointer.doCheckpoint() catch |err| {
                 close_err = err;
             };
@@ -441,6 +471,17 @@ pub const GraphEngine = struct {
     /// Internal cleanup of all engine resources. Always runs on close,
     /// even when errors have occurred.
     fn cleanupResources(self: *GraphEngine, allocator: Allocator) void {
+        // Release the submitter slot before draining the pool. The TLS-
+        // owner check inside releaseSubmitter (F-005) handles the case
+        // where the engine was torn down from a thread other than the one
+        // that first called ensureSubmitterRegistered — it becomes a free-
+        // mask CAS with no cache drain, which is correct because the
+        // pool's deinit path will scrub any residual cache entries.
+        if (self.submitter_slot) |idx| {
+            self.thread_pool.releaseSubmitter(idx);
+            self.submitter_slot = null;
+        }
+
         // Drain in-flight parallel flush tasks before tearing down the pool
         // so worker threads don't observe freed buffer-pool storage.
         self.thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};

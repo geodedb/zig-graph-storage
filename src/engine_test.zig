@@ -817,3 +817,22 @@ test "GAP-0022: multi-op transaction groups mutations" {
     try testing.expectEqual(edge_id, edges[0].edge_id);
     try testing.expectEqual(@as(u32, 42), edges[0].rel_type);
 }
+
+test "GraphEngine auto-registers a submitter slot on first flush" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x42} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Before any flush, submitter_slot is unset.
+    try testing.expectEqual(@as(?usize, null), engine.submitter_slot);
+
+    // Force the lazy-register path — direct invocation is the narrowest
+    // test of the contract (the flush path calls the same helper).
+    engine.ensureSubmitterRegistered();
+
+    try testing.expect(engine.submitter_slot != null);
+    try testing.expect(engine.submitter_slot.? < 64);
+}
