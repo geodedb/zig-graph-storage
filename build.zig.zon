@@ -5,16 +5,16 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#90b370bb0dd42bbaa32e1458c81de8e71edfef20",
-            .hash = "wal-0.1.0-EqPqpkDbAwBxvX56rxirSj7bT-pGcZRDlMRT5RMBM3bU",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#5fe714e270231eb4ba9bf404a4185ecfd89560e1",
+            .hash = "wal-0.1.0-EqPqpkDbAwDfpnyf6J7cKSEhokoOPpKGzeA8sDK7CFhX",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git#5836d2f1ae548e1bb4d5340ab5ae8321607bd702",
-            .hash = "uuid-0.1.0-tL1irpURDABkTJF9k8lcZNGWN-KNZnVQTi3cT9a9jguR",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git#3a5fbb6bf9dd668998bc1045b9a55720f9cf2b7a",
+            .hash = "uuid-0.1.0-tL1irpURDADgWBkBrJb285ZJNOSUxgbXLAgyXjbZIUNx",
         },
         .thread_pool = .{
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#a666ec363105372132969811d611a064b775bf95",
-            .hash = "thread_pool-0.2.0-11B1BjtmYwB9LmL7LoDdC6u0iW5C8ep8ajhAX2mEII64",
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#ef34a0e02226784f9b88616e259014ec1cde87aa",
+            .hash = "thread_pool-0.2.0-11B1BmzedQAFS-ESsZGvqiWz8ltQrqrphi5yVFzkuyfy",
         },
     },
     .paths = .{
