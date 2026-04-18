@@ -56,9 +56,10 @@ test "fuzz regression: migration rejects malformed per-graph headers" {
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/legacy.dat", .{tmp_path});
     defer std.testing.allocator.free(path);
 
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(&header_buf);
+    const io = fr_io();
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, &header_buf, 0);
 
     const migration = Migration.init(std.testing.allocator);
     try std.testing.expectError(error.InvalidMagic, migration.validatePerGraphHeader(path));
@@ -103,9 +104,10 @@ test "fuzz regression: backup restore rejects path traversal filenames" {
     const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{tmp_path});
     defer allocator.free(restore_path);
 
-    const file = try std.fs.cwd().createFile(backup_path, .{});
-    defer file.close();
-    try file.writeAll(&buf);
+    const io = fr_io();
+    const file = try std.Io.Dir.cwd().createFile(io, backup_path, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, &buf, 0);
 
     var backup = Backup.init(allocator);
     backup.setExpectedGraphUuid([_]u8{0x42} ** 16);
