@@ -4,6 +4,10 @@
 const std = @import("std");
 const gs = @import("graph_storage");
 
+fn fr_io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 const BufferPool = gs.buffer_pool.BufferPool;
 const FreeSpaceManager = gs.free_space.FreeSpaceManager;
 const Backup = gs.backup.Backup;
@@ -35,7 +39,9 @@ test "fuzz regression: migration rejects malformed per-graph headers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(fr_io(), &cwd_buf);
+    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buf[0..cwd_len], tmp.sub_path[0..] });
     defer std.testing.allocator.free(tmp_path);
 
     var header_buf: [PER_GRAPH_HEADER_SIZE]u8 = undefined;
@@ -87,7 +93,9 @@ test "fuzz regression: backup restore rejects path traversal filenames" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(fr_io(), &cwd_buf);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buf[0..cwd_len], tmp.sub_path[0..] });
     defer allocator.free(tmp_path);
 
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/malicious.geob", .{tmp_path});

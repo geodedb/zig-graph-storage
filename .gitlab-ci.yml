@@ -195,6 +195,9 @@ benchmark-regression:
     paths:
       - benchmarks/results/current-ci.json
     expire_in: 30 days
+  # Shared GitLab runners produce high variance (mixed.stddev can easily move
+  # ±300%). Keep the data but don't block the pipeline on environmental noise.
+  allow_failure: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
