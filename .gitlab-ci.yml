@@ -12,6 +12,10 @@
 #   this repository intentionally does not hard-pin image digests here.
 # - Pre-commit remains a fast local subset; GitLab CI is the authoritative gate.
 
+default:
+  tags:
+    - company
+
 include:
   # Security scanning
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.7.1
