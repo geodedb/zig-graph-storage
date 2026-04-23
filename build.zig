@@ -197,6 +197,18 @@ fn addBenchmarks(
     const run_compare_bench = b.addRunArtifact(compare_bench_exe);
     if (b.args) |args| run_compare_bench.addArgs(args);
     compare_bench_step.dependOn(&run_compare_bench.step);
+
+    // Shard distribution + put/get throughput vs std.AutoHashMap baseline.
+    // See benchmarks/sharded_store_bench.zig for the output format.
+    const sharded_bench_step = b.step("bench-sharded-store", "Run ShardedStore distribution + throughput benchmark");
+    const sharded_bench_exe = b.addExecutable(.{
+        .name = "sharded-store-bench",
+        .root_module = createModule(b, "benchmarks/sharded_store_bench.zig", target, bench_optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_sharded_bench = b.addRunArtifact(sharded_bench_exe);
+    sharded_bench_step.dependOn(&run_sharded_bench.step);
 }
 
 fn addCheckStep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: OptimizeMode, deps: Deps) void {

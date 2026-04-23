@@ -98,6 +98,10 @@ pub const maintenance = @import("maintenance.zig");
 pub const operation_result = @import("operation_result.zig");
 pub const test_support = @import("testing_support.zig");
 
+// In-memory concurrency primitives (reusable utilities for consumers
+// that layer concurrent in-memory structures on top of the engine).
+pub const sharded_store = @import("sharded_store.zig");
+
 pub const GraphEngine = engine.GraphEngine;
 
 // Re-export key types for convenience
@@ -117,7 +121,7 @@ pub const StorageError = errors.StorageError;
 pub const GraphConfig = config.GraphConfig;
 pub const Metrics = metrics.Metrics;
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 // ============================================================================
 // Unit Tests

@@ -225,6 +225,7 @@ graph LR
 - **Iterator Hot Paths**: `expandOutIter`, `expandInIter`, and `scanLabelIter` avoid result-sized allocations
 - **Minimal Dependencies**: [wal](https://gitlab.com/devnw/zig/wal), [uuid](https://gitlab.com/devnw/zig/uuid), and [spice](https://gitlab.com/devnw/zig/spice)
 - **Cross-Platform**: Linux, macOS, Windows support
+- **ShardedStore Primitive** _(v0.2.0+)_: N-way sharded `std.AutoHashMap` wrapper published for consumers that build concurrent in-memory graph structures on top of the single-threaded engine — see [docs/sharded-store.md](docs/sharded-store.md)
 
 ## Installation
 
@@ -235,7 +236,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .graph_storage = .{
-        .url = "https://gitlab.com/devnw/zig/graph-storage/-/archive/v0.1.0/graph-storage-v0.1.0.tar.gz",
+        .url = "https://gitlab.com/devnw/zig/graph-storage/-/archive/v0.2.0/graph-storage-v0.2.0.tar.gz",
         .hash = "...",
     },
 },
