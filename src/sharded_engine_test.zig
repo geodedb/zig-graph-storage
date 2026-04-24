@@ -64,3 +64,42 @@ test "ShardedGraphEngine.open re-reads an existing manifest and rebinds shards" 
 
     try testing.expectEqual(shard_count_mod.SHARD_COUNT, eng.shards.len);
 }
+
+test "ShardedGraphEngine.getNode routes by node id" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x33} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const n = try eng.allocNode();
+    try eng.putNode(n, test_support.emptyNode(1));
+
+    const got = try eng.getNode(n);
+    try testing.expect(got != null);
+
+    // The node must live in the shard that shardOfNode(n) selects.
+    const expected_shard = shard_count_mod.shardOfNode(n);
+    const direct_got = try eng.shards[expected_shard].getNode(n);
+    try testing.expect(direct_got != null);
+}
+
+test "ShardedGraphEngine.nodeCount sums per-shard counts" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x34} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    var created: u64 = 0;
+    while (created < 100) : (created += 1) {
+        const n = try eng.allocNode();
+        try eng.putNode(n, test_support.emptyNode(1));
+    }
+
+    try testing.expectEqual(@as(u64, 100), try eng.nodeCount());
+}

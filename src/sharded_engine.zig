@@ -14,10 +14,23 @@ const interface_mod = @import("interface.zig");
 const shard_count_mod = @import("shard_count.zig");
 const shard_manifest_mod = @import("shard_manifest.zig");
 const shard_uuid_mod = @import("shard_uuid.zig");
+const types = @import("types.zig");
+const node_mod = @import("node.zig");
+const edge_mod = @import("edge.zig");
+const metrics_mod = @import("metrics.zig");
+const adj_store_mod = @import("adj_store.zig");
 
 const GraphConfig = config_mod.GraphConfig;
 const GraphEngine = engine_mod.GraphEngine;
 const GraphStorage = interface_mod.GraphStorage;
+const NodeId = types.NodeId;
+const EdgeId = types.EdgeId;
+const LabelId = types.LabelId;
+const TxnId = types.TxnId;
+const PropertyValue = types.PropertyValue;
+const NodeRec = node_mod.NodeRec;
+const EdgeEntry = edge_mod.EdgeEntry;
+const Metrics = metrics_mod.Metrics;
 
 pub const SHARD_COUNT = shard_count_mod.SHARD_COUNT;
 
@@ -131,6 +144,60 @@ pub const ShardedGraphEngine = struct {
         for (self.shards) |eng| eng.deinit();
         self.allocator.free(self.graph_root);
         self.allocator.destroy(self);
+    }
+
+    pub fn getNode(self: *ShardedGraphEngine, id: NodeId) anyerror!?NodeRec {
+        return self.shards[shard_count_mod.shardOfNode(id)].getNode(id);
+    }
+
+    pub fn putNode(self: *ShardedGraphEngine, id: NodeId, rec: NodeRec) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(id)].putNode(id, rec);
+    }
+
+    pub fn allocNode(self: *ShardedGraphEngine) anyerror!NodeId {
+        // Round-robin across shards so consumers that call allocNode in a
+        // tight loop get balanced distribution. Deterministic routing keeps
+        // tests reproducible.
+        const idx = self.coordinator_txn_counter.fetchAdd(1, .monotonic) % SHARD_COUNT;
+        return self.shards[idx].allocNode();
+    }
+
+    pub fn deleteNode(self: *ShardedGraphEngine, id: NodeId) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(id)].deleteNode(id);
+    }
+
+    pub fn getEdge(self: *ShardedGraphEngine, edge_id: EdgeId) anyerror!?EdgeEntry {
+        // Edges live on their source node's shard. Edge id is shard-striped
+        // (allocated on the source shard), so shardOfNode(edge_id) == source shard.
+        return self.shards[shard_count_mod.shardOfNode(edge_id)].getEdge(edge_id);
+    }
+
+    pub fn expandOutIter(self: *ShardedGraphEngine, id: NodeId, rel_type: ?u32) anyerror!adj_store_mod.AdjStore.AdjEdgeIterator {
+        return self.shards[shard_count_mod.shardOfNode(id)].expandOutIter(id, rel_type);
+    }
+
+    pub fn expandInIter(self: *ShardedGraphEngine, id: NodeId, rel_type: ?u32) anyerror!adj_store_mod.AdjStore.AdjEdgeIterator {
+        // expandIn is intra-shard by construction — incoming adjacency
+        // for node v lives in v's shard (§Cross-shard operations.2).
+        return self.shards[shard_count_mod.shardOfNode(id)].expandInIter(id, rel_type);
+    }
+
+    pub fn getProperty(self: *ShardedGraphEngine, prop_head: u64, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
+        // Property chain heads live on the same shard as their owning node;
+        // prop_head is itself shard-striped.
+        return self.shards[shard_count_mod.shardOfNode(prop_head)].getProperty(prop_head, key, allocator);
+    }
+
+    pub fn nodeCount(self: *ShardedGraphEngine) anyerror!u64 {
+        var total: u64 = 0;
+        for (self.shards) |eng| total += try eng.nodeCount();
+        return total;
+    }
+
+    pub fn edgeCount(self: *ShardedGraphEngine) anyerror!u64 {
+        var total: u64 = 0;
+        for (self.shards) |eng| total += try eng.edgeCount();
+        return total;
     }
 };
 
