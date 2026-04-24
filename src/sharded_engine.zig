@@ -199,6 +199,20 @@ pub const ShardedGraphEngine = struct {
         for (self.shards) |eng| total += try eng.edgeCount();
         return total;
     }
+
+    pub fn addEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
+        const s_from = shard_count_mod.shardOfNode(from);
+        const s_to = shard_count_mod.shardOfNode(to);
+        if (s_from != s_to) return error.CrossShardEdgeUnsupported;
+        return self.shards[s_from].addEdge(from, to, rel_type);
+    }
+
+    pub fn removeEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
+        const s_from = shard_count_mod.shardOfNode(from);
+        const s_to = shard_count_mod.shardOfNode(to);
+        if (s_from != s_to) return error.CrossShardEdgeUnsupported;
+        return self.shards[s_from].removeEdge(from, to, edge_id);
+    }
 };
 
 pub fn uuidHex(uuid: [16]u8) [32]u8 {

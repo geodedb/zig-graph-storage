@@ -148,9 +148,14 @@ pub const GraphEngine = struct {
         };
 
         if (cfg.base_shard_index) |base| {
-            self.manifest.next_node_id = base;
-            self.manifest.next_edge_id = base;
-            self.manifest.next_txn_id = base;
+            // Id 0 is reserved as a sentinel (null out_head / in_head / prop_head / edge_id).
+            // Shard 0's base would collide, so skip ahead by one stride: shard 0 allocates
+            // `N, 2N, 3N, ...` (still 0 mod N) while other shards start at `base`.
+            const stride: u64 = @intCast(@import("sharded_store.zig").SHARD_COUNT);
+            const start: u64 = if (base == 0) stride else @intCast(base);
+            self.manifest.next_node_id = start;
+            self.manifest.next_edge_id = start;
+            self.manifest.next_txn_id = start;
         }
 
         // 3. Write initial manifest to slot A

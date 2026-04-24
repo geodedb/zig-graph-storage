@@ -103,3 +103,42 @@ test "ShardedGraphEngine.nodeCount sums per-shard counts" {
 
     try testing.expectEqual(@as(u64, 100), try eng.nodeCount());
 }
+
+test "ShardedGraphEngine.addEdge succeeds when source and target are co-located" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x40} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const n1 = try eng.shards[0].allocNode();
+    const n2 = try eng.shards[0].allocNode();
+    try eng.putNode(n1, test_support.emptyNode(1));
+    try eng.putNode(n2, test_support.emptyNode(1));
+
+    const e = try eng.addEdge(n1, n2, 1);
+    try testing.expect(e != 0);
+
+    const got = try eng.getEdge(e);
+    try testing.expect(got != null);
+    try testing.expectEqual(n2, got.?.neighbor);
+}
+
+test "ShardedGraphEngine.addEdge returns CrossShardEdgeUnsupported across shards" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x41} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const n_src = try eng.shards[0].allocNode();
+    const n_dst = try eng.shards[3].allocNode();
+    try eng.putNode(n_src, test_support.emptyNode(1));
+    try eng.putNode(n_dst, test_support.emptyNode(1));
+
+    try testing.expectError(error.CrossShardEdgeUnsupported, eng.addEdge(n_src, n_dst, 1));
+}
