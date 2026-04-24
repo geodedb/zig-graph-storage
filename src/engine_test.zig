@@ -841,3 +841,46 @@ test "GraphEngine auto-registers a submitter slot on first flush" {
     engine.ensureSubmitterRegistered();
     try testing.expectEqual(first_slot, engine.submitter_slot.?);
 }
+
+test "GraphEngine with base_shard_index allocates striped node ids" {
+    const SHARD_COUNT = @import("sharded_store.zig").SHARD_COUNT;
+
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0xAA} ** 16;
+
+    var cfg = testConfig();
+    cfg.base_shard_index = 3;
+
+    const engine = try GraphEngine.create(std.testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    const id1 = try engine.allocNode();
+    const id2 = try engine.allocNode();
+    try std.testing.expectEqual(@as(u64, 3), id1);
+    try std.testing.expectEqual(@as(u64, 3 + SHARD_COUNT), id2);
+}
+
+test "GraphEngine with base_shard_index bumps edge ids in stride" {
+    const SHARD_COUNT = @import("sharded_store.zig").SHARD_COUNT;
+
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0xAB} ** 16;
+
+    var cfg = testConfig();
+    cfg.base_shard_index = 5;
+
+    const engine = try GraphEngine.create(std.testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, test_support.emptyNode(1));
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, test_support.emptyNode(1));
+
+    const e1 = try engine.addEdge(n1, n2, 1);
+    const e2 = try engine.addEdge(n1, n2, 1);
+    try std.testing.expectEqual(@as(u64, 5), e1);
+    try std.testing.expectEqual(@as(u64, 5 + SHARD_COUNT), e2);
+}

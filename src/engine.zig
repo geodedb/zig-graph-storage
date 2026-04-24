@@ -147,6 +147,12 @@ pub const GraphEngine = struct {
             .next_txn_id = 1,
         };
 
+        if (cfg.base_shard_index) |base| {
+            self.manifest.next_node_id = base;
+            self.manifest.next_edge_id = base;
+            self.manifest.next_txn_id = base;
+        }
+
         // 3. Write initial manifest to slot A
         const path_a = try self.graph_dir.manifestPath(allocator, .a);
         defer allocator.free(path_a);
@@ -586,7 +592,11 @@ pub const GraphEngine = struct {
     pub fn allocNode(self: *GraphEngine) anyerror!NodeId {
         try self.ensureWritable();
         const id = self.manifest.next_node_id;
-        self.manifest.next_node_id += 1;
+        const stride: u64 = if (self.config.base_shard_index != null)
+            @intCast(@import("sharded_store.zig").SHARD_COUNT)
+        else
+            1;
+        self.manifest.next_node_id += stride;
         self.manifest.node_count += 1;
         self.metrics.nodes_created += 1;
         self.markDirty();
@@ -664,7 +674,11 @@ pub const GraphEngine = struct {
     pub fn addEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
         try self.ensureWritable();
         const edge_id = self.manifest.next_edge_id;
-        self.manifest.next_edge_id += 1;
+        const stride: u64 = if (self.config.base_shard_index != null)
+            @intCast(@import("sharded_store.zig").SHARD_COUNT)
+        else
+            1;
+        self.manifest.next_edge_id += stride;
 
         const entry = EdgeEntry{
             .neighbor = to,

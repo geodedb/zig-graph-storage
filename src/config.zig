@@ -63,6 +63,11 @@ pub const GraphConfig = struct {
     /// Bootstrap paths may create missing on-disk artifacts. Steady-state
     /// open/recovery flows must leave this disabled so damage fails closed.
     allow_create_missing_artifacts: bool = false,
+    /// Shard index (0..SHARD_COUNT-1) for striped id allocation. When
+    /// non-null, `allocNode` returns `k*SHARD_COUNT + base_shard_index`
+    /// and `addEdge` bumps edge ids by `SHARD_COUNT`. `null` preserves
+    /// the classic single-engine behaviour (++1 stride).
+    base_shard_index: ?usize = null,
 
     /// Compute the effective buffer pool size, applying auto-sizing when enabled.
     ///
