@@ -224,3 +224,33 @@ test "ShardedGraphEngine.storage() exposes GraphStorage vtable" {
     try testing.expectEqual(@as(usize, 1), nodes.len);
     try testing.expectEqual(n, nodes[0]);
 }
+
+test "FanOutNodeIterator touches every shard that has matching nodes" {
+    const NodeIdT = @import("types.zig").NodeId;
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x62} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    // One labelled node per shard, deterministically routed.
+    var shard_nodes: [shard_count_mod.SHARD_COUNT]NodeIdT = undefined;
+    for (0..shard_count_mod.SHARD_COUNT) |s| {
+        const n = try eng.shards[s].allocNode();
+        try eng.putNode(n, test_support.emptyNode(1));
+        try eng.addLabel(n, 7);
+        shard_nodes[s] = n;
+    }
+
+    var it = try eng.scanLabelIter(7);
+    defer it.deinit();
+
+    var seen = std.AutoHashMap(NodeIdT, void).init(testing.allocator);
+    defer seen.deinit();
+    while (try it.next()) |nid| try seen.put(nid, {});
+
+    try testing.expectEqual(@as(usize, shard_count_mod.SHARD_COUNT), seen.count());
+    for (shard_nodes) |n| try testing.expect(seen.contains(n));
+}

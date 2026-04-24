@@ -19,6 +19,7 @@ const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
 const metrics_mod = @import("metrics.zig");
 const adj_store_mod = @import("adj_store.zig");
+const label_index_mod = @import("label_index.zig");
 
 const GraphConfig = config_mod.GraphConfig;
 const GraphEngine = engine_mod.GraphEngine;
@@ -283,6 +284,18 @@ pub const ShardedGraphEngine = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// Streaming fan-out iterator across all shards' label indexes.
+    /// Two-argument form so `interface.GraphStorage.init` can bind it
+    /// to the vtable via its `scanLabelIter(self, label)` detection.
+    pub fn scanLabelIter(self: *ShardedGraphEngine, label: LabelId) !FanOutNodeIterator {
+        return .{
+            .owner = self,
+            .label = label,
+            .shard_idx = 0,
+            .current = null,
+        };
+    }
+
     pub fn getOrAssignLabel(self: *ShardedGraphEngine, label_name: []const u8) !LabelId {
         // Label dictionary is global across shards: assign on shard 0 and
         // broadcast the mapping so every shard's label_dict.get agrees on
@@ -362,6 +375,34 @@ pub const ShardedGraphEngine = struct {
         errdefer list.deinit(allocator);
         while (try iter.next()) |entry| try list.append(allocator, entry);
         return list.toOwnedSlice(allocator);
+    }
+};
+
+/// Streaming iterator across every shard's `LabelIndex` for a single
+/// label. Advances one shard at a time; drops into the next shard's
+/// inner iterator when the current one is exhausted. Value-typed so
+/// `GraphStorage.init`'s `wrapNodeIterator` can heap-wrap it for the
+/// vtable automatically.
+pub const FanOutNodeIterator = struct {
+    owner: *ShardedGraphEngine,
+    label: LabelId,
+    shard_idx: usize,
+    current: ?label_index_mod.LabelIndex.Iterator,
+
+    pub fn next(self: *FanOutNodeIterator) anyerror!?NodeId {
+        while (true) {
+            if (self.current) |*inner| {
+                if (try inner.next()) |nid| return nid;
+                self.current = null;
+            }
+            if (self.shard_idx >= SHARD_COUNT) return null;
+            self.current = try self.owner.shards[self.shard_idx].scanLabelIter(self.label);
+            self.shard_idx += 1;
+        }
+    }
+
+    pub fn deinit(_: *FanOutNodeIterator) void {
+        // LabelIndex.Iterator is a lightweight cursor; nothing to free.
     }
 };
 
