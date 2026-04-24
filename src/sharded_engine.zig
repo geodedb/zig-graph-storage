@@ -34,6 +34,22 @@ const Metrics = metrics_mod.Metrics;
 
 pub const SHARD_COUNT = shard_count_mod.SHARD_COUNT;
 
+// Encoded TxnId layout for the facade: high 8 bits = shard_index,
+// low 56 bits = per-shard local txn id. Keeps the public TxnId shape
+// a plain u64 so the GraphStorage vtable binding stays untouched.
+const TXN_SHARD_SHIFT: u6 = 56;
+const TXN_LOCAL_MASK: u64 = (@as(u64, 1) << 56) - 1;
+
+fn encodeTxn(shard: usize, local: TxnId) TxnId {
+    return (@as(TxnId, @intCast(shard)) << TXN_SHARD_SHIFT) | (local & TXN_LOCAL_MASK);
+}
+
+fn decodeTxn(txn: TxnId) struct { shard: usize, local: TxnId } {
+    const shard = @as(usize, @intCast(txn >> TXN_SHARD_SHIFT));
+    const local = txn & TXN_LOCAL_MASK;
+    return .{ .shard = shard, .local = local };
+}
+
 pub const ShardedGraphEngine = struct {
     allocator: Allocator,
     graph_uuid: [16]u8,
@@ -41,6 +57,7 @@ pub const ShardedGraphEngine = struct {
     shards: [SHARD_COUNT]*GraphEngine,
     shard_manifest: shard_manifest_mod.ShardManifest,
     coordinator_txn_counter: std.atomic.Value(u64),
+    aggregated_metrics: Metrics = .{},
 
     pub fn create(
         allocator: Allocator,
@@ -212,6 +229,112 @@ pub const ShardedGraphEngine = struct {
         const s_to = shard_count_mod.shardOfNode(to);
         if (s_from != s_to) return error.CrossShardEdgeUnsupported;
         return self.shards[s_from].removeEdge(from, to, edge_id);
+    }
+
+    pub fn putProperty(self: *ShardedGraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        // `owner == 0` means "create a new chain"; round-robin to a shard.
+        if (owner == 0) {
+            const idx = self.coordinator_txn_counter.fetchAdd(1, .monotonic) % SHARD_COUNT;
+            return self.shards[idx].putProperty(owner, key, val);
+        }
+        return self.shards[shard_count_mod.shardOfNode(owner)].putProperty(owner, key, val);
+    }
+
+    pub fn removeProperty(self: *ShardedGraphEngine, owner: u64, key: []const u8) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(owner)].removeProperty(owner, key);
+    }
+
+    pub fn getAllProperties(self: *ShardedGraphEngine, prop_head: u64) anyerror!@TypeOf(self.shards[0].getAllProperties(prop_head) catch unreachable) {
+        return self.shards[shard_count_mod.shardOfNode(prop_head)].getAllProperties(prop_head);
+    }
+
+    pub fn setEdgeProperty(self: *ShardedGraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, val: PropertyValue) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(from)].setEdgeProperty(from, to, edge_id, key, val);
+    }
+
+    pub fn removeEdgeProperty(self: *ShardedGraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(from)].removeEdgeProperty(from, edge_id, key);
+    }
+
+    pub fn getEdgeProperty(self: *ShardedGraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
+        return self.shards[shard_count_mod.shardOfNode(from)].getEdgeProperty(from, edge_id, key, allocator);
+    }
+
+    pub fn getAllEdgeProperties(self: *ShardedGraphEngine, from: NodeId, edge_id: EdgeId) anyerror!@TypeOf(self.shards[0].getAllEdgeProperties(from, edge_id) catch unreachable) {
+        return self.shards[shard_count_mod.shardOfNode(from)].getAllEdgeProperties(from, edge_id);
+    }
+
+    pub fn addLabel(self: *ShardedGraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(node_id)].addLabel(node_id, label);
+    }
+
+    pub fn removeLabel(self: *ShardedGraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(node_id)].removeLabel(node_id, label);
+    }
+
+    pub fn scanLabel(self: *ShardedGraphEngine, label: LabelId, allocator: Allocator) anyerror![]NodeId {
+        var out: std.ArrayList(NodeId) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.shards) |eng| {
+            const slice = try eng.scanLabel(label, allocator);
+            defer allocator.free(slice);
+            try out.appendSlice(allocator, slice);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn getOrAssignLabel(self: *ShardedGraphEngine, label_name: []const u8) !LabelId {
+        // Label dictionary is global across shards: assign on shard 0 and
+        // broadcast the mapping so every shard's label_dict.get agrees on
+        // the id. Hot-path addLabel(node, id) is single-shard; this
+        // broadcast only fires when a new name is registered.
+        const id = try self.shards[0].getOrAssignLabel(label_name);
+        for (self.shards[1..]) |eng| {
+            _ = try eng.getOrAssignLabel(label_name);
+        }
+        return id;
+    }
+
+    pub fn beginTxn(self: *ShardedGraphEngine) anyerror!TxnId {
+        const idx = self.coordinator_txn_counter.fetchAdd(1, .monotonic) % SHARD_COUNT;
+        const local = try self.shards[idx].beginTxn();
+        return encodeTxn(idx, local);
+    }
+
+    pub fn commitTxn(self: *ShardedGraphEngine, txn: TxnId) anyerror!void {
+        const d = decodeTxn(txn);
+        return self.shards[d.shard].commitTxn(d.local);
+    }
+
+    pub fn abortTxn(self: *ShardedGraphEngine, txn: TxnId) anyerror!void {
+        const d = decodeTxn(txn);
+        return self.shards[d.shard].abortTxn(d.local);
+    }
+
+    pub fn checkpoint(self: *ShardedGraphEngine) anyerror!void {
+        var first_err: ?anyerror = null;
+        for (self.shards) |eng| {
+            eng.checkpoint() catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
+    }
+
+    /// Aggregated metrics snapshot. Refreshes an internal buffer on each
+    /// call and returns a pointer to it — valid until the next call.
+    pub fn getMetrics(self: *ShardedGraphEngine) *const Metrics {
+        self.aggregated_metrics = .{};
+        inline for (std.meta.fields(Metrics)) |field| {
+            if (@typeInfo(field.type) == .int) {
+                var sum: field.type = 0;
+                for (self.shards) |eng| {
+                    sum += @field(eng.getMetrics().*, field.name);
+                }
+                @field(self.aggregated_metrics, field.name) = sum;
+            }
+        }
+        return &self.aggregated_metrics;
     }
 };
 

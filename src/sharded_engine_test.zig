@@ -142,3 +142,66 @@ test "ShardedGraphEngine.addEdge returns CrossShardEdgeUnsupported across shards
 
     try testing.expectError(error.CrossShardEdgeUnsupported, eng.addEdge(n_src, n_dst, 1));
 }
+
+test "ShardedGraphEngine.addLabel + scanLabel round-trips" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x50} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const n1 = try eng.allocNode();
+    const n2 = try eng.allocNode();
+    try eng.putNode(n1, test_support.emptyNode(1));
+    try eng.putNode(n2, test_support.emptyNode(1));
+    try eng.addLabel(n1, 7);
+    try eng.addLabel(n2, 7);
+
+    const nodes = try eng.scanLabel(7, testing.allocator);
+    defer testing.allocator.free(nodes);
+    try testing.expectEqual(@as(usize, 2), nodes.len);
+}
+
+test "ShardedGraphEngine.putProperty + getProperty round-trips on one shard" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x51} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const n = try eng.allocNode();
+    try eng.putNode(n, test_support.emptyNode(1));
+
+    var rec = (try eng.getNode(n)).?;
+    const new_head = try eng.putProperty(rec.prop_head, "name", .{ .string = "alice" });
+    rec.prop_head = new_head;
+    try eng.putNode(n, rec);
+
+    const got = try eng.getProperty(new_head, "name", testing.allocator);
+    try testing.expect(got != null);
+    defer if (got) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        else => {},
+    };
+    try testing.expectEqualStrings("alice", got.?.string);
+}
+
+test "ShardedGraphEngine.beginTxn encodes shard + commit routes back" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x52} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const txn = try eng.beginTxn();
+    try eng.commitTxn(txn);
+
+    const txn2 = try eng.beginTxn();
+    try eng.abortTxn(txn2);
+}
