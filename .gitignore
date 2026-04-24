@@ -55,3 +55,4 @@ coverage/
 *.gcda
 *.gcno
 zig-pkg/
+.bench-optimize/
