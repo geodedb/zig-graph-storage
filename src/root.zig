@@ -101,8 +101,13 @@ pub const test_support = @import("testing_support.zig");
 // In-memory concurrency primitives (reusable utilities for consumers
 // that layer concurrent in-memory structures on top of the engine).
 pub const sharded_store = @import("sharded_store.zig");
+pub const shard_count = @import("shard_count.zig");
+pub const shard_uuid = @import("shard_uuid.zig");
+pub const shard_manifest = @import("shard_manifest.zig");
+pub const sharded_engine = @import("sharded_engine.zig");
 
 pub const GraphEngine = engine.GraphEngine;
+pub const ShardedGraphEngine = sharded_engine.ShardedGraphEngine;
 
 // Re-export key types for convenience
 pub const GraphStorage = interface.GraphStorage;
