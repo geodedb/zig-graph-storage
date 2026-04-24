@@ -7,6 +7,26 @@ A high-performance, disk-resident graph storage engine written in Zig. Designed
 for single-graph OLTP workloads with crash-safe durability, incremental
 checkpointing, and locality-friendly adjacency traversal.
 
+## Sharded Engine
+
+For N-way writer concurrency per graph, `ShardedGraphEngine` owns 16
+independent single-threaded `GraphEngine` instances routed by
+`shardOfNode(id) = id % 16`. The `GraphStorage` vtable shape is
+unchanged. Cross-shard edges use a small 2PC protocol (see
+`docs/superpowers/specs/2026-04-24-sharded-graph-engine-design.md`).
+
+```zig
+const graph_storage = @import("graph_storage");
+var eng = try graph_storage.ShardedGraphEngine.create(allocator, data_dir, uuid, cfg);
+defer eng.close() catch {};
+const n = try eng.allocNode();
+try eng.putNode(n, node_rec);
+// Cross-shard edges work transparently.
+_ = try eng.addEdge(n_src, n_dst, rel_type);
+```
+
+Benchmark: `zig build bench-sharded-throughput` (target ≥4× single-engine throughput on 16 cores).
+
 ## Architecture Overview
 
 ```mermaid

@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Sharded Graph Engine
+
+- `ShardedGraphEngine` facade owning N=16 independent per-shard
+  `GraphEngine` instances per logical graph. Enables N-way writer
+  concurrency per graph while preserving each engine's single-threaded
+  correctness argument. The existing `GraphStorage` vtable shape is
+  preserved exactly; callers use `eng.storage()` for vtable dispatch or
+  `eng.*` methods directly.
+- Top-level `<graph_uuid>/shard_manifest.json` records shard-count,
+  routing-algorithm fingerprint, and per-shard UUIDs (derived via
+  BLAKE3 from the parent uuid + `"shard_NN"` tag).
+- WAL record types `cross_shard_prepare`, `cross_shard_commit`,
+  `cross_shard_abort` — support for cross-shard edge-create 2PC.
+- Striped id allocation (`GraphConfig.base_shard_index`) so
+  `shardOfNode(id) == shard_index` for every allocated id. Shard 0's
+  initial id is bumped to `SHARD_COUNT` so the sentinel `0` is never
+  returned.
+- `shard_count`, `shard_uuid`, `shard_manifest`, `sharded_engine`,
+  `sharded_engine_2pc`, `sharded_recovery` modules published from
+  `graph_storage.*`.
+- `tests/integration_sharded.zig` — full CRUD + cross-shard edges +
+  reopen + concurrent-writer smoke.
+- `tests/cross_shard_recovery.zig` — crash-after-both-prepares aborts;
+  crash-after-source-commit completes on reopen.
+- `benchmarks/sharded_throughput.zig` + `zig build
+  bench-sharded-throughput` — ShardedGraphEngine vs single-engine
+  throughput microbench (target: ≥4× on 16 cores).
+
+### Breaking
+
+- On-disk layout for sharded graphs is incompatible with the
+  pre-sharded single-engine layout. Upgrade requires wiping the data
+  directory; see
+  `docs/superpowers/specs/2026-04-24-sharded-graph-engine-design.md`.
+
 ## [0.2.0] - 2026-04-23
 
 ### Added
