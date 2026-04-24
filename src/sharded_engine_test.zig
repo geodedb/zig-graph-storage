@@ -126,21 +126,44 @@ test "ShardedGraphEngine.addEdge succeeds when source and target are co-located"
     try testing.expectEqual(n2, got.?.neighbor);
 }
 
-test "ShardedGraphEngine.addEdge returns CrossShardEdgeUnsupported across shards" {
+test "addEdge across shards commits via 2PC and both adjacencies are readable" {
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
-    const uuid = [_]u8{0x41} ** 16;
+    const uuid = [_]u8{0x70} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
         testing.allocator, td.path, uuid, test_support.testConfig(),
     );
     defer eng.close() catch {};
 
     const n_src = try eng.shards[0].allocNode();
-    const n_dst = try eng.shards[3].allocNode();
+    const n_dst = try eng.shards[5].allocNode();
     try eng.putNode(n_src, test_support.emptyNode(1));
     try eng.putNode(n_dst, test_support.emptyNode(1));
 
-    try testing.expectError(error.CrossShardEdgeUnsupported, eng.addEdge(n_src, n_dst, 1));
+    const e = try eng.addEdge(n_src, n_dst, 9);
+    try testing.expect(e != 0);
+
+    var out_iter = try eng.expandOutIter(n_src, null);
+    defer out_iter.deinit();
+    var saw_out = false;
+    while (try out_iter.next()) |entry| {
+        if (entry.edge_id == e) {
+            saw_out = true;
+            try testing.expectEqual(n_dst, entry.neighbor);
+        }
+    }
+    try testing.expect(saw_out);
+
+    var in_iter = try eng.expandInIter(n_dst, null);
+    defer in_iter.deinit();
+    var saw_in = false;
+    while (try in_iter.next()) |entry| {
+        if (entry.edge_id == e) {
+            saw_in = true;
+            try testing.expectEqual(n_src, entry.neighbor);
+        }
+    }
+    try testing.expect(saw_in);
 }
 
 test "ShardedGraphEngine.addLabel + scanLabel round-trips" {
