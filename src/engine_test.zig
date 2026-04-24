@@ -859,6 +859,9 @@ test "GraphEngine with base_shard_index allocates striped node ids" {
     const id2 = try engine.allocNode();
     try std.testing.expectEqual(@as(u64, 3), id1);
     try std.testing.expectEqual(@as(u64, 3 + SHARD_COUNT), id2);
+    const shard_count_mod = @import("shard_count.zig");
+    try std.testing.expectEqual(@as(usize, 3), shard_count_mod.shardOfNode(id1));
+    try std.testing.expectEqual(@as(usize, 3), shard_count_mod.shardOfNode(id2));
 }
 
 test "GraphEngine with base_shard_index bumps edge ids in stride" {
