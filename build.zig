@@ -117,6 +117,15 @@ fn addIntegrationTests(
     });
     const run_fuzz_regression = b.addRunArtifact(fuzz_regression_tests);
     fuzz_regression_step.dependOn(&run_fuzz_regression.step);
+
+    const cross_shard_step = b.step("test-cross-shard-recovery", "Run cross-shard 2PC crash recovery tests");
+    const cross_shard_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/cross_shard_recovery.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_cross_shard = b.addRunArtifact(cross_shard_tests);
+    cross_shard_step.dependOn(&run_cross_shard.step);
 }
 
 fn addExample(

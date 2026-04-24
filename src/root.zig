@@ -106,6 +106,7 @@ pub const shard_uuid = @import("shard_uuid.zig");
 pub const shard_manifest = @import("shard_manifest.zig");
 pub const sharded_engine = @import("sharded_engine.zig");
 pub const sharded_engine_2pc = @import("sharded_engine_2pc.zig");
+pub const sharded_recovery = @import("sharded_recovery.zig");
 
 pub const GraphEngine = engine.GraphEngine;
 pub const ShardedGraphEngine = sharded_engine.ShardedGraphEngine;

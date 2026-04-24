@@ -6,6 +6,7 @@
 //! docs/superpowers/specs/2026-04-24-sharded-graph-engine-design.md.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const config_mod = @import("config.zig");
@@ -21,6 +22,7 @@ const metrics_mod = @import("metrics.zig");
 const adj_store_mod = @import("adj_store.zig");
 const label_index_mod = @import("label_index.zig");
 const two_pc = @import("sharded_engine_2pc.zig");
+const sharded_recovery = @import("sharded_recovery.zig");
 
 const GraphConfig = config_mod.GraphConfig;
 const GraphEngine = engine_mod.GraphEngine;
@@ -143,6 +145,8 @@ pub const ShardedGraphEngine = struct {
             );
             opened += 1;
         }
+
+        _ = try sharded_recovery.reconcilePendingPrepares(self);
 
         return self;
     }
@@ -448,6 +452,99 @@ pub const ShardedGraphEngine = struct {
         errdefer list.deinit(allocator);
         while (try iter.next()) |entry| try list.append(allocator, entry);
         return list.toOwnedSlice(allocator);
+    }
+
+    /// TEST-ONLY: issue both prepares for a cross-shard edge but never
+    /// write the commit or abort record. Simulates a crash between 2PC
+    /// steps 2 and 5 of `crossShardAddEdge`. Recovery reconciliation must
+    /// abort the dangling prepares on reopen.
+    pub fn addEdgeCrashAfterPrepares(
+        self: *ShardedGraphEngine,
+        from: NodeId,
+        to: NodeId,
+        rel_type: u32,
+    ) !void {
+        if (!builtin.is_test) return error.TestOnly;
+        const s_from = shard_count_mod.shardOfNode(from);
+        const s_to = shard_count_mod.shardOfNode(to);
+        if (s_from == s_to) return error.NotCrossShard;
+
+        const src = self.shards[s_from];
+        const dst = self.shards[s_to];
+
+        const edge_id = src.manifest.next_edge_id;
+        src.manifest.next_edge_id += @as(u64, @intCast(SHARD_COUNT));
+
+        const global_txn_id = self.coordinator_txn_counter.fetchAdd(1, .monotonic) + 1;
+
+        var src_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
+        two_pc.encodePreparePayload(&src_prepare, global_txn_id, .source, @intCast(s_to), edge_id, from, to, rel_type);
+        const src_local_txn = try src.beginTxn();
+        _ = try two_pc.appendPrepare(src, src_prepare, src_local_txn);
+
+        var dst_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
+        two_pc.encodePreparePayload(&dst_prepare, global_txn_id, .target, @intCast(s_from), edge_id, from, to, rel_type);
+        const dst_local_txn = try dst.beginTxn();
+        _ = try two_pc.appendPrepare(dst, dst_prepare, dst_local_txn);
+        // Intentional crash simulation: txns are open but never committed.
+    }
+
+    /// TEST-ONLY: run through source-side adjacency + commit but crash
+    /// before target adjacency or target commit. Recovery must replay
+    /// the target-side write.
+    pub fn addEdgeCrashAfterSourceCommit(
+        self: *ShardedGraphEngine,
+        from: NodeId,
+        to: NodeId,
+        rel_type: u32,
+    ) !EdgeId {
+        if (!builtin.is_test) return error.TestOnly;
+        const s_from = shard_count_mod.shardOfNode(from);
+        const s_to = shard_count_mod.shardOfNode(to);
+        if (s_from == s_to) return error.NotCrossShard;
+        const src = self.shards[s_from];
+        const dst = self.shards[s_to];
+
+        const edge_id = src.manifest.next_edge_id;
+        src.manifest.next_edge_id += @as(u64, @intCast(SHARD_COUNT));
+
+        const global_txn_id = self.coordinator_txn_counter.fetchAdd(1, .monotonic) + 1;
+
+        var src_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
+        two_pc.encodePreparePayload(&src_prepare, global_txn_id, .source, @intCast(s_to), edge_id, from, to, rel_type);
+        const src_local_txn = try src.beginTxn();
+        _ = try two_pc.appendPrepare(src, src_prepare, src_local_txn);
+
+        var dst_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
+        two_pc.encodePreparePayload(&dst_prepare, global_txn_id, .target, @intCast(s_from), edge_id, from, to, rel_type);
+        const dst_local_txn = try dst.beginTxn();
+        _ = try two_pc.appendPrepare(dst, dst_prepare, dst_local_txn);
+
+        // Source-side adjacency + commit, skip target-side adjacency + commit.
+        var from_rec = try src.getNode(from) orelse return error.NodeNotFound;
+        const out_entry = edge_mod.EdgeEntry{
+            .neighbor = to,
+            .edge_id = edge_id,
+            .rel_type = rel_type,
+            .prop_head = 0,
+        };
+        const new_out_head = try src.adj_out.addEdge(from_rec.out_head, out_entry);
+        from_rec.out_head = new_out_head;
+        try src.node_store.putNode(from, from_rec);
+        try src.edge_index.put(edge_id, .{
+            .from = from,
+            .neighbor = to,
+            .rel_type = rel_type,
+            .prop_head = 0,
+        });
+        src.manifest.edge_count += 1;
+
+        _ = try two_pc.appendDecision(src, .cross_shard_commit, global_txn_id, src_local_txn);
+        try src.commitTxn(src_local_txn);
+
+        // Intentional crash simulation: dst_local_txn is open but never committed.
+        // dst_local_txn was passed to appendPrepare above so is already used.
+        return edge_id;
     }
 };
 
