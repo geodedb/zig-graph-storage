@@ -126,6 +126,15 @@ fn addIntegrationTests(
     });
     const run_cross_shard = b.addRunArtifact(cross_shard_tests);
     cross_shard_step.dependOn(&run_cross_shard.step);
+
+    const integration_sharded_step = b.step("test-integration-sharded", "Run sharded-engine integration tests");
+    const integration_sharded_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/integration_sharded.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_integration_sharded = b.addRunArtifact(integration_sharded_tests);
+    integration_sharded_step.dependOn(&run_integration_sharded.step);
 }
 
 fn addExample(
