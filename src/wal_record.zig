@@ -11,6 +11,9 @@ pub const WalRecordType = enum(u8) {
     commit_txn = 3,
     abort_txn = 4,
     checkpoint_marker = 5,
+    cross_shard_prepare = 6,
+    cross_shard_commit = 7,
+    cross_shard_abort = 8,
 };
 
 /// Header size: lsn(8) + txn_id(8) + record_type(1) + file_id(1) + page_id(8) + payload_len(4) = 30 bytes
@@ -443,6 +446,70 @@ test "serialize convenience wrapper matches serializeInto output" {
     // Both should produce identical output
     try std.testing.expectEqualSlices(u8, buf[0..n], heap_buf);
     try std.testing.expectEqual(record1.checksum, record2.checksum);
+}
+
+test "cross_shard_prepare record round-trips with global_txn_id payload" {
+    const allocator = std.testing.allocator;
+
+    // Payload encodes: global_txn_id(8) + remote_shard_index(2) + edge_id(8)
+    const global_txn_id: u64 = 0xC0FFEE;
+    const remote_shard: u16 = 7;
+    const edge_id: u64 = 42;
+
+    var payload: [18]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], global_txn_id, .little);
+    std.mem.writeInt(u16, payload[8..10], remote_shard, .little);
+    std.mem.writeInt(u64, payload[10..18], edge_id, .little);
+
+    var rec = WalRecord{
+        .lsn = 10,
+        .txn_id = 5,
+        .record_type = .cross_shard_prepare,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &payload,
+        .checksum = 0,
+    };
+    rec.checksum = rec.computeChecksum();
+
+    const bytes = try rec.serialize(allocator);
+    defer allocator.free(bytes);
+
+    const result = try WalRecord.deserialize(allocator, bytes);
+    defer result.record.deinit(allocator);
+
+    try std.testing.expectEqual(WalRecordType.cross_shard_prepare, result.record.record_type);
+    try std.testing.expectEqualSlices(u8, &payload, result.record.payload);
+}
+
+test "cross_shard_commit and cross_shard_abort record types round-trip" {
+    const allocator = std.testing.allocator;
+
+    const rts = [_]WalRecordType{ .cross_shard_commit, .cross_shard_abort };
+    for (rts) |rt| {
+        var payload: [8]u8 = undefined;
+        std.mem.writeInt(u64, &payload, 0xBEEF, .little);
+
+        var rec = WalRecord{
+            .lsn = 1,
+            .txn_id = 1,
+            .record_type = rt,
+            .file_id = 0,
+            .page_id = 0,
+            .payload = &payload,
+            .checksum = 0,
+        };
+        rec.checksum = rec.computeChecksum();
+
+        const bytes = try rec.serialize(allocator);
+        defer allocator.free(bytes);
+
+        const result = try WalRecord.deserialize(allocator, bytes);
+        defer result.record.deinit(allocator);
+
+        try std.testing.expectEqual(rt, result.record.record_type);
+        try std.testing.expectEqualSlices(u8, &payload, result.record.payload);
+    }
 }
 
 test {

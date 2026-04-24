@@ -186,6 +186,10 @@ pub const Recovery = struct {
                     .commit_txn => try ctx.txn_states.put(rec.txn_id, .committed),
                     .abort_txn => try ctx.txn_states.put(rec.txn_id, .aborted),
                     .page_update, .checkpoint_marker => {},
+                    // Cross-shard 2PC records are collected and reconciled
+                    // by sharded_recovery.reconcilePendingPrepares after
+                    // per-shard recovery completes. Skipped here.
+                    .cross_shard_prepare, .cross_shard_commit, .cross_shard_abort => {},
                 }
             }
         };
