@@ -227,6 +227,17 @@ fn addBenchmarks(
     });
     const run_sharded_bench = b.addRunArtifact(sharded_bench_exe);
     sharded_bench_step.dependOn(&run_sharded_bench.step);
+
+    // ShardedGraphEngine vs single-engine throughput (Task 16).
+    const sharded_throughput_step = b.step("bench-sharded-throughput", "ShardedGraphEngine vs single-engine throughput");
+    const sharded_throughput_exe = b.addExecutable(.{
+        .name = "sharded-throughput-bench",
+        .root_module = createModule(b, "benchmarks/sharded_throughput.zig", target, bench_optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_sharded_throughput = b.addRunArtifact(sharded_throughput_exe);
+    sharded_throughput_step.dependOn(&run_sharded_throughput.step);
 }
 
 fn addCheckStep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: OptimizeMode, deps: Deps) void {
