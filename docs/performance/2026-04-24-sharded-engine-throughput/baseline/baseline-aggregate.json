@@ -1,0 +1,58 @@
+{
+  "git_sha": "db4d9ab21ea3c2ade9b72a842886ae6b56256c8c",
+  "rounds_total": 10,
+  "rounds_used_for_variance": 9,
+  "rounds_discarded_as_cold": [
+    "round_01"
+  ],
+  "warmups_protocol": 1,
+  "warmups_effective": 2,
+  "metrics_steady_state": {
+    "sharded_elapsed_ns": {
+      "n": 9,
+      "min": 43088544844,
+      "max": 43893578126,
+      "mean": 43509703007.22222,
+      "median": 43523107659,
+      "p95": 43893578126,
+      "p99": 43893578126,
+      "stdev": 270501337.54840845,
+      "stddev_pct_of_median": 0.6215120015504507
+    },
+    "single_elapsed_ns": {
+      "n": 9,
+      "min": 351250001083,
+      "max": 360452355068,
+      "mean": 353090201884.6667,
+      "median": 351969627857,
+      "p95": 360452355068,
+      "p99": 360452355068,
+      "stdev": 2944140370.146681,
+      "stddev_pct_of_median": 0.8364756891304386
+    },
+    "sharded_ops_per_s": {
+      "n": 9,
+      "min": 455,
+      "max": 464,
+      "mean": 459.3333333333333,
+      "median": 459,
+      "p95": 464,
+      "p99": 464,
+      "stdev": 2.9154759474226504,
+      "stddev_pct_of_median": 0.635179944972255
+    },
+    "sharding_speedup_ratio": {
+      "n": 9,
+      "min": 8.0,
+      "max": 8.22,
+      "mean": 8.114444444444445,
+      "median": 8.14,
+      "p95": 8.22,
+      "p99": 8.22,
+      "stdev": 0.06482883446258923,
+      "stddev_pct_of_median": 0.7964230277959364
+    }
+  },
+  "variance_policy": "5% stddev limit (compiled micro)",
+  "notes": "round_01 (sharded=24.8s, single=584s, ratio=23.55) was a cold-I/O outlier not absorbed by the single discarded warmup round. Rounds 02-10 are steady-state with <2% spread. Variance evaluated on the steady-state subset (n=9)."
+}

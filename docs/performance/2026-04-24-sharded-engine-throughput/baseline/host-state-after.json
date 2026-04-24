@@ -1,0 +1,12 @@
+{
+  "timestamp_utc": "2026-04-24T20:47:05Z",
+  "os": "linux",
+  "kernel": "6.17.0-20-generic",
+  "arch": "x86_64",
+  "cpu_model": "AMD Ryzen Threadripper PRO 3955WX 16-Cores",
+  "cpu_count": 32,
+  "memory_kb": 263760900,
+  "governor": "performance",
+  "zig_version": "0.16.0",
+  "git_sha": "db4d9ab21ea3c2ade9b72a842886ae6b56256c8c"
+}
