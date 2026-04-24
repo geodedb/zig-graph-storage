@@ -277,3 +277,37 @@ test "FanOutNodeIterator touches every shard that has matching nodes" {
     try testing.expectEqual(@as(usize, shard_count_mod.SHARD_COUNT), seen.count());
     for (shard_nodes) |n| try testing.expect(seen.contains(n));
 }
+
+test "cross-shard commit blocks until both shards' WAL commit records are durable" {
+    const wal_record_mod = @import("wal_record.zig");
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x90} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const n_src = try eng.shards[0].allocNode();
+    const n_dst = try eng.shards[7].allocNode();
+    try eng.putNode(n_src, test_support.emptyNode(1));
+    try eng.putNode(n_dst, test_support.emptyNode(1));
+
+    _ = try eng.addEdge(n_src, n_dst, 1);
+
+    for ([_]usize{ 0, 7 }) |s| {
+        const records = try eng.shards[s].wal.readFrom(0, testing.allocator);
+        defer {
+            for (records) |*r| r.deinit(testing.allocator);
+            testing.allocator.free(records);
+        }
+        var found = false;
+        for (records) |r| {
+            if (r.record_type == wal_record_mod.WalRecordType.cross_shard_commit) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+}
