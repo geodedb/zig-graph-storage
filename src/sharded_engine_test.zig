@@ -205,3 +205,22 @@ test "ShardedGraphEngine.beginTxn encodes shard + commit routes back" {
     const txn2 = try eng.beginTxn();
     try eng.abortTxn(txn2);
 }
+
+test "ShardedGraphEngine.storage() exposes GraphStorage vtable" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x60} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator, td.path, uuid, test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    const gs = eng.storage();
+    const n = try gs.allocNode();
+    try gs.putNode(n, test_support.emptyNode(1));
+    try gs.addLabel(n, 42);
+    const nodes = try gs.scanLabel(42, testing.allocator);
+    defer testing.allocator.free(nodes);
+    try testing.expectEqual(@as(usize, 1), nodes.len);
+    try testing.expectEqual(n, nodes[0]);
+}

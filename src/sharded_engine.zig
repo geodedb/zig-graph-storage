@@ -336,6 +336,33 @@ pub const ShardedGraphEngine = struct {
         }
         return &self.aggregated_metrics;
     }
+
+    /// Returns a GraphStorage vtable bound to this sharded engine, allowing
+    /// external consumers (e.g. geode) to use ShardedGraphEngine through the
+    /// standard GraphStorage interface with zero API changes.
+    pub fn storage(self: *ShardedGraphEngine) GraphStorage {
+        return GraphStorage.init(ShardedGraphEngine, self);
+    }
+
+    /// Drains expandOutIter into a caller-owned []EdgeEntry slice.
+    pub fn expandOut(self: *ShardedGraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        var iter = try self.expandOutIter(id, rel_type);
+        defer iter.deinit();
+        var list: std.ArrayList(EdgeEntry) = .empty;
+        errdefer list.deinit(allocator);
+        while (try iter.next()) |entry| try list.append(allocator, entry);
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Drains expandInIter into a caller-owned []EdgeEntry slice.
+    pub fn expandIn(self: *ShardedGraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        var iter = try self.expandInIter(id, rel_type);
+        defer iter.deinit();
+        var list: std.ArrayList(EdgeEntry) = .empty;
+        errdefer list.deinit(allocator);
+        while (try iter.next()) |entry| try list.append(allocator, entry);
+        return list.toOwnedSlice(allocator);
+    }
 };
 
 pub fn uuidHex(uuid: [16]u8) [32]u8 {
