@@ -6,6 +6,7 @@ const testing = std.testing;
 const test_support = @import("testing_support.zig");
 const config_mod = @import("config.zig");
 const sharded_engine_mod = @import("sharded_engine.zig");
+const engine_mod = @import("engine.zig");
 const shard_count_mod = @import("shard_count.zig");
 const shard_manifest_mod = @import("shard_manifest.zig");
 
@@ -405,5 +406,49 @@ test "ShardedGraphEngine.create propagates external_thread_pool to all shards" {
     for (0..shard_count_mod.SHARD_COUNT) |i| {
         try testing.expectEqual(&caller_pool, eng.shards[i].thread_pool);
         try testing.expect(eng.shards[i].owned_thread_pool == null);
+    }
+}
+
+test "ShardedGraphEngine: 16 concurrent shard checkpoints complete on a 4-worker shared pool" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xBB} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    // Seed each shard with at least one dirty page so the per-shard
+    // checkpoint actually has work to flush.
+    for (0..shard_count_mod.SHARD_COUNT) |s| {
+        const id = try eng.shards[s].allocNode();
+        try eng.shards[s].putNode(id, test_support.emptyNode(1));
+    }
+
+    const Worker = struct {
+        fn run(shard_eng: *engine_mod.GraphEngine, out_err: *?anyerror) void {
+            shard_eng.checkpoint() catch |err| {
+                out_err.* = err;
+            };
+        }
+    };
+
+    var thread_errs: [shard_count_mod.SHARD_COUNT]?anyerror = .{null} ** shard_count_mod.SHARD_COUNT;
+    var threads: [shard_count_mod.SHARD_COUNT]std.Thread = undefined;
+
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ eng.shards[i], &thread_errs[i] });
+    }
+    for (threads) |t| t.join();
+
+    for (thread_errs) |maybe_err| {
+        if (maybe_err) |err| {
+            std.debug.print("shard checkpoint failed: {}\n", .{err});
+            return error.ShardCheckpointFailed;
+        }
     }
 }
