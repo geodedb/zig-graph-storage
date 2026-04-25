@@ -521,12 +521,6 @@ pub const GraphEngine = struct {
         // that first called ensureSubmitterRegistered — it becomes a free-
         // mask CAS with no cache drain, which is correct because the
         // pool's deinit path will scrub any residual cache entries.
-        // Release the submitter slot before draining the pool. The TLS-
-        // owner check inside releaseSubmitter (F-005) handles the case
-        // where the engine was torn down from a thread other than the one
-        // that first called ensureSubmitterRegistered — it becomes a free-
-        // mask CAS with no cache drain, which is correct because the
-        // pool's deinit path will scrub any residual cache entries.
         //
         // For borrowed pools (owned_thread_pool == null) we MUST still
         // release the slot — the slot belongs to this engine's lifecycle,
