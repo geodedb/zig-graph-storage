@@ -71,6 +71,14 @@ pub const EdgeIndexEntry = struct {
     prop_head: u32,
 };
 
+/// Default worker count for the owned (no-`external_thread_pool`) path.
+/// Sized for the only consumer — `BufferPool.flushAllParallel`, capped at
+/// `MAX_CHUNKS = 64` short-lived I/O tasks per checkpoint. Four workers
+/// saturate any one shard's flush bandwidth; larger graphs that need more
+/// throughput inject a caller-owned pool via `GraphConfig.external_thread_pool`.
+/// See docs/2026-04-25-shared-engine-thread-pool.md §5.2 and §9.
+pub const default_owned_pool_max_threads: u32 = 4;
+
 /// The central GraphEngine that wires everything together and implements
 /// the GraphStorage vtable.
 ///
@@ -103,7 +111,14 @@ pub const GraphEngine = struct {
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.Io.Dir,
-    thread_pool: tp.ThreadPool,
+    /// Pointer to the active pool. Either points into `owned_thread_pool`
+    /// (engine created it) or to a caller-supplied pool from
+    /// `GraphConfig.external_thread_pool`. Always non-null after init.
+    thread_pool: *tp.ThreadPool,
+    /// Backing storage for the owned-pool path. `null` when the engine is
+    /// borrowing an external pool. Never reassigned after init — that would
+    /// invalidate `thread_pool`.
+    owned_thread_pool: ?tp.ThreadPool,
     /// Thread-pool submitter slot, lazily registered on first flush. The
     /// engine owns the pool, so we claim a per-engine slot and release
     /// it in cleanupResources. Left `null` if registerSubmitter fails —
@@ -131,6 +146,7 @@ pub const GraphEngine = struct {
         self.property_index_dirty = true;
         self.edge_index_dirty = true;
         self.submitter_slot = null;
+        self.owned_thread_pool = null;
 
         // 1. Create graph directory
         self.graph_dir = try GraphDir.create(allocator, data_dir, graph_uuid);
@@ -195,19 +211,9 @@ pub const GraphEngine = struct {
         self.metrics = .{};
         self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
-        // Pin .work_stealing explicitly and propagate init errors instead
-        // of panicking — GraphEngine.create/open already return error
-        // unions, and pool-init failure (OOM, spawn-failure) is a recoverable
-        // condition the caller can retry or surface.
-        self.thread_pool = try tp.ThreadPool.init(allocator, .{
-            .scheduler_variant = .work_stealing,
-            // Enable one submitter slot for the per-engine registerSubmitter
-            // adoption (GraphEngine.ensureSubmitterRegistered). Without this,
-            // registerSubmitter returns error.NoSubmitterSlots because the
-            // library's default is 0.
-            .max_submitter_queues = 1,
-        });
-        self.buffer_pool.setThreadPool(&self.thread_pool);
+        // Initialize owned-or-borrowed thread pool (see initThreadPool).
+        try self.initThreadPool(allocator, cfg);
+        self.buffer_pool.setThreadPool(self.thread_pool);
         self.persistence_dirty = false;
 
         return self;
@@ -227,6 +233,7 @@ pub const GraphEngine = struct {
         self.property_index_dirty = false;
         self.edge_index_dirty = false;
         self.submitter_slot = null;
+        self.owned_thread_pool = null;
 
         // 1. Open graph directory
         self.graph_dir = try GraphDir.open(allocator, data_dir, graph_uuid);
@@ -311,19 +318,9 @@ pub const GraphEngine = struct {
         self.metrics = .{};
         self.wireMetricsCounters();
         self.buffer_pool.setMetrics(&self.metrics);
-        // Pin .work_stealing explicitly and propagate init errors instead
-        // of panicking — GraphEngine.create/open already return error
-        // unions, and pool-init failure (OOM, spawn-failure) is a recoverable
-        // condition the caller can retry or surface.
-        self.thread_pool = try tp.ThreadPool.init(allocator, .{
-            .scheduler_variant = .work_stealing,
-            // Enable one submitter slot for the per-engine registerSubmitter
-            // adoption (GraphEngine.ensureSubmitterRegistered). Without this,
-            // registerSubmitter returns error.NoSubmitterSlots because the
-            // library's default is 0.
-            .max_submitter_queues = 1,
-        });
-        self.buffer_pool.setThreadPool(&self.thread_pool);
+        // Initialize owned-or-borrowed thread pool (see initThreadPool).
+        try self.initThreadPool(allocator, cfg);
+        self.buffer_pool.setThreadPool(self.thread_pool);
         self.persistence_dirty = false;
 
         return self;
@@ -415,6 +412,32 @@ pub const GraphEngine = struct {
 
     fn saveLabelDictionary(self: *GraphEngine) !void {
         return engine_persist.saveLabelDictionary(self);
+    }
+
+    /// Initializes `thread_pool` to either the caller-supplied pool (when
+    /// `cfg.external_thread_pool` is set — borrowed) or a fresh
+    /// `default_owned_pool_max_threads`-worker pool stored in
+    /// `owned_thread_pool`. Both `create` and `open` route through this.
+    fn initThreadPool(self: *GraphEngine, allocator: Allocator, cfg: GraphConfig) !void {
+        if (cfg.external_thread_pool) |ext| {
+            self.owned_thread_pool = null;
+            self.thread_pool = ext;
+            return;
+        }
+        // Pin .work_stealing explicitly and propagate init errors instead of
+        // panicking — GraphEngine.create/open already return error unions, and
+        // pool-init failure (OOM, spawn-failure) is a recoverable condition the
+        // caller can retry or surface.
+        self.owned_thread_pool = try tp.ThreadPool.init(allocator, .{
+            .scheduler_variant = .work_stealing,
+            // One submitter slot for the per-engine registerSubmitter
+            // adoption (ensureSubmitterRegistered). Without this,
+            // registerSubmitter returns error.NoSubmitterSlots because the
+            // library default is 0.
+            .max_submitter_queues = 1,
+            .max_threads = default_owned_pool_max_threads,
+        });
+        self.thread_pool = &self.owned_thread_pool.?;
     }
 
     /// Lazily register the calling thread as a submitter. Idempotent at

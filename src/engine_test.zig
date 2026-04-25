@@ -842,6 +842,18 @@ test "GraphEngine auto-registers a submitter slot on first flush" {
     try testing.expectEqual(first_slot, engine.submitter_slot.?);
 }
 
+test "GraphEngine owned thread pool defaults to 4 workers" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x77} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    const stats = engine.thread_pool.statsSnapshot();
+    try testing.expectEqual(@as(usize, 4), stats.worker_stats.len);
+}
+
 test "GraphEngine with base_shard_index allocates striped node ids" {
     const SHARD_COUNT = @import("sharded_store.zig").SHARD_COUNT;
 
