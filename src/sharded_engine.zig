@@ -106,15 +106,22 @@ pub const ShardedGraphEngine = struct {
         try shard_manifest_mod.writeToDir(allocator, self.graph_root, self.shard_manifest);
 
         // Init or borrow the shared thread pool BEFORE creating sub-engines.
-        // Errdefer ensures we drain the owned pool if any sub-engine create fails.
+        // The errdefer below is registered BEFORE the per-shard errdefer so
+        // that Zig's LIFO ordering runs sub-engine closes first, then pool
+        // teardown — never the other way around. Insert no errdefer between
+        // these two registrations.
         self.owned_shared_pool = null;
         if (cfg.external_thread_pool) |ext| {
             self.shared_thread_pool = ext;
         } else {
             self.owned_shared_pool = try tp.ThreadPool.init(allocator, .{
                 .scheduler_variant = .work_stealing,
-                // One submitter slot per shard; SHARD_COUNT is 16 today
-                // and the pool's hard cap is 64 slots.
+                // One submitter slot per shard for THIS sharded graph.
+                // Callers that share a single pool across N sharded graphs
+                // must inject a pool with max_submitter_queues >= N *
+                // SHARD_COUNT (the pool's hard cap is 64). See
+                // GraphConfig.external_thread_pool docs and the design at
+                // docs/2026-04-25-shared-engine-thread-pool.md §5.4.
                 .max_submitter_queues = SHARD_COUNT,
                 .max_threads = engine_mod.default_owned_pool_max_threads,
             });
@@ -161,12 +168,22 @@ pub const ShardedGraphEngine = struct {
         self.shard_manifest = try shard_manifest_mod.readFromDir(allocator, self.graph_root);
 
         // Init or borrow the shared thread pool BEFORE opening sub-engines.
+        // The errdefer below is registered BEFORE the per-shard errdefer so
+        // that Zig's LIFO ordering runs sub-engine closes first, then pool
+        // teardown — never the other way around. Insert no errdefer between
+        // these two registrations.
         self.owned_shared_pool = null;
         if (cfg.external_thread_pool) |ext| {
             self.shared_thread_pool = ext;
         } else {
             self.owned_shared_pool = try tp.ThreadPool.init(allocator, .{
                 .scheduler_variant = .work_stealing,
+                // One submitter slot per shard for THIS sharded graph.
+                // Callers that share a single pool across N sharded graphs
+                // must inject a pool with max_submitter_queues >= N *
+                // SHARD_COUNT (the pool's hard cap is 64). See
+                // GraphConfig.external_thread_pool docs and the design at
+                // docs/2026-04-25-shared-engine-thread-pool.md §5.4.
                 .max_submitter_queues = SHARD_COUNT,
                 .max_threads = engine_mod.default_owned_pool_max_threads,
             });
