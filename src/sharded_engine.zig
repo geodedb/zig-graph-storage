@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const tp = @import("thread_pool");
 const Allocator = std.mem.Allocator;
 
 const config_mod = @import("config.zig");
@@ -62,6 +63,13 @@ pub const ShardedGraphEngine = struct {
     shard_manifest: shard_manifest_mod.ShardManifest,
     coordinator_txn_counter: std.atomic.Value(u64),
     aggregated_metrics: Metrics = .{},
+    /// Shared across all sub-engines. Either points into
+    /// `owned_shared_pool` (parent created it) or to a caller-supplied
+    /// pool from `cfg.external_thread_pool`.
+    shared_thread_pool: *tp.ThreadPool,
+    /// Backing storage for the owned shared-pool path. `null` when the
+    /// caller injected an external pool. Never reassigned after init.
+    owned_shared_pool: ?tp.ThreadPool,
 
     pub fn create(
         allocator: Allocator,
@@ -97,6 +105,27 @@ pub const ShardedGraphEngine = struct {
 
         try shard_manifest_mod.writeToDir(allocator, self.graph_root, self.shard_manifest);
 
+        // Init or borrow the shared thread pool BEFORE creating sub-engines.
+        // Errdefer ensures we drain the owned pool if any sub-engine create fails.
+        self.owned_shared_pool = null;
+        if (cfg.external_thread_pool) |ext| {
+            self.shared_thread_pool = ext;
+        } else {
+            self.owned_shared_pool = try tp.ThreadPool.init(allocator, .{
+                .scheduler_variant = .work_stealing,
+                // One submitter slot per shard; SHARD_COUNT is 16 today
+                // and the pool's hard cap is 64 slots.
+                .max_submitter_queues = SHARD_COUNT,
+                .max_threads = engine_mod.default_owned_pool_max_threads,
+            });
+            self.shared_thread_pool = &self.owned_shared_pool.?;
+        }
+        errdefer if (self.owned_shared_pool != null) {
+            self.shared_thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+            self.shared_thread_pool.deinit();
+            self.owned_shared_pool = null;
+        };
+
         var created: usize = 0;
         errdefer for (self.shards[0..created]) |e| e.close() catch {};
 
@@ -104,6 +133,7 @@ pub const ShardedGraphEngine = struct {
             var per_shard_cfg = cfg;
             per_shard_cfg.base_shard_index = s;
             per_shard_cfg.buffer_pool_pages = @max(1, cfg.buffer_pool_pages / @as(u32, @intCast(SHARD_COUNT)));
+            per_shard_cfg.external_thread_pool = self.shared_thread_pool;
             self.shards[s] = try GraphEngine.create(allocator, self.graph_root, per_shard[s], per_shard_cfg);
             created += 1;
         }
@@ -130,6 +160,24 @@ pub const ShardedGraphEngine = struct {
 
         self.shard_manifest = try shard_manifest_mod.readFromDir(allocator, self.graph_root);
 
+        // Init or borrow the shared thread pool BEFORE opening sub-engines.
+        self.owned_shared_pool = null;
+        if (cfg.external_thread_pool) |ext| {
+            self.shared_thread_pool = ext;
+        } else {
+            self.owned_shared_pool = try tp.ThreadPool.init(allocator, .{
+                .scheduler_variant = .work_stealing,
+                .max_submitter_queues = SHARD_COUNT,
+                .max_threads = engine_mod.default_owned_pool_max_threads,
+            });
+            self.shared_thread_pool = &self.owned_shared_pool.?;
+        }
+        errdefer if (self.owned_shared_pool != null) {
+            self.shared_thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+            self.shared_thread_pool.deinit();
+            self.owned_shared_pool = null;
+        };
+
         var opened: usize = 0;
         errdefer for (self.shards[0..opened]) |e| e.close() catch {};
 
@@ -137,6 +185,7 @@ pub const ShardedGraphEngine = struct {
             var per_shard_cfg = cfg;
             per_shard_cfg.base_shard_index = s;
             per_shard_cfg.buffer_pool_pages = @max(1, cfg.buffer_pool_pages / @as(u32, @intCast(SHARD_COUNT)));
+            per_shard_cfg.external_thread_pool = self.shared_thread_pool;
             self.shards[s] = try GraphEngine.open(
                 allocator,
                 self.graph_root,
@@ -158,6 +207,14 @@ pub const ShardedGraphEngine = struct {
                 if (first_err == null) first_err = err;
             };
         }
+        // Tear down the owned shared pool ONLY after every sub-engine has
+        // released its submitter slot and stopped submitting. Borrowed
+        // pools (owned_shared_pool == null) belong to the caller.
+        if (self.owned_shared_pool != null) {
+            self.shared_thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+            self.shared_thread_pool.deinit();
+            self.owned_shared_pool = null;
+        }
         self.allocator.free(self.graph_root);
         self.allocator.destroy(self);
         if (first_err) |err| return err;
@@ -165,6 +222,11 @@ pub const ShardedGraphEngine = struct {
 
     pub fn deinit(self: *ShardedGraphEngine) void {
         for (self.shards) |eng| eng.deinit();
+        if (self.owned_shared_pool != null) {
+            self.shared_thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+            self.shared_thread_pool.deinit();
+            self.owned_shared_pool = null;
+        }
         self.allocator.free(self.graph_root);
         self.allocator.destroy(self);
     }

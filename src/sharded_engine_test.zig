@@ -341,3 +341,30 @@ test "cross-shard commit blocks until both shards' WAL commit records are durabl
         try testing.expect(found);
     }
 }
+
+test "ShardedGraphEngine creates one shared pool across all shards" {
+    const tp = @import("thread_pool");
+
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0x99} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+
+    // Parent owns its pool (no external pool was injected).
+    try testing.expect(eng.owned_shared_pool != null);
+
+    // Every sub-engine borrows the parent's pool — same pointer.
+    const shared: *tp.ThreadPool = eng.shared_thread_pool;
+    try testing.expectEqual(&eng.owned_shared_pool.?, shared);
+    for (0..shard_count_mod.SHARD_COUNT) |i| {
+        try testing.expectEqual(shared, eng.shards[i].thread_pool);
+        try testing.expect(eng.shards[i].owned_thread_pool == null);
+    }
+}
