@@ -368,3 +368,42 @@ test "ShardedGraphEngine creates one shared pool across all shards" {
         try testing.expect(eng.shards[i].owned_thread_pool == null);
     }
 }
+
+test "ShardedGraphEngine.create propagates external_thread_pool to all shards" {
+    const tp = @import("thread_pool");
+
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    var caller_pool = try tp.ThreadPool.init(testing.allocator, .{
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 32,
+        .max_threads = 4,
+    });
+    defer {
+        caller_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+        caller_pool.deinit();
+    }
+
+    var cfg = test_support.testConfig();
+    cfg.external_thread_pool = &caller_pool;
+
+    const uuid = [_]u8{0xAA} ** 16;
+    const eng = try sharded_engine_mod.ShardedGraphEngine.create(
+        testing.allocator,
+        td.path,
+        uuid,
+        cfg,
+    );
+    defer eng.close() catch {};
+
+    // Parent did not allocate its own pool.
+    try testing.expect(eng.owned_shared_pool == null);
+    try testing.expectEqual(&caller_pool, eng.shared_thread_pool);
+
+    // Every sub-engine borrows the caller's pool — same pointer, no owned storage.
+    for (0..shard_count_mod.SHARD_COUNT) |i| {
+        try testing.expectEqual(&caller_pool, eng.shards[i].thread_pool);
+        try testing.expect(eng.shards[i].owned_thread_pool == null);
+    }
+}
