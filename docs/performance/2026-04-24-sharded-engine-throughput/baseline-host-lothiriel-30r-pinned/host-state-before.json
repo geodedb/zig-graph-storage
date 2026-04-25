@@ -1,0 +1,20 @@
+{
+  "timestamp_utc": "2026-04-24T23:29:53Z",
+  "hostname": "lothiriel",
+  "os": "linux",
+  "kernel": "6.12.74+deb13+1-amd64",
+  "arch": "x86_64",
+  "cpu_model": "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+  "cpu_count": 56,
+  "cpu_topology": "2 sockets x 14 cores x 2 threads",
+  "taskset_mask": "0-13,28-41 (socket 0, 14C+HT)",
+  "memory_kb": 263786484,
+  "governor": "performance",
+  "filesystem": "ext4",
+  "loadavg_1_5_15": [6.86,6.79,7.06],
+  "zig_version": "0.16.0",
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "rounds": 30,
+  "warmups": 1,
+  "notes": "Tightening protocol per noise-floor diagnosis (iteration #2 evidence). 30 measured rounds + single-socket pinning to bring sharded median CI under ~2%."
+}

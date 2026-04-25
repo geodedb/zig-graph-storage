@@ -1,0 +1,107 @@
+{
+  "hypothesis_ids": [
+    "h1",
+    "h4-light"
+  ],
+  "summary": "Stack: pin-once in addEdgeTxn + fetchRemove in TxnManager.commit",
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "iteration_number": 2,
+  "implemented": true,
+  "tests_pass": "452/452 (5/5 suites)",
+  "metrics_baseline_all10": {
+    "sharded_elapsed_ns": {
+      "n": 10,
+      "median": 2286749116.5,
+      "mean": 2323128096.9,
+      "stdev": 208131735.378355,
+      "stddev_pct": 9.101642758997214,
+      "min": 2104636943,
+      "max": 2702768044
+    },
+    "single_elapsed_ns": {
+      "n": 10,
+      "median": 14477391583.5,
+      "mean": 14493272359.4,
+      "stdev": 94086824.62742338,
+      "stddev_pct": 0.6498879586475709,
+      "min": 14358112992,
+      "max": 14635409272
+    }
+  },
+  "metrics_stack_all10": {
+    "sharded_elapsed_ns": {
+      "n": 10,
+      "median": 2240175189.0,
+      "mean": 2353753851.1,
+      "stdev": 259269453.52361158,
+      "stddev_pct": 11.573624009260982,
+      "min": 2169194078,
+      "max": 2989327572
+    },
+    "single_elapsed_ns": {
+      "n": 10,
+      "median": 14484460188.5,
+      "mean": 14485208684.5,
+      "stdev": 114282674.85101348,
+      "stddev_pct": 0.7890019604717385,
+      "min": 14276513147,
+      "max": 14652621306
+    }
+  },
+  "metrics_baseline_drop_worst_2": {
+    "sharded_elapsed_ns": {
+      "n": 8,
+      "median": 2253541994.5,
+      "mean": 2233854380.5,
+      "stdev": 100043529.4188498,
+      "stddev_pct": 4.4393905089417585,
+      "min": 2104636943,
+      "max": 2366157615
+    },
+    "single_elapsed_ns": {
+      "n": 8,
+      "median": 14454572003.0,
+      "mean": 14463489119.125,
+      "stdev": 78495637.27265331,
+      "stddev_pct": 0.5430505812026934,
+      "min": 14358112992,
+      "max": 14603992373
+    }
+  },
+  "metrics_stack_drop_worst_2": {
+    "sharded_elapsed_ns": {
+      "n": 8,
+      "median": 2230587410.5,
+      "mean": 2239359459.375,
+      "stdev": 50958680.41994731,
+      "stddev_pct": 2.284540842473625,
+      "min": 2169194078,
+      "max": 2325022865
+    },
+    "single_elapsed_ns": {
+      "n": 8,
+      "median": 14522700509.0,
+      "mean": 14522892077.75,
+      "stdev": 87850574.60512781,
+      "stddev_pct": 0.6049189994015582,
+      "min": 14405826982,
+      "max": 14652621306
+    }
+  },
+  "median_delta_pct": {
+    "all10_sharded": -2.0366872414619777,
+    "drop_worst_2_sharded": -1.018600232701366,
+    "all10_single": 0.04882512819544196
+  },
+  "verdict": "REJECTED",
+  "verdict_reason": "Stack median improvement (-1.02% to -2.04% depending on drop policy) is well below the configured target_gain_pct=5.0%. The stack stabilized variance (drop-worst-2 sharded stddev: 4.44% baseline -> 2.28% stack) but did not produce a clean median improvement. The smaller delta vs h1-alone (-4.32% to -4.40%) is most consistent with h1-alone being a sampling fluctuation rather than a real ~4% effect; the stack measurement (closer to 1-2%) is likely closer to the true effect size on this workload.",
+  "diagnostic_finding": "On this workload, per-hypothesis effect sizes are <=2% within the addressable (non-fsync) ~2% of wall time. Single-bench measurement noise on 10 rounds is ~3-4% on the sharded path. SIGNAL_BELOW_NOISE: hypotheses cannot be cleanly distinguished from sampling fluctuation under the current 10-round protocol. Two consecutive sub-threshold iterations (h1 alone and h1+h4-light stack) confirm this diagnosis.",
+  "code_diff_files": [
+    "src/engine.zig",
+    "src/node_store.zig",
+    "src/txn.zig"
+  ],
+  "completed_at": "2026-04-24T23:24:20Z",
+  "reverted": true,
+  "reverted_at": "2026-04-24T23:30:00Z"
+}

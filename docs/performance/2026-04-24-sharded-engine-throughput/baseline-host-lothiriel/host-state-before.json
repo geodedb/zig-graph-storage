@@ -1,0 +1,21 @@
+{
+  "timestamp_utc": "2026-04-24T22:43:57Z",
+  "hostname": "lothiriel",
+  "os": "linux",
+  "kernel": "6.12.74+deb13+1-amd64",
+  "arch": "x86_64",
+  "cpu_model": "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+  "cpu_count": 56,
+  "cpu_topology": "2 sockets x 14 cores x 2 threads",
+  "cpu_max_freq_khz": 3300000,
+  "cpu_min_freq_khz": 1200000,
+  "cpu_current_freq_pct_of_base": "85%",
+  "memory_kb": 263786484,
+  "governor": "performance",
+  "filesystem": "ext4",
+  "loadavg_1_5_15": [9.35,10.58,9.23],
+  "zig_version": "0.16.0",
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "tmp_dir": ".zig-cache/tmp/sharded-throughput",
+  "notes": "Attempt 2: governor flipped to performance via sudo for the duration of bench-optimize work. Will revert at session end. Attempt 1 (schedutil) is archived under attempt-1-schedutil-failed/."
+}

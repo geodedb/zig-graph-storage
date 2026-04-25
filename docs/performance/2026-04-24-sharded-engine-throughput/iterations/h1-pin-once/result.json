@@ -1,0 +1,170 @@
+{
+  "hypothesis_id": "h1",
+  "summary": "Pin nodes-page once across addEdgeTxn",
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "implemented": true,
+  "tests_pass": "452/452 (5/5 suites)",
+  "metrics_baseline_all10": {
+    "sharded_elapsed_ns": {
+      "n": 10,
+      "median": 2286749116.5,
+      "mean": 2323128096.9,
+      "stdev": 208131735.378355,
+      "stddev_pct": 9.101642758997214,
+      "min": 2104636943,
+      "max": 2702768044
+    },
+    "single_elapsed_ns": {
+      "n": 10,
+      "median": 14477391583.5,
+      "mean": 14493272359.4,
+      "stdev": 94086824.62742338,
+      "stddev_pct": 0.6498879586475709,
+      "min": 14358112992,
+      "max": 14635409272
+    },
+    "sharded_ops_per_s": {
+      "n": 10,
+      "median": 8746.5,
+      "mean": 8667.2,
+      "stdev": 729.0500363867734,
+      "stddev_pct": 8.335334549668707,
+      "min": 7399,
+      "max": 9502
+    },
+    "sharding_speedup_ratio": {
+      "n": 10,
+      "median": 6.32,
+      "mean": 6.279,
+      "stdev": 0.507158752265994,
+      "stddev_pct": 8.02466380167712,
+      "min": 5.4,
+      "max": 6.82
+    }
+  },
+  "metrics_h1_all10": {
+    "sharded_elapsed_ns": {
+      "n": 10,
+      "median": 2187953399.0,
+      "mean": 2269692036.7,
+      "stdev": 271904566.08396846,
+      "stddev_pct": 12.427347228155861,
+      "min": 2014923993,
+      "max": 2932384980
+    },
+    "single_elapsed_ns": {
+      "n": 10,
+      "median": 14624483530.0,
+      "mean": 14634725487.2,
+      "stdev": 131052112.91046058,
+      "stddev_pct": 0.8961144688742425,
+      "min": 14471069338,
+      "max": 14853703730
+    },
+    "sharded_ops_per_s": {
+      "n": 10,
+      "median": 9140.5,
+      "mean": 8910.7,
+      "stdev": 928.3377079489985,
+      "stddev_pct": 10.156312104906718,
+      "min": 6820,
+      "max": 9925
+    },
+    "sharding_speedup_ratio": {
+      "n": 10,
+      "median": 6.715,
+      "mean": 6.523,
+      "stdev": 0.6972652930476956,
+      "stddev_pct": 10.383697588200977,
+      "min": 4.95,
+      "max": 7.2
+    }
+  },
+  "metrics_baseline_drop_worst_2": {
+    "sharded_elapsed_ns": {
+      "n": 8,
+      "median": 2253541994.5,
+      "mean": 2233854380.5,
+      "stdev": 100043529.4188498,
+      "stddev_pct": 4.4393905089417585,
+      "min": 2104636943,
+      "max": 2366157615
+    },
+    "single_elapsed_ns": {
+      "n": 8,
+      "median": 14454572003.0,
+      "mean": 14463489119.125,
+      "stdev": 78495637.27265331,
+      "stddev_pct": 0.5430505812026934,
+      "min": 14358112992,
+      "max": 14603992373
+    },
+    "sharded_ops_per_s": {
+      "n": 8,
+      "median": 8875.0,
+      "mean": 8968.5,
+      "stdev": 404.3372001542418,
+      "stddev_pct": 4.555912114413992,
+      "min": 8452,
+      "max": 9502
+    },
+    "sharding_speedup_ratio": {
+      "n": 8,
+      "median": 6.449999999999999,
+      "mean": 6.484999999999999,
+      "stdev": 0.29553824988122457,
+      "stddev_pct": 4.581988370251544,
+      "min": 6.1,
+      "max": 6.82
+    }
+  },
+  "metrics_h1_drop_worst_2": {
+    "sharded_elapsed_ns": {
+      "n": 8,
+      "median": 2154472627.5,
+      "mean": 2163865976.875,
+      "stdev": 121189778.43909715,
+      "stddev_pct": 5.625032172245463,
+      "min": 2014923993,
+      "max": 2383983536
+    },
+    "single_elapsed_ns": {
+      "n": 8,
+      "median": 14680475046.5,
+      "mean": 14670706833.875,
+      "stdev": 120716319.38743281,
+      "stddev_pct": 0.8222916425052132,
+      "min": 14510619582,
+      "max": 14853703730
+    },
+    "sharded_ops_per_s": {
+      "n": 8,
+      "median": 9284.0,
+      "mean": 9267,
+      "stdev": 506.039241843668,
+      "stddev_pct": 5.450659649328609,
+      "min": 8389,
+      "max": 9925
+    },
+    "sharding_speedup_ratio": {
+      "n": 8,
+      "median": 6.85,
+      "mean": 6.7975,
+      "stdev": 0.3606244584051391,
+      "stddev_pct": 5.264590633651666,
+      "min": 6.19,
+      "max": 7.2
+    }
+  },
+  "median_delta_pct": {
+    "all10": -4.320356648971291,
+    "drop_worst_2": -4.396162451899674
+  },
+  "verdict": "REJECTED",
+  "verdict_reason": "Median improvement (-4.32% to -4.40% depending on drop policy) is below the configured target_gain_pct=5.0%. AND variance regressed (sharded stddev: 9.10% -> 12.43% all-10; 4.44% -> 5.63% drop-worst-2 which is now over the 5% compiled-micro policy). Per workflow rule 'If neutral/noisy/regressive: revert, move to next hypothesis.' Single-engine adjacent control showed +1.02% (likely within noise; single-stddev~0.8%) \u2014 within max_regression_pct=-3% guardrail.",
+  "code_diff_files": [
+    "src/engine.zig",
+    "src/node_store.zig"
+  ],
+  "next_hypothesis": "h4 (TxnManager autocommit fast path) \u2014 different optimization axis, comparable expected impact, doesn't preclude future re-attempt of h1"
+}

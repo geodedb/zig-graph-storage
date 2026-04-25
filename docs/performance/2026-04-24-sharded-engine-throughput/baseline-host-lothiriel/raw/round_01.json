@@ -1,0 +1,10 @@
+{
+  "tag": "round_01",
+  "started_utc": "2026-04-24T22:44:22Z",
+  "ended_utc": "2026-04-24T22:44:41Z",
+  "sharded_elapsed_ns": 2702768044,
+  "sharded_ops_per_s": 7399,
+  "single_elapsed_ns": 14589401369,
+  "single_ops_per_s": 1370,
+  "sharding_speedup_ratio": 5.40
+}

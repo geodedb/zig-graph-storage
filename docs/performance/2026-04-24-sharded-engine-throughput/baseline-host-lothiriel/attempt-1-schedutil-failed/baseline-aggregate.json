@@ -1,0 +1,131 @@
+{
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "host": "lothiriel",
+  "rounds_total": 10,
+  "warmups_protocol": 1,
+  "metrics_all_rounds": {
+    "sharded_elapsed_ns": {
+      "n": 10,
+      "min": 2147382417,
+      "max": 3400364839,
+      "mean": 2436586006.2,
+      "median": 2297000170.5,
+      "p95": 3400364839,
+      "p99": 3400364839,
+      "stdev": 379607189.316242,
+      "stddev_pct_of_median": 16.5262151127142
+    },
+    "single_elapsed_ns": {
+      "n": 10,
+      "min": 14828919724,
+      "max": 15749740568,
+      "mean": 15119579061.3,
+      "median": 15038359237.5,
+      "p95": 15749740568,
+      "p99": 15749740568,
+      "stdev": 280692922.2353087,
+      "stddev_pct_of_median": 1.8665129473391378
+    },
+    "sharded_ops_per_s": {
+      "n": 10,
+      "min": 5881,
+      "max": 9313,
+      "mean": 8354.4,
+      "median": 8710.0,
+      "p95": 9313,
+      "p99": 9313,
+      "stdev": 1056.8697176095075,
+      "stddev_pct_of_median": 12.13398068438011
+    },
+    "single_ops_per_s": {
+      "n": 10,
+      "min": 1269,
+      "max": 1348,
+      "mean": 1322.6,
+      "median": 1329.5,
+      "p95": 1348,
+      "p99": 1348,
+      "stdev": 24.116384471972577,
+      "stddev_pct_of_median": 1.8139439241799604
+    },
+    "sharding_speedup_ratio": {
+      "n": 10,
+      "min": 4.37,
+      "max": 7.1,
+      "mean": 6.322,
+      "median": 6.5649999999999995,
+      "p95": 7.1,
+      "p99": 7.1,
+      "stdev": 0.860578616719911,
+      "stddev_pct_of_median": 13.108585174713038
+    }
+  },
+  "rounds_dropped_as_outlier": [
+    "round_06"
+  ],
+  "rounds_dropped_reason": "round_06 sharded=3.40s vs ~2.25s steady-state median (single side normal at 14.87s). Likely schedutil clock-down or neighboring workload spike on dual-socket Xeon during that round window.",
+  "metrics_steady_state": {
+    "sharded_elapsed_ns": {
+      "n": 9,
+      "min": 2147382417,
+      "max": 2672450973,
+      "mean": 2329499469.2222223,
+      "median": 2251849632,
+      "p95": 2672450973,
+      "p99": 2672450973,
+      "stdev": 181946828.58421418,
+      "stddev_pct_of_median": 8.079883576534217
+    },
+    "single_elapsed_ns": {
+      "n": 9,
+      "min": 14828919724,
+      "max": 15749740568,
+      "mean": 15147284878,
+      "median": 15043173046,
+      "p95": 15749740568,
+      "p99": 15749740568,
+      "stdev": 282845263.40070504,
+      "stddev_pct_of_median": 1.8802234245115859
+    },
+    "sharded_ops_per_s": {
+      "n": 9,
+      "min": 7483,
+      "max": 9313,
+      "mean": 8629.222222222223,
+      "median": 8881,
+      "p95": 9313,
+      "p99": 9313,
+      "stdev": 637.8978714844912,
+      "stddev_pct_of_median": 7.182725723279937
+    },
+    "single_ops_per_s": {
+      "n": 9,
+      "min": 1269,
+      "max": 1348,
+      "mean": 1320.2222222222222,
+      "median": 1329,
+      "p95": 1348,
+      "p99": 1348,
+      "stdev": 24.30420631175691,
+      "stddev_pct_of_median": 1.828758939936562
+    },
+    "sharding_speedup_ratio": {
+      "n": 9,
+      "min": 5.61,
+      "max": 7.1,
+      "mean": 6.538888888888889,
+      "median": 6.71,
+      "p95": 7.1,
+      "p99": 7.1,
+      "stdev": 0.5513266827490858,
+      "stddev_pct_of_median": 8.216493036499044
+    }
+  },
+  "rounds_used_for_steady_state": 9,
+  "variance_policy": "5% stddev limit (compiled micro)",
+  "variance_policy_satisfied_steady_state": false,
+  "variance_policy_satisfied_all_rounds": false,
+  "gate_metric_min": 4.0,
+  "gate_metric_passes": true,
+  "notes": "Host on schedutil + 40%-of-base scaling; throughput is ~18-20x faster than prior Threadripper host because /data fsync latency is dramatically lower (likely NVMe vs slower disk). Lower absolute fsync cost compresses the sharded-vs-single advantage: ratio median ~6.7 here vs ~8.14 on prior host. Both clear the spec gate of >=4.0."
+}

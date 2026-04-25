@@ -1,0 +1,13 @@
+{
+  "timestamp_utc": "2026-04-24T22:49:04Z",
+  "hostname": "lothiriel",
+  "governor": "performance",
+  "cpu_current_freq_pct_of_base": "75%",
+  "loadavg_1_5_15": [5.16,10.20,9.75],
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "wall_time_total_sec": 213,
+  "rounds_completed": 10,
+  "exit_status": 0,
+  "variance_status": "WITHIN_BUDGET_AFTER_COLD_DROP",
+  "session_governor_revert_pending": "Set governor back to schedutil at end of bench-optimize session via: sudo bash -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo schedutil > \"$f\"; done'"
+}

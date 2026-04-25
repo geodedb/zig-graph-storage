@@ -1,0 +1,148 @@
+{
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "host": "lothiriel",
+  "attempt": 3,
+  "governor": "performance",
+  "taskset_mask": "0-13,28-41 (socket 0, 14C+HT)",
+  "rounds_total": 30,
+  "warmups_protocol": 1,
+  "metrics_all_rounds": {
+    "sharded_elapsed_ns": {
+      "n": 30,
+      "min": 2019374881,
+      "max": 3038152388,
+      "mean": 2383039923.8,
+      "median": 2262023633.5,
+      "stdev": 300993969.8529788,
+      "stddev_pct_of_median": 13.306402523622388,
+      "median_ci95_pct": 3.044045225751286
+    },
+    "single_elapsed_ns": {
+      "n": 30,
+      "min": 14179885014,
+      "max": 14880804863,
+      "mean": 14454982934.166666,
+      "median": 14415474362.0,
+      "stdev": 196588296.2873002,
+      "stddev_pct_of_median": 1.3637310250817551,
+      "median_ci95_pct": 0.31197454824769055
+    },
+    "sharding_speedup_ratio": {
+      "n": 30,
+      "min": 4.67,
+      "max": 7.29,
+      "mean": 6.155,
+      "median": 6.38,
+      "stdev": 0.7368233307175168,
+      "stddev_pct_of_median": 11.548955026920327,
+      "median_ci95_pct": 2.6420019497909175
+    }
+  },
+  "metrics_drop_worst_2": {
+    "sharded_elapsed_ns": {
+      "n": 28,
+      "min": 2019374881,
+      "max": 2920880849,
+      "mean": 2339193443.285714,
+      "median": 2252091420.5,
+      "stdev": 259376949.08873454,
+      "stddev_pct_of_median": 11.517158971776942,
+      "median_ci95_pct": 2.727202691213975
+    },
+    "single_elapsed_ns": {
+      "n": 28,
+      "min": 14208017089,
+      "max": 14880804863,
+      "mean": 14460723161.071428,
+      "median": 14415474362.0,
+      "stdev": 195417829.8624003,
+      "stddev_pct_of_median": 1.3556115113182308,
+      "median_ci95_pct": 0.32100167853611916
+    },
+    "sharding_speedup_ratio": {
+      "n": 28,
+      "min": 4.88,
+      "max": 7.29,
+      "mean": 6.251785714285714,
+      "median": 6.4399999999999995,
+      "stdev": 0.660421041746061,
+      "stddev_pct_of_median": 10.25498512028045,
+      "median_ci95_pct": 2.428326559260223
+    }
+  },
+  "metrics_drop_worst_4": {
+    "sharded_elapsed_ns": {
+      "n": 26,
+      "min": 2019374881,
+      "max": 2827233473,
+      "mean": 2294780990.923077,
+      "median": 2233610200.5,
+      "stdev": 209613723.73184752,
+      "stddev_pct_of_median": 9.384525719166437,
+      "median_ci95_pct": 2.306092513427204
+    },
+    "single_elapsed_ns": {
+      "n": 26,
+      "min": 14208017089,
+      "max": 14880804863,
+      "mean": 14467700045.461538,
+      "median": 14415474362.0,
+      "stdev": 196735292.4175421,
+      "stddev_pct_of_median": 1.3647507357520428,
+      "median_ci95_pct": 0.33536499857252267
+    },
+    "sharding_speedup_ratio": {
+      "n": 26,
+      "min": 5.06,
+      "max": 7.29,
+      "mean": 6.3538461538461535,
+      "median": 6.455,
+      "stdev": 0.5649996596323005,
+      "stddev_pct_of_median": 8.752899452088311,
+      "median_ci95_pct": 2.15088076918125
+    }
+  },
+  "metrics_drop_worst_6": {
+    "sharded_elapsed_ns": {
+      "n": 24,
+      "min": 2019374881,
+      "max": 2656633397,
+      "mean": 2254931710.9583335,
+      "median": 2220593434.5,
+      "stdev": 161125683.47226524,
+      "stddev_pct_of_median": 7.255974054905963,
+      "median_ci95_pct": 1.8558427357337877
+    },
+    "single_elapsed_ns": {
+      "n": 24,
+      "min": 14208017089,
+      "max": 14880804863,
+      "mean": 14484262848.791666,
+      "median": 14426399450.5,
+      "stdev": 195358318.50384182,
+      "stddev_pct_of_median": 1.3541723918997055,
+      "median_ci95_pct": 0.34635336033748904
+    },
+    "sharding_speedup_ratio": {
+      "n": 24,
+      "min": 5.4,
+      "max": 7.29,
+      "mean": 6.454583333333333,
+      "median": 6.49,
+      "stdev": 0.4568319942982242,
+      "stddev_pct_of_median": 7.039013779633654,
+      "median_ci95_pct": 1.8003513368175146
+    }
+  },
+  "variance_policy": "5% stddev limit (compiled micro)",
+  "variance_status": "ABOVE_BUDGET_BUT_TIGHTENED_MEDIAN_CI",
+  "median_ci95_pct_all30": 3.04,
+  "noise_diagnosis": "Sharded-side variance is dominated by thermal/power-state drift on socket 0 during sustained 16-thread fsync load (visible in rounds 14-24 elevation). Single-socket pinning did not reduce it; if anything, adding 30 rounds of sustained socket-0 load surfaced the throttle behavior. Median CI95 of 3.04% across 30 samples is the relevant signal for hypothesis comparison: effects >=4% are detectable.",
+  "gate_metric_passes": true,
+  "gate_metric_median": 6.38,
+  "key_medians_human": {
+    "sharded_elapsed_sec": 2.262,
+    "single_elapsed_sec": 14.415,
+    "sharding_speedup_ratio": 6.38
+  }
+}

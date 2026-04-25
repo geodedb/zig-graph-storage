@@ -1,0 +1,107 @@
+{
+  "hypothesis_id": "h1",
+  "summary": "Pin nodes-page once across addEdgeTxn (re-tested under 30r + socket-pinned protocol)",
+  "iteration_number": 3,
+  "git_sha": "0ce15769076d7c783c57d674e90182bc073853d1",
+  "implemented": true,
+  "tests_pass": "452/452 (5/5 suites)",
+  "protocol": {
+    "rounds": 30,
+    "warmups": 1,
+    "taskset": "0-13,28-41 (socket 0, 14C+HT)",
+    "governor": "performance"
+  },
+  "metrics_baseline_all30": {
+    "sharded_elapsed_ns": {
+      "n": 30,
+      "median": 2262023633.5,
+      "mean": 2383039923.8,
+      "stdev": 300993969.8529788,
+      "stddev_pct": 13.306402523622388,
+      "min": 2019374881,
+      "max": 3038152388
+    },
+    "single_elapsed_ns": {
+      "n": 30,
+      "median": 14415474362.0,
+      "mean": 14454982934.166666,
+      "stdev": 196588296.2873002,
+      "stddev_pct": 1.3637310250817551,
+      "min": 14179885014,
+      "max": 14880804863
+    }
+  },
+  "metrics_h1_all30": {
+    "sharded_elapsed_ns": {
+      "n": 30,
+      "median": 2250888546.5,
+      "mean": 2402355829.3,
+      "stdev": 371500596.1818558,
+      "stddev_pct": 16.504619776022118,
+      "min": 1996965869,
+      "max": 3490600520
+    },
+    "single_elapsed_ns": {
+      "n": 30,
+      "median": 14401181981.0,
+      "mean": 14434161618.833334,
+      "stdev": 165716324.80701128,
+      "stddev_pct": 1.1507133582899434,
+      "min": 14132006834,
+      "max": 14784855388
+    }
+  },
+  "metrics_baseline_drop_worst_6": {
+    "sharded_elapsed_ns": {
+      "n": 24,
+      "median": 2220593434.5,
+      "mean": 2254931710.9583335,
+      "stdev": 161125683.47226524,
+      "stddev_pct": 7.255974054905963,
+      "min": 2019374881,
+      "max": 2656633397
+    },
+    "single_elapsed_ns": {
+      "n": 24,
+      "median": 14426399450.5,
+      "mean": 14484262848.791666,
+      "stdev": 195358318.50384182,
+      "stddev_pct": 1.3541723918997055,
+      "min": 14208017089,
+      "max": 14880804863
+    }
+  },
+  "metrics_h1_drop_worst_6": {
+    "sharded_elapsed_ns": {
+      "n": 24,
+      "median": 2191082767.5,
+      "mean": 2248185882.375,
+      "stdev": 161671928.61944288,
+      "stddev_pct": 7.378631743971437,
+      "min": 1996965869,
+      "max": 2610424338
+    },
+    "single_elapsed_ns": {
+      "n": 24,
+      "median": 14390352445.0,
+      "mean": 14438988331.666666,
+      "stdev": 166463317.54324192,
+      "stddev_pct": 1.1567702610444432,
+      "min": 14132006834,
+      "max": 14784855388
+    }
+  },
+  "median_delta_pct": {
+    "all30": -0.4922621866143292,
+    "drop_worst_4": -1.2972245781074012,
+    "drop_worst_6": -1.3289540778384212,
+    "drop_worst_8": -1.2653693573236164,
+    "drop_worst_10": -0.9088760348242744
+  },
+  "z_scores_max": 0.59,
+  "verdict": "REJECTED",
+  "verdict_reason": "Across all drop policies (n=20 to n=30), h1 vs baseline delta lands in -0.49% to -1.33% range, with z-scores 0.10-0.59 \u2014 within sampling noise. Single-side control shows -0.10% delta (z=0.24), confirming no global timing shift. h1's true effect on this workload is statistically indistinguishable from zero. Iteration 1's apparent -4.4% gain was sampling fluctuation under the 10-round protocol.",
+  "definitive": true,
+  "completed_at": "2026-04-24T23:54:00Z",
+  "reverted": true
+}

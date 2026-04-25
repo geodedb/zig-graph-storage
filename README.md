@@ -25,7 +25,7 @@ try eng.putNode(n, node_rec);
 _ = try eng.addEdge(n_src, n_dst, rel_type);
 ```
 
-Benchmark: `zig build bench-sharded-throughput` (target ≥4× single-engine throughput on 16 cores).
+Benchmark: `zig build bench-sharded-throughput` (target ≥4× single-engine throughput on 16 cores). Latest evidence: [`docs/performance/2026-04-24-sharded-engine-throughput/`](docs/performance/2026-04-24-sharded-engine-throughput/) — audit, definitive 30-round + socket-pinned baseline, optimization session report (null result; no source-only win available without scope expansion).
 
 ## Architecture Overview
 
@@ -214,7 +214,7 @@ graph LR
 
 ### Page Format (all stores)
 
-```
+```text
 ┌──────────────────────────────────────────┐
 │  PageHeader (32 bytes)                   │
 │  ┌─────────┬─────────┬──────┬──────────┐ │

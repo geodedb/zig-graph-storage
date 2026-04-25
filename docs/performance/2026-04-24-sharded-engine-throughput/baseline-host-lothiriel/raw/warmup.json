@@ -1,0 +1,10 @@
+{
+  "tag": "warmup",
+  "started_utc": "2026-04-24T22:44:02Z",
+  "ended_utc": "2026-04-24T22:44:22Z",
+  "sharded_elapsed_ns": 2667866462,
+  "sharded_ops_per_s": 7496,
+  "single_elapsed_ns": 14857760451,
+  "single_ops_per_s": 1346,
+  "sharding_speedup_ratio": 5.57
+}
