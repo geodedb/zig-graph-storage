@@ -899,3 +899,73 @@ test "GraphEngine with base_shard_index bumps edge ids in stride" {
     try std.testing.expectEqual(@as(u64, 5), e1);
     try std.testing.expectEqual(@as(u64, 5 + SHARD_COUNT), e2);
 }
+
+test "GraphEngine borrows external thread pool — pool stays alive after engine close" {
+    const tp = @import("thread_pool");
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    var caller_pool = try tp.ThreadPool.init(testing.allocator, .{
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 16,
+        .max_threads = 4,
+    });
+    defer {
+        caller_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+        caller_pool.deinit();
+    }
+
+    var cfg = testConfig();
+    cfg.external_thread_pool = &caller_pool;
+
+    const uuid = [_]u8{0x88} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    try engine.close();
+
+    // Pool must still be usable after the engine closed. registerSubmitter
+    // will return error.PoolShutdown if the engine ran shutdown on us.
+    const slot = try caller_pool.registerSubmitter();
+    caller_pool.releaseSubmitter(slot);
+}
+
+test "two GraphEngines can borrow the same external thread pool" {
+    const tp = @import("thread_pool");
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    var caller_pool = try tp.ThreadPool.init(testing.allocator, .{
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 8,
+        .max_threads = 4,
+    });
+    defer {
+        caller_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+        caller_pool.deinit();
+    }
+
+    var cfg = testConfig();
+    cfg.external_thread_pool = &caller_pool;
+
+    const uuid_a = [_]u8{0x91} ** 16;
+    const uuid_b = [_]u8{0x92} ** 16;
+
+    const eng_a = try GraphEngine.create(testing.allocator, td.path, uuid_a, cfg);
+    defer eng_a.close() catch {};
+    const eng_b = try GraphEngine.create(testing.allocator, td.path, uuid_b, cfg);
+    defer eng_b.close() catch {};
+
+    // Both engines must point at the same pool.
+    try testing.expectEqual(&caller_pool, eng_a.thread_pool);
+    try testing.expectEqual(&caller_pool, eng_b.thread_pool);
+    try testing.expect(eng_a.owned_thread_pool == null);
+    try testing.expect(eng_b.owned_thread_pool == null);
+
+    // Force each to claim a submitter slot — must each get a distinct slot.
+    eng_a.ensureSubmitterRegistered();
+    eng_b.ensureSubmitterRegistered();
+    try testing.expect(eng_a.submitter_slot != null);
+    try testing.expect(eng_b.submitter_slot != null);
+    try testing.expect(eng_a.submitter_slot.? != eng_b.submitter_slot.?);
+}

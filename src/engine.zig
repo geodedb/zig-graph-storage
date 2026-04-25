@@ -521,15 +521,30 @@ pub const GraphEngine = struct {
         // that first called ensureSubmitterRegistered — it becomes a free-
         // mask CAS with no cache drain, which is correct because the
         // pool's deinit path will scrub any residual cache entries.
+        // Release the submitter slot before draining the pool. The TLS-
+        // owner check inside releaseSubmitter (F-005) handles the case
+        // where the engine was torn down from a thread other than the one
+        // that first called ensureSubmitterRegistered — it becomes a free-
+        // mask CAS with no cache drain, which is correct because the
+        // pool's deinit path will scrub any residual cache entries.
+        //
+        // For borrowed pools (owned_thread_pool == null) we MUST still
+        // release the slot — the slot belongs to this engine's lifecycle,
+        // not the pool's. The caller may keep using other slots after we
+        // close.
         if (self.submitter_slot) |idx| {
             self.thread_pool.releaseSubmitter(idx);
             self.submitter_slot = null;
         }
 
-        // Drain in-flight parallel flush tasks before tearing down the pool
-        // so worker threads don't observe freed buffer-pool storage.
-        self.thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
-        self.thread_pool.deinit();
+        // Only shut down + deinit a pool we own. Borrowed pools belong to
+        // the caller, who is responsible for their lifetime (must outlive
+        // every engine that borrows them — see GraphConfig docs).
+        if (self.owned_thread_pool != null) {
+            self.thread_pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+            self.thread_pool.deinit();
+            self.owned_thread_pool = null;
+        }
         self.txn_manager.deinit();
         self.wal.deinit();
         self.wal_dir_handle.close(std.Io.Threaded.global_single_threaded.io());
