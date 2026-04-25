@@ -16,7 +16,10 @@ test "full CRUD + cross-shard edges + reopen" {
 
     {
         var eng = try ShardedGraphEngine.create(
-            testing.allocator, td.path, uuid, test_support.testConfig(),
+            testing.allocator,
+            td.path,
+            uuid,
+            test_support.testConfig(),
         );
 
         var ids: [100]u64 = undefined;
@@ -39,7 +42,10 @@ test "full CRUD + cross-shard edges + reopen" {
     }
 
     var eng = try ShardedGraphEngine.open(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -56,7 +62,10 @@ test "concurrent writers across shards make forward progress (smoke)" {
     defer td.deinit();
     const uuid = [_]u8{0xC2} ** 16;
     var eng = try ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 

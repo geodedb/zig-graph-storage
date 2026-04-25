@@ -70,7 +70,10 @@ test "ShardedGraphEngine.getNode routes by node id" {
     defer td.deinit();
     const uuid = [_]u8{0x33} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -91,7 +94,10 @@ test "ShardedGraphEngine.nodeCount sums per-shard counts" {
     defer td.deinit();
     const uuid = [_]u8{0x34} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -109,7 +115,10 @@ test "ShardedGraphEngine.addEdge succeeds when source and target are co-located"
     defer td.deinit();
     const uuid = [_]u8{0x40} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -131,7 +140,10 @@ test "addEdge across shards commits via 2PC and both adjacencies are readable" {
     defer td.deinit();
     const uuid = [_]u8{0x70} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -171,7 +183,10 @@ test "ShardedGraphEngine.addLabel + scanLabel round-trips" {
     defer td.deinit();
     const uuid = [_]u8{0x50} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -192,7 +207,10 @@ test "ShardedGraphEngine.putProperty + getProperty round-trips on one shard" {
     defer td.deinit();
     const uuid = [_]u8{0x51} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -218,7 +236,10 @@ test "ShardedGraphEngine.beginTxn encodes shard + commit routes back" {
     defer td.deinit();
     const uuid = [_]u8{0x52} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -234,7 +255,10 @@ test "ShardedGraphEngine.storage() exposes GraphStorage vtable" {
     defer td.deinit();
     const uuid = [_]u8{0x60} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -254,7 +278,10 @@ test "FanOutNodeIterator touches every shard that has matching nodes" {
     defer td.deinit();
     const uuid = [_]u8{0x62} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -284,7 +311,10 @@ test "cross-shard commit blocks until both shards' WAL commit records are durabl
     defer td.deinit();
     const uuid = [_]u8{0x90} ** 16;
     const eng = try sharded_engine_mod.ShardedGraphEngine.create(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 

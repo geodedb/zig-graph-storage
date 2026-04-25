@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const tp = @import("thread_pool");
 
 pub const LogLevel = enum { debug, info, warn, err };
 
@@ -68,6 +69,15 @@ pub const GraphConfig = struct {
     /// and `addEdge` bumps edge ids by `SHARD_COUNT`. `null` preserves
     /// the classic single-engine behaviour (++1 stride).
     base_shard_index: ?usize = null,
+    /// Optional caller-owned ThreadPool. When non-null, the engine borrows
+    /// this pool for parallel buffer-pool flushes instead of creating its
+    /// own. The engine never calls `pool.deinit()` or `pool.shutdown()` on
+    /// a borrowed pool — the caller's lifetime must outlive every engine
+    /// that borrows it. Used by ShardedGraphEngine (one pool / sharded
+    /// graph) and by long-lived servers (one pool / process). When null
+    /// (default), each engine creates and owns a pool of
+    /// `default_owned_pool_max_threads` workers (4 — see engine.zig).
+    external_thread_pool: ?*tp.ThreadPool = null,
 
     /// Compute the effective buffer pool size, applying auto-sizing when enabled.
     ///
@@ -106,6 +116,11 @@ test "default config values" {
     try std.testing.expectEqual(@as(?[32]u8, null), cfg.encryption_key);
     try std.testing.expectEqualStrings("data", cfg.data_dir);
     try std.testing.expectEqual(@as(?*const fn (level: LogLevel, msg: []const u8) void, null), cfg.log_fn);
+}
+
+test "external_thread_pool defaults to null" {
+    const cfg = GraphConfig{};
+    try std.testing.expectEqual(@as(?*tp.ThreadPool, null), cfg.external_thread_pool);
 }
 
 test "config with custom values" {

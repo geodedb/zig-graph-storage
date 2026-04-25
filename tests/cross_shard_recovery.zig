@@ -13,7 +13,10 @@ test "recovery: crash after both prepares with no commit → edge not visible af
 
     {
         var eng = try graph_storage.ShardedGraphEngine.create(
-            testing.allocator, td.path, uuid, test_support.testConfig(),
+            testing.allocator,
+            td.path,
+            uuid,
+            test_support.testConfig(),
         );
         const n_src = try eng.shards[0].allocNode();
         const n_dst = try eng.shards[5].allocNode();
@@ -24,7 +27,10 @@ test "recovery: crash after both prepares with no commit → edge not visible af
     }
 
     var eng = try graph_storage.ShardedGraphEngine.open(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
@@ -41,7 +47,10 @@ test "recovery: crash after source commit, before target commit → edge visible
     var edge_saved: u64 = 0;
     {
         var eng = try graph_storage.ShardedGraphEngine.create(
-            testing.allocator, td.path, uuid, test_support.testConfig(),
+            testing.allocator,
+            td.path,
+            uuid,
+            test_support.testConfig(),
         );
         n_src_saved = try eng.shards[0].allocNode();
         n_dst_saved = try eng.shards[5].allocNode();
@@ -52,7 +61,10 @@ test "recovery: crash after source commit, before target commit → edge visible
     }
 
     var eng = try graph_storage.ShardedGraphEngine.open(
-        testing.allocator, td.path, uuid, test_support.testConfig(),
+        testing.allocator,
+        td.path,
+        uuid,
+        test_support.testConfig(),
     );
     defer eng.close() catch {};
 
