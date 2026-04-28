@@ -374,6 +374,38 @@ See the [docs](docs/) directory for detailed documentation:
 - **[Storage Requirements](docs/storage-requirements.md)** -- Functional requirements (FR-001 through FR-030+)
 - **[Storage Research](docs/storage-research.md)** -- Design rationale, bottleneck analysis, prior-art review
 
+## Observability
+
+graph-storage ships an opt-in OpenTelemetry seam. Build with
+`-Dwith_otel=true` to compile in instrumentation; the default
+(`-Dwith_otel=false`) leaves every span site as a comptime no-op so
+the optimizer eliminates the entry/exit calls and the `otel`
+dependency is never fetched.
+
+Each public engine operation emits exactly one span per call, named
+`db.{operation}` (e.g. `db.put_node`, `db.get_property`,
+`db.checkpoint`) with the OpenTelemetry `db.*` semantic-convention
+attributes:
+
+- `db.system = "graph-storage"`
+- `db.operation = <method>` (e.g. `put_node`, `add_edge`, `checkpoint`)
+
+```bash
+zig build test                  # default: -Dwith_otel=false (no-op)
+zig build test -Dwith_otel=true # otel compiled in, spans emitted
+```
+
+When enabled, the consumer's process bootstrap calls
+`graph_storage.observability_init.Otel.init(allocator, "service-name")`
+and parks the returned value at a stable address (a `var` in `main`
+or a heap allocation), then calls `installGlobals(&that_value)` so
+the seam can publish its tracer pointer. Span emission is non-fatal:
+every emit is `catch {}`-discarded so a failed exporter cannot
+propagate into storage operations.
+
+For the full integration recipe and template files, see
+`otel/docs/integration/RECIPE.md` in the otel repo.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
