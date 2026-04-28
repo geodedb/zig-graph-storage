@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const tp = @import("thread_pool");
+const observability = @import("observability");
 const Allocator = std.mem.Allocator;
 
 const types = @import("types.zig");
@@ -605,7 +606,12 @@ pub const GraphEngine = struct {
     // ========================================================================
 
     pub fn getNode(self: *GraphEngine, id: NodeId) anyerror!?NodeRec {
-        return self.node_store.getNode(id);
+        var __obs_span = observability.startOperationSpan("get_node");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+        const result = try self.node_store.getNode(id);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
     }
 
     /// Put a node within an existing transaction (no auto-commit).
@@ -618,15 +624,24 @@ pub const GraphEngine = struct {
 
     /// Put a node with auto-commit (backward compatible).
     pub fn putNode(self: *GraphEngine, id: NodeId, rec: NodeRec) anyerror!void {
+        var __obs_span = observability.startOperationSpan("put_node");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
         try self.putNodeTxn(id, rec, txn);
 
         try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn allocNode(self: *GraphEngine) anyerror!NodeId {
+        var __obs_span = observability.startOperationSpan("alloc_node");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.ensureWritable();
         const id = self.manifest.next_node_id;
         const stride: u64 = if (self.config.base_shard_index != null)
@@ -637,6 +652,7 @@ pub const GraphEngine = struct {
         self.manifest.node_count += 1;
         self.metrics.nodes_created += 1;
         self.markDirty();
+        observability.endOperationSpan(__obs_span, true, "");
         return id;
     }
 
@@ -655,18 +671,31 @@ pub const GraphEngine = struct {
 
     /// Delete a node with auto-commit (backward compatible).
     pub fn deleteNode(self: *GraphEngine, id: NodeId) anyerror!void {
+        var __obs_span = observability.startOperationSpan("delete_node");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
         try self.deleteNodeTxn(id, txn);
 
         try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     /// Look up an edge by its ID using the in-memory edge index.
     /// Returns the EdgeEntry if found, null otherwise.
     pub fn getEdge(self: *GraphEngine, edge_id: EdgeId) anyerror!?EdgeEntry {
-        const entry = self.edge_index.get(edge_id) orelse return null;
+        var __obs_span = observability.startOperationSpan("get_edge");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        const entry = self.edge_index.get(edge_id) orelse {
+            observability.endOperationSpan(__obs_span, true, "");
+            return null;
+        };
+        observability.endOperationSpan(__obs_span, true, "");
         return EdgeEntry{
             .neighbor = entry.neighbor,
             .edge_id = edge_id,
@@ -681,9 +710,15 @@ pub const GraphEngine = struct {
     }
 
     pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        var __obs_span = observability.startOperationSpan("expand_out");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         var iter = try self.expandOutIter(id, rel_type);
         defer iter.deinit();
-        return drainEdgeIterator(&iter, allocator);
+        const result = try drainEdgeIterator(&iter, allocator);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
     }
 
     pub fn expandInIter(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
@@ -692,9 +727,15 @@ pub const GraphEngine = struct {
     }
 
     pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
+        var __obs_span = observability.startOperationSpan("expand_in");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         var iter = try self.expandInIter(id, rel_type);
         defer iter.deinit();
-        return drainEdgeIterator(&iter, allocator);
+        const result = try drainEdgeIterator(&iter, allocator);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
     }
 
     /// Drain an AdjEdgeIterator into a heap-allocated slice.
@@ -770,12 +811,17 @@ pub const GraphEngine = struct {
 
     /// Add an edge with auto-commit (backward compatible).
     pub fn addEdge(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
+        var __obs_span = observability.startOperationSpan("add_edge");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
         const edge_id = try self.addEdgeTxn(from, to, rel_type, txn);
 
         try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
 
         return edge_id;
     }
@@ -808,25 +854,46 @@ pub const GraphEngine = struct {
 
     /// Remove an edge with auto-commit (backward compatible).
     pub fn removeEdge(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
+        var __obs_span = observability.startOperationSpan("remove_edge");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
         try self.removeEdgeTxn(from, to, edge_id, txn);
 
         try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn getProperty(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
+        var __obs_span = observability.startOperationSpan("get_property");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         self.metrics.properties_read += 1;
-        if (prop_head == 0) return null;
-        if (self.property_index.containsChain(prop_head) and !self.property_index.hasKey(prop_head, key)) {
+        if (prop_head == 0) {
+            observability.endOperationSpan(__obs_span, true, "");
             return null;
         }
-        return self.prop_store.getProperty(prop_head, key, alloc);
+        if (self.property_index.containsChain(prop_head) and !self.property_index.hasKey(prop_head, key)) {
+            observability.endOperationSpan(__obs_span, true, "");
+            return null;
+        }
+        const result = try self.prop_store.getProperty(prop_head, key, alloc);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
     }
 
     pub fn getAllProperties(self: *GraphEngine, prop_head: u64) anyerror!PropStore.PropIterator {
-        return self.prop_store.getAllProperties(prop_head);
+        var __obs_span = observability.startOperationSpan("get_all_properties");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        const iter = self.prop_store.getAllProperties(prop_head);
+        observability.endOperationSpan(__obs_span, true, "");
+        return iter;
     }
 
     /// Put a property within an existing transaction (no auto-commit).
@@ -857,17 +924,26 @@ pub const GraphEngine = struct {
 
     /// Put a property with auto-commit (backward compatible).
     pub fn putProperty(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        var __obs_span = observability.startOperationSpan("put_property");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
         const new_head = try self.putPropertyTxn(owner, key, val, txn);
 
         try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
 
         return new_head;
     }
 
     pub fn removeProperty(self: *GraphEngine, owner: u64, key: []const u8) anyerror!void {
+        var __obs_span = observability.startOperationSpan("remove_property");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.ensureWritable();
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
@@ -886,6 +962,7 @@ pub const GraphEngine = struct {
             try self.refreshPropertyChainIndex(owner);
         }
         self.markDirty();
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     /// Add a label within an existing transaction (no auto-commit).
@@ -909,12 +986,17 @@ pub const GraphEngine = struct {
 
     /// Add a label with auto-commit (backward compatible).
     pub fn addLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        var __obs_span = observability.startOperationSpan("add_label");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
         try self.addLabelTxn(node_id, label, txn);
 
         try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     /// Remove a label within an existing transaction (no auto-commit).
@@ -936,17 +1018,28 @@ pub const GraphEngine = struct {
 
     /// Remove a label with auto-commit (backward compatible).
     pub fn removeLabel(self: *GraphEngine, node_id: NodeId, label: LabelId) anyerror!void {
+        var __obs_span = observability.startOperationSpan("remove_label");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
         try self.removeLabelTxn(node_id, label, txn);
 
         try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn scanLabel(self: *GraphEngine, label: LabelId, alloc: Allocator) anyerror![]NodeId {
+        var __obs_span = observability.startOperationSpan("scan_label");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         // Delegate to label index for O(1) lookup instead of O(N) scan
-        return self.label_index.scan(label, alloc);
+        const result = try self.label_index.scan(label, alloc);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
     }
 
     pub fn scanLabelIter(self: *GraphEngine, label: LabelId) !LabelIndex.Iterator {
@@ -954,20 +1047,35 @@ pub const GraphEngine = struct {
     }
 
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {
+        var __obs_span = observability.startOperationSpan("begin_txn");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.ensureWritable();
         const txn_id = try self.txn_manager.begin();
         self.metrics.txn_begun += 1;
+        observability.endOperationSpan(__obs_span, true, "");
         return txn_id;
     }
 
     pub fn commitTxn(self: *GraphEngine, txn: TxnId) anyerror!void {
+        var __obs_span = observability.startOperationSpan("commit_txn");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.txn_manager.commit(txn);
         self.metrics.txn_committed += 1;
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn abortTxn(self: *GraphEngine, txn: TxnId) anyerror!void {
+        var __obs_span = observability.startOperationSpan("abort_txn");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.txn_manager.abort(txn);
         self.metrics.txn_aborted += 1;
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn nodeCount(self: *GraphEngine) anyerror!u64 {
@@ -979,35 +1087,67 @@ pub const GraphEngine = struct {
     }
 
     pub fn checkpoint(self: *GraphEngine) anyerror!void {
+        var __obs_span = observability.startOperationSpan("checkpoint");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.ensureWritable();
-        return engine_persist.checkpoint(self);
+        try engine_persist.checkpoint(self);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn getOrAssignLabel(self: *GraphEngine, label: []const u8) !LabelId {
+        var __obs_span = observability.startOperationSpan("get_or_assign_label");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.ensureWritable();
         const id = try self.label_dict.getOrAssign(label);
         self.markDirty();
+        observability.endOperationSpan(__obs_span, true, "");
         return id;
     }
 
     // ── Edge property helpers (delegated to engine_edge_props.zig) ─────
 
     pub fn setEdgeProperty(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue) anyerror!void {
+        var __obs_span = observability.startOperationSpan("set_edge_property");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.ensureWritable();
-        return engine_edge_props.setEdgeProperty(self, from, to, edge_id, key, value);
+        try engine_edge_props.setEdgeProperty(self, from, to, edge_id, key, value);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn removeEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
+        var __obs_span = observability.startOperationSpan("remove_edge_property");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
         try self.ensureWritable();
-        return engine_edge_props.removeEdgeProperty(self, from, edge_id, key);
+        try engine_edge_props.removeEdgeProperty(self, from, edge_id, key);
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     pub fn getEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
-        return engine_edge_props.getEdgeProperty(self, from, edge_id, key, allocator);
+        var __obs_span = observability.startOperationSpan("get_edge_property");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        const result = try engine_edge_props.getEdgeProperty(self, from, edge_id, key, allocator);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
     }
 
     pub fn getAllEdgeProperties(self: *GraphEngine, from: NodeId, edge_id: EdgeId) anyerror!?PropStore.PropIterator {
-        return engine_edge_props.getAllEdgeProperties(self, from, edge_id);
+        var __obs_span = observability.startOperationSpan("get_all_edge_properties");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        const result = try engine_edge_props.getAllEdgeProperties(self, from, edge_id);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
     }
 };
 
