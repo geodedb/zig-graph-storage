@@ -75,6 +75,22 @@ pub const recovery = @import("recovery.zig");
 // Metrics / observability
 pub const metrics = @import("metrics.zig");
 
+// otel observability seam. Surfaces `startOperationSpan` /
+// `endOperationSpan` plus the `enabled` flag. When
+// `-Dwith_otel=false` (the default), every helper collapses to a
+// comptime no-op and the otel dependency is never resolved. The
+// public API is reachable as `graph_storage.observability`.
+pub const observability = @import("observability");
+
+// Bootstrap helper for the enabled build. Only registered as a build
+// import when `-Dwith_otel=true`; under the disabled build the
+// reference resolves to a placeholder empty struct so the public root
+// stays uniform.
+pub const observability_init = if (observability.enabled)
+    @import("observability_init")
+else
+    struct {};
+
 // Engine
 pub const engine = @import("engine.zig");
 
