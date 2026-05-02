@@ -1,15 +1,15 @@
 .{
     .name = .graph_storage,
-    .version = "0.2.0",
+    .version = "0.1.0",
     .fingerprint = 0x713d4f134b894cf5,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#50400cba341fff6fd804e403abd0548fb9d1affb",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#v0.1.0",
             .hash = "wal-0.1.0-EqPqptFABABLt7wwK6L23ksFcgr9qfMjTNmWTOPbwiQk",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git#df891b6263d84279db219495352a7eef40bcb5aa",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git#v0.1.0",
             .hash = "uuid-0.1.0-tL1irrA0GADX2BRBwho8dCyGpFACIEm0FP7mOPiPXAgX",
         },
         .thread_pool = .{
