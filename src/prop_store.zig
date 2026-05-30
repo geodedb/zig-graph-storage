@@ -90,6 +90,22 @@ pub const PropStore = struct {
     free_space: *FreeSpaceManager,
     var_store: *VarStore,
     page_size: u32,
+    /// Bytes reserved at the tail of every physical property page for the
+    /// page-level AES-GCM authentication tag when at-rest encryption is
+    /// enabled. The slotted-page directory (dir_count + dir entries) grows
+    /// backward from the LOGICAL page end (page_size - tail_reserve), so it
+    /// never collides with the tag that the pager writes into the final
+    /// `tail_reserve` bytes on flush. Set to the encryption tag size when a
+    /// key is configured, 0 otherwise.
+    ///
+    /// SEC: Without this reservation the directory footer and the AES-GCM tag
+    /// share the last bytes of the page. Within a session reads hit the
+    /// decrypted in-memory frame, but after a restart the page is read from
+    /// disk where the tag has overwritten dir_count — producing a garbage
+    /// count and an integer-overflow panic in readDirEntry. Reserving the tag
+    /// tail keeps the directory inside the encrypted body so it round-trips.
+    /// Plaintext mode keeps tail_reserve == 0 for backward compatibility.
+    tail_reserve: u32 = 0,
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, var_store: *VarStore, page_size: u32) PropStore {
         return .{
@@ -97,14 +113,24 @@ pub const PropStore = struct {
             .free_space = free_space,
             .var_store = var_store,
             .page_size = page_size,
+            .tail_reserve = 0,
         };
     }
 
-    /// Usable data bytes per property page (excluding the dir_count footer).
+    /// Trim a physical page buffer to the logical region usable by the
+    /// slotted-page layout, excluding the reserved encryption-tag tail.
+    /// All directory and entry math operates on this logical slice so the
+    /// directory footer stays clear of the AES-GCM tag region.
+    inline fn logical(self: *const PropStore, data: []u8) []u8 {
+        return data[0 .. data.len - self.tail_reserve];
+    }
+
+    /// Usable data bytes per property page (excluding the dir_count footer
+    /// and the reserved encryption-tag tail).
     /// The actual available space also depends on the number of directory
     /// entries; callers must subtract dirOverhead(dir_count) separately.
     fn dataCapacity(self: *const PropStore) u32 {
-        return self.page_size - PROP_DATA_OFFSET - DIR_COUNT_SIZE;
+        return self.page_size - PROP_DATA_OFFSET - DIR_COUNT_SIZE - self.tail_reserve;
     }
 
     /// Get a property value by key from a property page chain.
@@ -122,7 +148,7 @@ pub const PropStore = struct {
             if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
+            const data = self.logical(frame.dataSlice());
 
             const next_page = readNextPage(data);
             const entry_count = readEntryCountChecked(data, self.page_size) catch {
@@ -225,13 +251,13 @@ pub const PropStore = struct {
                 if (self.current_frame_idx == null) {
                     const frame = try self.store.buffer_pool.pin(.props, self.current_page);
                     self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
-                    const data = frame.dataSlice();
+                    const data = self.store.logical(frame.dataSlice());
                     self.entry_count_cache = try readEntryCountChecked(data, self.store.page_size);
                     self.current_offset = PROP_DATA_OFFSET;
                 }
 
                 const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
-                const data = frame.dataSlice();
+                const data = self.store.logical(frame.dataSlice());
 
                 if (self.current_index < self.entry_count_cache) {
                     if (self.current_offset + 2 > data.len) return error.DataCorruption;
@@ -305,7 +331,7 @@ pub const PropStore = struct {
             const new_page = try self.free_space.allocPage();
             const frame = try self.buffer_pool.pinNew(.props, new_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
+            const data = self.logical(frame.dataSlice());
 
             writeNextPage(data, 0);
             writeEntryCount(data, 1);
@@ -347,7 +373,7 @@ pub const PropStore = struct {
             if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
+            const data = self.logical(frame.dataSlice());
 
             const next_page = readNextPage(data);
             var entry_count = readEntryCountChecked(data, self.page_size) catch {
@@ -402,7 +428,7 @@ pub const PropStore = struct {
             if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
+            const data = self.logical(frame.dataSlice());
 
             const next_page = readNextPage(data);
             const entry_count = readEntryCountChecked(data, self.page_size) catch {
@@ -433,7 +459,7 @@ pub const PropStore = struct {
                 const new_page = try self.free_space.allocPage();
                 const new_frame = try self.buffer_pool.pinNew(.props, new_page);
                 const new_frame_idx = self.buffer_pool.frameIndex(new_frame);
-                const new_data = new_frame.dataSlice();
+                const new_data = self.logical(new_frame.dataSlice());
 
                 writeNextPage(new_data, 0);
                 writeEntryCount(new_data, 1);
@@ -467,7 +493,7 @@ pub const PropStore = struct {
             if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(.props, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = frame.dataSlice();
+            const data = self.logical(frame.dataSlice());
 
             const next_page = readNextPage(data);
             const entry_count = readEntryCountChecked(data, self.page_size) catch {
@@ -628,8 +654,14 @@ fn readEntryCount(data: []const u8) u32 {
 /// (2-byte key_len + 1-byte value tag), so entry_count * 3 must fit in the
 /// data capacity (minus DIR_COUNT_SIZE for the directory footer).
 fn readEntryCountChecked(data: []const u8, page_size: u32) error{DataCorruption}!u32 {
+    // `data` is the logical page slice (physical page minus any reserved
+    // encryption-tag tail), so derive the capacity from data.len rather than
+    // the physical page_size to keep the corruption bound tight when at-rest
+    // encryption reserves a tail. page_size is retained for call-site
+    // compatibility but data.len is authoritative.
+    _ = page_size;
     const entry_count = readEntryCount(data);
-    const capacity = page_size - PROP_DATA_OFFSET - DIR_COUNT_SIZE;
+    const capacity = @as(u32, @intCast(data.len)) - PROP_DATA_OFFSET - DIR_COUNT_SIZE;
     // Minimum entry is 2 (key_len) + 0 (key) + 1 (tag) = 3 bytes
     // Plus DIR_ENTRY_SIZE bytes of directory overhead per entry.
     const min_per_entry = 3 + DIR_ENTRY_SIZE;

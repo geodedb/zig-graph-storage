@@ -203,6 +203,16 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.adj_in = AdjStore.init(&self.buffer_pool, &self.free_space_adj_in, .adj_in, cfg.page_size);
     self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
     self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
+    // SEC: when at-rest encryption is enabled the pager writes the per-page
+    // AES-GCM tag into the final TAG_SIZE bytes of the page on flush. Reserve
+    // that tail in the prop_store's slotted-page layout so the per-page key
+    // directory (which grows backward from the page end) never collides with
+    // the tag — otherwise dir_count is overwritten by tag bytes and the page
+    // fails to read back after a restart (integer-overflow panic).
+    self.prop_store.tail_reserve = if (cfg.encryption_key != null)
+        @import("encryption.zig").TAG_SIZE
+    else
+        0;
 
     // Label dictionary, label store, and label index
     self.label_dict = LabelDictionary.init(allocator);

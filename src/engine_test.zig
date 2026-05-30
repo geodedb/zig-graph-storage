@@ -157,6 +157,56 @@ test "create engine, checkpoint, close, open again, data persists" {
     }
 }
 
+test "encrypted properties survive checkpoint+close+reopen (tag/dir-footer collision regression)" {
+    // SEC regression: the prop_store per-page key directory (dir_count + dir
+    // entries) grows backward from the page end. The pager writes the per-page
+    // AES-GCM tag into the final TAG_SIZE bytes on flush. Without reserving the
+    // tag tail, the tag overwrites dir_count on disk; the next OPEN reads a
+    // garbage dir_count and panics with an integer overflow in readDirEntry.
+    // This test writes several encrypted properties, persists, reopens, and
+    // verifies every property reads back intact.
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x5e} ** 16;
+    var cfg = testConfig();
+    cfg.encryption_key = [_]u8{0xab} ** 32;
+
+    const keys = [_][]const u8{ "alpha", "bravo", "charlie", "delta", "echo", "foxtrot" };
+    const vals = [_][]const u8{ "v-alpha", "v-bravo", "v-charlie", "v-delta", "v-echo", "v-foxtrot" };
+
+    var head: u64 = 0;
+
+    // Write several string properties (builds a per-page directory), then
+    // checkpoint + close so the pages are flushed (encrypted) to disk.
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        for (keys, vals) |k, v| {
+            head = try engine.putProperty(head, k, .{ .string = v });
+        }
+
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Re-open with the same key: this is the path that previously panicked.
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        for (keys, vals) |k, expected| {
+            const got = try engine.getProperty(head, k, testing.allocator);
+            try testing.expect(got != null);
+            defer if (got) |g| switch (g) {
+                .string => |s| testing.allocator.free(s),
+                else => {},
+            };
+            try testing.expectEqualStrings(expected, got.?.string);
+        }
+    }
+}
+
 test "checkpoint persists labels.dict, labels.idx and props.idx snapshots" {
     var td = try testDataDir();
     defer td.deinit();
