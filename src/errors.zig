@@ -4,41 +4,109 @@
 const std = @import("std");
 
 pub const StorageError = error{
+    // Corruption / integrity
     CorruptedPage,
     CorruptedManifest,
     CorruptedWal,
     ChecksumMismatch,
     UuidMismatch,
     VersionMismatch,
+    HmacMismatch,
+    DataCorruption,
+    ManifestAuthFailed,
+
+    // Not-found
     PageNotFound,
     NodeNotFound,
     EdgeNotFound,
     PropertyNotFound,
+    GraphNotFound,
+    IndexNotFound,
+
+    // Already-exists / duplicate
+    GraphAlreadyExists,
+
+    // Capacity / limits
     BufferPoolFull,
+    WalFull,
+    DiskFull,
+    BackupTooLarge,
+    FileTooLarge,
+    WriteCountExhausted,
+    PropertyKeyTooLong,
+    WalRecordTooLarge,
+
+    // Contract / usage (caller violated a precondition)
     PagePinned,
     InvalidPageId,
-    WalFull,
+    ReadOnlyMode,
+    PageSizeMismatch,
+    NoPagerRegistered,
+    InvalidGraphPath,
+    GraphDirectoryMissing,
+    CrossShardEdgeUnsupported,
+    NotCrossShard,
+
+    // Input / format parsing
+    InvalidMagic,
+    InvalidMagicLength,
+    InvalidFormat,
+    InvalidData,
+    InvalidBufferSize,
+    BufferTooSmall,
+    UnexpectedEndOfInput,
+    UnexpectedEndOfFile,
+    UnexpectedEof,
+    IncompatibleVersion,
+
+    // WAL
     WalCorrupted,
     WalSegmentMissing,
+
+    // Transaction
     TxnNotFound,
     TxnAlreadyCommitted,
     TxnAlreadyAborted,
-    GraphNotFound,
-    GraphAlreadyExists,
-    GraphDirectoryMissing,
+
+    // Encryption / decryption
     EncryptionFailed,
     DecryptionFailed,
     InvalidKey,
-    DiskFull,
-    IoError,
-    OutOfMemory,
-    InvalidMagic,
-    InvalidFormat,
-    MigrationFailed,
-    IndexNotFound,
+    EncryptionKeyRequired,
+
+    // Backup / restore
+    LegacyBackupRestoreDisabled,
+    ExpectedGraphUuidRequired,
+    InvalidBackupFilename,
+
+    // Shard manifest / routing
+    NoManifest,
+    InvalidShardManifest,
+    InvalidShardUuid,
+    ShardAlgorithmMismatch,
+    ShardCountMismatch,
+    ShardManifestVersionMismatch,
+
+    // Index subsystem
     IndexBuildFailed,
     IndexCorrupted,
-    IncompatibleVersion,
+    EdgeIndexFileNotOpen,
+    LabelIndexFileNotOpen,
+    PropertyIndexFileNotOpen,
+
+    // Graph traversal
+    CircularChainDetected,
+
+    // 2PC / distributed protocol
+    InvalidPreparePayload,
+    InvalidDecisionPayload,
+
+    // Migration
+    MigrationFailed,
+
+    // I/O / memory (own contract surface — std errors that storage code owns)
+    IoError,
+    OutOfMemory,
 };
 
 // ============================================================================
@@ -85,6 +153,83 @@ test "StorageError covers all categories" {
     try std.testing.expectError(StorageError.IndexNotFound, @as(StorageError!void, StorageError.IndexNotFound));
     try std.testing.expectError(StorageError.IndexBuildFailed, @as(StorageError!void, StorageError.IndexBuildFailed));
     try std.testing.expectError(StorageError.IndexCorrupted, @as(StorageError!void, StorageError.IndexCorrupted));
+}
+
+// Coherence guard: asserts that every ad-hoc error returned by library code
+// is a member of StorageError.  Add a line here whenever you add a new
+// `return error.Foo` in src/ so the discrepancy is caught at compile time.
+// Uses std.meta.fieldNames (the correct introspection API for error sets).
+test "StorageError coherence guard — ad-hoc errors used by library code are declared" {
+    // Helper that fails at comptime if `name` is not a member of StorageError.
+    const assertMember = struct {
+        fn check(comptime name: []const u8) void {
+            comptime {
+                var found = false;
+                for (std.meta.fieldNames(StorageError)) |field| {
+                    if (std.mem.eql(u8, field, name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) @compileError("StorageError is missing member: " ++ name);
+            }
+        }
+    }.check;
+
+    // Corruption / integrity
+    assertMember("DataCorruption");
+    assertMember("HmacMismatch");
+    assertMember("ManifestAuthFailed");
+
+    // Input / format parsing
+    assertMember("InvalidData");
+    assertMember("InvalidBufferSize");
+    assertMember("InvalidMagicLength");
+    assertMember("BufferTooSmall");
+    assertMember("UnexpectedEndOfInput");
+    assertMember("UnexpectedEndOfFile");
+    assertMember("UnexpectedEof");
+
+    // Capacity / limits
+    assertMember("BackupTooLarge");
+    assertMember("FileTooLarge");
+    assertMember("WriteCountExhausted");
+    assertMember("PropertyKeyTooLong");
+    assertMember("WalRecordTooLarge");
+
+    // Contract / usage
+    assertMember("ReadOnlyMode");
+    assertMember("PageSizeMismatch");
+    assertMember("NoPagerRegistered");
+    assertMember("InvalidGraphPath");
+    assertMember("CrossShardEdgeUnsupported");
+    assertMember("NotCrossShard");
+
+    // Manifest / shard routing
+    assertMember("NoManifest");
+    assertMember("InvalidShardManifest");
+    assertMember("InvalidShardUuid");
+    assertMember("ShardAlgorithmMismatch");
+    assertMember("ShardCountMismatch");
+    assertMember("ShardManifestVersionMismatch");
+
+    // Backup / restore
+    assertMember("LegacyBackupRestoreDisabled");
+    assertMember("EncryptionKeyRequired");
+    assertMember("ExpectedGraphUuidRequired");
+    assertMember("InvalidBackupFilename");
+
+    // Index subsystem
+    assertMember("EdgeIndexFileNotOpen");
+    assertMember("LabelIndexFileNotOpen");
+    assertMember("PropertyIndexFileNotOpen");
+
+    // Graph traversal
+    assertMember("CircularChainDetected");
+
+    // 2PC / distributed protocol
+    assertMember("InvalidPreparePayload");
+    assertMember("InvalidDecisionPayload");
 }
 
 test {
