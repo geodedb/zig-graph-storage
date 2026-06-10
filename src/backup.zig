@@ -273,15 +273,29 @@ pub const Backup = struct {
             return error.UuidMismatch;
         }
 
+        // SEC-0038: Pass 1 — authenticate the ENTIRE archive (structure, CRC,
+        // and HMAC for V2) without writing a single byte to disk. Any failure
+        // here returns before the target directory is ever touched, so a
+        // tampered or truncated archive can never poison the destination.
+        try self.authenticateArchive(&file, header, layout, header_buf, archive_size);
+
+        // Authentication succeeded; only now do we mutate the filesystem.
         try ensureDirectoryMode(target_dir, 0o700);
         try self.ensureRestoreWalArtifacts(target_dir, header.graph_uuid);
 
-        var crc = Crc32.init();
-        var hmac_ctx: ?HmacSha256 = if (self.encryption_key) |key|
-            if (header.version >= BACKUP_VERSION_HMAC) HmacSha256.init(&key) else null
-        else
-            null;
-        updateIntegrityBytes(0, &header_buf, layout, &crc, &hmac_ctx);
+        // SEC-0049: Hold an open handle to the destination and create every
+        // file relative to it. `exclusive` refuses a pre-existing file or
+        // symlink at the name, and `resolve_beneath` (where supported) blocks
+        // any path that would resolve outside the destination.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var target = try std.Io.Dir.cwd().openDir(io, target_dir, .{ .iterate = false, .follow_symlinks = false });
+        defer target.close(io);
+
+        // Pass 2 — extract. The bytes were already authenticated above, so the
+        // integrity trackers are unnecessary here. A throwaway CRC and a null
+        // HMAC let us reuse the shared read/copy helpers without recomputing.
+        var no_crc = Crc32.init();
+        var no_hmac: ?HmacSha256 = null;
 
         var pos: usize = header_buf.len;
         var files_restored: u32 = 0;
@@ -290,45 +304,89 @@ pub const Backup = struct {
         var i: u32 = 0;
         while (i < header.file_count) : (i += 1) {
             var name_len_buf: [2]u8 = undefined;
-            try readTrackedExact(&file, &pos, &name_len_buf, layout, &crc, &hmac_ctx);
+            try readTrackedExact(&file, &pos, &name_len_buf, layout, &no_crc, &no_hmac);
             const name_len = std.mem.readInt(u16, &name_len_buf, .little);
 
             const name = try self.allocator.alloc(u8, name_len);
             defer self.allocator.free(name);
-            try readTrackedExact(&file, &pos, name, layout, &crc, &hmac_ctx);
+            try readTrackedExact(&file, &pos, name, layout, &no_crc, &no_hmac);
             if (!isValidBackupFilename(name)) return error.InvalidBackupFilename;
 
             var size_buf: [8]u8 = undefined;
-            try readTrackedExact(&file, &pos, &size_buf, layout, &crc, &hmac_ctx);
+            try readTrackedExact(&file, &pos, &size_buf, layout, &no_crc, &no_hmac);
             const file_size = std.mem.readInt(u64, &size_buf, .little);
 
             if (std.mem.lastIndexOfScalar(u8, name, '/')) |sep| {
-                const subdir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name[0..sep] });
-                defer self.allocator.free(subdir_path);
-                try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), subdir_path);
+                try target.createDirPath(io, name[0..sep]);
             }
 
-            const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ target_dir, name });
-            defer self.allocator.free(file_path);
-
-            const out_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
-            defer out_file.close(std.Io.Threaded.global_single_threaded.io());
-            _ = try copyTrackedToFile(&file, &out_file, &pos, file_size, layout, &crc, &hmac_ctx);
+            const out_file = try target.createFile(io, name, .{
+                .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+                .exclusive = true,
+                .resolve_beneath = true,
+            });
+            defer out_file.close(io);
+            _ = try copyTrackedToFile(&file, &out_file, &pos, file_size, layout, &no_crc, &no_hmac);
 
             files_restored += 1;
             total_bytes += file_size;
         }
 
+        return .{
+            .graph_uuid = header.graph_uuid,
+            .files_restored = files_restored,
+            .total_bytes = total_bytes,
+        };
+    }
+
+    /// SEC-0038: Read the whole archive and verify its integrity (entry
+    /// structure, CRC32, and HMAC-SHA256 for V2) without writing anything.
+    /// Returns an error if the archive is not authentic so the caller can
+    /// abort before touching the target directory.
+    fn authenticateArchive(
+        self: *Backup,
+        file: *const std.Io.File,
+        header: ArchiveHeader,
+        layout: ArchiveLayout,
+        header_buf: [26]u8,
+        archive_size: usize,
+    ) !void {
+        var crc = Crc32.init();
+        var hmac_ctx: ?HmacSha256 = if (self.encryption_key) |key|
+            if (header.version >= BACKUP_VERSION_HMAC) HmacSha256.init(&key) else null
+        else
+            null;
+        updateIntegrityBytes(0, &header_buf, layout, &crc, &hmac_ctx);
+
+        var pos: usize = header_buf.len;
+        var i: u32 = 0;
+        while (i < header.file_count) : (i += 1) {
+            var name_len_buf: [2]u8 = undefined;
+            try readTrackedExact(file, &pos, &name_len_buf, layout, &crc, &hmac_ctx);
+            const name_len = std.mem.readInt(u16, &name_len_buf, .little);
+
+            const name = try self.allocator.alloc(u8, name_len);
+            defer self.allocator.free(name);
+            try readTrackedExact(file, &pos, name, layout, &crc, &hmac_ctx);
+            if (!isValidBackupFilename(name)) return error.InvalidBackupFilename;
+
+            var size_buf: [8]u8 = undefined;
+            try readTrackedExact(file, &pos, &size_buf, layout, &crc, &hmac_ctx);
+            const file_size = std.mem.readInt(u64, &size_buf, .little);
+
+            try skipTracked(file, &pos, file_size, layout, &crc, &hmac_ctx);
+        }
+
         if (pos != layout.crc_offset) return error.InvalidData;
 
         var stored_crc_buf: [4]u8 = undefined;
-        try readTrackedExact(&file, &pos, &stored_crc_buf, layout, &crc, &hmac_ctx);
+        try readTrackedExact(file, &pos, &stored_crc_buf, layout, &crc, &hmac_ctx);
         const stored_crc = std.mem.readInt(u32, &stored_crc_buf, .little);
         if (stored_crc != crc.final()) return error.ChecksumMismatch;
 
         if (layout.hmac_offset) |_| {
             var stored_hmac: [HmacSha256.mac_length]u8 = undefined;
-            try readNoEof(&file, @intCast(pos), &stored_hmac);
+            try readNoEof(file, @intCast(pos), &stored_hmac);
             pos += stored_hmac.len;
 
             var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
@@ -339,12 +397,6 @@ pub const Backup = struct {
         }
 
         if (pos != archive_size) return error.InvalidData;
-
-        return .{
-            .graph_uuid = header.graph_uuid,
-            .files_restored = files_restored,
-            .total_bytes = total_bytes,
-        };
     }
 
     /// Validate a backup file's integrity (check header, CRC, and HMAC if applicable).
@@ -1392,6 +1444,196 @@ test "RestoreResult writeJson produces valid structured output" {
     try testing.expect(std.mem.indexOf(u8, json, "\"files_restored\":5") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"total_bytes\":654321") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"graph_uuid\":\"11223344") != null);
+}
+
+test "SEC-0038: tampered V2 restore leaves the target directory untouched" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    // Give the graph some content so there is data to extract on restore.
+    const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
+    defer allocator.free(nodes_path);
+    try writeTestFile(nodes_path, "authentic node data");
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_tampered.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    const key = [_]u8{0xDD} ** 32;
+    var backup = Backup.initWithKey(allocator, key);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+
+    // Tamper with the file-data region and recompute the CRC so only the HMAC
+    // (which the attacker cannot forge without the key) fails.
+    {
+        const data = try Backup.readFileAlloc(&backup, backup_path);
+        defer allocator.free(data);
+        try testing.expect(data.len > 30 + HmacSha256.mac_length);
+
+        const tampered = try allocator.alloc(u8, data.len);
+        defer allocator.free(tampered);
+        @memcpy(tampered, data);
+
+        const crc_offset = data.len - HmacSha256.mac_length - 4;
+
+        // Walk the entries to find a byte that lives inside a file's *data*
+        // region (never metadata), so every entry still parses cleanly and the
+        // failure surfaces only at the unforgeable HMAC. nodes.store carries
+        // "authentic node data", guaranteeing at least one non-empty payload.
+        var scan: usize = 26; // skip header
+        var tamper_index: ?usize = null;
+        while (scan < crc_offset) {
+            const nlen = std.mem.readInt(u16, tampered[scan..][0..2], .little);
+            scan += 2 + nlen;
+            const fsize = std.mem.readInt(u64, tampered[scan..][0..8], .little);
+            scan += 8;
+            if (fsize > 0) {
+                tamper_index = scan; // first byte of this entry's data
+                break;
+            }
+            scan += @intCast(fsize);
+        }
+        try testing.expect(tamper_index != null);
+        tampered[tamper_index.?] ^= 0xFF;
+
+        const new_crc = Crc32.hash(tampered[0..crc_offset]);
+        @memcpy(tampered[crc_offset..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+
+        const f = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), backup_path, .{});
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        try f.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), tampered);
+    }
+
+    // Target directory contains a sentinel file that must survive the failed restore.
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
+    defer allocator.free(restore_path);
+    try ensureDirectoryMode(restore_path, 0o700);
+    const sentinel_path = try std.fmt.allocPrint(allocator, "{s}/sentinel.txt", .{restore_path});
+    defer allocator.free(sentinel_path);
+    try writeTestFile(sentinel_path, "do-not-touch");
+
+    backup.setExpectedGraphUuid(env.graph_dir.graph_uuid);
+
+    const result = backup.restoreBackupResult(backup_path, restore_path);
+    try testing.expectError(error.HmacMismatch, result);
+
+    // Sentinel intact: no attacker bytes overwrote it.
+    try expectFileContents(sentinel_path, "do-not-touch");
+
+    // No poisoned store file landed in the target directory.
+    const poisoned_nodes = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{restore_path});
+    defer allocator.free(poisoned_nodes);
+    const probe = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), poisoned_nodes, .{});
+    if (probe) |f| {
+        f.close(std.Io.Threaded.global_single_threaded.io());
+        return error.PoisonedFileCreated;
+    } else |err| {
+        try testing.expectEqual(error.FileNotFound, err);
+    }
+}
+
+test "SEC-0049: restore refuses to follow a pre-planted symlink at a legal filename" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
+    defer allocator.free(nodes_path);
+    try writeTestFile(nodes_path, "authentic node data");
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_symlink.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    const key = [_]u8{0xEE} ** 32;
+    var backup = Backup.initWithKey(allocator, key);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+
+    // An outside file that the attacker hopes to overwrite via the symlink.
+    const victim_path = try std.fmt.allocPrint(allocator, "{s}/victim.txt", .{out_path_base});
+    defer allocator.free(victim_path);
+    try writeTestFile(victim_path, "victim contents");
+
+    // Pre-plant a symlink at a legal name inside the target directory.
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
+    defer allocator.free(restore_path);
+    try ensureDirectoryMode(restore_path, 0o700);
+    const link_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{restore_path});
+    defer allocator.free(link_path);
+    try std.Io.Dir.cwd().symLink(std.Io.Threaded.global_single_threaded.io(), victim_path, link_path, .{});
+
+    backup.setExpectedGraphUuid(env.graph_dir.graph_uuid);
+
+    const result = backup.restoreBackupResult(backup_path, restore_path);
+    try testing.expectError(error.PathAlreadyExists, result);
+
+    // The symlink's target file is NOT overwritten.
+    try expectFileContents(victim_path, "victim contents");
+}
+
+test "SEC-0038/0049: valid V2 restore still round-trips into a clean target" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
+    defer allocator.free(nodes_path);
+    try writeTestFile(nodes_path, "round-trip node data");
+
+    const labels_dict_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{env.graph_dir.path});
+    defer allocator.free(labels_dict_path);
+    try writeTestFile(labels_dict_path, "Person:1");
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_roundtrip.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    const key = [_]u8{0x5A} ** 32;
+    var backup = Backup.initWithKey(allocator, key);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+    backup.setExpectedGraphUuid(env.graph_dir.graph_uuid);
+
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
+    defer allocator.free(restore_path);
+
+    const restore_result = try backup.restoreBackupResult(backup_path, restore_path);
+    try testing.expectEqual(env.graph_dir.graph_uuid, restore_result.graph_uuid);
+    try testing.expect(restore_result.files_restored >= 2);
+
+    const restored_nodes = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{restore_path});
+    defer allocator.free(restored_nodes);
+    try expectFileContents(restored_nodes, "round-trip node data");
+    try expectOwnerOnlyMode(restored_nodes);
+
+    const restored_labels = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{restore_path});
+    defer allocator.free(restored_labels);
+    try expectFileContents(restored_labels, "Person:1");
+    try expectOwnerOnlyMode(restored_labels);
 }
 
 test {
