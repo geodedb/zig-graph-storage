@@ -21,9 +21,11 @@ const Allocator = std.mem.Allocator;
 const sharded_engine = @import("sharded_engine.zig");
 const two_pc = @import("sharded_engine_2pc.zig");
 const wal_record = @import("wal_record.zig");
+const wal_mod = @import("wal.zig");
 const engine_mod = @import("engine.zig");
 const edge_mod = @import("edge.zig");
 
+const WalRecord = wal_record.WalRecord;
 const WalRecordType = wal_record.WalRecordType;
 const ShardedGraphEngine = sharded_engine.ShardedGraphEngine;
 const GraphEngine = engine_mod.GraphEngine;
@@ -31,6 +33,51 @@ const GraphEngine = engine_mod.GraphEngine;
 pub const ReconcileStats = struct {
     committed: u32 = 0,
     aborted: u32 = 0,
+};
+
+/// Pass-A streaming callback context. Records cross-shard prepare/commit/abort
+/// observations into the global state vector and this shard's prepares map.
+/// Non-cross-shard records are ignored. Invoked only for records whose checksum
+/// has already been verified by `forEachFromStrict`.
+const CollectStateCtx = struct {
+    state: *std.AutoHashMap(u64, u8),
+    prepared_here: *std.AutoHashMap(u64, two_pc.PreparePayload),
+
+    fn mark(self: *@This(), gid: u64, bit: u8) !void {
+        const entry = try self.state.getOrPut(gid);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* |= bit;
+    }
+
+    fn visit(self: *@This(), rec: *const WalRecord) !void {
+        switch (rec.record_type) {
+            .cross_shard_prepare => {
+                const payload = try two_pc.decodePreparePayload(rec.payload);
+                try self.prepared_here.put(payload.global_txn_id, payload);
+                try self.mark(payload.global_txn_id, 0b001);
+            },
+            .cross_shard_commit => try self.mark(try two_pc.decodeDecisionPayload(rec.payload), 0b010),
+            .cross_shard_abort => try self.mark(try two_pc.decodeDecisionPayload(rec.payload), 0b100),
+            else => {},
+        }
+    }
+};
+
+/// Pass-B streaming callback context. Records which global_txn_ids this shard
+/// has already logged a local decision for, so reconciliation does not append a
+/// duplicate decision. Invoked only for checksum-verified records.
+const CollectResolvedCtx = struct {
+    locally_resolved: *std.AutoHashMap(u64, void),
+
+    fn visit(self: *@This(), rec: *const WalRecord) !void {
+        switch (rec.record_type) {
+            .cross_shard_commit, .cross_shard_abort => {
+                const gid = try two_pc.decodeDecisionPayload(rec.payload);
+                try self.locally_resolved.put(gid, {});
+            },
+            else => {},
+        }
+    }
 };
 
 pub fn reconcilePendingPrepares(self: *ShardedGraphEngine) !ReconcileStats {
@@ -48,37 +95,19 @@ pub fn reconcilePendingPrepares(self: *ShardedGraphEngine) !ReconcileStats {
     for (&prepared_here) |*m| m.* = std.AutoHashMap(u64, two_pc.PreparePayload).init(allocator);
     defer for (&prepared_here) |*m| m.deinit();
 
-    // Pass A: collect state from every shard's WAL.
+    // Pass A: collect state from every shard's WAL via a CHECKSUM-VERIFYING
+    // streaming walk. `forEachFromStrict` validates each record's checksum and
+    // fails closed (error.ChecksumMismatch / error.InvalidFormat) on any
+    // malformed or forged record — a crafted prepare/commit can no longer be
+    // trusted to forge an edge. Only the small per-txn bookkeeping maps are
+    // retained; the full record set is never materialized (PERF-0053).
     for (self.shards, 0..) |eng, s| {
-        const records = try eng.wal.readFrom(0, allocator);
-        defer {
-            for (records) |*r| r.deinit(allocator);
-            allocator.free(records);
-        }
-        for (records) |r| {
-            switch (r.record_type) {
-                .cross_shard_prepare => {
-                    const payload = try two_pc.decodePreparePayload(r.payload);
-                    try prepared_here[s].put(payload.global_txn_id, payload);
-                    const entry = try state.getOrPut(payload.global_txn_id);
-                    if (!entry.found_existing) entry.value_ptr.* = 0;
-                    entry.value_ptr.* |= 0b001;
-                },
-                .cross_shard_commit => {
-                    const gid = try two_pc.decodeDecisionPayload(r.payload);
-                    const entry = try state.getOrPut(gid);
-                    if (!entry.found_existing) entry.value_ptr.* = 0;
-                    entry.value_ptr.* |= 0b010;
-                },
-                .cross_shard_abort => {
-                    const gid = try two_pc.decodeDecisionPayload(r.payload);
-                    const entry = try state.getOrPut(gid);
-                    if (!entry.found_existing) entry.value_ptr.* = 0;
-                    entry.value_ptr.* |= 0b100;
-                },
-                else => {},
-            }
-        }
+        var failure: ?wal_mod.ReplayFailure = null;
+        var ctx = CollectStateCtx{
+            .state = &state,
+            .prepared_here = &prepared_here[s],
+        };
+        try eng.wal.forEachFromStrict(0, allocator, &failure, &ctx, CollectStateCtx.visit);
     }
 
     // Pass B: for each shard, for each prepare it owns, apply the
@@ -95,20 +124,9 @@ pub fn reconcilePendingPrepares(self: *ShardedGraphEngine) !ReconcileStats {
         var locally_resolved = std.AutoHashMap(u64, void).init(allocator);
         defer locally_resolved.deinit();
         {
-            const records = try eng.wal.readFrom(0, allocator);
-            defer {
-                for (records) |*r| r.deinit(allocator);
-                allocator.free(records);
-            }
-            for (records) |r| {
-                switch (r.record_type) {
-                    .cross_shard_commit, .cross_shard_abort => {
-                        const gid = try two_pc.decodeDecisionPayload(r.payload);
-                        try locally_resolved.put(gid, {});
-                    },
-                    else => {},
-                }
-            }
+            var failure: ?wal_mod.ReplayFailure = null;
+            var ctx = CollectResolvedCtx{ .locally_resolved = &locally_resolved };
+            try eng.wal.forEachFromStrict(0, allocator, &failure, &ctx, CollectResolvedCtx.visit);
         }
 
         var it = prepared_here[s].iterator();

@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const wal_lib = @import("wal");
 const wal_record = @import("wal_record.zig");
@@ -98,6 +99,17 @@ pub const WalManager = struct {
     /// Sync the WAL to disk (fsync).
     pub fn sync(self: *WalManager) !void {
         try self.inner.sync();
+    }
+
+    /// TEST-ONLY: append already-serialized record bytes verbatim, bypassing
+    /// the checksum recomputation that `appendRecord` performs. This exists so
+    /// tests can inject malformed / forged WAL records (e.g. a record whose
+    /// stored checksum does not match its contents) to exercise the strict,
+    /// fail-closed recovery path. Returns the assigned inner-log LSN.
+    pub fn appendRawForTest(self: *WalManager, bytes: []const u8) !u64 {
+        if (!builtin.is_test) return error.TestOnly;
+        self.current_lsn += 1;
+        return try self.inner.append(bytes);
     }
 
     /// Read all WAL records with LSN >= start_lsn by iterating over the
