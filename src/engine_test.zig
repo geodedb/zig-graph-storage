@@ -1019,3 +1019,57 @@ test "two GraphEngines can borrow the same external thread pool" {
     try testing.expect(eng_b.submitter_slot != null);
     try testing.expect(eng_a.submitter_slot.? != eng_b.submitter_slot.?);
 }
+
+// QUAL-0042 (#124): a step that fails AFTER initSubsystems during open() must
+// not leak the subsystems (WAL, txn manager, indexes, free-space managers) or
+// the WAL directory handle. initSubsystems' internal errdefer guards discharge
+// once it returns successfully, so without an `errdefer cleanupSubsystems()`
+// after that call the subsystems leak. We induce a deterministic failure by
+// corrupting labels.dict so that label_dict.loadFromFile (open step 6) returns
+// error.InvalidData (a non-FileNotFound error that propagates via `else =>
+// return err`). std.testing.allocator turns the leaked allocations into a test
+// failure pre-fix; post-fix the failure path frees everything and the only
+// observable result is the propagated error.InvalidData.
+test "open() failing after initSubsystems frees subsystems (QUAL-0042)" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x42} ** 16;
+    const cfg = testConfig();
+
+    // Create and cleanly close a graph so a valid on-disk graph exists.
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.close();
+    }
+
+    // Locate the graph directory: <data_dir>/graphs/<uuid_hex>.
+    var hex: [32]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (uuid, 0..) |byte, i| {
+        hex[i * 2] = hex_chars[byte >> 4];
+        hex[i * 2 + 1] = hex_chars[byte & 0x0F];
+    }
+    const labels_path = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/graphs/{s}/labels.dict",
+        .{ td.path, hex },
+    );
+    defer testing.allocator.free(labels_path);
+
+    // Corrupt labels.dict with a too-small payload. loadFromFile requires at
+    // least 8 bytes and returns error.InvalidData for anything shorter, which
+    // is a non-FileNotFound error and therefore propagates out of open().
+    {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = try std.Io.Dir.cwd().createFile(io, labels_path, .{ .truncate = true });
+        defer f.close(io);
+        _ = try f.writePositionalAll(io, "bad", 0);
+    }
+
+    // open() must fail at the label_dict load step (after initSubsystems) and
+    // must not leak. A leak here is detected by testing.allocator and fails the
+    // test pre-fix.
+    const result = GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    try testing.expectError(error.InvalidData, result);
+}

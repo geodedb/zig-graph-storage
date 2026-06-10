@@ -209,6 +209,11 @@ pub const GraphEngine = struct {
         var bootstrap_cfg = cfg;
         bootstrap_cfg.allow_create_missing_artifacts = true;
         try self.initSubsystems(allocator, graph_uuid, bootstrap_cfg, 0);
+        // QUAL-0042: initSubsystems' internal errdefers only cover failures
+        // inside that call; they discharge once it returns. Cover the steps
+        // that run afterwards (e.g. initThreadPool) so they cannot leak the
+        // subsystems and the WAL directory handle.
+        errdefer self.cleanupSubsystems();
 
         // 7. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
@@ -288,6 +293,12 @@ pub const GraphEngine = struct {
 
         // 5. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         try self.initSubsystems(allocator, graph_uuid, cfg, self.manifest.last_checkpoint_lsn);
+        // QUAL-0042: initSubsystems' internal errdefers only cover failures
+        // inside that call; they discharge once it returns. Cover the steps
+        // that run afterwards (loadFreeStore, rebuildFreeSpaceFromDisk,
+        // label_dict.loadFromFile, rebuildDerivedIndexes, initThreadPool) so a
+        // failure there cannot leak the subsystems and the WAL directory handle.
+        errdefer self.cleanupSubsystems();
 
         // 5b. Restore free space bitmaps. Prefer the persisted free.store
         // file which accurately tracks freed pages. Fall back to rebuilding
@@ -467,6 +478,39 @@ pub const GraphEngine = struct {
     /// Clean up the graph engine and its storage resources.
     pub fn deinit(self: *GraphEngine) void {
         self.cleanupResources(self.allocator);
+    }
+
+    /// QUAL-0042: Free exactly the subsystems that `initSubsystems` allocated.
+    ///
+    /// `initSubsystems`' own `errdefer` guards only protect against a failure
+    /// *inside* `initSubsystems`; they discharge once it returns successfully.
+    /// The steps that run afterwards in `create`/`open` (initThreadPool,
+    /// loadFreeStore, rebuildFreeSpaceFromDisk, label_dict.loadFromFile,
+    /// rebuildDerivedIndexes) are therefore uncovered. This helper is installed
+    /// via `errdefer self.cleanupSubsystems()` immediately after the
+    /// `initSubsystems` call so those later failures no longer leak the WAL,
+    /// txn manager, indexes, free-space managers, or the WAL directory handle.
+    ///
+    /// It deinits the same set, in the same order, as the corresponding portion
+    /// of `cleanupResources`, but deliberately EXCLUDES the thread pool,
+    /// buffer_pool, file_manager, graph_dir, key-zeroing, and `destroy(self)`:
+    /// those are owned by the top-level `errdefer`s in `create`/`open` and
+    /// freeing them here would double-free. The checkpointer holds no owned
+    /// allocations of its own, mirroring `cleanupResources` which never deinits
+    /// it.
+    fn cleanupSubsystems(self: *GraphEngine) void {
+        self.txn_manager.deinit();
+        self.wal.deinit();
+        self.wal_dir_handle.close(std.Io.Threaded.global_single_threaded.io());
+        self.free_space_nodes.deinit();
+        self.free_space_adj_out.deinit();
+        self.free_space_adj_in.deinit();
+        self.free_space_props.deinit();
+        self.free_space_var.deinit();
+        self.label_dict.deinit();
+        self.label_index.deinit();
+        self.property_index.deinit();
+        self.edge_index.deinit();
     }
 
     /// Close the engine (flush, checkpoint, close files).
