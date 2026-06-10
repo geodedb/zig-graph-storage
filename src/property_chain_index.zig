@@ -5,7 +5,16 @@ const std = @import("std");
 const index_snapshot_mod = @import("index_snapshot.zig");
 
 const Allocator = std.mem.Allocator;
-const SNAPSHOT_MAGIC = "GSPIDX1\x00";
+// SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
+const SNAPSHOT_MAGIC = "GSPIDX2\x00";
+
+// SEC-0044/SEC-0048: smallest bytes a single chain record consumes on disk
+// (prop_head u64 + entry_count u32, with zero entries).
+const CHAIN_RECORD_MIN_SIZE: usize = 8 + 4;
+
+// SEC-0044/SEC-0048: smallest bytes a single chain entry consumes on disk
+// (key_len u16 + zero-length key + value_hash u64).
+const ENTRY_RECORD_MIN_SIZE: usize = 2 + 8;
 
 pub const PropertyDigest = struct {
     key: []u8,
@@ -195,13 +204,16 @@ pub const PropertyChainIndex = struct {
                 write_offset += 8;
             }
         }
+
+        // SEC-0051: append a CRC32 over the header + payload.
+        try index_snapshot_mod.finalizeChecksum(self.allocator, file.*, write_offset);
     }
 
     /// Load a previously persisted props.idx snapshot.
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
     pub fn loadFromFile(self: *PropertyChainIndex, file: *std.Io.File) !?u64 {
-        const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC)) orelse return null;
+        const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC, CHAIN_RECORD_MIN_SIZE)) orelse return null;
 
         self.clear();
         errdefer self.clear();
@@ -220,6 +232,10 @@ pub const PropertyChainIndex = struct {
 
             try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
             const entry_count = std.mem.readInt(u32, &u32_buf, .little);
+
+            // SEC-0044/SEC-0048: bound the per-chain entry reservation against
+            // the bytes still available before reserving capacity.
+            if (entry_count > remaining / ENTRY_RECORD_MIN_SIZE) return error.InvalidFormat;
 
             const gop = try self.chains.getOrPut(prop_head);
             if (!gop.found_existing) {
@@ -319,4 +335,89 @@ test "saveToFile + loadFromFile round-trip preserves chain metadata" {
     try testing.expect(loaded.hasKey(7, "name"));
     try testing.expect(loaded.hasKey(7, "active"));
     try testing.expect(!loaded.hasKey(7, "missing"));
+}
+
+// SEC-0044/SEC-0048: a tiny props.idx that declares a huge chain count must be
+// rejected with error.InvalidFormat rather than driving a giant reservation.
+// std.testing.allocator additionally fails the test on any leak/over-alloc.
+test "loadFromFile rejects an oversized chain_count (SEC-0044/0048)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try tmp.dir.createFile(io, "props.idx", .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    // Header declares maxInt(u64) chains but writes only a 1-byte payload.
+    var write_offset: u64 = 0;
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, std.math.maxInt(u64));
+    try file.writePositionalAll(io, &[_]u8{0}, write_offset);
+    write_offset += 1;
+    try index_snapshot_mod.finalizeChecksum(testing.allocator, file, write_offset);
+
+    var loaded = PropertyChainIndex.init(testing.allocator);
+    defer loaded.deinit();
+
+    try testing.expectError(error.InvalidFormat, loaded.loadFromFile(&file));
+}
+
+// SEC-0044/SEC-0048: a valid chain header but an absurd per-chain entry_count
+// must be rejected before reserving the entries list.
+test "loadFromFile rejects an oversized entry_count (SEC-0044/0048)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try tmp.dir.createFile(io, "props.idx", .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var write_offset: u64 = 0;
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 1);
+    // One chain: prop_head=7, entry_count=maxInt(u32) but no entry bytes follow.
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], 7, .little);
+    std.mem.writeInt(u32, buf[8..12], std.math.maxInt(u32), .little);
+    try file.writePositionalAll(io, &buf, write_offset);
+    write_offset += buf.len;
+    try index_snapshot_mod.finalizeChecksum(testing.allocator, file, write_offset);
+
+    var loaded = PropertyChainIndex.init(testing.allocator);
+    defer loaded.deinit();
+
+    try testing.expectError(error.InvalidFormat, loaded.loadFromFile(&file));
+}
+
+// SEC-0051: flipping one payload byte (header intact) must be rejected as a
+// checksum mismatch rather than silently loading corrupt data.
+test "loadFromFile rejects a flipped payload byte (SEC-0051)" {
+    var idx = PropertyChainIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    var iter = TestIterator{
+        .entries = &[_]TestIterEntry{
+            .{ .key = "name", .encoded_value = "Alice" },
+        },
+    };
+    try idx.refreshFromIterator(7, &iter);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try tmp.dir.createFile(io, "props.idx", .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    try idx.saveToFile(&file, 123);
+
+    // Flip the first payload byte (just past magic + 16-byte header).
+    const payload_off: u64 = SNAPSHOT_MAGIC.len + index_snapshot_mod.HEADER_FIELDS_SIZE;
+    var orig: [1]u8 = undefined;
+    _ = try file.readPositionalAll(io, &orig, payload_off);
+    const flipped: [1]u8 = .{orig[0] ^ 0xFF};
+    try file.writePositionalAll(io, &flipped, payload_off);
+
+    var loaded = PropertyChainIndex.init(testing.allocator);
+    defer loaded.deinit();
+
+    try testing.expectError(error.ChecksumMismatch, loaded.loadFromFile(&file));
 }

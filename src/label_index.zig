@@ -17,7 +17,15 @@ const LabelId = types.LabelId;
 const NodeId = types.NodeId;
 
 const NodeList = std.ArrayList(NodeId);
-const SNAPSHOT_MAGIC = "GSLIDX1\x00";
+// SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
+const SNAPSHOT_MAGIC = "GSLIDX2\x00";
+
+// SEC-0044/SEC-0048: smallest bytes a single label record consumes on disk
+// (label_id u32 + node_count u64, with zero nodes).
+const LABEL_RECORD_MIN_SIZE: usize = 4 + 8;
+
+// SEC-0044/SEC-0048: bytes a single node id consumes on disk.
+const NODE_RECORD_SIZE: usize = 8;
 
 /// Label posting lists — maps LabelId to sorted arrays of NodeId.
 /// For v1, the posting lists are kept in memory and rebuilt from the
@@ -178,13 +186,16 @@ pub const LabelIndex = struct {
                 write_offset += 8;
             }
         }
+
+        // SEC-0051: append a CRC32 over the header + payload.
+        try index_snapshot_mod.finalizeChecksum(self.allocator, file.*, write_offset);
     }
 
     /// Load a previously persisted labels.idx snapshot.
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
     pub fn loadFromFile(self: *LabelIndex, file: *std.Io.File) !?u64 {
-        const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC)) orelse return null;
+        const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC, LABEL_RECORD_MIN_SIZE)) orelse return null;
 
         self.clear();
         errdefer self.clear();
@@ -202,6 +213,10 @@ pub const LabelIndex = struct {
 
             try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
             const node_count = std.mem.readInt(u64, &u64_buf, .little);
+
+            // SEC-0044/SEC-0048: bound the per-label posting-list reservation
+            // against the bytes still available before reserving capacity.
+            if (node_count > remaining / NODE_RECORD_SIZE) return error.InvalidFormat;
 
             const gop = try self.index.getOrPut(label_id);
             if (!gop.found_existing) {
@@ -334,6 +349,87 @@ test "saveToFile + loadFromFile round-trip preserves posting lists" {
     const label_two = try loaded.scan(2, testing.allocator);
     defer testing.allocator.free(label_two);
     try testing.expectEqualSlices(NodeId, &[_]NodeId{99}, label_two);
+}
+
+// SEC-0044/SEC-0048: a tiny labels.idx that declares a huge label count must be
+// rejected with error.InvalidFormat rather than driving a giant reservation.
+test "loadFromFile rejects an oversized label_count (SEC-0044/0048)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
+    defer env.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try env.tmp_dir.dir.createFile(io, "labels.idx", .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var write_offset: u64 = 0;
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, std.math.maxInt(u64));
+    try file.writePositionalAll(io, &[_]u8{0}, write_offset);
+    write_offset += 1;
+    try index_snapshot_mod.finalizeChecksum(testing.allocator, file, write_offset);
+
+    var loaded = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer loaded.deinit();
+
+    try testing.expectError(error.InvalidFormat, loaded.loadFromFile(&file));
+}
+
+// SEC-0044/SEC-0048: a valid label header but an absurd per-label node_count
+// must be rejected before reserving the posting list.
+test "loadFromFile rejects an oversized node_count (SEC-0044/0048)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
+    defer env.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try env.tmp_dir.dir.createFile(io, "labels.idx", .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    var write_offset: u64 = 0;
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 1);
+    // One label: label_id=1, node_count=maxInt(u64) but no node bytes follow.
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 1, .little);
+    std.mem.writeInt(u64, buf[4..12], std.math.maxInt(u64), .little);
+    try file.writePositionalAll(io, &buf, write_offset);
+    write_offset += buf.len;
+    try index_snapshot_mod.finalizeChecksum(testing.allocator, file, write_offset);
+
+    var loaded = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer loaded.deinit();
+
+    try testing.expectError(error.InvalidFormat, loaded.loadFromFile(&file));
+}
+
+// SEC-0051: flipping one payload byte (header intact) must be rejected as a
+// checksum mismatch rather than silently loading corrupt data.
+test "loadFromFile rejects a flipped payload byte (SEC-0051)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
+    defer env.deinit();
+
+    var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer idx.deinit();
+
+    try idx.addNode(1, 10);
+    try idx.addNode(1, 20);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try env.tmp_dir.dir.createFile(io, "labels.idx", .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    try idx.saveToFile(&file, 42);
+
+    const payload_off: u64 = SNAPSHOT_MAGIC.len + index_snapshot_mod.HEADER_FIELDS_SIZE;
+    var orig: [1]u8 = undefined;
+    _ = try file.readPositionalAll(io, &orig, payload_off);
+    const flipped: [1]u8 = .{orig[0] ^ 0xFF};
+    try file.writePositionalAll(io, &flipped, payload_off);
+
+    var loaded = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer loaded.deinit();
+
+    try testing.expectError(error.ChecksumMismatch, loaded.loadFromFile(&file));
 }
 
 test "count returns correct value" {

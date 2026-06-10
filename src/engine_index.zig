@@ -14,7 +14,12 @@ const NodeId = types.NodeId;
 const NodeRec = node_mod.NodeRec;
 const GraphEngine = engine_mod.GraphEngine;
 const EdgeIndexEntry = engine_mod.EdgeIndexEntry;
-const EDGE_SNAPSHOT_MAGIC = "GSEIDX1\x00";
+// SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
+const EDGE_SNAPSHOT_MAGIC = "GSEIDX2\x00";
+
+// SEC-0044/SEC-0048: smallest bytes a single edge-index record consumes on disk
+// (edge_id u64 + from u64 + neighbor u64 + rel_type u32 + prop_head u32).
+const EDGE_RECORD_MIN_SIZE: usize = 8 + 8 + 8 + 4 + 4;
 
 /// Rebuild the in-memory label index by reading each live node's labels
 /// from the LabelStore (var.store-backed).
@@ -231,13 +236,18 @@ fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
         try file.writePositionalAll(io, &u32_buf, write_offset);
         write_offset += 4;
     }
+
+    // SEC-0051: append a CRC32 over the header + payload.
+    try index_snapshot_mod.finalizeChecksum(engine.allocator, file.*, write_offset);
 }
 
 fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
-    const snapshot = (try index_snapshot_mod.loadHeader(file, EDGE_SNAPSHOT_MAGIC)) orelse return null;
+    const snapshot = (try index_snapshot_mod.loadHeader(file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_MIN_SIZE)) orelse return null;
     var file_offset: u64 = EDGE_SNAPSHOT_MAGIC.len + 16;
     var remaining = snapshot.payload_size;
 
+    // SEC-0044/SEC-0048: item_count was bounded against payload_size in
+    // loadHeader, so this reservation cannot be driven past the available bytes.
     try engine.edge_index.ensureTotalCapacity(@intCast(snapshot.item_count));
 
     var u32_buf: [4]u8 = undefined;

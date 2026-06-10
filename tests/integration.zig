@@ -133,6 +133,73 @@ test "integration: full lifecycle — create graph, add data, checkpoint, close,
     }
 }
 
+// SEC-0051: a corrupted edges.idx snapshot must trigger an index rebuild from
+// the primary stores on open() rather than loading attacker-controlled bytes or
+// driving an OOM-sized reservation. After reopen the graph must be intact.
+test "integration: corrupt edges.idx snapshot triggers index rebuild (SEC-0051)" {
+    const allocator = std.testing.allocator;
+    const cfg = testConfig();
+    const uuid = [_]u8{0x4C} ** 16;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    var edges_idx_path: []u8 = undefined;
+    defer allocator.free(edges_idx_path);
+
+    // Phase 1: build a small graph, checkpoint (writes v2 .idx snapshots), close.
+    {
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        var node_ids: [4]NodeId = undefined;
+        for (0..4) |i| {
+            const nid = try eng.allocNode();
+            try eng.putNode(nid, makeNode(1));
+            node_ids[i] = nid;
+        }
+        _ = try eng.addEdge(node_ids[0], node_ids[1], 7);
+        _ = try eng.addEdge(node_ids[1], node_ids[2], 7);
+        _ = try eng.addEdge(node_ids[2], node_ids[3], 7);
+
+        edges_idx_path = try std.fmt.allocPrint(allocator, "{s}/edges.idx", .{eng.graph_dir.path});
+
+        try eng.checkpoint();
+        try eng.close();
+    }
+
+    // Corrupt one payload byte of the persisted edge index snapshot, leaving the
+    // magic + checkpoint_counter header intact so staleness gating still passes.
+    {
+        const io = gs_io();
+        const f = try std.Io.Dir.cwd().openFile(io, edges_idx_path, .{ .mode = .read_write });
+        defer f.close(io);
+        // magic(8) + checkpoint_counter(8) + item_count(8) = first payload byte at 24.
+        const payload_off: u64 = 24;
+        var orig: [1]u8 = undefined;
+        _ = try f.readPositionalAll(io, &orig, payload_off);
+        const flipped: [1]u8 = .{orig[0] ^ 0xFF};
+        try f.writePositionalAll(io, &flipped, payload_off);
+    }
+
+    // Phase 2: reopen — corrupt snapshot must be rejected and rebuilt.
+    {
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        try std.testing.expectEqual(@as(u64, 4), try eng.nodeCount());
+        try std.testing.expectEqual(@as(u64, 3), try eng.edgeCount());
+
+        // Edge index served the query correctly post-rebuild.
+        const edges_out = try eng.expandOut(1, null, allocator);
+        defer allocator.free(edges_out);
+        var found_neighbor_2 = false;
+        for (edges_out) |e| {
+            if (e.neighbor == 2) found_neighbor_2 = true;
+        }
+        try std.testing.expect(found_neighbor_2);
+    }
+}
+
 test "integration: GraphStorage vtable round-trip" {
     const allocator = std.testing.allocator;
     const uuid = [_]u8{0x20} ** 16;
