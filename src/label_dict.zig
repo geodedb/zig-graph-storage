@@ -125,14 +125,33 @@ pub const LabelDictionary = struct {
             const name_len = std.mem.readInt(u32, &u32_buf, .little);
 
             const owned = try self.allocator.alloc(u8, name_len);
+            // owned is freed here on any error before it is adopted into next.name_to_id.
             errdefer self.allocator.free(owned);
             try readTracked(&file, &file_offset, &remaining, &crc, owned);
 
             try readTracked(&file, &file_offset, &remaining, &crc, &u32_buf);
             const id = std.mem.readInt(u32, &u32_buf, .little);
 
-            try next.name_to_id.put(owned, id);
-            try next.id_to_name.put(id, owned);
+            // Reject duplicate names.  If found_existing the errdefer above
+            // frees owned because it was not inserted into name_to_id.
+            const name_gop = try next.name_to_id.getOrPut(owned);
+            if (name_gop.found_existing) return error.InvalidData;
+            name_gop.value_ptr.* = id;
+
+            // Reject duplicate ids.  owned is now in next.name_to_id, so
+            // next.deinit() will free it.  On this error path we remove owned
+            // from name_to_id first so that the local errdefer (not deinit)
+            // handles the free, preventing a double-free.
+            const id_gop = try next.id_to_name.getOrPut(id);
+            if (id_gop.found_existing) {
+                _ = next.name_to_id.remove(owned);
+                return error.InvalidData;
+            }
+            id_gop.value_ptr.* = owned;
+            // Single-owner invariant: owned is the key in name_to_id and the
+            // value in id_to_name; deinit frees only name_to_id keys, which
+            // covers both pointers because they alias the same allocation.
+
             if (id >= max_id) max_id = id + 1;
         }
 
@@ -273,6 +292,135 @@ test "save/load round-trip preserves all mappings" {
     // Verify next_id is correctly restored
     const new_id = try dict2.getOrAssign("NewLabel");
     try std.testing.expectEqual(@as(u32, 3), new_id);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build a raw labels.dict byte buffer from a slice of (name, id) pairs
+// and write it to a temp file using the std.Io.Dir API.
+// ---------------------------------------------------------------------------
+fn buildDictFile(
+    allocator: Allocator,
+    dir: std.Io.Dir,
+    filename: []const u8,
+    entries: []const struct { name: []const u8, id: u32 },
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const entry_count: u32 = @intCast(entries.len);
+    try appendU32(&buf, allocator, entry_count);
+
+    for (entries) |e| {
+        try appendU32(&buf, allocator, @intCast(e.name.len));
+        try buf.appendSlice(allocator, e.name);
+        try appendU32(&buf, allocator, e.id);
+    }
+
+    const crc = Crc32.hash(buf.items);
+    try appendU32(&buf, allocator, crc);
+
+    const f = try dir.createFile(io, filename, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, buf.items);
+}
+
+// SEC-0050 regression: duplicate name entries must be rejected (no leak).
+test "loadFromFile rejects duplicate name entries" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Two entries with the same name but different IDs.
+    try buildDictFile(allocator, tmp_dir.dir, "dup_name.dict", &.{
+        .{ .name = "Person", .id = 0 },
+        .{ .name = "Person", .id = 1 },
+    });
+
+    const dir_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir_path);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/dup_name.dict", .{dir_path});
+    defer allocator.free(file_path);
+
+    var dict = LabelDictionary.init(allocator);
+    defer dict.deinit();
+
+    try std.testing.expectError(error.InvalidData, dict.loadFromFile(file_path));
+    // dict must be empty — no partial state committed.
+    try std.testing.expectEqual(@as(u32, 0), dict.count());
+}
+
+// SEC-0050 regression: duplicate id entries must be rejected (no leak).
+test "loadFromFile rejects duplicate id entries" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Two distinct names mapped to the same ID.
+    try buildDictFile(allocator, tmp_dir.dir, "dup_id.dict", &.{
+        .{ .name = "Person", .id = 42 },
+        .{ .name = "Company", .id = 42 },
+    });
+
+    const dir_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir_path);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/dup_id.dict", .{dir_path});
+    defer allocator.free(file_path);
+
+    var dict = LabelDictionary.init(allocator);
+    defer dict.deinit();
+
+    try std.testing.expectError(error.InvalidData, dict.loadFromFile(file_path));
+    try std.testing.expectEqual(@as(u32, 0), dict.count());
+}
+
+// SEC-0050 regression: bad CRC must be rejected without retaining partial state.
+test "loadFromFile rejects bad CRC with no partial state" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Build a valid buffer then flip the last byte of the CRC to corrupt it.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const entries = [_]struct { name: []const u8, id: u32 }{
+        .{ .name = "Person", .id = 0 },
+        .{ .name = "Company", .id = 1 },
+    };
+    try appendU32(&buf, allocator, @intCast(entries.len));
+    for (entries) |e| {
+        try appendU32(&buf, allocator, @intCast(e.name.len));
+        try buf.appendSlice(allocator, e.name);
+        try appendU32(&buf, allocator, e.id);
+    }
+    const crc = Crc32.hash(buf.items);
+    try appendU32(&buf, allocator, crc);
+    // Corrupt the last byte of the stored CRC.
+    buf.items[buf.items.len - 1] ^= 0xFF;
+
+    const bad_file = try tmp_dir.dir.createFile(io, "bad_crc.dict", .{});
+    defer bad_file.close(io);
+    try bad_file.writeStreamingAll(io, buf.items);
+
+    const dir_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir_path);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/bad_crc.dict", .{dir_path});
+    defer allocator.free(file_path);
+
+    var dict = LabelDictionary.init(allocator);
+    defer dict.deinit();
+
+    try std.testing.expectError(error.ChecksumMismatch, dict.loadFromFile(file_path));
+    // No partial state should be committed after a CRC failure.
+    try std.testing.expectEqual(@as(u32, 0), dict.count());
 }
 
 test {
