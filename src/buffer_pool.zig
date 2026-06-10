@@ -4,6 +4,7 @@
 const std = @import("std");
 const tp = @import("thread_pool");
 const types = @import("types.zig");
+const page_mod = @import("page.zig");
 const page_frame_mod = @import("page_frame.zig");
 const pager_mod = @import("pager.zig");
 const metrics_mod = @import("metrics.zig");
@@ -387,6 +388,15 @@ pub const BufferPool = struct {
                 self.frames[item.frame_idx].dirty = true;
                 if (first_err == null) first_err = e;
             } else {
+                // SEC-0037: writePage incremented write_count in the per-flush
+                // copy (data_buf), not in the live cached frame. Propagate the
+                // persisted write_count back so a later flush of this still-cached
+                // page derives a strictly greater AES-GCM nonce. Only relevant
+                // when encryption is active for this page's pager.
+                if (item.pager.encryption != null) {
+                    const copy = data_buf[item.data_offset..][0..ps];
+                    page_mod.writeWriteCount(self.frames[item.frame_idx].dataSlice(), page_mod.readWriteCount(copy));
+                }
                 write_count += 1;
             }
         }
@@ -456,6 +466,15 @@ pub const BufferPool = struct {
             return err;
         };
         self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+
+        // SEC-0037: writePage incremented write_count in its private copy `buf`,
+        // not in the live cached frame. Propagate the persisted write_count back
+        // into the live frame so the next flush of this still-cached page derives
+        // a strictly greater AES-GCM nonce (nonce reuse otherwise). Only relevant
+        // when encryption is active; harmless but unnecessary in plaintext mode.
+        if (p.encryption != null) {
+            page_mod.writeWriteCount(frame.dataSlice(), page_mod.readWriteCount(buf[0..self.page_size]));
+        }
 
         // Allowed to be evicted again
         frame.pin_count -= 1;
@@ -618,7 +637,6 @@ fn cleanupTempFile(file: std.Io.File, name: []const u8) void {
 
 /// Write a page with known data pattern to a file via a pager.
 fn writeTestPage(p: *Pager, page_id: PageId, pattern: u8) !void {
-    const page_mod = @import("page.zig");
     const page_size = p.page_size;
     const allocator = testing.allocator;
     const buf = try allocator.alloc(u8, page_size);
@@ -651,7 +669,6 @@ test "pin and read: data matches what was written to disk" {
     pool.registerPager(.nodes, &p);
 
     const frame = try pool.pin(.nodes, 0);
-    const page_mod = @import("page.zig");
 
     // Verify body data matches the pattern we wrote
     const body = frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..];
@@ -699,7 +716,6 @@ test "unpin dirty: flush writes data to disk" {
     const frame_idx = pool.frameIndex(frame);
 
     // Modify data in the frame
-    const page_mod = @import("page.zig");
     @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0xFF);
 
     pool.unpin(frame_idx, true);
@@ -748,7 +764,6 @@ test "eviction: LRU tail is evicted when pool is full" {
     const f2 = try pool.pin(.nodes, 2);
     try testing.expect(f2.valid);
 
-    const page_mod = @import("page.zig");
     const body = f2.dataSlice()[page_mod.PAGE_HEADER_SIZE..];
     for (body) |byte| {
         try testing.expectEqual(@as(u8, 0xCC), byte);
@@ -1002,6 +1017,94 @@ test "GAP-0089: pin waits for an in-flight page load" {
     try testing.expectEqual(@as(u32, 2), frame.pin_count);
 
     pool.unpin(frame_idx, false);
+}
+
+test "SEC-0037: re-flushing a cached encrypted page advances on-disk write_count (no nonce reuse)" {
+    // Without the fix, flushFrame copies the frame before writePage increments
+    // write_count, so the live cached frame never advances. Re-flushing the same
+    // hot page across two checkpoints reuses write_count N+1 -> SAME AES-GCM nonce.
+    const file = try createTempFile(".test_bp_sec0037_seq");
+    defer cleanupTempFile(file, ".test_bp_sec0037_seq");
+
+    const encryption_mod = @import("encryption.zig");
+    const page_size: u32 = 4096;
+    const key = [_]u8{0x37} ** 32;
+    var p = Pager.init(file, page_size);
+    p.encryption = encryption_mod.PageEncryption.init(key);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Pin a fresh page (write_count starts at 0 in the zeroed frame).
+    const frame = try pool.pinNew(.nodes, 0);
+    const frame_idx = pool.frameIndex(frame);
+
+    // First modification + flush (the page stays cached -- doCheckpoint does NOT evict).
+    @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x11);
+    frame.dirty = true;
+    try pool.flushAll();
+
+    // Capture the persisted write_count from the raw on-disk header bytes.
+    var raw1: [4096]u8 = undefined;
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &raw1, 0);
+    const wc1 = page_mod.readWriteCount(&raw1);
+
+    // Second modification (DIFFERENT content) + flush, WITHOUT poking write_count.
+    @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x22);
+    frame.dirty = true;
+    try pool.flushAll();
+
+    var raw2: [4096]u8 = undefined;
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &raw2, 0);
+    const wc2 = page_mod.readWriteCount(&raw2);
+
+    // The on-disk write_count MUST strictly increase between the two flushes,
+    // otherwise the same (page_id, file_id, write_count) nonce is reused.
+    try testing.expect(wc2 > wc1);
+
+    _ = frame_idx;
+}
+
+test "SEC-0037: re-flushing a cached encrypted page advances write_count under parallel flush" {
+    // Same invariant as the sequential test, exercised through the ThreadPool
+    // path (flushAllParallel / flushChunkFn) which uses a separate copy buffer.
+    const encryption_mod = @import("encryption.zig");
+    const file = try createTempFile(".test_bp_sec0037_par");
+    defer cleanupTempFile(file, ".test_bp_sec0037_par");
+
+    const page_size: u32 = 4096;
+    const key = [_]u8{0x73} ** 32;
+    var p = Pager.init(file, page_size);
+    p.encryption = encryption_mod.PageEncryption.init(key);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    var thread_pool = try tp.ThreadPool.init(testing.allocator, .{ .max_threads = 2 });
+    defer thread_pool.deinit();
+    pool.setThreadPool(&thread_pool);
+
+    const frame = try pool.pinNew(.nodes, 0);
+
+    @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x33);
+    frame.dirty = true;
+    try pool.flushAll();
+
+    var raw1: [4096]u8 = undefined;
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &raw1, 0);
+    const wc1 = page_mod.readWriteCount(&raw1);
+
+    @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x44);
+    frame.dirty = true;
+    try pool.flushAll();
+
+    var raw2: [4096]u8 = undefined;
+    _ = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &raw2, 0);
+    const wc2 = page_mod.readWriteCount(&raw2);
+
+    try testing.expect(wc2 > wc1);
 }
 
 test {

@@ -95,6 +95,21 @@ pub const Pager = struct {
         try self.file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, offset);
     }
 
+    /// Read the persisted write_count for a page directly from its on-disk
+    /// header without decrypting the body. The write_count field stays
+    /// plaintext after encryptPage, so a positional read of the header bytes
+    /// is sufficient. Returns 0 if the page does not exist on disk yet.
+    ///
+    /// Used by recovery to prevent the AES-GCM nonce counter from regressing
+    /// below what was already persisted (SEC-0037).
+    pub fn readWriteCountOnDisk(self: *const Pager, page_id: PageId) !u24 {
+        var header_buf: [PAGE_HEADER_SIZE]u8 = undefined;
+        const offset: u64 = page_id * @as(u64, self.page_size);
+        const bytes_read = try self.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &header_buf, offset);
+        if (bytes_read < PAGE_HEADER_SIZE) return 0;
+        return page_mod.readWriteCount(&header_buf);
+    }
+
     /// Get the number of pages currently in the file (based on file size).
     pub fn pageCount(self: *const Pager) !u64 {
         const stat = try self.file.stat(std.Io.Threaded.global_single_threaded.io());

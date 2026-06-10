@@ -14,6 +14,7 @@ const wal_record_mod = @import("wal_record.zig");
 const types = @import("types.zig");
 const metrics_mod = @import("metrics.zig");
 const config_mod = @import("config.zig");
+const page_mod = @import("page.zig");
 
 const BufferPool = buffer_pool_mod.BufferPool;
 const WalManager = wal_mod.WalManager;
@@ -210,6 +211,7 @@ pub const Recovery = struct {
         const ReplayCtx = struct {
             txn_states: *const std.AutoHashMap(u64, TxnRecoveryState),
             buffer_pool: *BufferPool,
+            file_manager: *FileManager,
 
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 if (rec.record_type != .page_update) return;
@@ -227,6 +229,23 @@ pub const Recovery = struct {
                     @memcpy(data[0..copy_len], rec.payload[0..copy_len]);
                 }
 
+                // SEC-0037: pinNew zeroes the frame and the WAL payload carries
+                // the write_count as of log time, which may be LOWER than the
+                // write_count already persisted to the on-disk page by a flush
+                // that happened after the record was logged (then crashed). A
+                // later flush would otherwise reuse a nonce already used on disk
+                // with different plaintext. Seed the replayed frame's write_count
+                // to max(on-disk, logged) so the AES-GCM nonce counter never
+                // regresses. write_count stays plaintext in the header, so it can
+                // be read from the raw on-disk bytes without decrypting.
+                if (copy_len > page_mod.WRITE_COUNT_OFFSET) {
+                    if (ctx.file_manager.getPager(file_id)) |pager_ptr| {
+                        const on_disk_wc = pager_ptr.readWriteCountOnDisk(rec.page_id) catch 0;
+                        const logged_wc = page_mod.readWriteCount(data);
+                        page_mod.writeWriteCount(data, @max(on_disk_wc, logged_wc));
+                    }
+                }
+
                 ctx.buffer_pool.unpin(frame_idx, true);
             }
         };
@@ -234,6 +253,7 @@ pub const Recovery = struct {
         var replay_ctx = ReplayCtx{
             .txn_states = &txn_states,
             .buffer_pool = buffer_pool,
+            .file_manager = file_manager,
         };
         try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &replay_ctx, ReplayCtx.visit);
 
@@ -442,7 +462,6 @@ test "recovery with committed transaction: changes visible after recovery" {
 
     // Check if data was written (the page should have our 0xAB pattern)
     // The buffer pool flush may have computed checksums, so check body area
-    const page_mod = @import("page.zig");
     var all_match = true;
     for (read_buf[page_mod.PAGE_HEADER_SIZE..]) |byte| {
         if (byte != 0xAB) {
@@ -611,7 +630,6 @@ test "recovery with uncommitted transaction: changes discarded" {
     };
 
     // If the page exists, verify it's NOT our uncommitted 0xCD pattern
-    const page_mod = @import("page.zig");
     var has_uncommitted_data = true;
     for (read_buf[page_mod.PAGE_HEADER_SIZE..]) |byte| {
         if (byte != 0xCD) {
@@ -962,7 +980,6 @@ test "GAP-0005c: multiple concurrent transactions -- only committed data survive
 
     // Verify: committed txn 1 page data (page 1) was applied
     const pager_ptr = fm.getPager(.nodes).?;
-    const page_mod = @import("page.zig");
 
     var read_buf1: [4096]u8 = undefined;
     pager_ptr.readPage(1, &read_buf1) catch {
@@ -1095,7 +1112,6 @@ test "GAP-0005d: recovery with many pages (>100 page updates in WAL)" {
 
     // Spot-check a sample of the 120 pages to verify data was applied correctly
     const pager_ptr = fm.getPager(.nodes).?;
-    const page_mod = @import("page.zig");
 
     const check_pages = [_]u64{ 1, 50, 100, 119, 120 };
     for (check_pages) |pg| {
@@ -1370,7 +1386,6 @@ test "uncommitted transaction not applied during recovery" {
     // zero-initialized frame (no store file backing for page 1).
     // If recovery incorrectly replayed the uncommitted txn, the page would
     // contain 0xAA bytes.
-    const page_mod = @import("page.zig");
     _ = try fm.openFile(.nodes, .create_if_missing);
     pool.registerPager(.nodes, &fm.pagers[@intFromEnum(FileId.nodes)].?);
 
@@ -1388,6 +1403,129 @@ test "uncommitted transaction not applied during recovery" {
         }
     }
     try testing.expect(!found_aa);
+}
+
+test "SEC-0037: recovery does not regress on-disk write_count below the persisted value" {
+    // Models a crash where the on-disk page was flushed (advancing write_count
+    // to N) AFTER the corresponding page_update was logged to the WAL (whose
+    // payload carries a LOWER write_count). Naively replaying via pinNew would
+    // reset write_count to the logged value and a later flush would reuse a
+    // nonce already used on disk with different plaintext. Recovery must seed
+    // the replayed frame to max(on-disk, logged) so the counter never regresses.
+    const allocator = testing.allocator;
+    const encryption_mod = @import("encryption.zig");
+
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const key = [_]u8{0x37} ** 32;
+
+    // Write initial manifest
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    // Pre-flush the nodes store page 1 several times via an encryption-enabled
+    // pager so the persisted on-disk write_count reaches a high value (N).
+    // This simulates flushes that happened on the crashed run AFTER the
+    // page_update below was appended to the WAL.
+    const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{setup.graph_dir.path});
+    defer allocator.free(nodes_path);
+    const on_disk_write_count: u24 = blk: {
+        const store = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), nodes_path, .{
+            .read = true,
+            .truncate = true,
+        });
+        defer store.close(std.Io.Threaded.global_single_threaded.io());
+
+        var disk_pager = Pager.init(store, 4096);
+        disk_pager.encryption = encryption_mod.PageEncryption.init(key);
+        disk_pager.file_id = .nodes;
+
+        var buf: [4096]u8 = undefined;
+        @memset(&buf, 0);
+        const header = page_mod.initHeader(1, .node_data, 4096);
+        @memcpy(buf[0..page_mod.PAGE_HEADER_SIZE], page_mod.headerToBytes(&header));
+        // Distinct on-disk content (NOT the WAL payload pattern).
+        @memset(buf[page_mod.PAGE_HEADER_SIZE .. 4096 - encryption_mod.TAG_SIZE], 0x99);
+
+        // Each writePage increments write_count; do it 5 times.
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            try disk_pager.writePage(1, &buf);
+            // Re-stage plaintext for the next round (writePage encrypts in place).
+            @memset(&buf, 0);
+            @memcpy(buf[0..page_mod.PAGE_HEADER_SIZE], page_mod.headerToBytes(&header));
+            @memset(buf[page_mod.PAGE_HEADER_SIZE .. 4096 - encryption_mod.TAG_SIZE], 0x99);
+            // Carry forward the persisted write_count so the next write advances it.
+            var raw: [4096]u8 = undefined;
+            _ = try store.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &raw, 4096); // page 1 offset
+            page_mod.writeWriteCount(&buf, page_mod.readWriteCount(&raw));
+        }
+
+        var raw: [4096]u8 = undefined;
+        _ = try store.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &raw, 4096); // page 1 offset
+        break :blk page_mod.readWriteCount(&raw);
+    };
+    try testing.expect(on_disk_write_count >= 5);
+
+    // Build an encrypted WAL with a committed page_update for page 1. Its
+    // payload header carries write_count = 0 (the value as of log time), which
+    // is LOWER than the on-disk write_count established above.
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{ .encryption_key = key });
+
+    var begin_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin_rec);
+
+    var page_data: [4096]u8 = undefined;
+    @memset(&page_data, 0);
+    const wal_header = page_mod.initHeader(1, .node_data, 4096);
+    @memcpy(page_data[0..page_mod.PAGE_HEADER_SIZE], page_mod.headerToBytes(&wal_header));
+    @memset(page_data[page_mod.PAGE_HEADER_SIZE..], 0xAB); // different from on-disk 0x99
+    page_mod.writeWriteCount(&page_data, 0); // logged write_count is LOWER than on disk
+
+    var update_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = 0, .page_id = 1, .payload = &page_data, .checksum = 0 };
+    _ = try wal.appendRecord(&update_rec);
+
+    var commit_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&commit_rec);
+    try wal.sync();
+    wal.deinit();
+
+    // Run recovery with encryption enabled.
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    fm.encryption_key = key;
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, key);
+    defer recovery.deinit();
+    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // The post-replay on-disk write_count must be >= the previously persisted
+    // value (no regression). write_count is stored PLAINTEXT in the header, so
+    // it can be read from the raw on-disk bytes without decrypting.
+    const verify_pager = fm.getPager(.nodes).?;
+    var verify_raw: [4096]u8 = undefined;
+    _ = try verify_pager.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &verify_raw, 4096); // page 1 offset
+    const post_write_count = page_mod.readWriteCount(&verify_raw);
+    try testing.expect(post_write_count >= on_disk_write_count);
 }
 
 test {
