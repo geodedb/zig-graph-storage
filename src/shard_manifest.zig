@@ -87,32 +87,47 @@ pub fn readFromDir(allocator: Allocator, dir_path: []const u8) !ShardManifest {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidShardManifest;
     const root = parsed.value.object;
-    const version = @as(u32, @intCast(root.get("version").?.integer));
-    const shard_count = @as(u32, @intCast(root.get("shard_count").?.integer));
+
+    const version_node = root.get("version") orelse return error.InvalidShardManifest;
+    if (version_node != .integer) return error.InvalidShardManifest;
+    if (version_node.integer < 0 or version_node.integer > std.math.maxInt(u32))
+        return error.InvalidShardManifest;
+    const version = @as(u32, @intCast(version_node.integer));
+
+    const shard_count_node = root.get("shard_count") orelse return error.InvalidShardManifest;
+    if (shard_count_node != .integer) return error.InvalidShardManifest;
+    if (shard_count_node.integer < 0 or shard_count_node.integer > std.math.maxInt(u32))
+        return error.InvalidShardManifest;
+    const shard_count = @as(u32, @intCast(shard_count_node.integer));
 
     // Handle algorithm_hash which may be parsed as number_string for large values
-    const ah_value = root.get("algorithm_hash").?;
-    const algorithm_hash = if (ah_value == .integer)
-        @as(u64, @intCast(ah_value.integer))
-    else if (ah_value == .number_string)
-        try std.fmt.parseInt(u64, ah_value.number_string, 10)
+    const ah_value = root.get("algorithm_hash") orelse return error.InvalidShardManifest;
+    const algorithm_hash: u64 = if (ah_value == .integer) blk: {
+        if (ah_value.integer < 0) return error.InvalidShardManifest;
+        break :blk @as(u64, @intCast(ah_value.integer));
+    } else if (ah_value == .number_string)
+        std.fmt.parseInt(u64, ah_value.number_string, 10) catch return error.InvalidShardManifest
     else
-        return error.InvalidAlgorithmHash;
+        return error.InvalidShardManifest;
 
     if (version != SHARD_MANIFEST_VERSION) return error.ShardManifestVersionMismatch;
     if (shard_count != shard_count_mod.SHARD_COUNT) return error.ShardCountMismatch;
     if (algorithm_hash != SHARD_ALGORITHM_HASH) return error.ShardAlgorithmMismatch;
 
-    const arr = root.get("per_shard_uuids").?.array;
+    const uuids_node = root.get("per_shard_uuids") orelse return error.InvalidShardManifest;
+    if (uuids_node != .array) return error.InvalidShardManifest;
+    const arr = uuids_node.array;
     if (arr.items.len != shard_count_mod.SHARD_COUNT) return error.ShardCountMismatch;
 
     var per_shard: [shard_count_mod.SHARD_COUNT][16]u8 = undefined;
     for (arr.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidShardManifest;
         const hex = item.string;
         if (hex.len != 32) return error.InvalidShardUuid;
         var out: [16]u8 = undefined;
-        _ = try std.fmt.hexToBytes(&out, hex);
+        _ = std.fmt.hexToBytes(&out, hex) catch return error.InvalidShardManifest;
         per_shard[i] = out;
     }
 
@@ -173,4 +188,127 @@ test "readFromDir rejects wrong algorithm_hash" {
     };
     try sm.writeToDir(std.testing.allocator, path, bad);
     try std.testing.expectError(error.ShardAlgorithmMismatch, sm.readFromDir(std.testing.allocator, path));
+}
+
+/// Write raw bytes to `<dir>/shard_manifest.json` using the same Io API
+/// used by writeToDir, so malformed-JSON regression tests can inject
+/// arbitrary content without going through the normal serialisation path.
+fn writeRawManifest(dir_path: []const u8, content: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ dir_path, FILE_NAME });
+    defer std.testing.allocator.free(file_path);
+    const file = try std.Io.Dir.cwd().createFile(io, file_path, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
+}
+
+test "readFromDir rejects non-object root: integer literal" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try writeRawManifest(path, "5");
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
+}
+
+test "readFromDir rejects non-object root: array" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try writeRawManifest(path, "[]");
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
+}
+
+test "readFromDir rejects missing version key" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try writeRawManifest(path, "{\"shard_count\":16,\"algorithm_hash\":1,\"per_shard_uuids\":[]}");
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
+}
+
+test "readFromDir rejects string-typed version" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try writeRawManifest(path, "{\"version\":\"x\",\"shard_count\":16,\"algorithm_hash\":1,\"per_shard_uuids\":[]}");
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
+}
+
+test "readFromDir rejects negative version" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try writeRawManifest(path, "{\"version\":-1,\"shard_count\":16,\"algorithm_hash\":1,\"per_shard_uuids\":[]}");
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
+}
+
+test "readFromDir rejects version > maxInt(u32)" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try writeRawManifest(path, "{\"version\":4294967296,\"shard_count\":16,\"algorithm_hash\":1,\"per_shard_uuids\":[]}");
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
+}
+
+test "readFromDir rejects per_shard_uuids not an array" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"shard_count\":16,\"algorithm_hash\":{d},\"per_shard_uuids\":\"bad\"}}",
+        .{sm.SHARD_ALGORITHM_HASH},
+    );
+    defer std.testing.allocator.free(payload);
+    try writeRawManifest(path, payload);
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
+}
+
+test "readFromDir rejects non-string element in per_shard_uuids" {
+    const sm = @import("shard_manifest.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    // Provide exactly 16 elements; the last one is an integer (42) instead of
+    // a hex string so the per-element type guard fires rather than the
+    // length check.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const header = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"shard_count\":16,\"algorithm_hash\":{d},\"per_shard_uuids\":[",
+        .{sm.SHARD_ALGORITHM_HASH},
+    );
+    defer std.testing.allocator.free(header);
+    try buf.appendSlice(std.testing.allocator, header);
+    const valid_uuid = "\"00000000000000000000000000000000\",";
+    for (0..15) |_| try buf.appendSlice(std.testing.allocator, valid_uuid);
+    try buf.appendSlice(std.testing.allocator, "42]}");
+    try writeRawManifest(path, buf.items);
+    try std.testing.expectError(error.InvalidShardManifest, sm.readFromDir(std.testing.allocator, path));
 }
