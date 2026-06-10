@@ -148,6 +148,87 @@ pub const PropStore = struct {
         return self.page_size - PROP_DATA_OFFSET - DIR_COUNT_SIZE - self.tail_reserve;
     }
 
+    /// QUAL-0040: Inter-page walk over a property page chain.
+    ///
+    /// Owns the single source of truth for the cross-page traversal scaffold
+    /// that was previously duplicated across getProperty, findAndRemoveKey,
+    /// insertEntry and removeProperty:
+    ///   - pin/unpin discipline (one pinned frame at a time, balanced on exit),
+    ///   - the MAX_CHAIN_HOPS guard (→ error.CircularChainDetected),
+    ///   - readNextPage to advance the chain,
+    ///   - the readEntryCountChecked → error.DataCorruption mapping.
+    ///
+    /// Callers retain only the op-specific intra-page logic. Each `next()` pins
+    /// the next page and returns its logical slice plus metadata; the caller
+    /// must call `unpinCurrent(dirty)` before the following `next()`. `deinit()`
+    /// guarantees the last frame is released even on an early return.
+    ///
+    /// **Lifetime:** the `data` slice in a returned `Page` points into the
+    /// pinned frame and is invalidated by `unpinCurrent`/`next`/`deinit`.
+    const PageChainCursor = struct {
+        store: *PropStore,
+        /// The next page id to pin; 0 means the chain is exhausted.
+        pending_page: PageId,
+        hops: u32 = 0,
+        current_frame_idx: ?u32 = null,
+
+        const Page = struct {
+            data: []u8,
+            frame_idx: u32,
+            page_id: PageId,
+            next_page: PageId,
+            entry_count: u32,
+        };
+
+        fn init(store: *PropStore, head: PageId) PageChainCursor {
+            return .{ .store = store, .pending_page = head };
+        }
+
+        /// Pin and return the next page in the chain, or null at chain end.
+        /// The caller must have already unpinned the previous page (via
+        /// unpinCurrent); a debug assert enforces this invariant.
+        fn next(self: *PageChainCursor) !?Page {
+            std.debug.assert(self.current_frame_idx == null);
+            if (self.pending_page == 0) return null;
+            if (self.hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
+            self.hops += 1;
+
+            const page_id = self.pending_page;
+            const frame = try self.store.buffer_pool.pin(.props, page_id);
+            const frame_idx = self.store.buffer_pool.frameIndex(frame);
+            const data = self.store.logical(frame.dataSlice());
+
+            const next_page = readNextPage(data);
+            const entry_count = readEntryCountChecked(data, self.store.page_size) catch {
+                self.store.buffer_pool.unpin(frame_idx, false);
+                return error.DataCorruption;
+            };
+
+            self.current_frame_idx = frame_idx;
+            self.pending_page = next_page;
+            return .{
+                .data = data,
+                .frame_idx = frame_idx,
+                .page_id = page_id,
+                .next_page = next_page,
+                .entry_count = entry_count,
+            };
+        }
+
+        /// Release the currently pinned page, marking it dirty when requested.
+        fn unpinCurrent(self: *PageChainCursor, dirty: bool) void {
+            if (self.current_frame_idx) |idx| {
+                self.store.buffer_pool.unpin(idx, dirty);
+                self.current_frame_idx = null;
+            }
+        }
+
+        /// Release any still-pinned page; safe to call unconditionally.
+        fn deinit(self: *PageChainCursor) void {
+            self.unpinCurrent(false);
+        }
+    };
+
     /// Get a property value by key from a property page chain.
     /// Returns null if not found.
     ///
@@ -157,23 +238,14 @@ pub const PropStore = struct {
     pub fn getProperty(self: *PropStore, prop_head: u64, key: []const u8, allocator: Allocator) !?PropertyValue {
         if (prop_head == 0) return null;
 
-        var current_page: PageId = prop_head;
-        var chain_hops: u32 = 0;
-        while (current_page != 0) : (chain_hops += 1) {
-            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
-            const frame = try self.buffer_pool.pin(.props, current_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = self.logical(frame.dataSlice());
-
-            const next_page = readNextPage(data);
-            const entry_count = readEntryCountChecked(data, self.page_size) catch {
-                self.buffer_pool.unpin(frame_idx, false);
-                return error.DataCorruption;
-            };
+        var cursor = PageChainCursor.init(self, prop_head);
+        defer cursor.deinit();
+        while (try cursor.next()) |page| {
+            const data = page.data;
 
             // PERF-0023: Try directory-based lookup first.
             const dir_count = readDirCountChecked(data) catch {
-                self.buffer_pool.unpin(frame_idx, false);
+                cursor.unpinCurrent(false);
                 return error.DataCorruption;
             };
             if (dir_count > 0) {
@@ -191,7 +263,7 @@ pub const PropStore = struct {
                                 if (std.mem.eql(u8, entry_key, key)) {
                                     const val_start = off + 2 + key_len;
                                     const decode_result = try property_mod.decode(allocator, data[val_start..]);
-                                    self.buffer_pool.unpin(frame_idx, false);
+                                    cursor.unpinCurrent(false);
                                     return decode_result.value;
                                 }
                             }
@@ -201,15 +273,14 @@ pub const PropStore = struct {
                 }
                 // If directory was present but key not found, skip to next page
                 // (no need to linear-scan since directory is authoritative).
-                self.buffer_pool.unpin(frame_idx, false);
-                current_page = next_page;
+                cursor.unpinCurrent(false);
                 continue;
             }
 
             // Legacy path: linear scan when dir_count == 0.
             var offset: u32 = PROP_DATA_OFFSET;
             var i: u32 = 0;
-            while (i < entry_count) : (i += 1) {
+            while (i < page.entry_count) : (i += 1) {
                 if (offset + 2 > data.len) return error.DataCorruption;
                 const key_len = std.mem.bytesToValue(u16, data[offset..][0..2]);
                 offset += 2;
@@ -220,7 +291,7 @@ pub const PropStore = struct {
                 if (std.mem.eql(u8, entry_key, key)) {
                     // Found it — decode the value
                     const decode_result = try property_mod.decode(allocator, data[offset..]);
-                    self.buffer_pool.unpin(frame_idx, false);
+                    cursor.unpinCurrent(false);
                     return decode_result.value;
                 }
 
@@ -229,8 +300,7 @@ pub const PropStore = struct {
                 offset += @intCast(val_size);
             }
 
-            self.buffer_pool.unpin(frame_idx, false);
-            current_page = next_page;
+            cursor.unpinCurrent(false);
         }
 
         return null;
@@ -388,23 +458,14 @@ pub const PropStore = struct {
         encoded_val: []const u8,
         entry_size: u32,
     ) !?u64 {
-        var current_page: PageId = prop_head;
-        var chain_hops: u32 = 0;
-        while (current_page != 0) : (chain_hops += 1) {
-            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
-            const frame = try self.buffer_pool.pin(.props, current_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = self.logical(frame.dataSlice());
+        var cursor = PageChainCursor.init(self, prop_head);
+        defer cursor.deinit();
+        while (try cursor.next()) |page| {
+            const data = page.data;
 
-            const next_page = readNextPage(data);
-            var entry_count = readEntryCountChecked(data, self.page_size) catch {
-                self.buffer_pool.unpin(frame_idx, false);
-                return error.DataCorruption;
-            };
-
-            if (try self.findEntrySpan(data, entry_count, key)) |span| {
-                const removal = try self.removeEntryAt(data, entry_count, span);
-                entry_count = removal.entry_count;
+            if (try self.findEntrySpan(data, page.entry_count, key)) |span| {
+                const removal = try self.removeEntryAt(data, page.entry_count, span);
+                const entry_count = removal.entry_count;
 
                 // PERF-0021: Check if freed space is enough for the new entry.
                 const used_after_remove = removal.new_end - PROP_DATA_OFFSET;
@@ -414,19 +475,18 @@ pub const PropStore = struct {
                     self.writePropertyEntry(data, removal.new_end, key, encoded_val);
                     writeEntryCount(data, entry_count + 1);
                     rebuildDirectory(data, entry_count + 1, self.page_size);
-                    self.buffer_pool.unpin(frame_idx, true);
+                    cursor.unpinCurrent(true);
                     return prop_head;
                 }
 
                 writeEntryCount(data, entry_count);
                 rebuildDirectory(data, entry_count, self.page_size);
-                self.buffer_pool.unpin(frame_idx, true);
+                cursor.unpinCurrent(true);
 
                 // Key removed but page too full; caller needs Pass 2.
                 return null;
             } else {
-                self.buffer_pool.unpin(frame_idx, false);
-                current_page = next_page;
+                cursor.unpinCurrent(false);
                 continue;
             }
         }
@@ -443,39 +503,30 @@ pub const PropStore = struct {
         encoded_val: []const u8,
         entry_size: u32,
     ) !u64 {
-        var current_page: PageId = prop_head;
-        var chain_hops: u32 = 0;
-        while (current_page != 0) : (chain_hops += 1) {
-            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
-            const frame = try self.buffer_pool.pin(.props, current_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = self.logical(frame.dataSlice());
+        var cursor = PageChainCursor.init(self, prop_head);
+        defer cursor.deinit();
+        while (try cursor.next()) |page| {
+            const data = page.data;
 
-            const next_page = readNextPage(data);
-            const entry_count = readEntryCountChecked(data, self.page_size) catch {
-                self.buffer_pool.unpin(frame_idx, false);
-                return error.DataCorruption;
-            };
-
-            const used = try self.usedBytes(data, entry_count);
-            const new_dir_size = @as(u32, entry_count + 1) * DIR_ENTRY_SIZE;
+            const used = try self.usedBytes(data, page.entry_count);
+            const new_dir_size = @as(u32, page.entry_count + 1) * DIR_ENTRY_SIZE;
             const available = self.dataCapacity() -| (used + new_dir_size);
 
             if (available >= entry_size) {
                 const write_offset = PROP_DATA_OFFSET + used;
                 self.writePropertyEntry(data, write_offset, key, encoded_val);
-                writeEntryCount(data, entry_count + 1);
+                writeEntryCount(data, page.entry_count + 1);
 
                 // PERF-0038: Append a single directory entry.
-                const new_count: u16 = @intCast(entry_count + 1);
+                const new_count: u16 = @intCast(page.entry_count + 1);
                 writeDirCount(data, new_count);
-                writeDirEntry(data, @intCast(entry_count), keyHash(key), @intCast(write_offset));
+                writeDirEntry(data, @intCast(page.entry_count), keyHash(key), @intCast(write_offset));
 
-                self.buffer_pool.unpin(frame_idx, true);
+                cursor.unpinCurrent(true);
                 return prop_head;
             }
 
-            if (next_page == 0) {
+            if (page.next_page == 0) {
                 // Allocate overflow page.
                 const new_page = try self.free_space.allocPage();
                 const new_frame = try self.buffer_pool.pinNew(.props, new_page);
@@ -491,13 +542,14 @@ pub const PropStore = struct {
 
                 self.buffer_pool.unpin(new_frame_idx, true);
 
+                // Link the freshly allocated overflow page onto the current
+                // page's tail; the cursor still holds the current frame pinned.
                 writeNextPage(data, new_page);
-                self.buffer_pool.unpin(frame_idx, true);
+                cursor.unpinCurrent(true);
                 return prop_head;
             }
 
-            self.buffer_pool.unpin(frame_idx, false);
-            current_page = next_page;
+            cursor.unpinCurrent(false);
         }
 
         return error.DataCorruption;
@@ -508,30 +560,20 @@ pub const PropStore = struct {
     pub fn removeProperty(self: *PropStore, prop_head: u64, key: []const u8) !void {
         if (prop_head == 0) return;
 
-        var current_page: PageId = prop_head;
-        var chain_hops: u32 = 0;
-        while (current_page != 0) : (chain_hops += 1) {
-            if (chain_hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
-            const frame = try self.buffer_pool.pin(.props, current_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = self.logical(frame.dataSlice());
+        var cursor = PageChainCursor.init(self, prop_head);
+        defer cursor.deinit();
+        while (try cursor.next()) |page| {
+            const data = page.data;
 
-            const next_page = readNextPage(data);
-            const entry_count = readEntryCountChecked(data, self.page_size) catch {
-                self.buffer_pool.unpin(frame_idx, false);
-                return error.DataCorruption;
-            };
-
-            if (try self.findEntrySpan(data, entry_count, key)) |span| {
-                const removal = try self.removeEntryAt(data, entry_count, span);
+            if (try self.findEntrySpan(data, page.entry_count, key)) |span| {
+                const removal = try self.removeEntryAt(data, page.entry_count, span);
                 writeEntryCount(data, removal.entry_count);
                 rebuildDirectory(data, removal.entry_count, self.page_size);
-                self.buffer_pool.unpin(frame_idx, true);
+                cursor.unpinCurrent(true);
                 return;
             }
 
-            self.buffer_pool.unpin(frame_idx, false);
-            current_page = next_page;
+            cursor.unpinCurrent(false);
         }
     }
 
@@ -1236,6 +1278,245 @@ test "SEC-0039: getProperty returns DataCorruption when dir_count just exceeds c
     env.pool().unpin(frame_idx, true);
 
     try testing.expectError(error.DataCorruption, store.getProperty(head, "k", testing.allocator));
+}
+
+// ============================================================================
+// QUAL-0044: Overflow-page-chain behavior-preservation tests
+//
+// All other prop_store tests use single pages where next_page is always 0.
+// These tests force a multi-page property chain (next_page != 0) and exercise
+// the full inter-page walk across getProperty, findAndRemoveKey/insertEntry
+// (via putProperty), and removeProperty, asserting correctness and the absence
+// of pinned-frame leaks (enforced by std.testing.allocator on env.deinit()).
+// ============================================================================
+
+/// Walk a property page chain and count how many physical pages it spans.
+fn chainPageCount(env: *PropTestEnv, head: u64) !u32 {
+    var current: u64 = head;
+    var count: u32 = 0;
+    while (current != 0) : (count += 1) {
+        const frame = try env.pool().pin(.props, current);
+        const frame_idx = env.pool().frameIndex(frame);
+        const next = readNextPage(frame.dataSlice());
+        env.pool().unpin(frame_idx, false);
+        current = next;
+    }
+    return count;
+}
+
+test "QUAL-0044: property overflow chain round-trips across multiple pages" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    // Insert enough distinct properties to spill the chain onto at least a
+    // second page. Each entry is keyN (~6-8 bytes) + a moderately sized string
+    // value, so a few dozen entries exceed a single 4096-byte page's capacity.
+    const n: usize = 300;
+    var key_buf: [32]u8 = undefined;
+    var head: u64 = 0;
+    var idx: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{idx});
+        head = try store.putProperty(head, key, .{ .int = @intCast(idx * 7 + 1) });
+    }
+    try testing.expect(head != 0);
+
+    // Confirm the chain actually spilled onto more than one page; otherwise the
+    // test would not exercise the inter-page walk it is meant to protect.
+    const pages = try chainPageCount(&env, head);
+    try testing.expect(pages >= 2);
+
+    // Read every property back, including ones that must live on non-head pages.
+    idx = 0;
+    while (idx < n) : (idx += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{idx});
+        const val = try store.getProperty(head, key, testing.allocator);
+        try testing.expect(val != null);
+        try testing.expectEqual(@as(i64, @intCast(idx * 7 + 1)), val.?.int);
+    }
+
+    // Read a key that is guaranteed to be on a non-head page (a late index)
+    // and one on the head page (an early index) to assert both ends explicitly.
+    {
+        const late = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{n - 1});
+        const v_late = try store.getProperty(head, late, testing.allocator);
+        try testing.expect(v_late != null);
+        try testing.expectEqual(@as(i64, @intCast((n - 1) * 7 + 1)), v_late.?.int);
+    }
+    {
+        const early = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{0});
+        const v_early = try store.getProperty(head, early, testing.allocator);
+        try testing.expect(v_early != null);
+        try testing.expectEqual(@as(i64, 1), v_early.?.int);
+    }
+
+    // getProperty for a key not present anywhere must walk the whole chain and
+    // return null.
+    const missing = try store.getProperty(head, "no_such_key_at_all", testing.allocator);
+    try testing.expect(missing == null);
+}
+
+test "QUAL-0044: find+remove and re-insert a key on a non-head page" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const n: usize = 300;
+    var key_buf: [32]u8 = undefined;
+    var head: u64 = 0;
+    var idx: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{idx});
+        head = try store.putProperty(head, key, .{ .int = @intCast(idx) });
+    }
+    try testing.expect(try chainPageCount(&env, head) >= 2);
+
+    // Replace a late key (which lives on a non-head page). This goes through
+    // findAndRemoveKey on a non-head page; either the in-place fast path or the
+    // remove-then-insert path must keep the value correct.
+    const target = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{n - 5});
+    const target_owned = try testing.allocator.dupe(u8, target);
+    defer testing.allocator.free(target_owned);
+    head = try store.putProperty(head, target_owned, .{ .int = 123456 });
+
+    const replaced = try store.getProperty(head, target_owned, testing.allocator);
+    try testing.expect(replaced != null);
+    try testing.expectEqual(@as(i64, 123456), replaced.?.int);
+
+    // All other late keys remain intact.
+    const neighbor = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{n - 6});
+    const v_neighbor = try store.getProperty(head, neighbor, testing.allocator);
+    try testing.expect(v_neighbor != null);
+    try testing.expectEqual(@as(i64, @intCast(n - 6)), v_neighbor.?.int);
+
+    // Replacing must not duplicate: exactly n entries remain across the chain.
+    var iter = store.getAllProperties(head);
+    defer iter.deinit();
+    var count: usize = 0;
+    while (try iter.next()) |_| count += 1;
+    try testing.expectEqual(n, count);
+}
+
+test "QUAL-0044: insert allocates a fresh overflow page when chain is full" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const n: usize = 300;
+    var key_buf: [32]u8 = undefined;
+    var head: u64 = 0;
+    var idx: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{idx});
+        head = try store.putProperty(head, key, .{ .int = @intCast(idx) });
+    }
+    const pages_before = try chainPageCount(&env, head);
+    try testing.expect(pages_before >= 2);
+
+    // Insert a large value that cannot fit into remaining slack on any existing
+    // page, forcing insertEntry to allocate a brand-new overflow page at the
+    // chain tail.
+    const big_value = "x" ** 3000;
+    head = try store.putProperty(head, "huge_overflow_key", .{ .string = big_value });
+
+    const pages_after = try chainPageCount(&env, head);
+    try testing.expect(pages_after > pages_before);
+
+    const v = try store.getProperty(head, "huge_overflow_key", testing.allocator);
+    try testing.expect(v != null);
+    defer property_mod.freeDecoded(testing.allocator, v.?);
+    try testing.expectEqualStrings(big_value, v.?.string);
+}
+
+test "QUAL-0044: removeProperty removes a key on a non-head page" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const n: usize = 300;
+    var key_buf: [32]u8 = undefined;
+    var head: u64 = 0;
+    var idx: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{idx});
+        head = try store.putProperty(head, key, .{ .int = @intCast(idx) });
+    }
+    try testing.expect(try chainPageCount(&env, head) >= 2);
+
+    // Remove a late key (on a non-head page) and a head-page key.
+    const late = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{n - 3});
+    const late_owned = try testing.allocator.dupe(u8, late);
+    defer testing.allocator.free(late_owned);
+    try store.removeProperty(head, late_owned);
+
+    const gone = try store.getProperty(head, late_owned, testing.allocator);
+    try testing.expect(gone == null);
+
+    try store.removeProperty(head, "property_key_0000");
+    const gone_head = try store.getProperty(head, "property_key_0000", testing.allocator);
+    try testing.expect(gone_head == null);
+
+    // Surviving keys are still retrievable with correct values.
+    const survivor = try std.fmt.bufPrint(&key_buf, "property_key_{d:0>4}", .{n - 4});
+    const v_survivor = try store.getProperty(head, survivor, testing.allocator);
+    try testing.expect(v_survivor != null);
+    try testing.expectEqual(@as(i64, @intCast(n - 4)), v_survivor.?.int);
+
+    // Exactly two entries were removed.
+    var iter = store.getAllProperties(head);
+    defer iter.deinit();
+    var count: usize = 0;
+    while (try iter.next()) |_| count += 1;
+    try testing.expectEqual(n - 2, count);
+}
+
+test "QUAL-0040: PageChainCursor detects circular chain in getProperty" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const head = try store.putProperty(0, "key", .{ .int = 42 });
+
+    // Corrupt next_page into a self-loop so the inter-page walk never terminates
+    // naturally; the cursor's MAX_CHAIN_HOPS guard must fire.
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
+    writeNextPage(frame.dataSlice(), head);
+    env.pool().unpin(frame_idx, true);
+
+    // A search for a missing key keeps advancing through the self-loop until the
+    // guard fires (the present key short-circuits, so use a missing key).
+    try testing.expectError(
+        error.CircularChainDetected,
+        store.getProperty(head, "missing", testing.allocator),
+    );
+}
+
+test "QUAL-0040: PageChainCursor detects circular chain in removeProperty" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const head = try store.putProperty(0, "key", .{ .int = 42 });
+
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
+    writeNextPage(frame.dataSlice(), head);
+    env.pool().unpin(frame_idx, true);
+
+    // Removing a missing key forces the walk to traverse the whole (looping)
+    // chain, so the guard must trip rather than spinning forever.
+    try testing.expectError(
+        error.CircularChainDetected,
+        store.removeProperty(head, "missing"),
+    );
 }
 
 // ============================================================================
