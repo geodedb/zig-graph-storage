@@ -25,6 +25,7 @@
 ### Task 1: Define B+tree page layout
 
 **Files:**
+
 - Modify: `src/page.zig`
 
 - [ ] **Step 1: Define B+tree page body layout**
@@ -50,6 +51,7 @@ pub const BTREE_NODE_HEADER_SIZE = 1 + 2 + 8 + 8; // 19 bytes
 ### Task 2: Implement B+tree node serialization
 
 **Files:**
+
 - Create: `src/btree_pager.zig`
 
 - [ ] **Step 1: Write test for leaf node round-trip**
@@ -77,6 +79,7 @@ Functions that pack/unpack leaf node data into a page-sized buffer.
 ### Task 3: Implement page-backed B+tree operations
 
 **Files:**
+
 - Modify: `src/btree_pager.zig`
 
 - [ ] **Step 1: Write test for insert + lookup through pages**
@@ -101,6 +104,7 @@ When a node overflows, allocate a new page from free_space, split entries, updat
 ### Task 4: Wire into engine checkpoint/recovery
 
 **Files:**
+
 - Modify: `src/engine.zig`, `src/index_catalog.zig`
 
 - [ ] **Step 1: Store btree root page_id in IndexCatalog/manifest**

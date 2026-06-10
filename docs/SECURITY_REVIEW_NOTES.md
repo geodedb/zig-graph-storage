@@ -78,8 +78,8 @@ All scan outputs were written under `/tmp/security-review-20260407/`.
 | `SEMGREP_SEND_METRICS=off semgrep scan --config p/default --metrics=off --json -o /tmp/security-review-20260407/semgrep-pdefault.json .` | clean | `results: 0` | `/tmp/security-review-20260407/semgrep-pdefault.json` |
 | `bandit -r . -f json -o /tmp/security-review-20260407/bandit.json` | clean | no Python findings in this Zig repo | `/tmp/security-review-20260407/bandit.json` |
 | `checkov -d . -o json > /tmp/security-review-20260407/checkov.json` | clean | no failed checks; JSON output was a two-entry result array | `/tmp/security-review-20260407/checkov.json` |
-| `git ls-files '*.sh' | xargs -r shellcheck -x` | clean | no tracked shell issues | `/tmp/security-review-20260407/shellcheck.txt` |
-| `git ls-files '*Dockerfile*' | xargs -r hadolint` | clean | repo has no tracked Dockerfiles | `/tmp/security-review-20260407/hadolint.txt` |
+| `git ls-files '*.sh' \| xargs -r shellcheck -x` | clean | no tracked shell issues | `/tmp/security-review-20260407/shellcheck.txt` |
+| `git ls-files '*Dockerfile*' \| xargs -r hadolint` | clean | repo has no tracked Dockerfiles | `/tmp/security-review-20260407/hadolint.txt` |
 
 Not applicable in this repo layout:
 
@@ -97,7 +97,7 @@ Not applicable in this repo layout:
   - `glab api "projects/devnw%2Fzig%2Fgraph-storage/approvals" | jq '{approvals_before_merge,reset_approvals_on_push}'`
   - Output: `{"approvals_before_merge":0,"reset_approvals_on_push":true}`
   - `glab api "projects/devnw%2Fzig%2Fgraph-storage/protected_branches?per_page=100" | jq -r '.[] | [.name, (.allow_force_push|tostring)] | @tsv'`
-  - Output included `main	true`
+  - Output included `main true`
 - Verified code-level fail-open recovery behavior:
   - `src/wal.zig:107-145` drops deserialize failures with `catch continue`
   - `src/recovery.zig:169-183` skips checksum-invalid WAL records

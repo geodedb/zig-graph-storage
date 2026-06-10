@@ -1,18 +1,31 @@
 # Gap Analysis
 
-Last updated: 2026-04-07
+Last updated: 2026-06-10
 
-This file is the authoritative close-out record for the 2026-04-07 gap
-closure pass.
+This file is the close-out record for the gap closure passes. It was first
+written for the 2026-04-07 pass and updated during the 2026-06-10 Phase 4
+tracking sync, which verified a further batch Implemented at HEAD (`eca7466`)
+and moved them to `docs/GAP_ANALYSIS_RESOLVED.md`. GitLab issues are the
+authoritative source of truth; this file mirrors them.
 
 ## Summary
 
+The counts below cover the dispositions recorded in this file. The full set of
+resolved/invalidated gap IDs lives in `docs/GAP_ANALYSIS_RESOLVED.md`, and the
+live open gaps are tracked in GitLab.
+
 | Status | Count |
 | --- | ---: |
-| Closed | 7 |
+| Closed (2026-06-10 verified Implemented) | 6 |
+| Closed (2026-04-07 pass) | 7 |
 | Blocked | 2 |
 | Won't Do | 1 |
-| Open | 0 |
+| Open (this file) | 0 |
+
+Open requirement/gap IDs in GitLab as of 2026-06-10: `GAP-0002` (#40),
+`GAP-0017` (#41), `GAP-0023` (#43), `GAP-0025` (#44), `GAP-0027` (#45),
+`GAP-0031` (#47), `GAP-0033` (#49), `GAP-0038` (#77), `GAP-0039` (#78),
+`GAP-0043` (#93), `GAP-0044` (#94), `GAP-0048` (#107).
 
 ## Future Agent Notes
 
@@ -23,6 +36,29 @@ closure pass.
 - GitLab CI is the authoritative merge gate. Local pre-commit hooks are
   intentionally a fast subset and are tracked separately in
   `docs/QUALITY_GAP_ANALYSIS.md`.
+- `GAP-0030` (#46) stays closed. Single-engine recovery streams the WAL tail;
+  the sharded path still materializes the full per-shard WAL at
+  `src/sharded_recovery.zig:53,98` (`eng.wal.readFrom(0, allocator)`). That
+  residual is a performance/memory concern tracked by the performance tracker
+  as `PERF-0051`, not a correctness regression — do not reopen `GAP-0030` for it.
+
+## 2026-06-10 Phase 4 tracking sync
+
+Verified Implemented at HEAD (`eca7466`); full suite green
+(`zig build test` 443/444 with 1 Windows-skip, `test-integration` 14/14,
+`test-fuzz-regression` 3/3, 464 total). Closed and moved to
+`docs/GAP_ANALYSIS_RESOLVED.md`:
+
+- `GAP-0018` ([#42](https://gitlab.com/devnw/zig/graph-storage/-/work_items/42)) — legacy read-only policy wired through `GraphEngine.open()`.
+- `GAP-0032` ([#48](https://gitlab.com/devnw/zig/graph-storage/-/work_items/48)) — restore requires an authoritative expected graph UUID.
+- `GAP-0042` ([#92](https://gitlab.com/devnw/zig/graph-storage/-/work_items/92)) — verify validates WAL/auxiliary artifacts, no longer treats missing files as clean.
+- `GAP-0045` ([#104](https://gitlab.com/devnw/zig/graph-storage/-/work_items/104)) — recovery fails closed on malformed/checksum-invalid WAL records.
+- `GAP-0046` ([#105](https://gitlab.com/devnw/zig/graph-storage/-/work_items/105)) — open/recovery no longer auto-create missing durable artifacts.
+- `GAP-0047` ([#106](https://gitlab.com/devnw/zig/graph-storage/-/work_items/106)) — restore rejects CRC-only V1 backups by default.
+
+The detailed dispositions for `GAP-0018`, `GAP-0032`, `GAP-0042`, `GAP-0045`,
+`GAP-0046`, and `GAP-0047` recorded under "Disposition" below remain accurate
+and are retained for historical continuity.
 
 ## Disposition
 

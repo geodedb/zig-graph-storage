@@ -268,6 +268,7 @@ graph TB
 ```
 
 **Key properties:**
+
 - Pin/unpin reference counting prevents eviction of in-use pages
 - Dirty flag tracks frames needing write-back at checkpoint
 - LRU eviction ensures the working set stays in memory

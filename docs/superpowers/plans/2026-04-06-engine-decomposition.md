@@ -28,6 +28,7 @@ Tests remain inline in each extracted file, or move to a shared `tests/engine_te
 ### Task 1: Extract edge-property methods to `engine_edge_props.zig`
 
 **Files:**
+
 - Create: `src/engine_edge_props.zig`
 - Modify: `src/engine.zig`
 
@@ -88,6 +89,7 @@ git commit -m "refactor: extract edge-property methods to engine_edge_props.zig"
 ### Task 2: Extract integrity/stats to `engine_integrity.zig`
 
 **Files:**
+
 - Create: `src/engine_integrity.zig`
 - Modify: `src/engine.zig`
 

@@ -23,7 +23,7 @@
 
 The property page currently uses sequential entries from `PROP_DATA_OFFSET` forward. The directory lives at the end of the page, growing backward (like PostgreSQL's line pointer array).
 
-```
+```text
 Page layout:
 [PageHeader 32B] [meta 12B] [entries →  ...free space...  ← directory] [dir_count 2B]
 
@@ -44,6 +44,7 @@ Max entries per 8KB page: (8192 - 32 - 12 - 2) / (min_entry_size + 4) ≈ 100
 ### Task 2: Migration compatibility
 
 Since existing property pages don't have directories, the code must handle both formats:
+
 - Pages without directory (dir_count == 0 or legacy) → linear scan (current behavior)
 - Pages with directory → hash lookup
 

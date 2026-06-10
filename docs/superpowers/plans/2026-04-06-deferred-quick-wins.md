@@ -23,6 +23,7 @@
 ### Task 1: Index Catalog Integrity (SEC-0021)
 
 **Files:**
+
 - Modify: `src/index_catalog.zig`
 - Test: inline tests in `src/index_catalog.zig`
 
@@ -244,6 +245,7 @@ git commit -m "fix: close SEC-0021 - add magic+CRC integrity to index catalog"
 ### Task 2: Multi-Operation Transactions (GAP-0022)
 
 **Files:**
+
 - Modify: `src/engine.zig`
 - Test: inline tests in `src/engine.zig`
 
@@ -333,6 +335,7 @@ git commit -m "feat: close GAP-0022 - add transaction-aware mutation methods"
 ### Task 3: Edge-ID Index (GAP-0021)
 
 **Files:**
+
 - Modify: `src/engine.zig`
 - Test: inline tests in `src/engine.zig`
 
@@ -368,11 +371,13 @@ Expected: FAIL (getEdge returns error.EdgeIndexNotImplemented)
 - [ ] **Step 3: Add edge index field and maintain it**
 
 In `GraphEngine` struct, add:
+
 ```zig
 edge_index: std.AutoHashMap(EdgeId, EdgeIndexEntry),
 ```
 
 Where `EdgeIndexEntry` is:
+
 ```zig
 const EdgeIndexEntry = struct {
     from: NodeId,
@@ -387,16 +392,19 @@ In `create()` / `initSubsystems()`, initialize: `self.edge_index = std.AutoHashM
 In `deinit()`/`cleanupResources()`, add: `self.edge_index.deinit();`
 
 In `addEdge()`, after the edge is created, add to index:
+
 ```zig
 try self.edge_index.put(edge_id, .{ .from = from, .neighbor = to, .rel_type = rel_type, .prop_head = 0 });
 ```
 
 In `removeEdge()`, remove from index:
+
 ```zig
 _ = self.edge_index.remove(edge_id);
 ```
 
 Replace `getEdge()`:
+
 ```zig
 pub fn getEdge(self: *GraphEngine, edge_id: EdgeId) anyerror!?EdgeEntry {
     const entry = self.edge_index.get(edge_id) orelse return null;

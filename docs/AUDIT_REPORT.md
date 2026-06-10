@@ -162,6 +162,7 @@ Following the audit, 23 gap items were implemented across 23 commits in 16 files
 **All open items from the audit have been addressed.** Zero items remain in Open status across all four tracking files.
 
 Key closures:
+
 - **Security:** All 8 open findings closed -- key zeroing (SEC-0029/0030), cycle detection (SEC-0032/0033), unreachable-to-error (SEC-0031), key length validation (SEC-0035), directory permissions (SEC-0036), recovery deinit (SEC-0034).
 - **Quality:** Memory leak fixed (QUAL-0022), error propagation (QUAL-0023/0024/0028), ARIES recovery test (QUAL-0025), putProperty decomposition (QUAL-0026), unused imports (QUAL-0029), test constants (QUAL-0030).
 - **Performance:** Index rebuild batch API (PERF-0030), HashMap pre-sizing (PERF-0032/0033), txn leak fix (PERF-0035), directory rebuild dedup (PERF-0038), bench alignment (PERF-0039).
@@ -214,17 +215,17 @@ Won't Do items (5) are documented with rationale -- all require architectural ch
 
 ### Next sprint
 
-7. **PERF-0030: Refactor index rebuild to use scanNodes** -- Replace 3 per-ID scan loops with page-level batch scan. Expected 50-100x fewer mutex acquisitions.
-8. **SEC-0031/0032/0033: Add chain cycle detection** -- Hop counter or visited-set for all page-chain traversals in prop_store, var_store.
-9. **QUAL-0024: Fix integrity check error handling** -- Replace `catch null` with error propagation + io_errors counter.
-10. **QUAL-0025: Add uncommitted-txn recovery test** -- BEGIN + page_update without COMMIT, verify not applied.
+1. **PERF-0030: Refactor index rebuild to use scanNodes** -- Replace 3 per-ID scan loops with page-level batch scan. Expected 50-100x fewer mutex acquisitions.
+2. **SEC-0031/0032/0033: Add chain cycle detection** -- Hop counter or visited-set for all page-chain traversals in prop_store, var_store.
+3. **QUAL-0024: Fix integrity check error handling** -- Replace `catch null` with error propagation + io_errors counter.
+4. **QUAL-0025: Add uncommitted-txn recovery test** -- BEGIN + page_update without COMMIT, verify not applied.
 
 ### This quarter
 
-11. **PERF-0028: Delta WAL logging** -- Replace full-page WAL with physiological logging (changed bytes only). 10-50x WAL I/O reduction.
-12. **PERF-0029: Group commit** -- Batch fsync across multiple transactions. 10-100x write throughput on real storage.
-13. **GAP-0027: Wire B+tree into engine** -- Import IndexCatalog, load/save on open/checkpoint, route property queries through B+tree.
-14. **PERF-0031: Fuzzy/incremental checkpoint** -- Allow reads during flush, checkpoint in background.
+1. **PERF-0028: Delta WAL logging** -- Replace full-page WAL with physiological logging (changed bytes only). 10-50x WAL I/O reduction.
+2. **PERF-0029: Group commit** -- Batch fsync across multiple transactions. 10-100x write throughput on real storage.
+3. **GAP-0027: Wire B+tree into engine** -- Import IndexCatalog, load/save on open/checkpoint, route property queries through B+tree.
+4. **PERF-0031: Fuzzy/incremental checkpoint** -- Allow reads during flush, checkpoint in background.
 
 ---
 

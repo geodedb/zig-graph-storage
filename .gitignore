@@ -56,3 +56,8 @@ coverage/
 *.gcno
 zig-pkg/
 .bench-optimize/
+
+# Node tooling (not part of the Zig project)
+node_modules/
+package.json
+package-lock.json

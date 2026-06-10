@@ -39,6 +39,7 @@
 ## Task 1: Shard-count module
 
 **Files:**
+
 - Create: `src/shard_count.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -124,6 +125,7 @@ git commit -m "feat: add shard_count module with SHARD_COUNT and routing helpers
 ## Task 2: Per-shard UUID derivation
 
 **Files:**
+
 - Create: `src/shard_uuid.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -206,6 +208,7 @@ git commit -m "feat: add deriveShardUuid BLAKE3-based per-shard UUID helper"
 ## Task 3: ShardManifest JSON format
 
 **Files:**
+
 - Create: `src/shard_manifest.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -397,6 +400,7 @@ git commit -m "feat: add ShardManifest JSON format with version/algorithm guard"
 **Rationale:** Every shard must allocate ids of the form `k*N + shard_index` so that `shardOfNode(id) == shard_index`. The single-engine `GraphEngine` today writes `manifest.next_node_id += 1`. We extend `GraphConfig` with an optional `base_shard_index` and change the allocator to `manifest.next_node_id += SHARD_COUNT` (or `+= 1` in the classic single-engine default).
 
 **Files:**
+
 - Modify: `src/config.zig`
 - Modify: `src/engine.zig` lines around 586–594 (`allocNode`) and 664–668 (`addEdgeTxn` edge-id bump) and lines 140–148 (`Manifest` init in `create`).
 
@@ -538,6 +542,7 @@ git commit -m "feat(engine): optional striped id allocation via base_shard_index
 ## Task 5: Extend WalRecord with cross-shard record types
 
 **Files:**
+
 - Modify: `src/wal_record.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -651,6 +656,7 @@ git commit -m "feat(wal): add cross_shard_{prepare,commit,abort} record types"
 ## Task 6: ShardedGraphEngine scaffolding — create/open/close/deinit
 
 **Files:**
+
 - Create: `src/sharded_engine.zig`
 - Create: `src/sharded_engine_test.zig`
 - Modify: `src/root.zig`
@@ -930,6 +936,7 @@ git commit -m "feat(sharded): ShardedGraphEngine create/open/close/deinit scaffo
 **Scope:** Implement the read side of the `GraphStorage` vtable — `getNode`, `getEdge`, `expandOutIter`, `expandInIter`, `getProperty`, `getAllProperties`, `nodeCount`, `edgeCount`, `getMetrics`. Each routes to `shards[shardOfNode(id)]` (or `shardOfEdgeSource(edge.from)`); aggregates come from all shards.
 
 **Files:**
+
 - Modify: `src/sharded_engine.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -1091,6 +1098,7 @@ git commit -m "feat(sharded): intra-shard read op routing (getNode/getEdge/expan
 **Scope:** Route `addEdge` to the source shard **when source and target live on the same shard**. Cross-shard is deferred to Task 12. Route `removeEdge` identically.
 
 **Files:**
+
 - Modify: `src/sharded_engine.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -1186,6 +1194,7 @@ git commit -m "feat(sharded): intra-shard addEdge/removeEdge routing (cross-shar
 **Scope:** `putProperty`, `removeProperty`, edge-property variants, `addLabel`, `removeLabel`, `beginTxn`/`commitTxn`/`abortTxn`, `checkpoint`, `getMetrics`. Labels route by node id; property owner is a node-id-shaped head so it routes identically. Transactions are per-shard — `beginTxn` on the facade returns an opaque `TxnId` that encodes `(shard_index, local_txn_id)`; commit/abort route back to the shard.
 
 **Files:**
+
 - Modify: `src/sharded_engine.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -1430,6 +1439,7 @@ git commit -m "feat(sharded): properties, labels, transactions, checkpoint, metr
 **Scope:** Expose `ShardedGraphEngine.storage()` returning a `GraphStorage` backed by the facade so external consumers (geode) use the sharded engine through the existing vtable with zero API changes.
 
 **Files:**
+
 - Modify: `src/sharded_engine.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -1549,6 +1559,7 @@ git commit -m "feat(sharded): GraphStorage vtable binding via storage()"
 **Scope:** Replace the materialising `scanLabelIter` from Task 10 with a streaming iterator that advances across shards without pre-allocating the full result slice. This preserves memory bounds for large-cardinality labels.
 
 **Files:**
+
 - Modify: `src/sharded_engine.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -1703,6 +1714,7 @@ git commit -m "feat(sharded): streaming FanOutNodeIterator for scanLabelIter"
 **Scope:** Implement the two-phase protocol from §Architecture / Cross-shard operations.1 — prepare → write source adjacency → write target adjacency → commit. Replaces `error.CrossShardEdgeUnsupported` from Task 8.
 
 **Files:**
+
 - Create: `src/sharded_engine_2pc.zig`
 - Modify: `src/sharded_engine.zig` — re-dispatch `addEdge` to the 2PC helper when `s_from != s_to`.
 
@@ -2018,6 +2030,7 @@ git commit -m "feat(sharded): cross-shard edge create via 2PC prepare/commit"
 **Scope:** After per-shard WAL replay (each shard's existing `Recovery` runs as-is), scan all shards' replayed records for dangling `cross_shard_prepare` records — ones whose matching `cross_shard_commit` or `cross_shard_abort` is missing. Resolve: if ANY shard logged the commit for a given `global_txn_id`, all shards commit (replay the adjacency write); otherwise all abort (undo).
 
 **Files:**
+
 - Create: `src/sharded_recovery.zig`
 - Modify: `src/sharded_engine.zig` — call `sharded_recovery.reconcilePendingPrepares(self)` at the end of `open`.
 
@@ -2448,6 +2461,7 @@ git commit -m "feat(sharded): crash recovery reconciliation for 2PC dangling pre
 **Rationale:** The spec §WAL and durability says "for a 2PC commit, both shards must have the commit record durable before the caller sees success." `appendPrepare` and `appendDecision` in Task 12 already call `eng.wal.sync()` after each append, so every prepare and decision is durable on disk before control returns. This task is a **verification-only task** — no new code — to confirm the invariant holds and to assert it with a test.
 
 **Files:**
+
 - Modify: `src/sharded_engine_test.zig`
 
 - [ ] **Step 1: Write the failing test**
@@ -2512,6 +2526,7 @@ git commit -m "test(sharded): assert cross-shard commit records are WAL-durable 
 ## Task 15: Integration tests — full-engine exercise
 
 **Files:**
+
 - Create: `tests/integration_sharded.zig`
 - Modify: `build.zig` — add `test-integration-sharded` step.
 
@@ -2646,6 +2661,7 @@ git commit -m "test(sharded): integration — CRUD, cross-shard, reopen, concurr
 ## Task 16: Microbench — ≥ 4× single-engine throughput target
 
 **Files:**
+
 - Create: `benchmarks/sharded_throughput.zig`
 - Modify: `build.zig` — add `bench-sharded-throughput` step.
 
@@ -2782,7 +2798,7 @@ sharded_throughput_step.dependOn(&run_sharded_throughput.step);
 Run: `zig build bench-sharded-throughput`
 Expected: Output lines like:
 
-```
+```text
 SHARDED_THROUGHPUT workers=16 ops=20000 elapsed_ns=... ops_per_s=...
 SINGLE_THROUGHPUT  workers=1 ops=20000 elapsed_ns=... ops_per_s=...
 SHARDING_SPEEDUP ratio=4.XX
@@ -2802,6 +2818,7 @@ git commit -m "bench: sharded-vs-single throughput microbench (target ≥4× on 
 ## Task 17: CHANGELOG + README pointer
 
 **Files:**
+
 - Modify: `CHANGELOG.md`
 - Modify: `README.md` (brief section linking to the design spec and this plan)
 
