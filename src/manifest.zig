@@ -216,8 +216,15 @@ pub const Manifest = struct {
         const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
         defer allocator.free(tmp_path);
 
-        // Write to tmp file
-        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        // Write to tmp file.
+        // SEC-0052: resolve_beneath prevents symlink traversal out of the
+        // graph directory via a crafted path.  exclusive is omitted because a
+        // previous crashed write may have left a stale .tmp file behind that
+        // is legitimately safe to overwrite on the retry path.
+        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
+            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+            .resolve_beneath = true,
+        });
         defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
 
         try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), data);

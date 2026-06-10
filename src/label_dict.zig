@@ -91,7 +91,13 @@ pub const LabelDictionary = struct {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
-        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        // SEC-0052: resolve_beneath prevents symlink traversal out of the
+        // label dictionary directory via a crafted path.  exclusive is omitted
+        // because a stale .tmp file from a previous crashed write may exist.
+        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
+            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+            .resolve_beneath = true,
+        });
         defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
         try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf.items);
         try tmp_file.sync(std.Io.Threaded.global_single_threaded.io());

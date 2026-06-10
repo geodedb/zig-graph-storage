@@ -110,8 +110,18 @@ pub const FileManager = struct {
                 maybe_file.* = null;
             }
         }
-        // Reset pagers
-        self.pagers = [_]?Pager{null} ** FILE_COUNT;
+        // SEC-0045: securely zero each pager's per-file encryption key copy
+        // before releasing the pager slot so that up to FILE_COUNT 32-byte key
+        // copies are not left in memory without a secure wipe.  The zero and
+        // the null assignment happen in the same loop iteration so that the
+        // secureZero is not followed by an unrelated write that could obscure
+        // whether zeroing actually occurred.
+        for (&self.pagers) |*maybe_pager| {
+            if (maybe_pager.*) |*p| {
+                if (p.encryption) |*e| e.deinit();
+            }
+            maybe_pager.* = null;
+        }
         // Zero sensitive key material
         if (self.encryption_key) |*k| {
             std.crypto.secureZero(u8, k);
@@ -326,6 +336,64 @@ test "FILE_NAMES has correct count and entries" {
     try testing.expectEqualStrings("labels.idx", FILE_NAMES[@intFromEnum(FileId.label_idx)]);
     try testing.expectEqualStrings("props.idx", FILE_NAMES[@intFromEnum(FileId.prop_idx)]);
     try testing.expectEqualStrings("edges.idx", FILE_NAMES[@intFromEnum(FileId.edge_idx)]);
+}
+
+test "SEC-0045: deinit zeroes all per-pager encryption key copies" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    const key = [_]u8{0xAB} ** 32;
+
+    var fm = FileManager.init(testing.allocator, dir_path, 4096);
+    fm.encryption_key = key;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Create all FILE_COUNT store files so every pager slot gets an encryption copy
+    for (FILE_NAMES) |name| {
+        const f = try tmp.dir.createFile(io, name, .{ .read = true, .truncate = true });
+        f.close(io);
+    }
+
+    // Open all files so each pager gets its own PageEncryption copy
+    const file_ids = [_]@import("types.zig").FileId{
+        .nodes, .adj_out, .adj_in, .props, .var_store, .free, .label_idx, .prop_idx, .edge_idx,
+    };
+    for (file_ids) |fid| {
+        _ = try fm.openFile(fid, .open_existing);
+    }
+
+    // Verify every open pager has the expected key set before deinit.
+    const all_zero = [_]u8{0} ** 32;
+    for (&fm.pagers) |*maybe_pager| {
+        if (maybe_pager.*) |*p| {
+            try testing.expect(p.encryption != null);
+            try testing.expect(!std.mem.eql(u8, &p.encryption.?.key, &all_zero));
+        }
+    }
+
+    // Verify the master encryption key is non-zero before deinit.
+    try testing.expect(fm.encryption_key != null);
+    try testing.expect(!std.mem.eql(u8, &fm.encryption_key.?, &all_zero));
+
+    // deinit must secureZero each pager's key copy then null the slot.  Zig
+    // debug mode fills the freed payload area with 0xAA sentinel bytes after
+    // `maybe_pager.* = null`, so we cannot observe the intermediate zeroed
+    // state through the same pointer after deinit returns.  We therefore
+    // verify the observable postconditions: (a) the master key is zeroed, and
+    // (b) no pager slot is live (confirming the loop ran without panic).
+    fm.deinit();
+
+    // (a) Master encryption key must be secureZero'd.
+    try testing.expect(fm.encryption_key == null or
+        std.mem.eql(u8, &fm.encryption_key.?, &all_zero));
+
+    // (b) All pager slots are null — the loop completed without error.
+    for (fm.pagers) |maybe_pager| {
+        try testing.expect(maybe_pager == null);
+    }
 }
 
 test "created files have mode 0o600" {

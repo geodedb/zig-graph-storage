@@ -31,12 +31,19 @@ pub const GraphDir = struct {
             dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
         }
 
-        // Create empty store files
+        // Create empty store files.
+        // SEC-0052: resolve_beneath prevents symlink / TOCTOU traversal out of
+        // the graph directory.  exclusive = true is appropriate here because
+        // these are brand-new files that must not already exist.
         for (file_manager.FILE_NAMES) |file_name| {
             const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, file_name });
             defer allocator.free(file_path);
 
-            const file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .permissions = std.Io.File.Permissions.fromMode(0o600) });
+            const file = try std.Io.Dir.cwd().createFile(io, file_path, .{
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .exclusive = true,
+                .resolve_beneath = true,
+            });
             file.close(io);
         }
 
