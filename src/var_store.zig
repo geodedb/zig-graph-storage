@@ -118,6 +118,11 @@ pub const VarStore = struct {
             const next_page = std.mem.bytesToValue(u64, page_data[meta_off..][0..8]);
             const data_len = std.mem.bytesToValue(u32, page_data[meta_off + 8 ..][0..4]);
 
+            if (data_len > self.dataCapacity()) {
+                self.buffer_pool.unpin(frame_idx, false);
+                return error.DataCorruption;
+            }
+
             if (data_len > 0) {
                 const chunk = page_data[meta_off + VAR_META_SIZE ..][0..data_len];
                 try result.appendSlice(allocator, chunk);
@@ -220,6 +225,52 @@ test "free releases pages" {
     try store.free(ref);
     const free_after_free = env.fsm.freeCount();
     try testing.expectEqual(free_before, free_after_free);
+}
+
+test "read rejects data_len exceeding dataCapacity (dataCapacity+1)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    // Allocate a real page through the free space manager so it has a valid page_id.
+    const page_id = try env.fsm.allocPage();
+
+    // Pin the page and write a corrupt header directly: next_page=0, data_len=cap+1.
+    const frame = try env.pool.pinNew(.var_store, page_id);
+    const frame_idx = env.pool.frameIndex(frame);
+    const page_data = frame.dataSlice();
+    const meta_off = PAGE_HEADER_SIZE;
+    @memcpy(page_data[meta_off..][0..8], &std.mem.toBytes(@as(u64, 0))); // next_page = 0
+    const bad_len: u32 = store.dataCapacity() + 1;
+    @memcpy(page_data[meta_off + 8 ..][0..4], &std.mem.toBytes(bad_len));
+    env.pool.unpin(frame_idx, true);
+
+    // Build a ref matching how write() encodes it.
+    const ref: u64 = @as(u64, page_id) << 16;
+    try testing.expectError(error.DataCorruption, store.read(ref, testing.allocator));
+}
+
+test "read rejects data_len exceeding dataCapacity (0xFFFFFFFF)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    const page_id = try env.fsm.allocPage();
+
+    const frame = try env.pool.pinNew(.var_store, page_id);
+    const frame_idx = env.pool.frameIndex(frame);
+    const page_data = frame.dataSlice();
+    const meta_off = PAGE_HEADER_SIZE;
+    @memcpy(page_data[meta_off..][0..8], &std.mem.toBytes(@as(u64, 0))); // next_page = 0
+    @memcpy(page_data[meta_off + 8 ..][0..4], &std.mem.toBytes(@as(u32, 0xFFFFFFFF)));
+    env.pool.unpin(frame_idx, true);
+
+    const ref: u64 = @as(u64, page_id) << 16;
+    try testing.expectError(error.DataCorruption, store.read(ref, testing.allocator));
 }
 
 test {
