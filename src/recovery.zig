@@ -109,8 +109,10 @@ pub const Recovery = struct {
         const path_b = try graph_dir.manifestPath(self.allocator, .b);
         defer self.allocator.free(path_b);
 
-        const manifest_a = Manifest.readFromFile(self.allocator, path_a) catch null;
-        const manifest_b = Manifest.readFromFile(self.allocator, path_b) catch null;
+        // SEC-0043: under TDE (key configured) the manifest is HMAC-authenticated.
+        // A forged manifest (e.g. rolled-back last_checkpoint_lsn) is rejected here.
+        const manifest_a = Manifest.readFromFileWithKey(self.allocator, path_a, self.encryption_key) catch null;
+        const manifest_b = Manifest.readFromFileWithKey(self.allocator, path_b, self.encryption_key) catch null;
 
         var m = try Manifest.selectManifest(manifest_a, manifest_b);
         if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
@@ -268,11 +270,11 @@ pub const Recovery = struct {
         // Write to both slots for a clean state after recovery
         const manifest_path_a = try graph_dir.manifestPath(self.allocator, .a);
         defer self.allocator.free(manifest_path_a);
-        try m.writeToFile(self.allocator, manifest_path_a);
+        try m.writeToFileWithKey(self.allocator, manifest_path_a, self.encryption_key);
 
         const manifest_path_b = try graph_dir.manifestPath(self.allocator, .b);
         defer self.allocator.free(manifest_path_b);
-        try m.writeToFile(self.allocator, manifest_path_b);
+        try m.writeToFileWithKey(self.allocator, manifest_path_b, self.encryption_key);
 
         return m;
     }
@@ -1154,6 +1156,99 @@ test "deinit with null encryption key does not panic" {
     recovery.deinit(); // should not panic
 }
 
+test "SEC-0043: recovery rejects forged TDE manifest (rolled-back LSN, recomputed CRC)" {
+    // Under TDE, an attacker with filesystem write access rolls back the
+    // manifest's last_checkpoint_lsn and RECOMPUTES the CRC32 so the legacy
+    // CRC-only check would pass. The keyed HMAC must catch the forgery and
+    // recovery must fail closed instead of redirecting replay.
+    const allocator = testing.allocator;
+    const Crc32 = std.hash.crc.Crc32Iscsi;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const key = [_]u8{0x43} ** 32;
+
+    // Write an authenticated manifest to slot A with a real checkpoint LSN.
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 5,
+        .last_checkpoint_lsn = 9000,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFileWithKey(allocator, path_a, key);
+
+    // Forge slot A: roll back last_checkpoint_lsn to 0, recompute CRC32, but
+    // leave the HMAC trailer (which no longer matches the tampered body).
+    {
+        const f = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path_a, .{ .mode = .read_write });
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const flen = try f.length(io);
+        const buf = try allocator.alloc(u8, @intCast(flen));
+        defer allocator.free(buf);
+        _ = try f.readPositionalAll(io, buf, 0);
+        const lsn_offset: usize = 8 + 4 + 16 + 4 + 8; // magic+fmt+uuid+page_size+counter
+        @memcpy(buf[lsn_offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, 0))));
+        const crc_offset = manifest_mod.SERIALIZED_SIZE - 4;
+        const new_crc = Crc32.hash(buf[0..crc_offset]);
+        @memcpy(buf[crc_offset..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+        try f.writePositionalAll(io, buf, 0);
+    }
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    fm.encryption_key = key;
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, key);
+    defer recovery.deinit();
+    // No valid manifest survives: slot A is forged (HMAC fails -> dropped) and
+    // slot B was never written, so recovery has nothing authentic to load.
+    const result = recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectError(error.NoManifest, result);
+}
+
+test "SEC-0043: TDE recovery round-trip — authenticated manifest loads cleanly" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const key = [_]u8{0x43} ** 32;
+
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 3,
+        .next_node_id = 77,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFileWithKey(allocator, path_a, key);
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    fm.encryption_key = key;
+    defer fm.deinit();
+
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, key);
+    defer recovery.deinit();
+    const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectEqual(@as(u64, 77), recovered.next_node_id);
+    try testing.expectEqual([_]u8{0xBB} ** 16, recovered.graph_uuid);
+}
+
 test "recovery writes manifest to both slots A and B" {
     const allocator = testing.allocator;
     var setup = try setupTestGraph(allocator);
@@ -1423,7 +1518,8 @@ test "SEC-0037: recovery does not regress on-disk write_count below the persiste
 
     const key = [_]u8{0x37} ** 32;
 
-    // Write initial manifest
+    // Write initial manifest. SEC-0043: under TDE the manifest must be
+    // HMAC-authenticated with the same key recovery reads it with.
     const initial = Manifest{
         .graph_uuid = [_]u8{0xBB} ** 16,
         .page_size = 4096,
@@ -1432,7 +1528,7 @@ test "SEC-0037: recovery does not regress on-disk write_count below the persiste
     };
     const path_a = try setup.graph_dir.manifestPath(allocator, .a);
     defer allocator.free(path_a);
-    try initial.writeToFile(allocator, path_a);
+    try initial.writeToFileWithKey(allocator, path_a, key);
 
     // Pre-flush the nodes store page 1 several times via an encryption-enabled
     // pager so the persisted on-disk write_count reaches a high value (N).

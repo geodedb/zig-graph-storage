@@ -31,6 +31,9 @@ pub const Checkpointer = struct {
     allocator: Allocator,
     /// Which manifest slot was last written. Alternates each checkpoint.
     last_slot: GraphDir.ManifestSlot = .a,
+    /// SEC-0043: encryption key for HMAC-authenticating the manifest under TDE.
+    /// When set, checkpoints write the manifest with a keyed HMAC-SHA256 trailer.
+    encryption_key: ?[32]u8 = null,
     /// Optional log callback for structured event emission.
     log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
 
@@ -79,7 +82,7 @@ pub const Checkpointer = struct {
         const manifest_path = try self.graph_dir.manifestPath(self.allocator, next_slot);
         defer self.allocator.free(manifest_path);
 
-        try self.manifest.writeToFile(self.allocator, manifest_path);
+        try self.manifest.writeToFileWithKey(self.allocator, manifest_path, self.encryption_key);
 
         // 6. Update last_slot tracker
         self.last_slot = next_slot;

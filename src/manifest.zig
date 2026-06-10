@@ -4,10 +4,25 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const timing_safe = std.crypto.timing_safe;
 const owner_only_file_mode = 0o600;
 
 pub const MANIFEST_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'M', 'N', 'F', '0', '1' };
 pub const MANIFEST_VERSION: u32 = 2;
+
+/// SEC-0043: When Transparent Data Encryption is enabled (an encryption key is
+/// configured), the manifest carries a keyed HMAC-SHA256 trailer in addition to
+/// the CRC32 footer. The trailer is appended after the CRC-only body, so its
+/// presence is detectable purely from the on-disk file size — the change is
+/// additive and plaintext (no-key) manifests are byte-for-byte unchanged.
+///
+/// The HMAC is computed over the ENTIRE CRC-only body (magic + fields + CRC32),
+/// keyed with the configured encryption key, mirroring `backup.zig`. CRC32 is
+/// trivially recomputable, so without this trailer an attacker with filesystem
+/// write access could forge a manifest (roll back `last_checkpoint_lsn`, tamper
+/// page counts/UUID) to redirect recovery undetected.
+pub const MANIFEST_HMAC_SIZE: usize = HmacSha256.mac_length;
 
 /// V1 used a 40-byte NodeRec with label_set: u32 bitmap.
 /// V2 uses a 48-byte NodeRec with label_head: u64 + label_count: u16.
@@ -17,7 +32,10 @@ pub const MANIFEST_VERSION_V1: u32 = 1;
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields (see below) + CRC32(4)
 const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 148
-const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4; // magic + fields + crc = 160
+/// Size of the CRC-only (plaintext) serialized manifest: magic + fields + crc = 160.
+pub const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4;
+/// Authenticated (TDE) size: CRC-only body + HMAC-SHA256 trailer = 192.
+pub const SERIALIZED_SIZE_HMAC: usize = SERIALIZED_SIZE + MANIFEST_HMAC_SIZE;
 
 pub const Manifest = struct {
     format_version: u32 = MANIFEST_VERSION,
@@ -41,8 +59,20 @@ pub const Manifest = struct {
     edge_count: u64 = 0,
 
     /// Serialize to bytes: magic(8) + all fields in little-endian + CRC32(4).
+    /// Plaintext (no-key) form. Identical to `serializeWithKey(allocator, null)`.
     pub fn serialize(self: *const Manifest, allocator: Allocator) ![]u8 {
-        const buf = try allocator.alloc(u8, SERIALIZED_SIZE);
+        return self.serializeWithKey(allocator, null);
+    }
+
+    /// SEC-0043: Serialize, optionally authenticating with a keyed HMAC-SHA256.
+    ///
+    /// When `key` is null the output is the plaintext CRC-only form (unchanged).
+    /// When `key` is set, a 32-byte HMAC-SHA256 trailer is appended over the
+    /// entire CRC-only body (magic + fields + CRC32). The longer length makes
+    /// the authenticated form detectable from the file size alone.
+    pub fn serializeWithKey(self: *const Manifest, allocator: Allocator, key: ?[32]u8) ![]u8 {
+        const out_len: usize = if (key != null) SERIALIZED_SIZE_HMAC else SERIALIZED_SIZE;
+        const buf = try allocator.alloc(u8, out_len);
         errdefer allocator.free(buf);
 
         var pos: usize = 0;
@@ -77,11 +107,31 @@ pub const Manifest = struct {
         const crc = Crc32.hash(buf[0..pos]);
         writeU32(buf, &pos, crc);
 
+        // SEC-0043: keyed HMAC-SHA256 trailer over the full CRC-only body.
+        if (key) |k| {
+            var tag: [MANIFEST_HMAC_SIZE]u8 = undefined;
+            HmacSha256.create(&tag, buf[0..SERIALIZED_SIZE], &k);
+            @memcpy(buf[pos..][0..MANIFEST_HMAC_SIZE], &tag);
+            pos += MANIFEST_HMAC_SIZE;
+        }
+
         return buf;
     }
 
     /// Parse bytes, validate magic and CRC32, return manifest.
+    /// Plaintext (no-key) form. Identical to `deserializeWithKey(.., null)`.
     pub fn deserialize(allocator: Allocator, data: []const u8) !Manifest {
+        return deserializeWithKey(allocator, data, null);
+    }
+
+    /// SEC-0043: Parse bytes, validate magic + CRC32, and (when a key is set)
+    /// verify the HMAC-SHA256 trailer with a constant-time compare.
+    ///
+    /// Fail-closed semantics under TDE: if a key is configured the trailer is
+    /// REQUIRED. A CRC-only manifest (legacy/plaintext layout) or any HMAC
+    /// mismatch returns `error.ManifestAuthFailed` — an attacker cannot strip
+    /// the trailer to downgrade to CRC-only verification.
+    pub fn deserializeWithKey(allocator: Allocator, data: []const u8, key: ?[32]u8) !Manifest {
         _ = allocator;
 
         if (data.len < SERIALIZED_SIZE) return error.InvalidData;
@@ -89,10 +139,22 @@ pub const Manifest = struct {
         // Validate magic
         if (!std.mem.eql(u8, data[0..8], &MANIFEST_MAGIC)) return error.InvalidMagic;
 
-        // Validate CRC32
+        // Validate CRC32 over the CRC-only body.
         const stored_crc = readU32(data, SERIALIZED_SIZE - 4);
         const computed_crc = Crc32.hash(data[0 .. SERIALIZED_SIZE - 4]);
         if (stored_crc != computed_crc) return error.ChecksumMismatch;
+
+        // SEC-0043: under TDE the HMAC trailer is mandatory and authenticated.
+        if (key) |k| {
+            if (data.len < SERIALIZED_SIZE_HMAC) return error.ManifestAuthFailed;
+            var expected: [MANIFEST_HMAC_SIZE]u8 = undefined;
+            HmacSha256.create(&expected, data[0..SERIALIZED_SIZE], &k);
+            var stored: [MANIFEST_HMAC_SIZE]u8 = undefined;
+            @memcpy(&stored, data[SERIALIZED_SIZE..][0..MANIFEST_HMAC_SIZE]);
+            if (!timing_safe.eql([MANIFEST_HMAC_SIZE]u8, stored, expected)) {
+                return error.ManifestAuthFailed;
+            }
+        }
 
         var pos: usize = 8;
         var m = Manifest{};
@@ -139,8 +201,16 @@ pub const Manifest = struct {
     }
 
     /// Serialize and write atomically (write to .tmp, fsync, rename).
+    /// Plaintext (no-key) form. Identical to `writeToFileWithKey(.., null)`.
     pub fn writeToFile(self: *const Manifest, allocator: Allocator, path: []const u8) !void {
-        const data = try self.serialize(allocator);
+        return self.writeToFileWithKey(allocator, path, null);
+    }
+
+    /// SEC-0043: Serialize (optionally HMAC-authenticated) and write atomically
+    /// (write to .tmp, fsync, rename). When `key` is set the on-disk manifest
+    /// carries a keyed HMAC-SHA256 trailer verified by `readFromFileWithKey`.
+    pub fn writeToFileWithKey(self: *const Manifest, allocator: Allocator, path: []const u8, key: ?[32]u8) !void {
+        const data = try self.serializeWithKey(allocator, key);
         defer allocator.free(data);
 
         const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
@@ -158,7 +228,14 @@ pub const Manifest = struct {
     }
 
     /// Read file, deserialize. Return null if file doesn't exist.
+    /// Plaintext (no-key) form. Identical to `readFromFileWithKey(.., null)`.
     pub fn readFromFile(allocator: Allocator, path: []const u8) !?Manifest {
+        return readFromFileWithKey(allocator, path, null);
+    }
+
+    /// SEC-0043: Read file, deserialize and (when a key is set) verify the
+    /// HMAC-SHA256 trailer. Returns null if the file doesn't exist.
+    pub fn readFromFileWithKey(allocator: Allocator, path: []const u8, key: ?[32]u8) !?Manifest {
         const file = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| {
             if (err == error.FileNotFound) return null;
             return err;
@@ -167,13 +244,13 @@ pub const Manifest = struct {
 
         const io = std.Io.Threaded.global_single_threaded.io();
         const file_len = try file.length(io);
-        if (file_len > SERIALIZED_SIZE * 2) return error.FileTooLarge;
+        if (file_len > SERIALIZED_SIZE_HMAC * 2) return error.FileTooLarge;
         const data = try allocator.alloc(u8, @intCast(file_len));
         defer allocator.free(data);
         const bytes_read = try file.readPositionalAll(io, data, 0);
         if (bytes_read != data.len) return error.UnexpectedEndOfFile;
 
-        return try deserialize(allocator, data);
+        return try deserializeWithKey(allocator, data, key);
     }
 
     /// Pick the manifest with the higher counter.
@@ -347,6 +424,136 @@ test "readFromFile returns null for missing file" {
     const allocator = std.testing.allocator;
     const result = try Manifest.readFromFile(allocator, "/tmp/nonexistent_manifest_file_12345");
     try std.testing.expectEqual(@as(?Manifest, null), result);
+}
+
+test "SEC-0043: TDE round-trip — HMAC manifest written and read back with key succeeds" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x43} ** 32;
+
+    var uuid: [16]u8 = undefined;
+    @memset(&uuid, 0xCD);
+
+    const m = Manifest{
+        .graph_uuid = uuid,
+        .counter = 7,
+        .last_checkpoint_lsn = 1234,
+        .next_node_id = 500,
+        .node_count = 9,
+        .edge_count = 11,
+    };
+
+    const data = try m.serializeWithKey(allocator, key);
+    defer allocator.free(data);
+
+    // Authenticated form is longer than the plaintext (CRC-only) form.
+    try std.testing.expect(data.len > SERIALIZED_SIZE);
+
+    const m2 = try Manifest.deserializeWithKey(allocator, data, key);
+    try std.testing.expectEqual(m.graph_uuid, m2.graph_uuid);
+    try std.testing.expectEqual(m.counter, m2.counter);
+    try std.testing.expectEqual(m.last_checkpoint_lsn, m2.last_checkpoint_lsn);
+    try std.testing.expectEqual(m.next_node_id, m2.next_node_id);
+    try std.testing.expectEqual(m.node_count, m2.node_count);
+    try std.testing.expectEqual(m.edge_count, m2.edge_count);
+}
+
+test "SEC-0043: TDE tamper with recomputed CRC32 is rejected (HMAC auth fails)" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x43} ** 32;
+
+    const m = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .counter = 10,
+        .last_checkpoint_lsn = 9999,
+    };
+
+    const data = try m.serializeWithKey(allocator, key);
+    defer allocator.free(data);
+
+    // Roll back last_checkpoint_lsn in the serialized body and RECOMPUTE the
+    // CRC32 so a CRC-only check would pass. The HMAC must still catch it.
+    const lsn_offset: usize = 8 + 4 + 16 + 4 + 8; // magic + fmt + uuid + page_size + counter
+    @memcpy(data[lsn_offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, 0))));
+    const new_crc = Crc32.hash(data[0 .. SERIALIZED_SIZE - 4]);
+    @memcpy(data[SERIALIZED_SIZE - 4 ..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+
+    // CRC-only deserialize would happily accept the forgery...
+    const forged = try Manifest.deserialize(allocator, data[0..SERIALIZED_SIZE]);
+    try std.testing.expectEqual(@as(u64, 0), forged.last_checkpoint_lsn);
+
+    // ...but the keyed path detects the tamper via HMAC and fails closed.
+    const result = Manifest.deserializeWithKey(allocator, data, key);
+    try std.testing.expectError(error.ManifestAuthFailed, result);
+}
+
+test "SEC-0043: keyed read of a plaintext (CRC-only) manifest fails closed" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x43} ** 32;
+
+    const m = Manifest{ .graph_uuid = [_]u8{0xAA} ** 16, .counter = 3 };
+    const data = try m.serialize(allocator); // plaintext, no HMAC trailer
+    defer allocator.free(data);
+
+    // Attempting to read it with a key must not silently downgrade.
+    const result = Manifest.deserializeWithKey(allocator, data, key);
+    try std.testing.expectError(error.ManifestAuthFailed, result);
+}
+
+test "SEC-0043: plaintext regression — no key path unchanged (CRC32 only)" {
+    const allocator = std.testing.allocator;
+    const m = Manifest{ .graph_uuid = [_]u8{0x11} ** 16, .counter = 42 };
+
+    // serialize and serializeWithKey(null) must produce identical bytes.
+    const a = try m.serialize(allocator);
+    defer allocator.free(a);
+    const b = try m.serializeWithKey(allocator, null);
+    defer allocator.free(b);
+    try std.testing.expectEqualSlices(u8, a, b);
+    try std.testing.expectEqual(@as(usize, SERIALIZED_SIZE), a.len);
+
+    // Round-trips both ways.
+    const m1 = try Manifest.deserialize(allocator, a);
+    const m2 = try Manifest.deserializeWithKey(allocator, a, null);
+    try std.testing.expectEqual(m.counter, m1.counter);
+    try std.testing.expectEqual(m.counter, m2.counter);
+}
+
+test "SEC-0043: writeToFileWithKey/readFromFileWithKey round-trip and tamper detection" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x77} ** 32;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/manifest.hmac", .{tmp_path});
+    defer allocator.free(file_path);
+
+    const m = Manifest{ .graph_uuid = [_]u8{0xEE} ** 16, .counter = 21, .last_checkpoint_lsn = 555 };
+    try m.writeToFileWithKey(allocator, file_path, key);
+
+    const loaded = try Manifest.readFromFileWithKey(allocator, file_path, key);
+    try std.testing.expect(loaded != null);
+    try std.testing.expectEqual(@as(u64, 555), loaded.?.last_checkpoint_lsn);
+
+    // Tamper the on-disk body and recompute CRC; keyed read must reject it.
+    {
+        const f = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), file_path, .{ .mode = .read_write });
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const flen = try f.length(io);
+        const buf = try allocator.alloc(u8, @intCast(flen));
+        defer allocator.free(buf);
+        _ = try f.readPositionalAll(io, buf, 0);
+        const lsn_offset: usize = 8 + 4 + 16 + 4 + 8;
+        @memcpy(buf[lsn_offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, 0))));
+        const new_crc = Crc32.hash(buf[0 .. SERIALIZED_SIZE - 4]);
+        @memcpy(buf[SERIALIZED_SIZE - 4 ..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+        try f.writePositionalAll(io, buf, 0);
+    }
+
+    const tampered = Manifest.readFromFileWithKey(allocator, file_path, key);
+    try std.testing.expectError(error.ManifestAuthFailed, tampered);
 }
 
 test {

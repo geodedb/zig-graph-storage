@@ -234,6 +234,8 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
         &self.file_manager,
         &self.graph_dir,
     );
+    // SEC-0043: HMAC-authenticate the manifest at checkpoint when TDE is enabled.
+    self.checkpointer.encryption_key = cfg.encryption_key;
 }
 
 /// Run a full checkpoint: update manifest counters, flush dirty pages,

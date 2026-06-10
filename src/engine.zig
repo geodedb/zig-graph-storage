@@ -176,9 +176,11 @@ pub const GraphEngine = struct {
         }
 
         // 3. Write initial manifest to slot A
+        // SEC-0043: HMAC-authenticate the manifest under TDE so the very first
+        // open/recovery verifies it instead of trusting a forgeable CRC32.
         const path_a = try self.graph_dir.manifestPath(allocator, .a);
         defer allocator.free(path_a);
-        try self.manifest.writeToFile(allocator, path_a);
+        try self.manifest.writeToFileWithKey(allocator, path_a, cfg.encryption_key);
 
         // 4. Open all store files via FileManager
         self.file_manager = FileManager.init(allocator, self.graph_dir.path, cfg.page_size);
