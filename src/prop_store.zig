@@ -256,6 +256,7 @@ pub const PropStore = struct {
         current_index: u32 = 0,
         current_offset: u32 = PROP_DATA_OFFSET,
         entry_count_cache: u32 = 0,
+        hops: u32 = 0,
 
         pub fn deinit(self: *PropIterator) void {
             if (self.current_frame_idx) |idx| {
@@ -267,11 +268,13 @@ pub const PropStore = struct {
         pub fn next(self: *PropIterator) anyerror!?PropertyEntrySlice {
             while (self.current_page != 0) {
                 if (self.current_frame_idx == null) {
+                    if (self.hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
                     const frame = try self.store.buffer_pool.pin(.props, self.current_page);
                     self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
                     const data = self.store.logical(frame.dataSlice());
                     self.entry_count_cache = try readEntryCountChecked(data, self.store.page_size);
                     self.current_offset = PROP_DATA_OFFSET;
+                    self.hops += 1;
                 }
 
                 const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
@@ -1233,6 +1236,43 @@ test "SEC-0039: getProperty returns DataCorruption when dir_count just exceeds c
     env.pool().unpin(frame_idx, true);
 
     try testing.expectError(error.DataCorruption, store.getProperty(head, "k", testing.allocator));
+}
+
+// ============================================================================
+// SEC-0042: PropIterator chain-cycle guard regression test
+// ============================================================================
+
+test "SEC-0042: PropIterator.next detects circular page chain" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    // Create a real property page with one entry.
+    const head = try store.putProperty(0, "key", .{ .int = 42 });
+
+    // Corrupt next_page to point back to itself, forming a self-loop.
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
+    writeNextPage(frame.dataSlice(), head);
+    env.pool().unpin(frame_idx, true);
+
+    var iter = store.getAllProperties(head);
+    defer iter.deinit();
+
+    // Drain until the hop guard fires; the self-loop causes every page
+    // advance to revisit the same page. The guard fires after MAX_CHAIN_HOPS.
+    var got_error = false;
+    while (true) {
+        if (iter.next()) |_| {
+            // entry returned; continue draining
+        } else |err| {
+            try testing.expectEqual(error.CircularChainDetected, err);
+            got_error = true;
+            break;
+        }
+    }
+    try testing.expect(got_error);
 }
 
 test {

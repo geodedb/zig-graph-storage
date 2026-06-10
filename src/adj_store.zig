@@ -21,6 +21,10 @@ const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
 const BLOCK_HEADER_SIZE: u32 = @sizeOf(EdgeBlockHeader);
 const ENTRY_SIZE: u32 = @sizeOf(EdgeEntry);
 
+/// Maximum hops allowed in an adjacency-block chain traversal before
+/// assuming the chain is corrupt or circular (SEC-0042).
+pub const MAX_CHAIN_HOPS: u32 = 100_000;
+
 /// Adjacency block storage for outgoing/incoming edges.
 /// Each adjacency list is a chain of pages, each containing an EdgeBlockHeader
 /// followed by an array of EdgeEntry records.
@@ -117,7 +121,9 @@ pub const AdjStore = struct {
         if (head_page == 0) return;
 
         var current_page = head_page;
-        while (current_page != 0) {
+        var hops: u32 = 0;
+        while (current_page != 0) : (hops += 1) {
+            if (hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(self.file_id, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
@@ -152,6 +158,7 @@ pub const AdjStore = struct {
         current_frame_idx: ?u32 = null,
         current_index: u16 = 0,
         rel_type: ?u32,
+        hops: u32 = 0,
 
         pub fn deinit(self: *AdjEdgeIterator) void {
             if (self.current_frame_idx) |idx| {
@@ -163,8 +170,10 @@ pub const AdjStore = struct {
         pub fn next(self: *AdjEdgeIterator) anyerror!?EdgeEntry {
             while (self.current_page != 0) {
                 if (self.current_frame_idx == null) {
+                    if (self.hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
                     const frame = try self.store.buffer_pool.pin(self.store.file_id, self.current_page);
                     self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
+                    self.hops += 1;
                 }
 
                 const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
@@ -211,7 +220,9 @@ pub const AdjStore = struct {
         if (head_page == 0) return false;
 
         var current_page = head_page;
-        while (current_page != 0) {
+        var hops: u32 = 0;
+        while (current_page != 0) : (hops += 1) {
+            if (hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(self.file_id, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
@@ -245,7 +256,9 @@ pub const AdjStore = struct {
 
         var count: u64 = 0;
         var current_page = head_page;
-        while (current_page != 0) {
+        var hops: u32 = 0;
+        while (current_page != 0) : (hops += 1) {
+            if (hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
             const frame = try self.buffer_pool.pin(self.file_id, current_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
@@ -570,6 +583,91 @@ test "edgeCount on empty list returns 0" {
 
     const count = try store.edgeCount(0);
     try testing.expectEqual(@as(u64, 0), count);
+}
+
+// ============================================================================
+// SEC-0042: chain-cycle / max-hop guard regression tests
+// ============================================================================
+
+/// Corrupt a block so its next_block points back to itself, creating a
+/// self-loop. Caller must already hold no pins on the page.
+fn makeSelfLoop(store: *AdjStore, page_id: PageId) !void {
+    const frame = try store.buffer_pool.pin(store.file_id, page_id);
+    const frame_idx = store.buffer_pool.frameIndex(frame);
+    const data = frame.dataSlice();
+    var bh = try store.readBlockHeader(data);
+    bh.next_block = page_id; // point to itself
+    store.writeBlockHeader(data, bh);
+    store.buffer_pool.unpin(frame_idx, true);
+}
+
+test "SEC-0042: removeEdge detects circular chain" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const head = try store.addEdge(0, makeEdge(10, 1, 5));
+    try makeSelfLoop(&store, head);
+
+    // Edge ID 999 does not exist; traversal must trip the hop guard.
+    try testing.expectError(error.CircularChainDetected, store.removeEdge(head, 999));
+}
+
+test "SEC-0042: AdjEdgeIterator.next detects circular chain" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const head = try store.addEdge(0, makeEdge(10, 1, 5));
+    try makeSelfLoop(&store, head);
+
+    var iter = store.expand(head, null);
+    defer iter.deinit();
+
+    // Drain until the hop guard fires; each iteration revisits the self-loop
+    // block and increments the hop counter. The guard fires after MAX_CHAIN_HOPS.
+    var got_error = false;
+    while (true) {
+        if (iter.next()) |_| {
+            // entry returned; continue draining
+        } else |err| {
+            try testing.expectEqual(error.CircularChainDetected, err);
+            got_error = true;
+            break;
+        }
+    }
+    try testing.expect(got_error);
+}
+
+test "SEC-0042: updateEdgePropHead detects circular chain" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const head = try store.addEdge(0, makeEdge(10, 1, 5));
+    try makeSelfLoop(&store, head);
+
+    // Edge ID 999 does not exist; traversal must trip the hop guard.
+    try testing.expectError(error.CircularChainDetected, store.updateEdgePropHead(head, 999, 42));
+}
+
+test "SEC-0042: edgeCount detects circular chain" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const head = try store.addEdge(0, makeEdge(10, 1, 5));
+    try makeSelfLoop(&store, head);
+
+    try testing.expectError(error.CircularChainDetected, store.edgeCount(head));
 }
 
 test {
