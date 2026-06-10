@@ -57,6 +57,21 @@ fn readDirCount(data: []const u8) u16 {
     return std.mem.readInt(u16, data[data.len - DIR_COUNT_SIZE ..][0..DIR_COUNT_SIZE], .little);
 }
 
+/// Read dir_count with bounds validation: the directory region (dir_count
+/// entries + the 2-byte count field) must fit entirely within the data
+/// region that follows PROP_DATA_OFFSET. A corrupt or adversarially crafted
+/// page with an inflated dir_count would otherwise cause an integer underflow
+/// in readDirEntry's base-address calculation (OOB read in ReleaseFast,
+/// panic in ReleaseSafe). SEC-0039.
+fn readDirCountChecked(data: []const u8) error{DataCorruption}!u16 {
+    const dir_count = readDirCount(data);
+    if (dir_count == 0) return 0;
+    // Ensure dirOverhead(dir_count) + PROP_DATA_OFFSET <= data.len
+    const overhead = dirOverhead(dir_count);
+    if (PROP_DATA_OFFSET + overhead > data.len) return error.DataCorruption;
+    return dir_count;
+}
+
 /// Write the directory entry count to the last 2 bytes of a page.
 fn writeDirCount(data: []u8, count: u16) void {
     std.mem.writeInt(u16, data[data.len - DIR_COUNT_SIZE ..][0..DIR_COUNT_SIZE], count, .little);
@@ -157,7 +172,10 @@ pub const PropStore = struct {
             };
 
             // PERF-0023: Try directory-based lookup first.
-            const dir_count = readDirCount(data);
+            const dir_count = readDirCountChecked(data) catch {
+                self.buffer_pool.unpin(frame_idx, false);
+                return error.DataCorruption;
+            };
             if (dir_count > 0) {
                 const target_hash = keyHash(key);
                 var di: u16 = 0;
@@ -1164,6 +1182,57 @@ test "PERF-0023: directory helpers read/write round-trip" {
     const e1 = readDirEntry(&buf, 1);
     try testing.expectEqual(@as(u16, 0x1234), e1.hash);
     try testing.expectEqual(@as(u16, 100), e1.offset);
+}
+
+// ============================================================================
+// SEC-0039: dir_count bounds-validation regression tests
+// ============================================================================
+
+test "SEC-0039: getProperty returns DataCorruption when dir_count is 0xFFFF" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    // Create a real property page.
+    const head = try store.putProperty(0, "k", .{ .int = 1 });
+
+    // Corrupt the dir_count field to the maximum possible u16 value.
+    // This makes dirOverhead(0xFFFF) = 2 + 65535*4 = 262142 bytes, which
+    // far exceeds the 4096-byte page; readDirEntry would underflow the base
+    // index in ReleaseFast or panic in ReleaseSafe.
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
+    writeDirCount(frame.dataSlice(), 0xFFFF);
+    env.pool().unpin(frame_idx, true);
+
+    // getProperty must return DataCorruption rather than panicking or
+    // producing an out-of-bounds read.
+    try testing.expectError(error.DataCorruption, store.getProperty(head, "k", testing.allocator));
+}
+
+test "SEC-0039: getProperty returns DataCorruption when dir_count just exceeds capacity" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const head = try store.putProperty(0, "k", .{ .int = 1 });
+
+    // Compute the maximum valid dir_count for a 4096-byte page.
+    // capacity = 4096 - PROP_DATA_OFFSET - DIR_COUNT_SIZE
+    // PROP_DATA_OFFSET = PAGE_HEADER_SIZE(32) + PROP_META_SIZE(12) = 44
+    // capacity = 4096 - 44 - 2 = 4050
+    // max_valid = capacity / DIR_ENTRY_SIZE(4) = 1012
+    // One past capacity: 1013
+    const one_past_capacity: u16 = 1013;
+
+    const frame = try env.pool().pin(.props, head);
+    const frame_idx = env.pool().frameIndex(frame);
+    writeDirCount(frame.dataSlice(), one_past_capacity);
+    env.pool().unpin(frame_idx, true);
+
+    try testing.expectError(error.DataCorruption, store.getProperty(head, "k", testing.allocator));
 }
 
 test {
