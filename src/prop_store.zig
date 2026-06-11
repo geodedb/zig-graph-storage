@@ -417,6 +417,14 @@ pub const PropStore = struct {
 
         const entry_size: u32 = 2 + @as(u32, @intCast(key.len)) + @as(u32, @intCast(encoded_val.len));
 
+        // Guard: an entry that cannot fit on any single fresh property page
+        // (key_len field + key bytes + encoded value + one directory slot) would
+        // cause an out-of-bounds write in writePropertyEntry for both the
+        // prop_head==0 fast path and the overflow-page allocation in insertEntry.
+        // Treat this as an oversized key even when the u16 range guard above
+        // passed, because the key is still too long for the configured page size.
+        if (entry_size > self.dataCapacity() -| DIR_ENTRY_SIZE) return error.PropertyKeyTooLong;
+
         if (prop_head == 0) {
             // Allocate new property page
             const new_page = try self.free_space.allocPage();
@@ -745,12 +753,44 @@ fn writeEntryCount(data: []u8, count: u32) void {
 /// This is called after insertions and removals to keep the directory
 /// consistent with the entry data. The scan is O(entry_count) which is
 /// bounded by the page size.
+///
+/// Two-phase approach: first scan to check whether ALL entries fit within the
+/// space that would remain after reserving the directory region (max_dir_end).
+/// Only when every entry fits do we perform the second pass that writes the
+/// directory entries. This prevents partial directory writes from landing inside
+/// the entry data region for pages that were constructed without directory
+/// overhead (legacy / manually crafted), which would corrupt those entries.
 fn rebuildDirectory(data: []u8, entry_count: u32, page_size: u32) void {
     _ = page_size;
-    // First verify there is room for the directory. If entries + directory
-    // would overlap, write dir_count=0 to disable the directory (legacy mode).
+    // Lowest address at which a directory entry can safely be placed:
+    //   max_dir_end = data.len - DIR_COUNT_SIZE - entry_count * DIR_ENTRY_SIZE
+    // If any entry's data pointer exceeds this boundary the directory cannot
+    // be placed without overlapping the entry data — disable it.
     const max_dir_end = data.len - DIR_COUNT_SIZE - @as(usize, entry_count) * DIR_ENTRY_SIZE;
 
+    // Phase 1: pre-flight check. Scan all entries without writing anything.
+    // If any entry pushes the data pointer past max_dir_end, disable the
+    // directory immediately (no writes at all) so that entry data is never
+    // corrupted by partially-written directory entries.
+    {
+        var off: u32 = PROP_DATA_OFFSET;
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            if (off + 2 > data.len) break;
+            const key_len = std.mem.bytesToValue(u16, data[off..][0..2]);
+            off += 2;
+            if (off + key_len > data.len) break;
+            off += key_len;
+            const val_size = encodedSizeFromBytes(data[off..]) catch break;
+            off += @intCast(val_size);
+            if (off > max_dir_end) {
+                writeDirCount(data, 0);
+                return;
+            }
+        }
+    }
+
+    // Phase 2: all entries fit — build the directory.
     var off: u32 = PROP_DATA_OFFSET;
     var di: u16 = 0;
     var i: u32 = 0;
@@ -762,18 +802,8 @@ fn rebuildDirectory(data: []u8, entry_count: u32, page_size: u32) void {
         if (off + key_len > data.len) break;
         const k = data[off..][0..key_len];
         off += key_len;
-
-        // Skip value
         const val_size = encodedSizeFromBytes(data[off..]) catch break;
         off += @intCast(val_size);
-
-        // Check that entry data hasn't grown into the directory space.
-        if (off > max_dir_end) {
-            // No room for directory — disable it.
-            writeDirCount(data, 0);
-            return;
-        }
-
         writeDirEntry(data, di, keyHash(k), @intCast(entry_off));
         di += 1;
     }
@@ -1554,6 +1584,168 @@ test "SEC-0042: PropIterator.next detects circular page chain" {
         }
     }
     try testing.expect(got_error);
+}
+
+// ============================================================================
+// QUAL-0044 T2: prop_store edge/boundary cases
+// ============================================================================
+
+test "QUAL-0044 T2: putProperty returns PropertyKeyTooLong for key exceeding u16 max" {
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    // key.len = maxInt(u16) + 1 = 65536 must fire the u16-range guard.
+    const over_limit = try testing.allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer testing.allocator.free(over_limit);
+    @memset(over_limit, 'x');
+    try testing.expectError(error.PropertyKeyTooLong, store.putProperty(0, over_limit, .{ .int = 1 }));
+}
+
+test "QUAL-0044 T2: putProperty returns PropertyKeyTooLong for key at u16 max on 4096-byte page" {
+    // key.len == maxInt(u16) == 65535 passes the u16-range guard but cannot
+    // fit on a 4096-byte page. The page-capacity guard must prevent an
+    // out-of-bounds write and return a clean error instead of panicking.
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const at_limit = try testing.allocator.alloc(u8, std.math.maxInt(u16));
+    defer testing.allocator.free(at_limit);
+    @memset(at_limit, 'k');
+    try testing.expectError(error.PropertyKeyTooLong, store.putProperty(0, at_limit, .{ .int = 1 }));
+}
+
+test "QUAL-0044 T2: page-boundary entry lands exactly at usable-capacity limit" {
+    // Compute the maximum entry size that still fits with one directory slot:
+    //   dataCapacity = 4096 - PROP_DATA_OFFSET - DIR_COUNT_SIZE = 4050
+    //   available for one entry = dataCapacity - DIR_ENTRY_SIZE = 4046
+    //   entry layout: 2 (key_len field) + key_len + encoded_null (1)
+    //   → max key_len = 4046 - 2 - 1 = 4043
+    // Inserting a key of exactly 4043 bytes with a null value must succeed
+    // and be retrievable.
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    const boundary_key_len: usize = 4043;
+    const key = try testing.allocator.alloc(u8, boundary_key_len);
+    defer testing.allocator.free(key);
+    @memset(key, 'B');
+
+    const head = try store.putProperty(0, key, PropertyValue.null);
+    try testing.expect(head != 0);
+
+    const val = try store.getProperty(head, key, testing.allocator);
+    try testing.expect(val != null);
+    try testing.expectEqual(PropertyValue.null, val.?);
+}
+
+test "QUAL-0044 T2: rebuildDirectory disables directory when data region overlaps directory space" {
+    // The rebuildDirectory path that sets dir_count=0 (linear-scan fallback)
+    // fires when the total entry data pushes the scan pointer past max_dir_end.
+    // This cannot be reached via the normal insert API (which accounts for
+    // directory overhead), but can occur for pages that were written in legacy
+    // format (dir_count=0) with entries packed tightly.
+    //
+    // Strategy:
+    //   1. Insert one real sentinel entry via putProperty.
+    //   2. Pin the page and manually append N entries (key_len=2, 2-byte key,
+    //      null value = 5 bytes each) directly into the data region, update
+    //      entry_count, and clear dir_count to 0 (legacy mode).
+    //   3. Unpin (dirty).
+    //   4. Call removeProperty on the real sentinel key — this uses linear scan
+    //      (dir_count == 0) to find-and-remove the entry, then calls
+    //      rebuildDirectory for the N remaining entries. With N=500 and entry_size
+    //      5 bytes, the scan pointer after all N entries exceeds max_dir_end and
+    //      the directory is disabled (dir_count stays 0).
+    //   5. Assert dir_count == 0.
+    //   6. Assert that the remaining 2-byte-key entries are still accessible via
+    //      getProperty (linear scan fallback).
+    //
+    // readEntryCountChecked bound: max_entries = (4096 - 44 - 2) / (3 + 4) = 578.
+    // Total entry_count in buffer = 501 (1 sentinel + 500 extra) ≤ 578. OK.
+    // After removal: 500 entries × 5 bytes = 2500 bytes of data.
+    //   data_end = 44 + 2500 = 2544
+    //   max_dir_end = 4094 - 500×4 = 4094 - 2000 = 2094
+    //   2544 > 2094 → rebuildDirectory sets dir_count = 0.
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+
+    // Insert the sentinel entry that will be removed later.
+    const sentinel_key = "sentinel";
+    const head = try store.putProperty(0, sentinel_key, .{ .int = 99 });
+
+    // n_extra must satisfy:
+    //   (1) 1 + n_extra <= max_entries (578) so readEntryCountChecked accepts it.
+    //   (2) After removal: n_extra entries of entry_size bytes trigger directory
+    //       disable in rebuildDirectory.
+    const n_extra: u32 = 500;
+    const extra_key_len: u16 = 2;
+    const extra_entry_size: u32 = 2 + extra_key_len + 1; // key_len_field + key + null tag
+
+    {
+        const frame = try env.pool().pin(.props, head);
+        const frame_idx = env.pool().frameIndex(frame);
+        const data = frame.dataSlice();
+
+        // Sentinel: key_len(2) + "sentinel"(8) + int_tag(1) + i64(8) = 19 bytes.
+        const sentinel_entry_size: u32 = 2 + sentinel_key.len + 9;
+        var off: u32 = PROP_DATA_OFFSET + sentinel_entry_size;
+
+        // Write n_extra entries: each is key_len=2, key="\xAB\xCD", null value.
+        var i: u32 = 0;
+        while (i < n_extra) : (i += 1) {
+            std.mem.writeInt(u16, data[off..][0..2], extra_key_len, .little);
+            off += 2;
+            data[off] = 0xAB;
+            off += 1;
+            data[off] = 0xCD;
+            off += 1;
+            data[off] = @intFromEnum(property_mod.Tag.null);
+            off += 1;
+        }
+
+        // Update entry_count and switch to legacy mode (dir_count = 0).
+        writeEntryCount(data, 1 + n_extra);
+        writeDirCount(data, 0);
+
+        env.pool().unpin(frame_idx, true);
+    }
+
+    // Remove the sentinel. findEntrySpan uses linear scan (dir_count == 0),
+    // finds "sentinel", removes it (shifting n_extra entries to front), then
+    // calls rebuildDirectory(data, n_extra, 4096). With n_extra=500 and
+    // entry_size=5, the data scan pointer exceeds max_dir_end → dir_count = 0.
+    try store.removeProperty(head, sentinel_key);
+
+    // Verify dir_count == 0 (directory disabled by rebuildDirectory).
+    {
+        const frame = try env.pool().pin(.props, head);
+        const frame_idx = env.pool().frameIndex(frame);
+        const data = frame.dataSlice();
+        const dir_count = readDirCount(data);
+        env.pool().unpin(frame_idx, false);
+        try testing.expectEqual(@as(u16, 0), dir_count);
+    }
+
+    // Verify that the extra entries are still readable via linear scan.
+    // getProperty with key="\xAB\xCD" must find the first matching entry.
+    const lookup_key = "\xAB\xCD";
+    const val = try store.getProperty(head, lookup_key, testing.allocator);
+    try testing.expect(val != null);
+    try testing.expectEqual(PropertyValue.null, val.?);
+
+    // The sentinel must no longer be visible.
+    const gone = try store.getProperty(head, sentinel_key, testing.allocator);
+    try testing.expect(gone == null);
+
+    _ = extra_entry_size;
 }
 
 test {
