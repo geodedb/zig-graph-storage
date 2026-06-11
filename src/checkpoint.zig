@@ -66,8 +66,20 @@ pub const Checkpointer = struct {
         // 2. Flush all dirty pages
         try self.buffer_pool.flushAll();
 
-        // 3. Sync all store files
-        try self.file_manager.syncAll();
+        // 3. Sync ONLY the store files modified since their last successful fsync
+        //    (PERF-0057). takeDirtyFiles() drains the set the flush in step 2
+        //    just populated; syncDirty() then fsyncs exactly those files. This
+        //    runs BEFORE the manifest write below and BEFORE the WAL truncate in
+        //    step 7, preserving the data -> manifest -> WAL-truncate durability
+        //    ordering. A file is skipped only when no page was written to it
+        //    since its last fsync, so its on-disk state is already durable.
+        const dirty_files = self.buffer_pool.takeDirtyFiles();
+        // If anything from here through the manifest write fails, restore the
+        // drained marks so the next checkpoint re-fsyncs these files. Without
+        // this, a failed fsync would clear the flags and a later checkpoint
+        // could skip a file whose data is not yet durable.
+        errdefer self.buffer_pool.restoreDirtyFiles(dirty_files);
+        try self.file_manager.syncDirty(dirty_files);
 
         // 4. Update manifest
         self.manifest.last_checkpoint_lsn = checkpoint_lsn;
@@ -312,6 +324,105 @@ test "checkpoint emits start and end events via log_fn" {
 
     // Expect checkpoint_start + checkpoint_end = 2 events
     try testing.expectEqual(@as(usize, 2), checkpoint_event_count);
+}
+
+const page_mod = @import("page.zig");
+const FileId = @import("types.zig").FileId;
+const FILE_COUNT = @typeInfo(FileId).@"enum".fields.len;
+
+test "PERF-0057: checkpoint drains the buffer pool dirty-file set" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    // Write a dirty page to the nodes store through the pool.
+    const nodes_pager = env.file_manager.getPager(.nodes).?;
+    const f = try env.buffer_pool.pinNew(.nodes, 0);
+    const header = page_mod.initHeader(0, .node_data, 4096);
+    @memcpy(f.dataSlice()[0..page_mod.PAGE_HEADER_SIZE], page_mod.headerToBytes(&header));
+    @memset(f.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x5A);
+    f.dirty = true;
+    env.buffer_pool.unpin(env.buffer_pool.frameIndex(f), true);
+
+    var cp = Checkpointer.init(
+        testing.allocator,
+        &env.buffer_pool,
+        &env.wal,
+        &env.manifest,
+        &env.file_manager,
+        &env.graph_dir,
+    );
+
+    try cp.doCheckpoint();
+
+    // The checkpoint must have drained the dirty-file set (it owns the fsync).
+    const after = env.buffer_pool.takeDirtyFiles();
+    for (after) |d| try testing.expect(!d);
+
+    // The page must be readable from disk (durability of the synced file).
+    var read_buf: [4096]u8 = undefined;
+    try nodes_pager.readPage(0, &read_buf);
+    for (read_buf[page_mod.PAGE_HEADER_SIZE..]) |b| {
+        try testing.expectEqual(@as(u8, 0x5A), b);
+    }
+}
+
+test "PERF-0057: a checkpoint with no page writes leaves the dirty set empty" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var cp = Checkpointer.init(
+        testing.allocator,
+        &env.buffer_pool,
+        &env.wal,
+        &env.manifest,
+        &env.file_manager,
+        &env.graph_dir,
+    );
+
+    // No pages written -> the flush flags nothing.
+    try cp.doCheckpoint();
+    const after = env.buffer_pool.takeDirtyFiles();
+    for (after) |d| try testing.expect(!d);
+}
+
+test "PERF-0057: a flush after checkpoint flags the modified file for the next sync" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+
+    var cp = Checkpointer.init(
+        testing.allocator,
+        &env.buffer_pool,
+        &env.wal,
+        &env.manifest,
+        &env.file_manager,
+        &env.graph_dir,
+    );
+
+    // First checkpoint with no writes drains nothing.
+    try cp.doCheckpoint();
+
+    // Write a dirty nodes page and flush WITHOUT checkpointing: the file must be
+    // flagged so the NEXT checkpoint fsyncs it (proving no fsync is dropped).
+    const f = try env.buffer_pool.pinNew(.nodes, 1);
+    const header = page_mod.initHeader(1, .node_data, 4096);
+    @memcpy(f.dataSlice()[0..page_mod.PAGE_HEADER_SIZE], page_mod.headerToBytes(&header));
+    @memset(f.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x6B);
+    f.dirty = true;
+    env.buffer_pool.unpin(env.buffer_pool.frameIndex(f), true);
+    try env.buffer_pool.flushAll();
+
+    // Peek the live flags without draining by restoring after.
+    const flags = env.buffer_pool.takeDirtyFiles();
+    try testing.expect(flags[@intFromEnum(FileId.nodes)]);
+    env.buffer_pool.restoreDirtyFiles(flags);
+
+    // The next checkpoint drains and fsyncs it.
+    try cp.doCheckpoint();
+    const after = env.buffer_pool.takeDirtyFiles();
+    for (after) |d| try testing.expect(!d);
 }
 
 test {

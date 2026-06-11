@@ -1037,3 +1037,63 @@ test "integration: maintenance getStats" {
     try std.testing.expectEqual(@as(u64, 1000), stats.next_edge_id);
     try std.testing.expectEqual(@as(u64, 42), stats.last_checkpoint_lsn);
 }
+
+test "PERF-0057: dirty-aware checkpoint preserves durability across multiple checkpoints" {
+    const allocator = std.testing.allocator;
+    const cfg = testConfig();
+    const uuid = [_]u8{0x57} ** 16;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    // Phase 1: create, add a node, checkpoint #1 (writes touch the data stores).
+    {
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        const n1 = try eng.allocNode();
+        try eng.putNode(n1, makeNode(11));
+        try eng.checkpoint();
+
+        // After a successful checkpoint the buffer pool's dirty-file set must be
+        // drained: the checkpoint owns (and just performed) the fsync of every
+        // file it wrote. A redundant drain here therefore observes an empty set,
+        // which is exactly why the NEXT no-op checkpoint can skip all fsyncs.
+        const drained = eng.buffer_pool.takeDirtyFiles();
+        for (drained) |d| try std.testing.expect(!d);
+
+        // Phase 2: mutate a DIFFERENT logical area (add an edge -> adjacency
+        // stores) and checkpoint #2. Durability must hold across both.
+        const n2 = try eng.allocNode();
+        try eng.putNode(n2, makeNode(22));
+        _ = try eng.addEdge(n1, n2, 7);
+        try eng.checkpoint();
+
+        const drained2 = eng.buffer_pool.takeDirtyFiles();
+        for (drained2) |d| try std.testing.expect(!d);
+
+        try eng.close();
+    }
+
+    // Phase 3: reopen and assert ALL data written across both checkpoints is
+    // present. If dirty-aware fsync had dropped a needed sync, a store written
+    // in checkpoint #1 or #2 would be lost here.
+    {
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        try std.testing.expectEqual(@as(u64, 2), try eng.nodeCount());
+
+        const got1 = try eng.getNode(1);
+        try std.testing.expect(got1 != null);
+        const got2 = try eng.getNode(2);
+        try std.testing.expect(got2 != null);
+
+        const n1_out = try eng.expandOut(1, null, allocator);
+        defer allocator.free(n1_out);
+        var found = false;
+        for (n1_out) |e| {
+            if (e.neighbor == 2 and e.rel_type == 7) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}

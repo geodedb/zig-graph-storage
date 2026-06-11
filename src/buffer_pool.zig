@@ -23,6 +23,12 @@ pub const BufferPoolError = error{
     NoPagerRegistered,
 };
 
+/// PERF-0056: upper bound (in pages) on the reusable parallel-flush scratch
+/// buffer. With a 16 KiB page this caps the transient flush allocation at
+/// 16 MiB regardless of how many pages are dirty in a single checkpoint;
+/// larger dirty sets are written in successive capacity-sized waves.
+pub const PARALLEL_FLUSH_SCRATCH_PAGES: usize = 1024;
+
 pub const PageKey = struct {
     file_id: FileId,
     page_id: PageId,
@@ -56,6 +62,22 @@ pub const BufferPool = struct {
     resident_counts: [FILE_COUNT]u32 = [_]u32{0} ** FILE_COUNT,
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
+    // PERF-0057: per-FileId "needs fsync" flags. Set whenever a page is
+    // successfully written to a file's pager via any flush path (flushFrame,
+    // flushAllParallel, eviction). Cleared only by takeDirtyFiles() once the
+    // caller commits to fsyncing that file. This lets the checkpointer fsync
+    // ONLY the store files actually modified since their last successful sync,
+    // without ever dropping a fsync the data depends on. Indexed by
+    // @intFromEnum(FileId). Always mutated under `mutex`.
+    dirty_files: [FILE_COUNT]bool = [_]bool{false} ** FILE_COUNT,
+    // PERF-0056: bounded scratch buffer reused by flushAllParallel instead of
+    // allocating dirty_count*page_size per checkpoint. Grown on demand up to
+    // max_scratch_pages pages; flushes with more dirty pages are written in
+    // capacity-sized waves so peak transient memory stays bounded.
+    flush_scratch: []u8 = &.{},
+    // PERF-0056: cap (in pages) on the reusable scratch buffer. Defaults to
+    // PARALLEL_FLUSH_SCRATCH_PAGES; lowered in tests to exercise the wave path.
+    max_scratch_pages: usize = PARALLEL_FLUSH_SCRATCH_PAGES,
     // Concurrency protection for multi-threaded access
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     cond: std.Io.Condition = std.Io.Condition.init,
@@ -117,6 +139,7 @@ pub const BufferPool = struct {
         self.free_list.deinit(self.allocator);
         self.allocator.free(self.frames);
         self.allocator.free(self.page_buf);
+        if (self.flush_scratch.len != 0) self.allocator.free(self.flush_scratch);
     }
 
     /// Register a pager for the given file_id.
@@ -155,6 +178,41 @@ pub const BufferPool = struct {
         const reserve = self.reserved_frames[idx];
         if (reserve == 0) return false;
         return self.resident_counts[idx] <= reserve;
+    }
+
+    /// PERF-0057: mark `file_id` as needing an fsync because a page was just
+    /// persisted to its pager. Caller holds the mutex. The flag is only cleared
+    /// later by takeDirtyFiles(), so a mark can never be lost between flush and
+    /// the fsync that makes the write durable.
+    fn markFileDirty(self: *BufferPool, file_id: FileId) void {
+        self.dirty_files[@intFromEnum(file_id)] = true;
+    }
+
+    /// PERF-0057: atomically read and clear the set of files that have received
+    /// page writes since the previous call (or since init). The returned set is
+    /// the caller's obligation: it MUST fsync every file flagged `true` before
+    /// relying on those writes being durable (e.g. before writing the manifest).
+    /// Because the flags are cleared here and only set under the same mutex by
+    /// the flush paths, a write that races in after this drain stays flagged for
+    /// the next drain — no fsync is ever silently dropped.
+    pub fn takeDirtyFiles(self: *BufferPool) [FILE_COUNT]bool {
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        const snapshot = self.dirty_files;
+        self.dirty_files = [_]bool{false} ** FILE_COUNT;
+        return snapshot;
+    }
+
+    /// PERF-0057: OR a previously-drained dirty set back into the live flags.
+    /// Used by the checkpoint to recover after a failed fsync so the affected
+    /// files are re-synced on the next checkpoint and no durability-relevant
+    /// fsync is ever lost. Safe to call with a set produced by takeDirtyFiles().
+    pub fn restoreDirtyFiles(self: *BufferPool, dirty: [FILE_COUNT]bool) void {
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        for (dirty, 0..) |d, i| {
+            if (d) self.dirty_files[i] = true;
+        }
     }
 
     /// Attach a metrics struct for recording buffer hit/miss and page I/O counters.
@@ -324,6 +382,13 @@ pub const BufferPool = struct {
 
     /// Parallel flush: collect dirty frames under mutex, copy data, then
     /// write pages concurrently via submitBatch + WaitGroup.
+    ///
+    /// PERF-0056: the per-page copy buffer is a bounded, reusable scratch buffer
+    /// (`flush_scratch`, capped at PARALLEL_FLUSH_SCRATCH_PAGES pages) rather
+    /// than a fresh `dirty_count * page_size` allocation per checkpoint. When the
+    /// dirty set exceeds the scratch capacity the flush proceeds in successive
+    /// capacity-sized waves, so peak transient memory stays bounded no matter how
+    /// many pages are dirty.
     fn flushAllParallel(self: *BufferPool, pool: *tp.ThreadPool) !void {
         self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
 
@@ -338,19 +403,27 @@ pub const BufferPool = struct {
             return;
         }
 
-        // Allocate descriptors and a contiguous data buffer for page copies
+        const ps: usize = self.page_size;
+
+        // Descriptor array for every dirty frame (tiny, ~constant per frame).
+        // The large page-copy storage is the bounded scratch buffer below.
         const items = self.allocator.alloc(FlushItem, dirty_count) catch {
             self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             return error.OutOfMemory;
         };
-        const ps: usize = self.page_size;
-        const data_buf = self.allocator.alloc(u8, dirty_count * ps) catch {
+
+        // Bounded reusable scratch buffer: holds at most wave_pages page copies.
+        const wave_pages: usize = @min(dirty_count, @max(self.max_scratch_pages, 1));
+        self.ensureFlushScratch(wave_pages * ps) catch {
             self.allocator.free(items);
             self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             return error.OutOfMemory;
         };
+        const data_buf = self.flush_scratch;
 
-        // Collect dirty frames: copy page data, bump pin, clear dirty
+        // Collect descriptors for every dirty frame: pin (prevent eviction
+        // across the whole flush) and clear dirty. No page bytes are copied yet;
+        // copies happen per wave into the bounded scratch buffer.
         var idx: usize = 0;
         for (self.frames, 0..) |*frame, fi| {
             if (frame.dirty and frame.valid) {
@@ -361,14 +434,10 @@ pub const BufferPool = struct {
                         self.frames[item.frame_idx].pin_count -= 1;
                         self.frames[item.frame_idx].dirty = true;
                     }
-                    self.allocator.free(data_buf);
                     self.allocator.free(items);
                     self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
                     return error.NoPagerRegistered;
                 };
-
-                const offset = idx * ps;
-                @memcpy(data_buf[offset..][0..ps], frame.dataSlice());
 
                 frame.pin_count += 1;
                 frame.dirty = false;
@@ -377,83 +446,114 @@ pub const BufferPool = struct {
                     .pager = p,
                     .page_id = frame.page_id,
                     .frame_idx = @intCast(fi),
-                    .data_offset = offset,
+                    .data_offset = 0, // assigned per wave
                     .err = null,
                 };
                 idx += 1;
             }
         }
-        self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
-        // Parallel I/O via submitBatch + WaitGroup
         const MAX_CHUNKS = 64;
-        const n_chunks = @min(dirty_count, MAX_CHUNKS);
         var flush_ctxs: [MAX_CHUNKS]FlushChunkCtx = undefined;
         var batch_tasks: [MAX_CHUNKS]tp.BatchTask = undefined;
-        var wg = pool.waitGroup();
-
-        const chunk_size = (dirty_count + n_chunks - 1) / n_chunks;
-        var n_chunks_actual: usize = 0;
-        {
-            var item_i: usize = 0;
-            while (item_i < dirty_count) : (n_chunks_actual += 1) {
-                const end = @min(item_i + chunk_size, dirty_count);
-                flush_ctxs[n_chunks_actual] = .{
-                    .items = items[item_i..end],
-                    .data_buf = data_buf,
-                    .page_size = self.page_size,
-                };
-                batch_tasks[n_chunks_actual] = .{
-                    .task_fn = flushChunkFn,
-                    .ctx = &flush_ctxs[n_chunks_actual],
-                };
-                item_i = end;
-            }
-        }
-
-        // Single source of truth for done-counting: SubmitOptions.wait_group
-        // auto-adds on each successful submit and auto-dones on completion.
-        // Unsubmitted chunks run inline below *before* wg.wait(), so they
-        // don't need their own wg accounting.
-        const submitted: usize = if (pool.submitBatch(batch_tasks[0..n_chunks_actual], .{ .wait_group = &wg })) |r|
-            r.submitted
-        else |_|
-            0;
-        for (flush_ctxs[submitted..n_chunks_actual]) |*c| {
-            flushChunkFn(c, undefined);
-        }
-
-        wg.wait();
-
-        // Re-acquire mutex to unpin frames and handle errors
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
         var first_err: ?anyerror = null;
         var write_count: u64 = 0;
-        for (items) |*item| {
-            self.frames[item.frame_idx].pin_count -= 1;
-            if (item.err) |e| {
-                self.frames[item.frame_idx].dirty = true;
-                if (first_err == null) first_err = e;
-            } else {
-                // SEC-0037: writePage incremented write_count in the per-flush
-                // copy (data_buf), not in the live cached frame. Propagate the
-                // persisted write_count back so a later flush of this still-cached
-                // page derives a strictly greater AES-GCM nonce. Only relevant
-                // when encryption is active for this page's pager.
-                if (item.pager.encryption != null) {
-                    const copy = data_buf[item.data_offset..][0..ps];
-                    page_mod.writeWriteCount(self.frames[item.frame_idx].dataSlice(), page_mod.readWriteCount(copy));
-                }
-                write_count += 1;
+
+        // Process the dirty set in bounded waves of at most wave_pages frames.
+        var wave_start: usize = 0;
+        while (wave_start < dirty_count) {
+            const wave_end = @min(wave_start + wave_pages, dirty_count);
+            const wave = items[wave_start..wave_end];
+            const wave_len = wave.len;
+
+            // Copy this wave's page bytes into the scratch buffer (mutex held).
+            for (wave, 0..) |*item, w| {
+                const offset = w * ps;
+                item.data_offset = offset;
+                @memcpy(data_buf[offset..][0..ps], self.frames[item.frame_idx].dataSlice());
             }
+            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+
+            // Parallel I/O via submitBatch + WaitGroup for this wave.
+            const n_chunks = @min(wave_len, MAX_CHUNKS);
+            var wg = pool.waitGroup();
+            const chunk_size = (wave_len + n_chunks - 1) / n_chunks;
+            var n_chunks_actual: usize = 0;
+            {
+                var item_i: usize = 0;
+                while (item_i < wave_len) : (n_chunks_actual += 1) {
+                    const end = @min(item_i + chunk_size, wave_len);
+                    flush_ctxs[n_chunks_actual] = .{
+                        .items = wave[item_i..end],
+                        .data_buf = data_buf,
+                        .page_size = self.page_size,
+                    };
+                    batch_tasks[n_chunks_actual] = .{
+                        .task_fn = flushChunkFn,
+                        .ctx = &flush_ctxs[n_chunks_actual],
+                    };
+                    item_i = end;
+                }
+            }
+
+            // Single source of truth for done-counting: SubmitOptions.wait_group
+            // auto-adds on each successful submit and auto-dones on completion.
+            // Unsubmitted chunks run inline below *before* wg.wait(), so they
+            // don't need their own wg accounting.
+            const submitted: usize = if (pool.submitBatch(batch_tasks[0..n_chunks_actual], .{ .wait_group = &wg })) |r|
+                r.submitted
+            else |_|
+                0;
+            for (flush_ctxs[submitted..n_chunks_actual]) |*c| {
+                flushChunkFn(c, undefined);
+            }
+
+            wg.wait();
+
+            // Re-acquire mutex to unpin this wave's frames and reconcile errors.
+            self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+            for (wave) |*item| {
+                self.frames[item.frame_idx].pin_count -= 1;
+                if (item.err) |e| {
+                    self.frames[item.frame_idx].dirty = true;
+                    if (first_err == null) first_err = e;
+                } else {
+                    // PERF-0057: the page reached the OS page cache; flag its file
+                    // for fsync so the next checkpoint syncs it (never skips it).
+                    self.markFileDirty(self.frames[item.frame_idx].file_id);
+                    // SEC-0037: writePage incremented write_count in the per-flush
+                    // copy (data_buf), not in the live cached frame. Propagate the
+                    // persisted write_count back so a later flush of this still-cached
+                    // page derives a strictly greater AES-GCM nonce. Only relevant
+                    // when encryption is active for this page's pager.
+                    if (item.pager.encryption != null) {
+                        const copy = data_buf[item.data_offset..][0..ps];
+                        page_mod.writeWriteCount(self.frames[item.frame_idx].dataSlice(), page_mod.readWriteCount(copy));
+                    }
+                    write_count += 1;
+                }
+            }
+
+            wave_start = wave_end;
+            // Keep the mutex held for the next wave's copy phase; the final wave
+            // unlocks below.
         }
+
         if (self.metrics) |m| m.page_writes += write_count;
         self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
-        self.allocator.free(data_buf);
         self.allocator.free(items);
 
         if (first_err) |e| return e;
+    }
+
+    /// PERF-0056: ensure `flush_scratch` is at least `min_bytes` long, growing
+    /// (never shrinking) the reusable buffer. Caller holds the mutex.
+    fn ensureFlushScratch(self: *BufferPool, min_bytes: usize) !void {
+        if (self.flush_scratch.len >= min_bytes) return;
+        if (self.flush_scratch.len != 0) self.allocator.free(self.flush_scratch);
+        self.flush_scratch = &.{};
+        self.flush_scratch = try self.allocator.alloc(u8, min_bytes);
     }
 
     /// Flush up to max_count dirty unpinned pages to disk, starting from the LRU tail.
@@ -513,6 +613,11 @@ pub const BufferPool = struct {
             return err;
         };
         self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+
+        // PERF-0057: the write reached the OS page cache; this file now needs an
+        // fsync before its data is durable. Flag it so the next checkpoint syncs
+        // exactly this file (and never skips it).
+        self.markFileDirty(fid);
 
         // SEC-0037: writePage incremented write_count in its private copy `buf`,
         // not in the live cached frame. Propagate the persisted write_count back
@@ -1308,6 +1413,129 @@ test "PERF-0051: BufferPoolFull still raised when reserved frames are all pinned
     // No evictable frame exists in either pass -> must still surface the error
     // rather than spin or corrupt the floor accounting.
     try testing.expectError(error.BufferPoolFull, pool.pin(.props, 0));
+}
+
+test "PERF-0057: flushAll flags only the files that had pages written" {
+    const node_file = try createTempFile(".test_bp_perf0057_nodes");
+    defer cleanupTempFile(node_file, ".test_bp_perf0057_nodes");
+    const prop_file = try createTempFile(".test_bp_perf0057_props");
+    defer cleanupTempFile(prop_file, ".test_bp_perf0057_props");
+
+    const page_size: u32 = 4096;
+    var node_pager = Pager.init(node_file, page_size);
+    var prop_pager = Pager.init(prop_file, page_size);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 8);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &node_pager);
+    pool.registerPager(.props, &prop_pager);
+
+    // No flush yet -> nothing dirty.
+    const initial = pool.takeDirtyFiles();
+    for (initial) |d| try testing.expect(!d);
+
+    // Write a dirty page to the NODES store only and flush.
+    const nf = try pool.pinNew(.nodes, 0);
+    @memset(nf.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x11);
+    nf.dirty = true;
+    pool.unpin(pool.frameIndex(nf), true);
+    try pool.flushAll();
+
+    var dirty = pool.takeDirtyFiles();
+    try testing.expect(dirty[@intFromEnum(FileId.nodes)]);
+    try testing.expect(!dirty[@intFromEnum(FileId.props)]);
+
+    // takeDirtyFiles drained the set: a second drain with no new writes is empty.
+    dirty = pool.takeDirtyFiles();
+    for (dirty) |d| try testing.expect(!d);
+
+    // Now modify a DIFFERENT store (props) and flush: only props must be flagged.
+    const pf = try pool.pinNew(.props, 0);
+    @memset(pf.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x22);
+    pf.dirty = true;
+    pool.unpin(pool.frameIndex(pf), true);
+    try pool.flushAll();
+
+    dirty = pool.takeDirtyFiles();
+    try testing.expect(dirty[@intFromEnum(FileId.props)]);
+    try testing.expect(!dirty[@intFromEnum(FileId.nodes)]);
+}
+
+test "PERF-0057: parallel flushAll flags only the files that had pages written" {
+    const node_file = try createTempFile(".test_bp_perf0057_par_nodes");
+    defer cleanupTempFile(node_file, ".test_bp_perf0057_par_nodes");
+    const prop_file = try createTempFile(".test_bp_perf0057_par_props");
+    defer cleanupTempFile(prop_file, ".test_bp_perf0057_par_props");
+
+    const page_size: u32 = 4096;
+    var node_pager = Pager.init(node_file, page_size);
+    var prop_pager = Pager.init(prop_file, page_size);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 8);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &node_pager);
+    pool.registerPager(.props, &prop_pager);
+
+    var thread_pool = try tp.ThreadPool.init(testing.allocator, .{ .max_threads = 2 });
+    defer thread_pool.deinit();
+    pool.setThreadPool(&thread_pool);
+
+    // Write dirty pages to the props store only, then flush in parallel.
+    const pf = try pool.pinNew(.props, 0);
+    @memset(pf.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0xCD);
+    pf.dirty = true;
+    pool.unpin(pool.frameIndex(pf), true);
+    try pool.flushAll();
+
+    const dirty = pool.takeDirtyFiles();
+    try testing.expect(dirty[@intFromEnum(FileId.props)]);
+    try testing.expect(!dirty[@intFromEnum(FileId.nodes)]);
+}
+
+test "PERF-0056: bounded scratch flushes more dirty pages than scratch capacity in waves" {
+    const file = try createTempFile(".test_bp_perf0056_waves");
+    defer cleanupTempFile(file, ".test_bp_perf0056_waves");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    // Force the wave path: cap the reusable scratch at 3 pages while making 16
+    // frames dirty, so the parallel flush must run several capacity-sized waves.
+    // Every page must still be persisted with its distinct pattern.
+    const capacity: u32 = 16;
+    var pool = try BufferPool.init(testing.allocator, page_size, capacity);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+    pool.max_scratch_pages = 3;
+
+    var thread_pool = try tp.ThreadPool.init(testing.allocator, .{ .max_threads = 4 });
+    defer thread_pool.deinit();
+    pool.setThreadPool(&thread_pool);
+
+    // Make every frame dirty with a per-page distinct pattern.
+    var i: PageId = 0;
+    while (i < capacity) : (i += 1) {
+        const f = try pool.pinNew(.nodes, i);
+        @memset(f.dataSlice()[page_mod.PAGE_HEADER_SIZE..], @intCast(0x40 + i));
+        f.dirty = true;
+        pool.unpin(pool.frameIndex(f), true);
+    }
+
+    try pool.flushAll();
+
+    // Every page must be persisted with its distinct pattern.
+    i = 0;
+    while (i < capacity) : (i += 1) {
+        var read_buf: [4096]u8 = undefined;
+        try p.readPage(i, &read_buf);
+        for (read_buf[page_mod.PAGE_HEADER_SIZE..]) |b| {
+            try testing.expectEqual(@as(u8, @intCast(0x40 + i)), b);
+        }
+    }
+
+    // The reused scratch buffer must stay within the configured cap (3 pages),
+    // proving the allocation did NOT scale to dirty_count*page_size.
+    try testing.expect(pool.flush_scratch.len <= 3 * @as(usize, page_size));
 }
 
 test {

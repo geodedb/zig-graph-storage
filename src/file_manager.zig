@@ -136,6 +136,26 @@ pub const FileManager = struct {
             }
         }
     }
+
+    /// PERF-0057: Sync only the open files flagged in `dirty`, indexed by
+    /// @intFromEnum(FileId). Files not flagged are skipped because no page has
+    /// been written to them since their last successful fsync, so their on-disk
+    /// state is already durable.
+    ///
+    /// DURABILITY: the caller (checkpoint) MUST derive `dirty` from
+    /// BufferPool.takeDirtyFiles() and invoke this BEFORE writing/fsyncing the
+    /// manifest and BEFORE truncating the WAL. This preserves the
+    /// data -> manifest -> WAL-truncate ordering: every file that received a
+    /// write this checkpoint is fsynced here; only definitively-unmodified files
+    /// are skipped.
+    pub fn syncDirty(self: *FileManager, dirty: [FILE_COUNT]bool) !void {
+        for (&self.pagers, 0..) |*maybe_pager, idx| {
+            if (!dirty[idx]) continue;
+            if (maybe_pager.*) |*p| {
+                try p.sync();
+            }
+        }
+    }
 };
 
 // ============================================================================
@@ -416,6 +436,39 @@ test "created files have mode 0o600" {
     // Mask out file type bits, check permission bits
     const perm = stat.permissions.toMode() & 0o7777;
     try testing.expectEqual(@as(u32, 0o600), perm);
+}
+
+test "PERF-0057: syncDirty only syncs flagged open files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    var fm = FileManager.init(testing.allocator, dir_path, 4096);
+    defer fm.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const nodes_file = try tmp.dir.createFile(io, "nodes.store", .{ .read = true, .truncate = true });
+    nodes_file.close(io);
+    const props_file = try tmp.dir.createFile(io, "props.store", .{ .read = true, .truncate = true });
+    props_file.close(io);
+
+    _ = try fm.openFile(.nodes, .open_existing);
+    _ = try fm.openFile(.props, .open_existing);
+
+    // Sync with an empty set: must be a no-op and must not error.
+    var dirty = [_]bool{false} ** FILE_COUNT;
+    try fm.syncDirty(dirty);
+
+    // Flag only nodes: syncDirty must succeed (and only touch the nodes pager).
+    dirty[@intFromEnum(@import("types.zig").FileId.nodes)] = true;
+    try fm.syncDirty(dirty);
+
+    // Flagging an UNOPENED file is harmless (skipped because no pager).
+    var dirty2 = [_]bool{false} ** FILE_COUNT;
+    dirty2[@intFromEnum(@import("types.zig").FileId.edge_idx)] = true;
+    try fm.syncDirty(dirty2);
 }
 
 test {
