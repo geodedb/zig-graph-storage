@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const operation_result_mod = @import("operation_result.zig");
 const GraphOperationSummary = operation_result_mod.GraphOperationSummary;
+const config_mod = @import("config.zig");
 
 /// Magic bytes for the per-graph file header.
 pub const PER_GRAPH_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'D', 'G', 'R', 'F', '1' };
@@ -75,6 +76,8 @@ pub const PerGraphHeader = struct {
 /// bulk-load from Geode's binary format is stubbed for v1.
 pub const Migration = struct {
     allocator: Allocator,
+    /// Optional log callback for structured event emission.
+    log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
 
     pub fn init(allocator: Allocator) Migration {
         return .{ .allocator = allocator };
@@ -150,6 +153,8 @@ pub const Migration = struct {
     /// infrastructure.
     pub fn migrate(self: *Migration, data_dir: []const u8, target_dir: []const u8) !MigrationResult {
         _ = target_dir;
+        config_mod.emitEvent(self.log_fn, .migration_start);
+        defer config_mod.emitEvent(self.log_fn, .migration_end);
         const state = self.detectStorageState(data_dir);
         return switch (state) {
             .fresh => .{},
@@ -426,6 +431,34 @@ test "migrate: fresh directory returns zero result" {
     try std.testing.expectEqual(@as(u64, 0), result.graphs_migrated);
     try std.testing.expectEqual(@as(u64, 0), result.total_nodes);
     try std.testing.expectEqual(@as(u64, 0), result.total_edges);
+}
+
+var migration_event_count: usize = 0;
+var migration_event_labels: [8][]const u8 = undefined;
+
+fn migrationTestLogFn(_: config_mod.LogLevel, msg: []const u8) void {
+    if (migration_event_count < migration_event_labels.len) {
+        migration_event_labels[migration_event_count] = msg;
+        migration_event_count += 1;
+    }
+}
+
+test "NFR-OBS-002: migrate emits migration_start and migration_end events" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+
+    migration_event_count = 0;
+    var m = Migration.init(allocator);
+    m.log_fn = &migrationTestLogFn;
+    _ = try m.migrate(tmp_path, "/tmp/target");
+
+    try std.testing.expectEqual(@as(usize, 2), migration_event_count);
+    try std.testing.expectEqualStrings("migration_start", migration_event_labels[0]);
+    try std.testing.expectEqualStrings("migration_end", migration_event_labels[1]);
 }
 
 test "MigrationResult writeJson produces valid structured output" {

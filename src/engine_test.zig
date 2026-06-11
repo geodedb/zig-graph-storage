@@ -1558,3 +1558,50 @@ test "PERF-0055: putProperty no redundant ArrayList alloc for fixed-size values"
     // MUST be fewer than 2 (i.e. no ArrayList alloc for the encode).
     try testing.expect(counting.alloc_count < 2);
 }
+
+var index_build_event_count: usize = 0;
+var index_build_event_labels: [8][]const u8 = undefined;
+
+fn indexBuildTestLogFn(_: config_mod.LogLevel, msg: []const u8) void {
+    if (index_build_event_count < index_build_event_labels.len) {
+        index_build_event_labels[index_build_event_count] = msg;
+        index_build_event_count += 1;
+    }
+}
+
+test "NFR-OBS-002: GraphEngine.open emits index_build_start and index_build_end events" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0xEE} ** 16;
+
+    // Create then close so the directory exists for open()
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+        try engine.close();
+    }
+
+    index_build_event_count = 0;
+    var cfg = testConfig();
+    cfg.log_fn = &indexBuildTestLogFn;
+
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    var found_start = false;
+    var found_end = false;
+    for (index_build_event_labels[0..index_build_event_count]) |lbl| {
+        if (std.mem.eql(u8, lbl, "index_build_start")) found_start = true;
+        if (std.mem.eql(u8, lbl, "index_build_end")) found_end = true;
+    }
+    try testing.expect(found_start);
+    try testing.expect(found_end);
+    // start must precede end
+    var start_pos: usize = 0;
+    var end_pos: usize = 0;
+    for (index_build_event_labels[0..index_build_event_count], 0..) |lbl, i| {
+        if (std.mem.eql(u8, lbl, "index_build_start")) start_pos = i;
+        if (std.mem.eql(u8, lbl, "index_build_end")) end_pos = i;
+    }
+    try testing.expect(start_pos < end_pos);
+}

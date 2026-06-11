@@ -4,6 +4,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const config_mod = @import("config.zig");
 const page_mod = @import("page.zig");
 const manifest_mod = @import("manifest.zig");
 const graph_dir_mod = @import("graph_dir.zig");
@@ -99,6 +100,8 @@ pub const VerifyResult = struct {
 
 pub const VerifyTool = struct {
     allocator: Allocator,
+    /// Optional log callback for structured event emission.
+    log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
 
     pub fn init(allocator: Allocator) VerifyTool {
         return .{ .allocator = allocator };
@@ -109,6 +112,8 @@ pub const VerifyTool = struct {
     /// 2. All page checksums in each store file
     /// 3. Graph UUID consistency
     pub fn verifyGraph(self: *VerifyTool, graph_dir: *const GraphDir, page_size: u32) !VerifyResult {
+        config_mod.emitEvent(self.log_fn, .verify_start);
+        defer config_mod.emitEvent(self.log_fn, .verify_end);
         var result = VerifyResult.init(self.allocator);
         errdefer result.deinit();
 
@@ -765,6 +770,55 @@ test "verifyGraph reports missing WAL artifacts" {
 
     try testing.expect(!result.isClean());
     try testing.expect(std.mem.indexOf(u8, result.errors.items[result.errors.items.len - 1], "wal/: missing") != null);
+}
+
+var verify_event_count: usize = 0;
+var verify_event_labels: [8][]const u8 = undefined;
+
+fn verifyTestLogFn(_: config_mod.LogLevel, msg: []const u8) void {
+    if (verify_event_count < verify_event_labels.len) {
+        verify_event_labels[verify_event_count] = msg;
+        verify_event_count += 1;
+    }
+}
+
+test "NFR-OBS-002: verifyGraph emits verify_start and verify_end events" {
+    const allocator = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var uuid: [16]u8 = undefined;
+    @memset(&uuid, 0x99);
+
+    var gd = try GraphDir.create(allocator, tmp_path, uuid);
+    defer gd.deinit();
+
+    const m = manifest_mod.Manifest{
+        .graph_uuid = uuid,
+        .page_size = 4096,
+        .counter = 1,
+    };
+    const path_a = try gd.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try m.writeToFile(allocator, path_a);
+    const path_b = try gd.manifestPath(allocator, .b);
+    defer allocator.free(path_b);
+    try m.writeToFile(allocator, path_b);
+    try setupWalArtifacts(allocator, gd.path, uuid);
+
+    verify_event_count = 0;
+    var tool = VerifyTool.init(allocator);
+    tool.log_fn = &verifyTestLogFn;
+    var result = try tool.verifyGraph(&gd, 4096);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), verify_event_count);
+    try testing.expectEqualStrings("verify_start", verify_event_labels[0]);
+    try testing.expectEqualStrings("verify_end", verify_event_labels[1]);
 }
 
 test {

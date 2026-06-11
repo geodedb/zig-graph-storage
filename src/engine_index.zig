@@ -9,6 +9,7 @@ const node_mod = @import("node.zig");
 const index_snapshot_mod = @import("index_snapshot.zig");
 const types = @import("types.zig");
 const engine_mod = @import("engine.zig");
+const config_mod = @import("config.zig");
 
 const NodeId = types.NodeId;
 const NodeRec = node_mod.NodeRec;
@@ -91,6 +92,8 @@ pub fn rebuildPropertyIndex(engine: *GraphEngine) !void {
 
 /// Rebuild all derived indexes (label, property, edge).
 pub fn rebuildDerivedIndexes(engine: *GraphEngine) !void {
+    config_mod.emitEvent(engine.config.log_fn, .index_build_start);
+    defer config_mod.emitEvent(engine.config.log_fn, .index_build_end);
     // GAP-0026: Track index rebuild progress (0-10000).
     engine.metrics.index_rebuild_progress = 0;
     try rebuildLabelIndex(engine);

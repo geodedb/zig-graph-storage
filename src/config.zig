@@ -14,6 +14,12 @@ pub const StorageEvent = enum {
     recovery_end,
     backup_start,
     backup_end,
+    migration_start,
+    migration_end,
+    verify_start,
+    verify_end,
+    index_build_start,
+    index_build_end,
 
     /// Return a human-readable label for the event.
     pub fn label(self: StorageEvent) []const u8 {
@@ -24,6 +30,12 @@ pub const StorageEvent = enum {
             .recovery_end => "recovery_end",
             .backup_start => "backup_start",
             .backup_end => "backup_end",
+            .migration_start => "migration_start",
+            .migration_end => "migration_end",
+            .verify_start => "verify_start",
+            .verify_end => "verify_end",
+            .index_build_start => "index_build_start",
+            .index_build_end => "index_build_end",
         };
     }
 };
@@ -260,6 +272,12 @@ test "StorageEvent labels are distinct and non-empty" {
         .recovery_end,
         .backup_start,
         .backup_end,
+        .migration_start,
+        .migration_end,
+        .verify_start,
+        .verify_end,
+        .index_build_start,
+        .index_build_end,
     };
     for (events) |ev| {
         try std.testing.expect(ev.label().len > 0);
@@ -283,6 +301,43 @@ test "emitEvent invokes log_fn callback" {
 test "emitEvent is safe with null log_fn" {
     // Should not panic
     emitEvent(null, .recovery_start);
+}
+
+var test_event_labels: [16][]const u8 = undefined;
+var test_event_label_count: usize = 0;
+
+fn testLabelLogFn(_: LogLevel, msg: []const u8) void {
+    if (test_event_label_count < test_event_labels.len) {
+        test_event_labels[test_event_label_count] = msg;
+        test_event_label_count += 1;
+    }
+}
+
+test "NFR-OBS-002: new lifecycle event variants have correct labels" {
+    try std.testing.expectEqualStrings("migration_start", StorageEvent.migration_start.label());
+    try std.testing.expectEqualStrings("migration_end", StorageEvent.migration_end.label());
+    try std.testing.expectEqualStrings("verify_start", StorageEvent.verify_start.label());
+    try std.testing.expectEqualStrings("verify_end", StorageEvent.verify_end.label());
+    try std.testing.expectEqualStrings("index_build_start", StorageEvent.index_build_start.label());
+    try std.testing.expectEqualStrings("index_build_end", StorageEvent.index_build_end.label());
+}
+
+test "NFR-OBS-002: emitEvent delivers new lifecycle events in order" {
+    test_event_label_count = 0;
+    const log: *const fn (level: LogLevel, msg: []const u8) void = &testLabelLogFn;
+    emitEvent(log, .migration_start);
+    emitEvent(log, .migration_end);
+    emitEvent(log, .verify_start);
+    emitEvent(log, .verify_end);
+    emitEvent(log, .index_build_start);
+    emitEvent(log, .index_build_end);
+    try std.testing.expectEqual(@as(usize, 6), test_event_label_count);
+    try std.testing.expectEqualStrings("migration_start", test_event_labels[0]);
+    try std.testing.expectEqualStrings("migration_end", test_event_labels[1]);
+    try std.testing.expectEqualStrings("verify_start", test_event_labels[2]);
+    try std.testing.expectEqualStrings("verify_end", test_event_labels[3]);
+    try std.testing.expectEqualStrings("index_build_start", test_event_labels[4]);
+    try std.testing.expectEqualStrings("index_build_end", test_event_labels[5]);
 }
 
 test {
