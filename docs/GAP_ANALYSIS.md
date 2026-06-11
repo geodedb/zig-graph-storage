@@ -3,10 +3,13 @@
 Last updated: 2026-06-10
 
 This file is the close-out record for the gap closure passes. It was first
-written for the 2026-04-07 pass and updated during the 2026-06-10 Phase 4
-tracking sync, which verified a further batch Implemented at HEAD (`eca7466`)
-and moved them to `docs/GAP_ANALYSIS_RESOLVED.md`. GitLab issues are the
-authoritative source of truth; this file mirrors them.
+written for the 2026-04-07 pass, updated during the 2026-06-10 Phase 4
+tracking sync, and updated again during the 2026-06-10 closure sync for the
+`audit-remediation-2026-06-10` branch (full suite green Debug + ReleaseSafe:
+542/543 unit + 23 integration + 6 cross-shard + 3 sharded), which verified the
+feature/requirement batch Implemented and moved them to
+`docs/GAP_ANALYSIS_RESOLVED.md`. GitLab issues are the authoritative source of
+truth; this file mirrors them.
 
 ## Summary
 
@@ -16,16 +19,27 @@ live open gaps are tracked in GitLab.
 
 | Status | Count |
 | --- | ---: |
-| Closed (2026-06-10 verified Implemented) | 6 |
+| Closed (2026-06-10 feature/requirement closure sync) | 4 |
+| Closed (2026-06-10 Phase 4 verified Implemented) | 6 |
 | Closed (2026-04-07 pass) | 7 |
-| Blocked | 2 |
+| Blocked | 3 |
 | Won't Do | 1 |
 | Open (this file) | 0 |
 
+The 2026-06-10 feature/requirement closure sync resolved `GAP-0027` (#45,
+B+tree/index-catalog wired into the engine; closed via `7743b03`) and the
+matching requirements FR-016 (#16), FR-017 (#17), and FR-021 (#21, index
+extension points via `1ed2b7d`). NFR-OBS-002 (#36) lifecycle events were also
+delivered (`19870bc`) and closed. These are recorded in
+`docs/GAP_ANALYSIS_RESOLVED.md`. See the "Documented follow-up" note there: the
+new B+tree range queries operate over value-HASH space, not natural value
+ordering — ordered range scans are a future enhancement.
+
 Open requirement/gap IDs in GitLab as of 2026-06-10: `GAP-0002` (#40),
-`GAP-0017` (#41), `GAP-0023` (#43), `GAP-0025` (#44), `GAP-0027` (#45),
-`GAP-0031` (#47), `GAP-0033` (#49), `GAP-0038` (#77), `GAP-0039` (#78),
-`GAP-0043` (#93), `GAP-0044` (#94), `GAP-0048` (#107).
+`GAP-0017` (#41), `GAP-0023` (#43), `GAP-0025` (#44), `GAP-0031` (#47),
+`GAP-0033` (#49), `GAP-0038` (#77), `GAP-0039` (#78), `GAP-0043` (#93),
+`GAP-0044` (#94), `GAP-0048` (#107). Of these, `GAP-0002` (#40), `GAP-0017`
+(#41), and `GAP-0044` (#94) are currently BLOCKED (see Disposition).
 
 ## Future Agent Notes
 
@@ -60,7 +74,68 @@ The detailed dispositions for `GAP-0018`, `GAP-0032`, `GAP-0042`, `GAP-0045`,
 `GAP-0046`, and `GAP-0047` recorded under "Disposition" below remain accurate
 and are retained for historical continuity.
 
+## 2026-06-10 feature/requirement closure sync
+
+Closure pass on branch `audit-remediation-2026-06-10` (full suite green Debug +
+ReleaseSafe: 542/543 unit + 23 integration + 6 cross-shard + 3 sharded).
+
+Closed and moved to `docs/GAP_ANALYSIS_RESOLVED.md`:
+
+- `GAP-0027` ([#45](https://gitlab.com/devnw/zig/graph-storage/-/work_items/45)) — IndexCatalog wired into engine open/checkpoint; opt-in B+tree property indexes (`7743b03`).
+- FR-016 ([#16](https://gitlab.com/devnw/zig/graph-storage/-/work_items/16)) — opt-in B+tree property indexes delivered via the engine wiring (`7743b03`).
+- FR-017 ([#17](https://gitlab.com/devnw/zig/graph-storage/-/work_items/17)) — per-graph index catalog with online/offline build (`7743b03`).
+- FR-021 ([#21](https://gitlab.com/devnw/zig/graph-storage/-/work_items/21)) — index extension points via `IndexKindRegistry` (`1ed2b7d`).
+- NFR-OBS-002 ([#36](https://gitlab.com/devnw/zig/graph-storage/-/work_items/36)) — migration/verify/index-build lifecycle events on `StorageEvent` (`19870bc`).
+
+The following requirement-domain items were updated with a status comment and
+kept OPEN because they are genuinely blocked (not skipped). Their unblock
+conditions are recorded under "Disposition" below.
+
+- `GAP-0002` (#40) + FR-018 (#18) — migration bulk-load; blocked on the external Geode binary-format reader.
+- `GAP-0017` (#41) + NFR-OBS-001 (#35) — OTel metrics export seam; blocked on an upstream Zig 0.16 module-dedup diamond bug.
+- `GAP-0044` (#94) + REQ-README-001 (#91) — Windows cross-platform verification; blocked on the absence of a Windows CI runner.
+
 ## Disposition
+
+### GAP-0002: Migration bulk-load is still stubbed
+
+- Status: Blocked
+- GitLab issue: [#40](https://gitlab.com/devnw/zig/graph-storage/-/work_items/40) (also FR-018 [#18](https://gitlab.com/devnw/zig/graph-storage/-/work_items/18))
+- Reason: `Migration.migrate()` remains a stub by design. Bulk-load requires the
+  external Geode binary-format reader to decode legacy Geode storage payloads
+  into the new store; that reader is not available in this environment.
+- Unblock:
+  1. The external Geode binary-format reader becomes available.
+  2. `migrate()` decodes legacy payloads and emits a populated
+     `MigrationResult`, with import coverage for legacy single-file and current
+     per-graph snapshots.
+
+### GAP-0017: Observability wiring is incomplete (OTel export seam)
+
+- Status: Blocked
+- GitLab issue: [#41](https://gitlab.com/devnw/zig/graph-storage/-/work_items/41) (also NFR-OBS-001 [#35](https://gitlab.com/devnw/zig/graph-storage/-/work_items/35))
+- Done so far: lifecycle EVENTS shipped under NFR-OBS-002 ([#36](https://gitlab.com/devnw/zig/graph-storage/-/work_items/36), `19870bc`, closed); metrics counters exist in the engine.
+- Reason: the OTel export seam is hardcoded disabled in `observability.zig`
+  because of an upstream Zig 0.16 module-dedup diamond bug that prevents the OTel
+  export module from linking cleanly.
+- Unblock:
+  1. The upstream Zig 0.16 module-dedup diamond bug is fixed (or a viable
+     workaround lands).
+  2. Re-enable the OTel export seam in `observability.zig` and verify metrics
+     export end-to-end.
+
+### GAP-0044: Cross-platform support is documented but not verified
+
+- Status: Blocked
+- GitLab issue: [#94](https://gitlab.com/devnw/zig/graph-storage/-/work_items/94) (also REQ-README-001 [#91](https://gitlab.com/devnw/zig/graph-storage/-/work_items/91))
+- Done so far: the README support claim was scoped to Zig 0.16.0/Linux-validated
+  (QUAL-0045 doc fix); Linux is validated by the green suite.
+- Reason: Windows remains untested because no Windows CI runner is available in
+  this environment.
+- Unblock:
+  1. A Windows CI runner is provisioned.
+  2. The test suite runs on Windows so the cross-platform claim can be verified
+     or further scoped.
 
 ### GAP-0038: `main` can merge without green pipelines or meaningful approval gates
 

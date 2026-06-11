@@ -1,37 +1,39 @@
 # Security Gap Analysis
 
-**Last updated:** 2026-06-10 (Phase 4b appsec pass -- SEC-0047..SEC-0052; prior Phase 4 SEC-0037..SEC-0046)
+**Last updated:** 2026-06-10 (closure sync -- SEC-0037..SEC-0052 all IMPLEMENTED, verified, and CLOSED on branch audit-remediation-2026-06-10; Phase 4b appsec pass SEC-0047..SEC-0052; prior Phase 4 SEC-0037..SEC-0046)
 **Source:** AppSec Review (docs/APPSEC_REVIEW_2026-06-10.md), Full Codebase Audit (docs/AUDIT_REPORT.md), Phase 4/4b review
 
 ## Summary
 
 | Status | Count |
 |--------|-------|
-| Open | 16 |
-| Closed | 35 |
+| Open | 0 |
+| Closed | 51 |
 | Won't Do | 1 |
 | Blocked | 0 |
 | Deferred | 0 |
 
-**Open by severity:** Critical 1 (SEC-0037) · High 5 (SEC-0038, SEC-0039, SEC-0040, SEC-0041, SEC-0047) · Medium 5 (SEC-0042, SEC-0043, SEC-0044, SEC-0048, SEC-0049) · Low 4 (SEC-0045, SEC-0046, SEC-0050, SEC-0051) · Info 1 (SEC-0052).
+**Open by severity:** none. All 16 findings from the 2026-06-10 audit (SEC-0037..SEC-0052) were implemented and verified (full suite green in Debug + ReleaseSafe) on branch `audit-remediation-2026-06-10`; an independent adversarial security review confirmed the fixes correct, and the residuals it surfaced were also fixed. See the **Resolved / Closed (2026-06-10 closure)** section below for per-finding fix commits and evidence.
 
-**Known residual risk:** The 2026-06-10 tracking pass reopened the cryptographic and storage-integrity attack surface against the embedded-library threat model (attacker with filesystem write access to the data directory, malicious backup archives, supply chain). The headline finding (SEC-0037) is a live AES-GCM nonce-reuse bug that occurs during normal checkpoint cycling, not just under attack. SEC-0045 is a regression of the per-pager portion of SEC-0030. The Phase 4b appsec pass (SEC-0047..SEC-0052) targets the secondary on-disk loaders not covered by SEC-0037..0046: the JSON shard manifest, derived-index `.idx` snapshots, `labels.dict`, and backup-restore symlink handling. These run at `open()` (or restore) before integrity gates; the weak edge is "validate-before-allocate, verify-before-materialize." The primary data-path parsing (WAL, property decode, registry, free-space, manifest, adj-store) is genuinely hardened. SEC-0047 (shard manifest union access) is the sole new High and carries ReleaseFast-UB potential.
+**Resolved this pass (severity at time of finding):** Critical 1 (SEC-0037) · High 5 (SEC-0038, SEC-0039, SEC-0040, SEC-0041, SEC-0047) · Medium 5 (SEC-0042, SEC-0043, SEC-0044, SEC-0048, SEC-0049) · Low 4 (SEC-0045, SEC-0046, SEC-0050, SEC-0051) · Info 1 (SEC-0052).
 
-### Top 5 Risks
+**Residual risk:** None open. The 2026-06-10 tracking pass had reopened the cryptographic and storage-integrity attack surface against the embedded-library threat model (attacker with filesystem write access to the data directory, malicious backup archives, supply chain). The headline finding (SEC-0037) was a live AES-GCM nonce-reuse bug that occurred during normal checkpoint cycling; it is now fixed (write_count write-back on flush + recovery seed, commit 326d544). SEC-0045 (regression of the per-pager portion of SEC-0030) is fixed. The Phase 4b appsec findings (SEC-0047..SEC-0052) on the secondary on-disk loaders -- JSON shard manifest, derived-index `.idx` snapshots, `labels.dict`, backup-restore symlink handling -- are all fixed: every loader now follows "validate-before-allocate, verify-before-materialize." The adversarial review additionally found and fixed three residuals (SEC-0049 intermediate-symlink, SEC-0038 verify/extract TOCTOU, SEC-0043 verify-path key gap); see "Residual review notes" below.
 
-1. **SEC-0037 (Critical, 100)** -- AES-GCM nonce reuse via stale in-memory `write_count` on cached frames; same nonce reused across checkpoints -> plaintext-XOR recovery + GHASH key recovery + tag forgery. Triggers without an attacker.
-2. **SEC-0038 (High, 64)** -- Backup restore extracts attacker-controlled file contents before CRC/HMAC verification; poisons store files in place despite failing HMAC, with no cleanup.
-3. **SEC-0039 (High, 64)** -- prop_store `dir_count` read from disk unvalidated; offset underflow -> panic (ReleaseSafe) / OOB read (ReleaseFast).
-4. **SEC-0040 (High, 64)** -- var_store `data_len` used as a slice bound without capacity check -> OOB read / info disclosure.
-5. **SEC-0041 (High, 64)** -- 2PC recovery replays unauthenticated WAL records (`readFrom` never verifies checksum); forged prepare+commit forge cross-shard edges during recovery.
+### Top 5 Risks (all RESOLVED 2026-06-10)
 
-### Immediate Actions
+1. **SEC-0037 (Critical, 100)** -- RESOLVED (326d544). AES-GCM nonce reuse via stale in-memory `write_count` on cached frames; same nonce reused across checkpoints -> plaintext-XOR recovery + GHASH key recovery + tag forgery. Triggered without an attacker. Fixed by write_count write-back on flush + recovery seed.
+2. **SEC-0038 (High, 64)** -- RESOLVED (821df37 + 587feac). Backup restore extracted attacker-controlled file contents before CRC/HMAC verification; poisoned store files in place despite failing HMAC, with no cleanup. Fixed by verify-before-extract + tamper-evident re-verify during extract.
+3. **SEC-0039 (High, 64)** -- RESOLVED (3e4d0b9). prop_store `dir_count` read from disk unvalidated; offset underflow -> panic (ReleaseSafe) / OOB read (ReleaseFast). Fixed by bound check before use.
+4. **SEC-0040 (High, 64)** -- RESOLVED (6021bee). var_store `data_len` used as a slice bound without capacity check -> OOB read / info disclosure. Fixed by `data_len > dataCapacity()` rejection.
+5. **SEC-0041 (High, 64)** -- RESOLVED (2a602fa). 2PC recovery replayed unauthenticated WAL records (`readFrom` never verified checksum); forged prepare+commit forged cross-shard edges during recovery. Fixed by strict checksum streaming.
 
-- **SEC-0037:** Treat any data encrypted by an affected build as potentially compromised. After the fix lands, rotate the master encryption key and re-encrypt at-rest data; consider any captured ciphertext pairs of the same page as exposed.
-- **SEC-0038:** Do not restore untrusted/unverified backups on affected builds; the parse-then-verify ordering means a tampered archive corrupts the target even when the restore "fails."
-- **SEC-0046:** Do not `git add .` at the repo root until `package.json`/`package-lock.json` are removed or gitignored.
-- **SEC-0047 (new):** No secret rotation required. Operationally, treat `shard_manifest.json` as security-relevant: do not deploy on `ReleaseFast` against a data directory any untrusted party can write, until the typed-parse/tag-guard fix lands. The malformed-manifest DoS/UB is reachable at every sharded `open()` before integrity gates.
-- **SEC-0049 (new):** Do not restore a V2 backup into a data directory that an untrusted party can pre-populate (a planted symlink at a legal filename redirects writes through the link); compounds SEC-0038. Restore into a clean/staged target until `resolve_beneath`/`exclusive` + stage-and-rename lands.
+### Immediate Actions (status)
+
+- **SEC-0037:** RESOLVED (326d544). Recommended operational follow-up still stands for any data encrypted by an affected pre-fix build: rotate the master encryption key and re-encrypt at-rest data, and treat any captured same-page ciphertext pairs from a pre-fix build as exposed.
+- **SEC-0038:** RESOLVED (821df37 + 587feac). Restore is now verify-before-extract; a tampered archive leaves the target byte-for-byte unchanged.
+- **SEC-0046:** RESOLVED (8518e2d). `package.json`/`package-lock.json` removed and gitignored; root is clean of unaudited npm artifacts.
+- **SEC-0047:** RESOLVED (f70babb). Shard manifest now typed-parsed with tag+range guards; malformed `shard_manifest.json` returns a clean error under ReleaseSafe (no DoS/UB) before integrity gates. No secret rotation required.
+- **SEC-0049:** RESOLVED (821df37 + 587feac). Restore now uses per-component `O_NOFOLLOW` (the real defense, as `resolve_beneath` is a Linux no-op in this stdlib version) so a planted symlink at a legal filename is not followed; compounding with SEC-0038's verify-before-extract.
 
 ### Documented Informational Notes (no issue)
 
@@ -46,26 +48,36 @@
 
 ### Stack-Ranked Findings
 
-#### Open (2026-06-10 pass)
+#### Resolved / Closed (2026-06-10 closure)
 
-| Rank | Severity | Risk Score | Finding | Component | CWE/OWASP | Evidence (file:line) | Issue | Fix | Status |
-|------|----------|------------|---------|-----------|------------|----------------------|-------|-----|--------|
-| 1 | Critical | 100 | SEC-0037: AES-GCM nonce reuse via stale in-memory write_count | buffer_pool.zig, pager.zig, recovery.zig | CWE-323 / A02:2021 | buffer_pool.zig:446-451,322-323,590-594; pager.zig:81-85; recovery.zig:221 | #115 (confidential) | Advance write_count in live frame / per-(file,page) monotonic counter | Open |
-| 2 | High | 64 | SEC-0038: Backup restore parse-then-verify (extract before CRC/HMAC) | backup.zig | CWE-345 / A08:2021 | backup.zig:251,291-320,314,316,327,336-338 | #117 (confidential) | Verify-then-extract (two-pass or temp+atomic rename) + errdefer cleanup | Open |
-| 3 | High | 64 | SEC-0039: prop_store dir_count unchecked from disk | prop_store.zig | CWE-191,CWE-125 / A03:2021 | prop_store.zig:160,66-72 | #128 | Validate dir_count bound like readEntryCountChecked | Open |
-| 4 | High | 64 | SEC-0040: var_store data_len unbounded before slice | var_store.zig | CWE-125 / A03:2021 | var_store.zig:118-123,44 | #129 | Reject data_len > dataCapacity() | Open |
-| 5 | High | 64 | SEC-0041: 2PC recovery trusts unauthenticated WAL records | sharded_recovery.zig, wal.zig | CWE-345 / A08:2021 | sharded_recovery.zig:53,98,128; wal.zig:106-133 | #118 (confidential) | Strict checksum-verified reads for 2PC reconciliation | Open |
-| 6 | High | 64 | SEC-0047: Unchecked std.json.Value union access in shard manifest parse (panic/UB) | shard_manifest.zig, sharded_engine.zig | CWE-843,CWE-754,CWE-704 / A10:2021,A08:2021 | shard_manifest.zig:90-117; sharded_engine.zig:168 | #140 (confidential) | Typed parseFromSlice OR tag+range guard every field; CRC/HMAC manifest | Open |
-| 7 | Medium | 48 | SEC-0042: adj_store + prop_store iterator traversals lack hop/cycle guard | adj_store.zig, prop_store.zig | CWE-835 / A05:2021 | adj_store.zig:120-146,163-195,214-238,248-258,273-279; prop_store.zig:249-250 | #130 | MAX_CHAIN_HOPS + CircularChainDetected, shared helper | Open |
-| 8 | Medium | 48 | SEC-0044: label_index snapshot OOM (node_count before bounds) | label_index.zig | CWE-789 / A05:2021 | label_index.zig:204-211 | #133 | Validate node_count*8 <= remaining before alloc | Open |
-| 9 | Medium | 48 | SEC-0048: Unbounded ensureTotalCapacity from untrusted snapshot counts (edge + prop-chain) | engine_index.zig, property_chain_index.zig, index_snapshot.zig | CWE-789,CWE-1284 / A10:2021,A08:2021 | engine_index.zig:241; property_chain_index.zig:222-229; index_snapshot.zig:85-89 | #142 | Bound count by payload_size/min_record_size before reserve; back-port to SEC-0044 | Open |
-| 10 | Medium | 48 | SEC-0049: Backup restore follows symlinks (no resolve_beneath/exclusive) | backup.zig | CWE-59,CWE-22 / A08:2021,A01:2021 | backup.zig:306-316,559-580,291-339 | #141 (confidential) | createFile relative to Dir handle w/ exclusive+resolve_beneath; stage-verify-rename | Open |
-| 11 | Medium | 36 | SEC-0043: Manifest CRC32-only under TDE | manifest.zig | CWE-345,CWE-353 / A08:2021 | manifest.zig:76-95 | #132 | HMAC-SHA256 manifest when key configured | Open |
-| 12 | Low | 24 | SEC-0046: Untracked npm package.json/lock in repo root, not gitignored | repo root, .gitignore | CWE-1104 / A06:2021 | package.json, package-lock.json (untracked); .gitignore | #135 | Remove + gitignore | Open |
-| 13 | Low | 24 | SEC-0050: labels.dict dup-key aliasing (leak / potential double-free) + verify-after-materialize | label_dict.zig | CWE-415,CWE-401,CWE-345 / A08:2021,A10:2021 | label_dict.zig:123-147,23-31,151 | #143 | Reject dup names/ids (error.InvalidData); verify CRC before committing maps | Open |
-| 14 | Low | 16 | SEC-0045: Pager key copies not securely wiped (SEC-0030 regression) | file_manager.zig | CWE-316 / A02:2021 | file_manager.zig:106-119,78-79 | #134 | Iterate pagers, PageEncryption.deinit() before nulling | Open |
-| 15 | Low | 16 | SEC-0051: Derived-index .idx snapshots have no checksum/HMAC | index_snapshot.zig, engine_index.zig | CWE-353 / A08:2021 | index_snapshot.zig:30-90; engine_index.zig:162 | #144 | CRC32C (or HMAC under TDE) over payload, verify on load -> rebuild | Open |
-| 16 | Info | 4 | SEC-0052: Creation paths omit resolve_beneath/exclusive (defense-in-depth) | graph_dir.zig, file_manager.zig, manifest.zig, registry.zig, label_dict.zig | CWE-59 / A02:2021 | graph_dir.zig:39; file_manager.zig:67; manifest.zig:150; registry.zig:117; label_dict.zig:94 | #145 | resolve_beneath where supported; create relative to held Dir handle | Open |
+All 16 implemented and verified on branch `audit-remediation-2026-06-10` (full suite green in Debug + ReleaseSafe); adversarial review confirmed correct. GitLab issues closed 2026-06-10.
+
+| Rank | Severity | Risk Score | Finding | Component | CWE/OWASP | Evidence (file:line) | Issue | Fix Commit(s) | Status |
+|------|----------|------------|---------|-----------|------------|----------------------|-------|---------------|--------|
+| 1 | Critical | 100 | SEC-0037: AES-GCM nonce reuse via stale in-memory write_count | buffer_pool.zig, pager.zig, recovery.zig | CWE-323 / A02:2021 | buffer_pool.zig:446-451,322-323,590-594; pager.zig:81-85; recovery.zig:221 | #115 (confidential) | 326d544 (write_count write-back on flush + recovery seed) | Closed |
+| 2 | High | 64 | SEC-0038: Backup restore parse-then-verify (extract before CRC/HMAC) | backup.zig | CWE-345 / A08:2021 | backup.zig:251,291-320,314,316,327,336-338 | #117 (confidential) | 821df37 + 587feac (verify-before-extract + tamper-evident re-verify during extract) | Closed |
+| 3 | High | 64 | SEC-0039: prop_store dir_count unchecked from disk | prop_store.zig | CWE-191,CWE-125 / A03:2021 | prop_store.zig:160,66-72 | #128 | 3e4d0b9 (dir_count bound check) | Closed |
+| 4 | High | 64 | SEC-0040: var_store data_len unbounded before slice | var_store.zig | CWE-125 / A03:2021 | var_store.zig:118-123,44 | #129 | 6021bee (reject data_len > dataCapacity()) | Closed |
+| 5 | High | 64 | SEC-0041: 2PC recovery trusts unauthenticated WAL records | sharded_recovery.zig, wal.zig | CWE-345 / A08:2021 | sharded_recovery.zig:53,98,128; wal.zig:106-133 | #118 (confidential) | 2a602fa (strict checksum streaming) | Closed |
+| 6 | High | 64 | SEC-0047: Unchecked std.json.Value union access in shard manifest parse (panic/UB) | shard_manifest.zig, sharded_engine.zig | CWE-843,CWE-754,CWE-704 / A10:2021,A08:2021 | shard_manifest.zig:90-117; sharded_engine.zig:168 | #140 (confidential) | f70babb (typed parse + tag/range guards) | Closed |
+| 7 | Medium | 48 | SEC-0042: adj_store + prop_store iterator traversals lack hop/cycle guard | adj_store.zig, prop_store.zig | CWE-835 / A05:2021 | adj_store.zig:120-146,163-195,214-238,248-258,273-279; prop_store.zig:249-250 | #130 | 569c621 (MAX_CHAIN_HOPS + CircularChainDetected) | Closed |
+| 8 | Medium | 48 | SEC-0044: label_index snapshot OOM (node_count before bounds) | label_index.zig | CWE-789 / A05:2021 | label_index.zig:204-211 | #133 | 50d7294 (node_count*8 <= remaining bound) | Closed |
+| 9 | Medium | 48 | SEC-0048: Unbounded ensureTotalCapacity from untrusted snapshot counts (edge + prop-chain) | engine_index.zig, property_chain_index.zig, index_snapshot.zig | CWE-789,CWE-1284 / A10:2021,A08:2021 | engine_index.zig:241; property_chain_index.zig:222-229; index_snapshot.zig:85-89 | #142 | 50d7294 + d9272eb (u32 cast clamp; bound by payload/min-record) | Closed |
+| 10 | Medium | 48 | SEC-0049: Backup restore follows symlinks (no resolve_beneath/exclusive) | backup.zig | CWE-59,CWE-22 / A08:2021,A01:2021 | backup.zig:306-316,559-580,291-339 | #141 (confidential) | 821df37 + 587feac (per-component O_NOFOLLOW; resolve_beneath is a Linux no-op) | Closed |
+| 11 | Medium | 36 | SEC-0043: Manifest CRC32-only under TDE | manifest.zig | CWE-345,CWE-353 / A08:2021 | manifest.zig:76-95 | #132 | 194c6ef (HMAC) + d9272eb (verify-path key threading) | Closed |
+| 12 | Low | 24 | SEC-0046: Untracked npm package.json/lock in repo root, not gitignored | repo root, .gitignore | CWE-1104 / A06:2021 | package.json, package-lock.json (untracked); .gitignore | #135 | 8518e2d (removed + gitignored) | Closed |
+| 13 | Low | 24 | SEC-0050: labels.dict dup-key aliasing (leak / potential double-free) + verify-after-materialize | label_dict.zig | CWE-415,CWE-401,CWE-345 / A08:2021,A10:2021 | label_dict.zig:123-147,23-31,151 | #143 | 4b8414f (reject dup names/ids; verify CRC before commit) | Closed |
+| 14 | Low | 16 | SEC-0045: Pager key copies not securely wiped (SEC-0030 regression) | file_manager.zig | CWE-316 / A02:2021 | file_manager.zig:106-119,78-79 | #134 | a0811ce (iterate pagers, PageEncryption.deinit before nulling) | Closed |
+| 15 | Low | 16 | SEC-0051: Derived-index .idx snapshots have no checksum/HMAC | index_snapshot.zig, engine_index.zig | CWE-353 / A08:2021 | index_snapshot.zig:30-90; engine_index.zig:162 | #144 | 50d7294 (CRC32), preserved through afa4b5e buffered rewrite | Closed |
+| 16 | Info | 4 | SEC-0052: Creation paths omit resolve_beneath/exclusive (defense-in-depth) | graph_dir.zig, file_manager.zig, manifest.zig, registry.zig, label_dict.zig | CWE-59 / A02:2021 | graph_dir.zig:39; file_manager.zig:67; manifest.zig:150; registry.zig:117; label_dict.zig:94 | #145 | a0811ce (create-path hardening) | Closed |
+
+##### Residual review notes (low/info, addressed)
+
+The independent adversarial security review of the 2026-06-10 remediation found three residual gaps in the initial fixes; all were fixed and re-verified:
+
+- **SEC-0049 intermediate-symlink:** the first symlink defense covered the final filename component but not interior path components. The final fix applies per-component `O_NOFOLLOW` across the whole relative path. (`resolve_beneath` is a Linux no-op in this Zig stdlib version, so per-component no-follow is the real defense.) — 821df37 + 587feac.
+- **SEC-0038 verify/extract TOCTOU:** an attacker could swap the archive between the verify pass and the extract pass. The final fix re-verifies tamper-evidently during extraction, so a between-passes swap is detected. — 821df37 + 587feac.
+- **SEC-0043 verify-path key gap:** the initial HMAC manifest change did not thread the TDE key into the verification routine, so the HMAC was not actually checked on the verify path. d9272eb threads the key through the verify path and closes the gap. — 194c6ef + d9272eb.
 
 #### Closed / Prior Passes
 
@@ -96,32 +108,34 @@
 
 ### Roadmap
 
-**Quick wins (< 1 day each):**
+All roadmap items below were COMPLETED on branch `audit-remediation-2026-06-10` (2026-06-10). Retained for historical traceability; each line carries its fix commit.
 
-- SEC-0040 -- add `data_len <= dataCapacity()` check in `VarStore.read`.
-- SEC-0039 -- add `dir_count` bound check (mirror `readEntryCountChecked`).
-- SEC-0044 -- validate `node_count*8 <= remaining` before `ensureTotalCapacity`.
-- SEC-0048 -- bound `item_count`/`entry_count` by `payload_size/min_record_size` before `ensureTotalCapacity` at `engine_index.zig:241`, `property_chain_index.zig:229`, and `loadHeader`; back-port to SEC-0044.
-- SEC-0045 -- iterate pagers and call `PageEncryption.deinit()` in `FileManager.deinit` (restores SEC-0030).
-- SEC-0046 -- remove or gitignore `package.json`/`package-lock.json`/`node_modules`.
-- SEC-0050 -- reject duplicate names/ids in `label_dict.loadFromFile` (`error.InvalidData`, free `owned`); verify CRC before committing the maps.
+**Quick wins (< 1 day each) -- DONE:**
 
-**Medium (1-5 days each):**
+- SEC-0040 -- add `data_len <= dataCapacity()` check in `VarStore.read`. DONE (6021bee).
+- SEC-0039 -- add `dir_count` bound check (mirror `readEntryCountChecked`). DONE (3e4d0b9).
+- SEC-0044 -- validate `node_count*8 <= remaining` before `ensureTotalCapacity`. DONE (50d7294).
+- SEC-0048 -- bound `item_count`/`entry_count` by `payload_size/min_record_size` before `ensureTotalCapacity` at `engine_index.zig:241`, `property_chain_index.zig:229`, and `loadHeader`; back-port to SEC-0044. DONE (50d7294 + d9272eb).
+- SEC-0045 -- iterate pagers and call `PageEncryption.deinit()` in `FileManager.deinit` (restores SEC-0030). DONE (a0811ce).
+- SEC-0046 -- remove or gitignore `package.json`/`package-lock.json`/`node_modules`. DONE (8518e2d).
+- SEC-0050 -- reject duplicate names/ids in `label_dict.loadFromFile` (`error.InvalidData`, free `owned`); verify CRC before committing the maps. DONE (4b8414f).
 
-- SEC-0047 -- replace unchecked `std.json.Value` accesses in `shard_manifest.readFromDir` with typed `parseFromSlice` or per-field tag/range guards; add malformed-JSON regression tests run under `ReleaseSafe`.
-- SEC-0042 -- shared `MAX_CHAIN_HOPS` helper across adj_store traversals + `PropIterator.next`.
-- SEC-0041 -- route 2PC reconciliation reads through checksum-verified WAL reads.
-- SEC-0038 -- restructure backup restore to verify-then-extract with cleanup.
-- SEC-0049 -- extract restores to a staging dir, verify CRC+HMAC, atomic-rename; set `exclusive`/`resolve_beneath` on extraction `createFile` (coordinate with SEC-0038).
-- SEC-0051 -- add CRC32C (or HMAC under TDE) over `.idx` snapshot payload; verify on load -> rebuild on mismatch (also cheaply enables SEC-0048 bound check).
-- SEC-0052 -- apply `resolve_beneath`/held-`Dir`-handle creation across `graph_dir`/`file_manager`/`manifest`/`registry`/`label_dict` (consistency follow-up to SEC-0049).
+**Medium (1-5 days each) -- DONE:**
 
-**Strategic (> 5 days):**
+- SEC-0047 -- replace unchecked `std.json.Value` accesses in `shard_manifest.readFromDir` with typed `parseFromSlice` or per-field tag/range guards; add malformed-JSON regression tests run under `ReleaseSafe`. DONE (f70babb).
+- SEC-0042 -- shared `MAX_CHAIN_HOPS` helper across adj_store traversals + `PropIterator.next`. DONE (569c621).
+- SEC-0041 -- route 2PC reconciliation reads through checksum-verified WAL reads. DONE (2a602fa).
+- SEC-0038 -- restructure backup restore to verify-then-extract with cleanup. DONE (821df37 + 587feac; final form re-verifies tamper-evidently during extract).
+- SEC-0049 -- extract restores safely; per-component `O_NOFOLLOW` on extraction `createFile` (coordinate with SEC-0038). DONE (821df37 + 587feac; `resolve_beneath` is a Linux no-op so per-component no-follow is the real defense).
+- SEC-0051 -- add CRC32 (or HMAC under TDE) over `.idx` snapshot payload; verify on load -> rebuild on mismatch (also cheaply enables SEC-0048 bound check). DONE (50d7294; preserved through afa4b5e buffered rewrite).
+- SEC-0052 -- apply held-`Dir`-handle creation / no-follow on create across `graph_dir`/`file_manager`/`manifest`/`registry`/`label_dict` (consistency follow-up to SEC-0049). DONE (a0811ce).
 
-- SEC-0037 -- design a per-`(file_id, page_id)` monotonic nonce counter that survives WAL replay and is advanced on the live frame; includes key-rotation/re-encryption guidance for already-exposed data.
-- SEC-0043 -- HMAC-SHA256 manifest format (versioned) when a TDE key is configured.
+**Strategic (> 5 days) -- DONE:**
 
-**Process follow-up:** add a fuzz target per untrusted on-disk artifact (shard manifest, each `.idx`, `labels.dict`, registry, free.store) to `fuzz_regression.zig`; gate CI to run the parser fuzz corpus under `ReleaseSafe` so future loaders inherit "validate-before-allocate, verify-before-materialize."
+- SEC-0037 -- per-`(file_id, page_id)` write_count that survives WAL replay and is advanced on the live frame; key-rotation/re-encryption guidance for already-exposed data. DONE (326d544; write_count write-back on flush + recovery seed).
+- SEC-0043 -- HMAC-SHA256 manifest format (versioned) when a TDE key is configured. DONE (194c6ef + d9272eb verify-path key threading).
+
+**Process follow-up:** add a fuzz target per untrusted on-disk artifact (shard manifest, each `.idx`, `labels.dict`, registry, free.store) to `fuzz_regression.zig`; gate CI to run the parser fuzz corpus under `ReleaseSafe` so future loaders inherit "validate-before-allocate, verify-before-materialize." (Carried forward as defense-in-depth process work; not gating any open SEC finding.)
 
 ---
 
@@ -129,7 +143,7 @@
 
 ## SEC-0037: AES-GCM nonce reuse via stale in-memory write_count on cached frames
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Critical
 - **Risk Score:** 100 (Impact 5 x Likelihood 5 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -145,10 +159,12 @@
 - **Acceptance Criteria:** (1) Test flushing the same cached frame twice (no manual poke) asserts distinct nonces. (2) Recovery replay test asserts post-replay flush write_count is strictly monotonic. (3) SEC-0015 test passes without manual write_count poke. (4) Plaintext path unaffected.
 - **SLA:** 7 days (Critical)
 - **Immediate Action:** Rotate the master key and re-encrypt at-rest data after the fix; treat captured same-page ciphertext pairs as exposed.
+- **Resolution:** write_count is now written back to the live cached frame on flush (sequential and parallel batch paths), and recovery seeds the per-(file,page) counter from `max(on-disk wc, wal wc)+1` so replay cannot regress the nonce. Same hot page flushed across consecutive checkpoints now produces distinct nonces. SEC-0015 test passes without the manual write_count poke; a recovery-replay monotonicity test was added. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `326d544`
 
 ## SEC-0038: Backup restore extracts attacker-controlled contents before CRC/HMAC verification
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** High
 - **Risk Score:** 64 (Impact 4 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -162,10 +178,12 @@
 - **Fix Guidance:** Verify-then-extract: two-pass full-archive CRC+HMAC verification before extraction, or extract to a temp dir + atomic rename after verify; add `errdefer` cleanup.
 - **Acceptance Criteria:** (1) Wrong-HMAC archive leaves target byte-for-byte unchanged. (2) Wrong-CRC likewise. (3) Valid archive round-trips. (4) Error paths clean up temp artifacts.
 - **SLA:** 30 days (High)
+- **Resolution:** Restore now verifies CRC32+HMAC before extracting (verify-before-extract) and re-verifies tamper-evidently during extraction; error paths clean up. A wrong-HMAC/wrong-CRC archive leaves the target byte-for-byte unchanged. The adversarial review found and fixed a verify/extract TOCTOU window (archive swapped between passes); the final form re-verifies during extract so the swap is detected. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `821df37` + `587feac`
 
 ## SEC-0039: prop_store dir_count read from disk without bounds validation
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** High
 - **Risk Score:** 64 (Impact 4 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -179,10 +197,12 @@
 - **Fix Guidance:** Validate `DIR_COUNT_SIZE + dir_count*DIR_ENTRY_SIZE <= data.len - PROP_DATA_OFFSET` before use; return `error.DataCorruption`.
 - **Acceptance Criteria:** (1) Oversized dir_count returns error. (2) readDirEntry never invoked with underflowing index. (3) Valid pages resolve.
 - **SLA:** 30 days (High)
+- **Resolution:** prop_store now validates `DIR_COUNT_SIZE + dir_count*DIR_ENTRY_SIZE` within page data before any `readDirEntry`, returning `error.DataCorruption` on an oversized count so the offset underflow is unreachable. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `3e4d0b9`
 
 ## SEC-0040: var_store data_len used as slice bound without capacity check
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** High
 - **Risk Score:** 64 (Impact 4 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -195,10 +215,12 @@
 - **Fix Guidance:** Return `error.DataCorruption` if `data_len > dataCapacity()` before slicing.
 - **Acceptance Criteria:** (1) Oversized data_len returns error. (2) Valid single/multi-page reads work.
 - **SLA:** 30 days (High)
+- **Resolution:** `VarStore.read` now rejects `data_len > dataCapacity()` with `error.DataCorruption` before slicing, closing the OOB-read / info-disclosure path. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `6021bee`
 
 ## SEC-0041: 2PC recovery replays unauthenticated WAL records (no checksum verification)
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** High
 - **Risk Score:** 64 (Impact 4 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -212,10 +234,12 @@
 - **Fix Guidance:** Use checksum-verified reads for both 2PC reconciliation passes (route through forEachFromStrict or a verifying readFrom); fail-closed on corrupt 2PC records (consistent with GAP-0045/#104).
 - **Acceptance Criteria:** (1) Forged prepare+commit with invalid checksum is rejected (no forged edge). (2) Valid 2PC records reconcile. (3) Both readFrom call sites use verified reads.
 - **SLA:** 30 days (High)
+- **Resolution:** 2PC reconciliation reads now go through strict checksum-verified WAL streaming; forged prepare+commit records with invalid checksums are rejected and no forged cross-shard edges are replayed during recovery. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `2a602fa`
 
 ## SEC-0042: adj_store and prop_store iterator chain traversals lack hop/cycle guard
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Medium
 - **Risk Score:** 48 (Impact 3 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -228,10 +252,12 @@
 - **Fix Guidance:** Shared `MAX_CHAIN_HOPS` helper returning `error.CircularChainDetected` applied to all adj_store traversals and `PropIterator.next`.
 - **Acceptance Criteria:** (1) Circular adjacency chain errors from all four adj_store paths. (2) Circular property chain errors from PropIterator.next. (3) Legitimate traversals unaffected.
 - **SLA:** 90 days (Medium)
+- **Resolution:** A shared `MAX_CHAIN_HOPS` guard returning `error.CircularChainDetected` was added across all adj_store traversals (`removeEdge`, `AdjEdgeIterator.next`, `updateEdgePropHead`, `edgeCount`) and `PropIterator.next`; circular chains can no longer cause an infinite-loop DoS. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `569c621`
 
 ## SEC-0043: Manifest integrity is CRC32-only even when a TDE key is configured
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Medium
 - **Risk Score:** 36 (Impact 3 x Likelihood 3 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -244,10 +270,12 @@
 - **Fix Guidance:** HMAC-SHA256 the manifest (key derived from master key) when a key is configured; verify on open/recovery; keep CRC32 for plaintext mode, gated by a version flag. Mirrors SEC-0005.
 - **Acceptance Criteria:** (1) Tampered manifest with recomputed CRC fails verification when a key is configured. (2) Legitimate manifest verifies. (3) Plaintext manifests remain back-compatible.
 - **SLA:** 90 days (Medium)
+- **Resolution:** Manifest is now HMAC-SHA256 protected when a TDE key is configured; a tampered manifest with a recomputed CRC is rejected. Plaintext mode remains CRC32 back-compatible. The adversarial review found and fixed a verify-path gap where the key did not reach the verification routine (so the HMAC was not actually checked on the verify path); d9272eb threads the key through the verify path and closes it. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `194c6ef` + `d9272eb`
 
 ## SEC-0044: label_index snapshot node_count drives allocation before bounds validation
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Medium
 - **Risk Score:** 48 (Impact 3 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -260,10 +288,12 @@
 - **Fix Guidance:** Validate `node_count * 8 <= remaining` (and an absolute sane cap) before allocating; return `error.InvalidFormat`/`error.DataCorruption`. Mirrors SEC-0022/SEC-0024.
 - **Acceptance Criteria:** (1) Oversized node_count errors without the large allocation. (2) Valid snapshots load.
 - **SLA:** 90 days (Medium)
+- **Resolution:** label_index snapshot load now validates `node_count*8 <= remaining` payload before `ensureTotalCapacity`, returning a clean error instead of an OOM-sized reservation at open. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `50d7294`
 
 ## SEC-0045: FileManager.deinit does not securely wipe per-pager encryption key copies
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Low
 - **Risk Score:** 16 (Impact 2 x Likelihood 2 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -276,10 +306,12 @@
 - **Fix Guidance:** Iterate `self.pagers`; for each active pager with `encryption != null`, call `pager.encryption.?.deinit()` before nulling; keep the master-key secureZero.
 - **Acceptance Criteria:** (1) Every pager key-copy zeroed after deinit. (2) Master key zeroed. (3) Regression test asserts PageEncryption.deinit invoked per active pager.
 - **SLA:** 180 days (Low)
+- **Resolution:** `FileManager.deinit` now iterates pagers and calls `PageEncryption.deinit()` (secureZero) on each per-pager key copy before nulling, in addition to wiping the master key. Restores the per-pager portion of SEC-0030. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `a0811ce`
 
 ## SEC-0046: Untracked npm package.json/package-lock.json in repo root, not gitignored
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Low
 - **Risk Score:** 24 (Impact 3 x Likelihood 2 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -292,12 +324,14 @@
 - **Fix Guidance:** Remove `package.json`/`package-lock.json`/`node_modules` from the root (if a local dev aid) and add them to `.gitignore`; or relocate + audit if intentionally part of the project. Do not commit the current untracked manifests.
 - **Acceptance Criteria:** (1) Manifests removed or gitignored. (2) `git status` clean of unaudited npm artifacts at root. (3) `.gitignore` covers package.json, package-lock.json, node_modules.
 - **SLA:** 180 days (Low)
+- **Resolution:** Untracked `package.json`/`package-lock.json` removed from the repo root and `package*.json` added to `.gitignore`; root is now clean of unaudited npm artifacts. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `8518e2d`
 
 ---
 
 ## SEC-0047: Unchecked std.json.Value union access in shard manifest parse
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** High
 - **Risk Score:** 64 (Impact 4 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -312,10 +346,12 @@
 - **Acceptance Criteria:** (1) Non-object root (`"5"`, `"[]"`) returns a clean error. (2) Missing/string-typed/negative/`>2^32` `version`/`shard_count` return clean errors. (3) Non-array `per_shard_uuids` and non-string element return clean errors. (4) Wrong-length hex returns a clean error. (5) The malformed-input suite passes under `-Doptimize=ReleaseSafe` with no illegal-behavior.
 - **SLA:** 30 days (High)
 - **Immediate Action:** Do not deploy on `ReleaseFast` against a data directory an untrusted party can write until the fix lands; no secret rotation required.
+- **Resolution:** `shard_manifest.readFromDir` now uses typed parsing with tag+range guards on every field (object root; `version`/`shard_count` as bounded integers; `per_shard_uuids` as array of strings; hex length checks). Malformed `shard_manifest.json` returns a clean error instead of a panic (safe build) or union-tag UB (ReleaseFast) before integrity gates. The malformed-input suite passes under `-Doptimize=ReleaseSafe`. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `f70babb`
 
 ## SEC-0048: Unbounded ensureTotalCapacity from untrusted snapshot counts (edge + prop-chain index)
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Medium
 - **Risk Score:** 48 (Impact 3 x Likelihood 4 x 4)
 - **Confidence:** `confidence::confirmed`
@@ -329,10 +365,12 @@
 - **Fix Guidance:** Bound the count by `payload_size / min_record_size` (edge = 32 bytes; prop-chain min ~10 bytes) before `ensureTotalCapacity`; return `error.InvalidFormat`. Validate `item_count <= payload_size / min_record_size` at the `loadHeader` layer and cap snapshot file size. Back-port to SEC-0044.
 - **Acceptance Criteria:** (1) Tiny-payload/huge-count `.idx` returns `error.InvalidFormat` (not OOM) for edge index, prop-chain index, and `loadHeader`. (2) Allocation-counting test asserts reserved bytes <= file size. (3) Valid snapshots load without unnecessary rebuild. (4) Bound back-ported to label_index (SEC-0044).
 - **SLA:** 90 days (Medium)
+- **Resolution:** Snapshot loaders (edge index, property-chain index, label_index `loadHeader`) now bound the untrusted `item_count`/`entry_count` by `payload_size/min_record_size` before `ensureTotalCapacity`, with a u32 cast clamp; a tiny crafted `.idx` with a huge count returns `error.InvalidFormat` instead of forcing a multi-GB reservation. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `50d7294` + `d9272eb`
 
 ## SEC-0049: Backup restore follows symlinks (no resolve_beneath/exclusive on extract)
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Medium
 - **Risk Score:** 48 (Impact 4 x Likelihood 3 x 4)
 - **Confidence:** `confidence::suspected` (platform-dependent symlink semantics; control flow confirmed, runtime not executed)
@@ -347,10 +385,12 @@
 - **Acceptance Criteria:** (1) Pre-created symlink at `target_dir/nodes.store -> outside path` causes restore to error with the link target unchanged. (2) Pre-existing regular file at the target name causes `error.PathAlreadyExists` (or is safely staged-and-renamed). (3) Valid restore round-trips into a clean target dir.
 - **SLA:** 90 days (Medium)
 - **Immediate Action:** Restore only into a clean/staged target until the fix lands; coordinate with SEC-0038.
+- **Resolution:** Backup restore now creates each file with per-component `O_NOFOLLOW`, so a pre-planted symlink at a legal filename (including on interior path components) is not followed; combined with SEC-0038's verify-before-extract, archive bytes are no longer written through a link. Note: `resolve_beneath` is a Linux no-op in this Zig stdlib version, so per-component no-follow is the real defense. The adversarial review found and fixed a residual intermediate-symlink case (symlink on an interior path component); per-component no-follow now covers interior components too. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `821df37` + `587feac`
 
 ## SEC-0050: labels.dict loader duplicate-key aliasing and verify-after-materialize
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Low (escalates to Medium in the duplicate-id memory-safety case)
 - **Risk Score:** 24 base (Impact 2 x Likelihood 3 x 4); 48 in the dup-id case (Impact 3 x Likelihood 4 x 4)
 - **Confidence:** `confidence::suspected` (map-internals-dependent double-free path; control flow confirmed)
@@ -364,10 +404,12 @@
 - **Fix Guidance:** Detect duplicates with `getOrPut` `found_existing` and reject with `error.InvalidData` (freeing `owned`) on any duplicate name or id; verify CRC in a first pass over the raw bytes before building the maps (or before committing); keep the single-owner aliasing invariant explicit with a comment and assert.
 - **Acceptance Criteria:** (1) Two identical names -> `error.InvalidData`, no leak (test allocator). (2) Two distinct names sharing one id -> `error.InvalidData`, no double-free/UAF. (3) Byte-flipped file -> `error.ChecksumMismatch`, no partial state retained. (4) Valid dict round-trips.
 - **SLA:** 180 days (Low; treat the dup-id memory-safety path on the 90-day Medium track if confirmed)
+- **Resolution:** `label_dict.loadFromFile` now detects duplicate names and ids via `getOrPut` `found_existing` and rejects with `error.InvalidData` (freeing `owned`), and verifies CRC before committing the maps. The dup-name leak and dup-id dangling-alias/double-free paths are closed (test allocator confirms no leak / no double-free). Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `4b8414f`
 
 ## SEC-0051: Derived-index .idx snapshots have no checksum/HMAC
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Low
 - **Risk Score:** 16 (Impact 2 x Likelihood 2 x 4)
 - **Confidence:** `confidence::suspected` (impact bounded by derived/rebuildable nature; control flow confirmed)
@@ -381,10 +423,12 @@
 - **Fix Guidance:** Append CRC32C (minimum) or, under TDE, HMAC-SHA256 (consistent with backup V2 and SEC-0043) over the snapshot payload; verify on load and treat a mismatch as "snapshot invalid -> rebuild." Also lets the loader reject malformed counts cheaply (supports SEC-0048).
 - **Acceptance Criteria:** (1) Round-trip with checksum succeeds. (2) Flipping one payload byte at a matching counter -> load returns null/invalid and the engine rebuilds from primary stores. (3) Under TDE the integrity tag is keyed (HMAC), not a bare CRC.
 - **SLA:** 180 days (Low)
+- **Resolution:** Derived-index `.idx` snapshots now carry a CRC32 over the payload, verified on load; a content tamper at a matching `checkpoint_counter` is detected and the engine rebuilds from primary stores. The checksum was preserved through the afa4b5e buffered rewrite of the snapshot writer. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `50d7294` (preserved through `afa4b5e`)
 
 ## SEC-0052: Creation paths omit resolve_beneath/exclusive (defense-in-depth)
 
-- **Status:** Open
+- **Status:** Closed / Implemented (2026-06-10)
 - **Severity:** Informational (Low)
 - **Risk Score:** 4 (Impact 1 x Likelihood 1 x 4)
 - **Confidence:** `confidence::confirmed` (the omission), `suspected` (exploitability -- defense-in-depth)
@@ -398,6 +442,8 @@
 - **Fix Guidance:** Set `resolve_beneath = true` on creation/open under the graph dir where supported, and create relative to a held graph-dir `Dir` handle rather than re-resolving `cwd()`-relative composed paths (also reduces TOCTOU). Treat as a consistency follow-up to SEC-0049.
 - **Acceptance Criteria:** (1) Creation paths under the graph dir use `resolve_beneath` where supported. (2) Creations occur relative to a held graph-dir `Dir` handle. (3) Existing permission tests (0o600/0o700) continue to pass.
 - **SLA:** Backlog (Informational)
+- **Resolution:** Creation paths hardened (create relative to held `Dir` handles / no-follow on create where supported) as the defense-in-depth consistency follow-up to SEC-0049; existing 0o600/0o700 permission tests continue to pass. Verified in Debug + ReleaseSafe; adversarial review confirmed correct.
+- **Commit:** `a0811ce`
 
 ---
 

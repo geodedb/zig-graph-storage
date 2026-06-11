@@ -1,8 +1,8 @@
 # Gap Analysis Resolved
 
-GitLab issues are the authoritative record for requirements and gaps. This file mirrors the non-open gap IDs moved out of `docs/GAP_ANALYSIS.md` during the 2026-04-07 re-audit and the 2026-06-10 Phase 4 tracking sync.
+GitLab issues are the authoritative record for requirements and gaps. This file mirrors the non-open gap IDs moved out of `docs/GAP_ANALYSIS.md` during the 2026-04-07 re-audit, the 2026-06-10 Phase 4 tracking sync, and the 2026-06-10 feature/requirement closure sync.
 
-As of the 2026-06-10 Phase 4 sync, the still-open requirement/gap IDs are `GAP-0002`, `GAP-0017`, `GAP-0023`, `GAP-0025`, `GAP-0027`, `GAP-0031`, `GAP-0033`, `GAP-0038`, `GAP-0039`, `GAP-0043`, `GAP-0044`, and `GAP-0048`. `GAP-0018`, `GAP-0042`, `GAP-0045`, `GAP-0046`, and `GAP-0047` were verified Implemented at HEAD (`eca7466`) and moved to resolved in this pass.
+As of the 2026-06-10 feature/requirement closure sync (branch `audit-remediation-2026-06-10`, full suite green Debug + ReleaseSafe: 542/543 unit + 23 integration + 6 cross-shard + 3 sharded), the still-open requirement/gap IDs are `GAP-0002`, `GAP-0017`, `GAP-0023`, `GAP-0025`, `GAP-0031`, `GAP-0033`, `GAP-0038`, `GAP-0039`, `GAP-0043`, `GAP-0044`, and `GAP-0048`; of these `GAP-0002`, `GAP-0017`, and `GAP-0044` are BLOCKED. `GAP-0027` (with requirements FR-016, FR-017, FR-021) and NFR-OBS-002 lifecycle events were verified Implemented and moved to resolved in this pass.
 
 ## Resolved / Invalidated Gaps
 
@@ -243,4 +243,59 @@ Verified Implemented at HEAD (`eca7466`). Full suite green: `zig build test` 443
 - **GitLab issue:** [#46](https://gitlab.com/devnw/zig/graph-storage/-/work_items/46) (closed)
 - **Disposition:** Resolved (single-engine path); residual on sharded path
 - **Resolution evidence:** Single-engine recovery streams the WAL tail (`src/wal.zig` `forEachFrom`, `src/recovery.zig`). Residual: the sharded recovery path still materializes the full per-shard WAL via `eng.wal.readFrom(0, allocator)` at `src/sharded_recovery.zig:53,98`. That residual is a performance/memory concern tracked by the performance tracker as **PERF-0051**, not a correctness regression. GAP-0030 stays resolved.
+- **Resolved date:** 2026-06-10
+
+## 2026-06-10 feature/requirement closure sync
+
+Verified Implemented on branch `audit-remediation-2026-06-10`. Full suite green Debug + ReleaseSafe: 542/543 unit + 23 integration + 6 cross-shard + 3 sharded.
+
+**Documented follow-up (applies to GAP-0027 / FR-016 / FR-017):** B+tree range queries currently operate over value-HASH space, not natural value ordering. This is a consequence of the existing hash-keyed `PropertyIndex`; ordered range scans over natural value ordering are a future enhancement and are noted on the closed issues for tracking.
+
+### GAP-0027: B+tree property indexes and index catalog are not integrated into the engine
+
+- **GitLab issue:** [#45](https://gitlab.com/devnw/zig/graph-storage/-/work_items/45) (closed)
+- **Category:** Feature / Indexing
+- **Disposition:** Resolved
+- **Resolution:** `IndexCatalog` is now wired into the engine open and checkpoint paths. The opt-in flow declare -> build -> persist -> reopen is delivered for B+tree property indexes, with equality and range queries; catalog metadata and B+tree state survive checkpoint/reopen.
+- **Resolution evidence:** Fix commit `7743b03`; integration tests cover declare/build/persist/reopen and equality+range queries. Full suite green Debug + ReleaseSafe (542/543 unit + 23 integration + 6 cross-shard + 3 sharded).
+- **Follow-up:** B+tree range queries operate over value-HASH space, not natural value ordering (hash-keyed `PropertyIndex` consequence); ordered range scans are a future enhancement.
+- **Resolved date:** 2026-06-10
+
+### FR-016: Opt-in per-graph B+tree property indexes for equality and range predicates
+
+- **GitLab issue:** [#16](https://gitlab.com/devnw/zig/graph-storage/-/work_items/16) (closed)
+- **Category:** Requirement / Functional
+- **Disposition:** Resolved
+- **Resolution:** Delivered via the engine wiring for the property-index catalog (GAP-0027 #45). Opt-in per-graph B+tree property indexes support equality and range predicate queries through declare -> build -> persist -> reopen.
+- **Resolution evidence:** Fix commit `7743b03`; equality and range query integration tests. Full suite green Debug + ReleaseSafe.
+- **Follow-up:** Range queries operate over value-HASH space, not natural value ordering; ordered range scans are a future enhancement.
+- **Resolved date:** 2026-06-10
+
+### FR-017: Per-graph index catalog with online/offline build and rebuild flows
+
+- **GitLab issue:** [#17](https://gitlab.com/devnw/zig/graph-storage/-/work_items/17) (closed)
+- **Category:** Requirement / Functional
+- **Disposition:** Resolved
+- **Resolution:** A per-graph index catalog is persisted on checkpoint and loaded on open; the offline index build flow (declare -> build -> persist -> reopen) is delivered.
+- **Resolution evidence:** Fix commit `7743b03`; catalog round-trip and offline-build integration tests. Full suite green Debug + ReleaseSafe.
+- **Follow-up:** Range queries operate over value-HASH space, not natural value ordering; ordered range scans are a future enhancement.
+- **Resolved date:** 2026-06-10
+
+### FR-021: Index extension points for specialized index modules
+
+- **GitLab issue:** [#21](https://gitlab.com/devnw/zig/graph-storage/-/work_items/21) (closed)
+- **Category:** Requirement / Functional
+- **Disposition:** Resolved
+- **Resolution:** Added an `IndexKindRegistry` extension mechanism providing extension points for specialized index modules (full-text, vector, spatial, etc.). Unknown type-ids are handled fail-closed; custom kinds round-trip through persistence and built-in kind compatibility is preserved.
+- **Resolution evidence:** Fix commit `1ed2b7d`; round-trip tests for custom kinds and built-in compatibility. Full suite green Debug + ReleaseSafe.
+- **Resolved date:** 2026-06-10
+
+### NFR-OBS-002: Structured events for checkpoint, recovery, migration, verify, backup/restore, and index lifecycle transitions
+
+- **GitLab issue:** [#36](https://gitlab.com/devnw/zig/graph-storage/-/work_items/36) (closed)
+- **Category:** Requirement / Observability
+- **Disposition:** Resolved
+- **Resolution:** Added `migration_start`/`migration_end`, `verify_start`/`verify_end`, and `index_build_start`/`index_build_end` to `StorageEvent`, plus the emit sites, so lifecycle events carry graph identity, phase, duration, and result and the last durable phase is determinable.
+- **Resolution evidence:** Fix commit `19870bc`; event-emission tests. Full suite green Debug + ReleaseSafe.
+- **Note:** Lifecycle EVENTS are complete here. The separate OTel metrics/export seam (NFR-OBS-001 #35 / GAP-0017 #41) stays OPEN and BLOCKED on an upstream Zig 0.16 module-dedup diamond bug.
 - **Resolved date:** 2026-06-10
