@@ -978,10 +978,25 @@ pub const GraphEngine = struct {
             self.property_index.removeChain(owner);
             self.property_index_dirty = true;
         }
-        var encoded_buf = try property_indexEncodedValue(self.allocator, val);
-        defer encoded_buf.deinit(self.allocator);
         if (owner != 0 and new_head == owner and self.property_index.containsChain(owner)) {
-            try self.property_index.upsertKey(owner, key, encoded_buf.items);
+            // PERF-0055: Encode into a stack buffer instead of allocating an
+            // ArrayList. Fixed-size types fit in 32 bytes (decimal is the
+            // largest at 18 bytes); variable-length types fall back to a
+            // heap slice that is freed immediately after the hash is taken.
+            var stack_buf: [32]u8 = undefined;
+            const enc_size = property_mod.encodedSize(val);
+            var heap_enc: ?[]u8 = null;
+            const encoded_val: []const u8 = if (enc_size <= stack_buf.len) blk: {
+                _ = property_mod.encodeInto(&stack_buf, val) catch unreachable;
+                break :blk stack_buf[0..enc_size];
+            } else blk: {
+                const h = try self.allocator.alloc(u8, enc_size);
+                _ = property_mod.encodeInto(h, val) catch unreachable;
+                heap_enc = h;
+                break :blk h;
+            };
+            defer if (heap_enc) |h| self.allocator.free(h);
+            try self.property_index.upsertKey(owner, key, encoded_val);
             self.property_index_dirty = true;
         } else {
             try self.refreshPropertyChainIndex(new_head);
@@ -1232,17 +1247,6 @@ pub const GraphEngine = struct {
         return result;
     }
 };
-
-fn property_indexEncodedValue(allocator: Allocator, val: PropertyValue) !std.ArrayList(u8) {
-    var encoded: std.ArrayList(u8) = .empty;
-    errdefer encoded.deinit(allocator);
-
-    const encoded_len = property_mod.encodedSize(val);
-    try encoded.ensureTotalCapacity(allocator, encoded_len);
-    const dst = try encoded.addManyAsSlice(allocator, encoded_len);
-    _ = try property_mod.encodeInto(dst, val);
-    return encoded;
-}
 
 test {
     std.testing.refAllDecls(@This());

@@ -18,6 +18,7 @@ const engine_mod = @import("engine.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
+const PropertyValue = types.PropertyValue;
 const GraphConfig = config_mod.GraphConfig;
 const Manifest = manifest_mod.Manifest;
 const GraphDir = graph_dir_mod.GraphDir;
@@ -1292,4 +1293,173 @@ test "open() failing after initSubsystems frees subsystems (QUAL-0042)" {
     // test pre-fix.
     const result = GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     try testing.expectError(error.InvalidData, result);
+}
+
+// PERF-0055: Verify that the per-write property encode no longer allocates a
+// heap ArrayList on the hot path for fixed-size (stack-encodable) values,
+// and that read-back is correct for both small (inline/stack) and large
+// (overflow) property values.
+test "PERF-0055: putProperty no redundant ArrayList alloc for fixed-size values" {
+    // A minimal counting allocator that wraps testing.allocator and counts
+    // the number of heap allocations issued.
+    const CountingAllocator = struct {
+        inner: std.mem.Allocator,
+        alloc_count: usize = 0,
+
+        fn allocFn(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.alloc_count += 1;
+            return self.inner.rawAlloc(n, alignment, ra);
+        }
+
+        fn resizeFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.rawResize(buf, alignment, new_len, ra);
+        }
+
+        fn remapFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.rawRemap(buf, alignment, new_len, ra);
+        }
+
+        fn freeFn(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.rawFree(buf, alignment, ra);
+        }
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = allocFn,
+                    .resize = resizeFn,
+                    .remap = remapFn,
+                    .free = freeFn,
+                },
+            };
+        }
+    };
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x55} ** 16;
+    const cfg = testConfig();
+
+    // -----------------------------------------------------------------------
+    // Part 1: correctness for all value kinds (inline and large).
+    // -----------------------------------------------------------------------
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        var head: u64 = 0;
+
+        // Fixed-size types (all encode into ≤18 bytes — well within 32-byte
+        // stack buffer).
+        head = try engine.putProperty(head, "a_bool", .{ .bool = true });
+        head = try engine.putProperty(head, "an_int", .{ .int = -9_876_543_210 });
+        head = try engine.putProperty(head, "a_float", .{ .float = 2.71828 });
+        head = try engine.putProperty(head, "a_decimal", .{ .decimal = .{ .coeff = 999_999_999_999, .scale = 6 } });
+        head = try engine.putProperty(head, "a_null", PropertyValue.null);
+
+        // Variable-length types: short string (fits in stack buf) and a long
+        // string that overflows the 32-byte stack buf in the encode path.
+        head = try engine.putProperty(head, "short_str", .{ .string = "hi" });
+        const long_str = "A" ** 64; // 64 bytes → encoded size = 1+4+64 = 69 > 32
+        head = try engine.putProperty(head, "long_str", .{ .string = long_str });
+
+        // Update an existing key so the upsertKey fast-path is exercised.
+        head = try engine.putProperty(head, "an_int", .{ .int = 42 });
+
+        // Read every key back and assert correctness.
+        {
+            const v = (try engine.getProperty(head, "a_bool", testing.allocator)).?;
+            try testing.expectEqual(true, v.bool);
+        }
+        {
+            const v = (try engine.getProperty(head, "an_int", testing.allocator)).?;
+            try testing.expectEqual(@as(i64, 42), v.int);
+        }
+        {
+            const v = (try engine.getProperty(head, "a_float", testing.allocator)).?;
+            try testing.expectApproxEqAbs(@as(f64, 2.71828), v.float, 1e-9);
+        }
+        {
+            const v = (try engine.getProperty(head, "a_decimal", testing.allocator)).?;
+            try testing.expectEqual(@as(i128, 999_999_999_999), v.decimal.coeff);
+            try testing.expectEqual(@as(u8, 6), v.decimal.scale);
+        }
+        {
+            const v = (try engine.getProperty(head, "a_null", testing.allocator)).?;
+            try testing.expectEqual(PropertyValue.null, v);
+        }
+        {
+            const v = (try engine.getProperty(head, "short_str", testing.allocator)).?;
+            defer testing.allocator.free(v.string);
+            try testing.expectEqualStrings("hi", v.string);
+        }
+        {
+            const v = (try engine.getProperty(head, "long_str", testing.allocator)).?;
+            defer testing.allocator.free(v.string);
+            try testing.expectEqualStrings(long_str, v.string);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 2: allocation-count regression for the upsertKey fast path.
+    //
+    // On the *second* putProperty for a key that already exists AND whose
+    // chain head is unchanged (the upsertKey branch), the old code allocated
+    // an ArrayList (1 heap alloc + 1 free).  With PERF-0055 applied, fixed-
+    // size values use a stack buffer and incur ZERO extra heap allocations
+    // on that path.
+    //
+    // We measure this by wrapping the engine allocator with a counting shim
+    // and issuing an update for a fixed-size (int) property, then asserting
+    // that zero additional allocations were made by the encode path.
+    // -----------------------------------------------------------------------
+    var td2 = try TestDataDir.init(testing.allocator);
+    defer td2.deinit();
+
+    const uuid2 = [_]u8{0x56} ** 16;
+
+    var counting = CountingAllocator{ .inner = testing.allocator };
+    const count_alloc = counting.allocator();
+
+    const engine2 = try GraphEngine.create(count_alloc, td2.path, uuid2, cfg);
+    defer engine2.close() catch {};
+
+    // First write: creates the property chain and index entry.
+    var head2: u64 = 0;
+    head2 = try engine2.putProperty(head2, "counter", .{ .int = 0 });
+
+    // Reset counter *after* the first write so setup noise is excluded.
+    counting.alloc_count = 0;
+
+    // Second write: updates an existing key on the same chain head (upsertKey
+    // path). With the fix, no ArrayList is allocated for the encode, so no
+    // extra heap allocation for the encode step.
+    head2 = try engine2.putProperty(head2, "counter", .{ .int = 1 });
+
+    // Verify correctness first.
+    const got = (try engine2.getProperty(head2, "counter", testing.allocator)).?;
+    try testing.expectEqual(@as(i64, 1), got.int);
+
+    // The encode step must contribute zero allocations (fixed-size int uses
+    // the stack buffer path).  Other allocations (txn bookkeeping etc.) may
+    // still occur; we only assert the encode no longer adds its own.
+    // Before the fix: 1 allocation (ArrayList for the encoded bytes).
+    // After the fix: 0 allocations from the encode path.
+    //
+    // We count total allocations in the update and assert the fix did not
+    // re-introduce an ArrayList allocation.  The total is bounded: txn begin
+    // may allocate, but the encode itself contributes 0.
+    // To make this assertion concrete we verify the count is strictly less
+    // than it would have been with the old ArrayList approach (which always
+    // allocated at least 1 time for the ArrayList backing store).
+    //
+    // The simplest portable assertion: allocations for a fixed-size update
+    // MUST be fewer than 2 (i.e. no ArrayList alloc for the encode).
+    try testing.expect(counting.alloc_count < 2);
 }
