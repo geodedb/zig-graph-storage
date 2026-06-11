@@ -256,7 +256,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .graph_storage = .{
-        .url = "https://gitlab.com/devnw/zig/graph-storage/-/archive/v0.2.0/graph-storage-v0.2.0.tar.gz",
+        .url = "https://gitlab.com/devnw/zig/graph-storage/-/archive/v0.2.1/graph-storage-v0.2.1.tar.gz",
         .hash = "...",
     },
 },

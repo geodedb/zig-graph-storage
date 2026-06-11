@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-11
+
+### Security — 2026-06-10 audit remediation
+
+- AES-GCM page nonce reuse fixed: flush now advances the live frame's
+  `write_count` and recovery seeds it to `max(on-disk, logged)` so the
+  per-page nonce is strictly monotonic (SEC-0037).
+- Backup restore authenticates the whole archive (CRC + HMAC) before any
+  bytes are written and defends every path component against symlink
+  traversal (per-component `O_NOFOLLOW`; `resolve_beneath` is a no-op on
+  Linux) with tamper-evident extraction (SEC-0038, SEC-0049).
+- Cross-shard 2PC recovery now verifies WAL checksums via a streaming
+  strict reader and fails closed on forged/malformed records (SEC-0041).
+- Manifest is authenticated with HMAC-SHA256 when encryption is enabled,
+  and the `verify` tool checks it under TDE (SEC-0043).
+- Untrusted on-disk inputs are bounds/shape validated before use:
+  `var_store` data_len, `prop_store` dir_count, adjacency/property chain
+  cycle guards, `shard_manifest.json` JSON shape, `labels.dict`
+  duplicate-key handling, and index-snapshot counts plus a CRC32 over
+  each snapshot payload (SEC-0039/0040/0042/0044/0047/0048/0050/0051).
+- Per-pager encryption keys are securely zeroed on teardown and file
+  creation is hardened (SEC-0045, SEC-0052). Untracked npm artifacts
+  removed and gitignored (SEC-0046).
+
+### Added
+
+- Opt-in B+tree property indexes and per-graph index catalog wired into
+  the engine lifecycle (declare → build → persist → reopen → equality /
+  range query), with index-kind extension points (GAP-0027, FR-016,
+  FR-017, FR-021).
+- Structured lifecycle events for migration, verify, and index build
+  (NFR-OBS-002).
+- Opt-in `GraphConfig.sync_mode` (default `sync_each_commit` preserves
+  per-commit durability; `deferred` trades durability for throughput).
+
+### Performance
+
+- Buffer pool auto-sizes on `create()` and reserves frames for hot node
+  pages, fixing the at-scale point-lookup degradation (PERF-0051).
+- Buffered single-pass index-snapshot I/O, O(1) label-index posting
+  lists, dirty-aware checkpoint fsync, parallel cross-shard 2PC, and
+  single-pass integrity scan (PERF-0052/0054/0057/0058/0060).
+
+### Fixed
+
+- Resource/FD leak on `create`/`open` error paths (QUAL-0042).
+- Integrity scan no longer swallows I/O errors as a clean result.
+- Property-store out-of-bounds write on oversized keys and a directory
+  rebuild corruption (found via new fuzz coverage).
+
 ### Added — Sharded Graph Engine
 
 - `ShardedGraphEngine` facade owning N=16 independent per-shard
@@ -93,6 +143,7 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.2.0...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.2.1...HEAD
+[0.2.1]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.2.0...v0.2.1
 [0.2.0]: https://gitlab.com/devnw/zig/graph-storage/-/releases/v0.2.0
 [0.1.0]: https://gitlab.com/devnw/zig/graph-storage/-/releases/v0.1.0
