@@ -59,7 +59,7 @@ Every data file is divided into fixed-size pages. The default page size is
 
 ### 1.4 Checksum Computation
 
-```
+```text
 checksum = CRC32C(page_body)
 ```
 
@@ -100,7 +100,7 @@ inter-record gaps.
 
 ### 2.3 Nodes Per Page
 
-```
+```text
 nodes_per_page = (page_size - 32) / 40
 ```
 
@@ -144,7 +144,7 @@ contiguous array of `EdgeEntry` records.
 
 ### 3.3 Adjacency Block Page Layout
 
-```
+```text
 +--------------------+  offset 0
 | PageHeader (32 B)  |
 +--------------------+  offset 32
@@ -162,7 +162,7 @@ contiguous array of `EdgeEntry` records.
 
 ### 3.4 Entries Per Block
 
-```
+```text
 entries_per_block = (page_size - 32 - 16) / 24
 ```
 
@@ -180,7 +180,7 @@ for O(1) lookup.
 
 ### 3.5.1 Page Structure
 
-```
+```text
 +---------------------+  offset 0
 | PageHeader (32 B)   |
 +---------------------+  offset 32
@@ -197,10 +197,22 @@ for O(1) lookup.
 | DirEntry[M-1] (4 B) |  ← directory grows backward
 | ...                 |
 | DirEntry[0] (4 B)  |
-+---------------------+  offset page_size - 2
++---------------------+  offset page_size - tail_reserve - 2
 | dir_count (2 B)     |  u16 LE -- number of directory entries
++---------------------+  offset page_size - tail_reserve
+| (AES-GCM auth tag)  |  tail_reserve bytes (encrypted mode only; 0 in plaintext)
 +---------------------+  offset page_size
 ```
+
+**Encrypted-mode tail reservation (`tail_reserve`):** When at-rest encryption
+is enabled (`GraphConfig.encryption_key != null`), `PropStore` reserves
+`tail_reserve` bytes at the physical end of every property page for the
+AES-GCM authentication tag written by the pager on flush. The slotted-page
+directory (`dir_count` footer and all `DirEntry` records) therefore grows
+backward from the **logical** page end at `page_size - tail_reserve`, not
+from the physical end. In plaintext mode `tail_reserve == 0` and the layout
+collapses to the diagram as written, preserving full backward compatibility.
+The constant is sourced from `src/prop_store.zig` (`PropStore.tail_reserve`).
 
 ### 3.5.2 Property Entry (variable length)
 
@@ -239,7 +251,7 @@ linear-scan mode.
 
 **Hash function:** FNV-1a with 32-bit state, truncated to u16:
 
-```
+```text
 h = 2166136261
 for each byte b in key:
     h ^= b
@@ -423,7 +435,7 @@ Backups are self-contained archives of a single graph's data files.
 
 ### 6.2 File Layout
 
-```
+```text
 +-----------------------------+  offset 0
 | Header (26 bytes)           |
 +-----------------------------+
@@ -544,7 +556,7 @@ trailer.
 The CRC32C checksum is computed incrementally over the serialized header fields
 and payload, **excluding** the checksum itself:
 
-```
+```text
 CRC32C(
     lsn[8] ||
     txn_id[8] ||
@@ -588,7 +600,7 @@ The graph registry is a catalog of all graphs managed by the storage engine.
 
 ### 8.2 File Layout
 
-```
+```text
 +-----------------------------+  offset 0
 | Header (40 bytes)           |
 +-----------------------------+
@@ -655,7 +667,7 @@ The index catalog persists definitions of all secondary indexes.
 
 ### 9.3 File Layout
 
-```
+```text
 +-----------------------------+  offset 0
 | entry_count (4 bytes)       |
 +-----------------------------+

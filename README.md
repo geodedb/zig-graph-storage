@@ -1,7 +1,7 @@
 # graph-storage
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/Zig-0.15.1+-orange.svg)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange.svg)](https://ziglang.org/)
 
 A high-performance, disk-resident graph storage engine written in Zig. Designed
 for single-graph OLTP workloads with crash-safe durability, incremental
@@ -10,7 +10,7 @@ checkpointing, and locality-friendly adjacency traversal.
 ## Sharded Engine
 
 For N-way writer concurrency per graph, `ShardedGraphEngine` owns 16
-independent single-threaded `GraphEngine` instances routed by
+independent single-writer `GraphEngine` instances routed by
 `shardOfNode(id) = id % 16`. The `GraphStorage` vtable shape is
 unchanged. Cross-shard edges use a small 2PC protocol (see
 `docs/superpowers/specs/2026-04-24-sharded-graph-engine-design.md`).
@@ -347,7 +347,7 @@ const cfg = gs.GraphConfig{
 
 ## Requirements
 
-- Zig 0.15.1 or later (`build.zig.zon` minimum); CI currently validates with Zig 0.15.2
+- Zig 0.16.0 or later; CI validates with Zig 0.16.0 (`build.zig.zon` `minimum_zig_version` is `0.15.1`)
 
 ## Building
 
