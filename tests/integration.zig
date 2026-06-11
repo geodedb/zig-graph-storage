@@ -1097,3 +1097,146 @@ test "PERF-0057: dirty-aware checkpoint preserves durability across multiple che
         try std.testing.expect(found);
     }
 }
+
+// ============================================================================
+// PERF-0045: opt-in commit sync policy (config.SyncMode)
+// ============================================================================
+
+test "PERF-0045: default sync_mode is sync_each_commit (NOT deferred)" {
+    // The default durability contract (NFR-SEC-003) requires per-commit fsync.
+    // Assert the shipped default is unchanged: any other default would silently
+    // weaken durability for every caller.
+    const cfg = GraphConfig{};
+    try std.testing.expectEqual(lib.SyncMode.sync_each_commit, cfg.sync_mode);
+    // testConfig() (used across the suite) must also keep the durable default.
+    try std.testing.expectEqual(lib.SyncMode.sync_each_commit, testConfig().sync_mode);
+}
+
+test "PERF-0045: DEFAULT mode — acknowledged commit survives a crash (no checkpoint, no clean close)" {
+    // This is the durability GATE for the default path. An auto-commit
+    // (putNode) acknowledges the commit only after the WAL is fsynced under
+    // `sync_each_commit`. We then SIMULATE A CRASH with `deinit()` — which
+    // tears down resources WITHOUT running a checkpoint or clean close — and
+    // reopen. Recovery must replay the committed WAL records, proving the
+    // acknowledged commit was durable. If the default ever stopped fsyncing
+    // per commit, this test would lose the node and fail.
+    const allocator = std.testing.allocator;
+    const uuid = [_]u8{0x45} ** 16;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    // Phase 1: write + auto-commit, then crash before any checkpoint/close.
+    {
+        const cfg = testConfig(); // default sync_mode = sync_each_commit
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        const n1 = try eng.allocNode();
+        try eng.putNode(n1, makeNode(0)); // auto-commit: fsynced before return
+
+        var rec1 = (try eng.getNode(n1)).?;
+        rec1.prop_head = try eng.putProperty(rec1.prop_head, "k", .{ .string = "durable" });
+        try eng.putNode(n1, rec1); // auto-commit: fsynced before return
+
+        // SIMULATED CRASH: no checkpoint(), no close() — just abandon the
+        // engine. Only data that reached stable storage (the fsynced WAL)
+        // can survive.
+        eng.deinit();
+    }
+
+    // Phase 2: reopen — recovery replays the committed WAL tail.
+    {
+        const cfg = testConfig();
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // The acknowledged commit MUST be present after the crash.
+        const got = try eng.getNode(1);
+        try std.testing.expect(got != null);
+        try std.testing.expect(got.?.prop_head != 0);
+
+        const val = try eng.getProperty(got.?.prop_head, "k", allocator);
+        try std.testing.expect(val != null);
+        switch (val.?) {
+            .string => |s| {
+                defer allocator.free(s);
+                try std.testing.expectEqualStrings("durable", s);
+            },
+            else => return error.UnexpectedPropertyType,
+        }
+    }
+}
+
+test "PERF-0045: deferred mode — commit becomes durable after an explicit checkpoint" {
+    // Documents the relaxed-durability semantics of `deferred`: the commit's
+    // data is durable once a checkpoint (which flushes+fsyncs data pages to
+    // their store files, independent of the WAL) runs. Here we DO checkpoint,
+    // then simulate a crash (deinit), reopen, and assert the data survived.
+    const allocator = std.testing.allocator;
+    const uuid = [_]u8{0x46} ** 16;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    {
+        var cfg = testConfig();
+        cfg.sync_mode = .deferred; // OPT-IN relaxed durability
+        try std.testing.expectEqual(lib.SyncMode.deferred, cfg.sync_mode);
+
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        const n1 = try eng.allocNode();
+        try eng.putNode(n1, makeNode(0)); // commit appended, NOT fsynced
+
+        // Explicit durability barrier: checkpoint flushes+fsyncs data pages.
+        try eng.checkpoint();
+
+        // Simulated crash AFTER the checkpoint barrier.
+        eng.deinit();
+    }
+
+    {
+        var cfg = testConfig();
+        cfg.sync_mode = .deferred;
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Checkpointed data is durable even in deferred mode.
+        const got = try eng.getNode(1);
+        try std.testing.expect(got != null);
+    }
+}
+
+test "PERF-0045: deferred mode — data is durable after a clean close" {
+    // A clean close() runs a checkpoint when there are pending writes, so even
+    // deferred-mode commits are durable after a normal shutdown.
+    const allocator = std.testing.allocator;
+    const uuid = [_]u8{0x47} ** 16;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    {
+        var cfg = testConfig();
+        cfg.sync_mode = .deferred;
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        const n1 = try eng.allocNode();
+        try eng.putNode(n1, makeNode(0));
+        const n2 = try eng.allocNode();
+        try eng.putNode(n2, makeNode(0));
+
+        try eng.close(); // clean shutdown -> checkpoint -> durable
+    }
+
+    {
+        var cfg = testConfig();
+        cfg.sync_mode = .deferred;
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        try std.testing.expectEqual(@as(u64, 2), try eng.nodeCount());
+        try std.testing.expect((try eng.getNode(1)) != null);
+        try std.testing.expect((try eng.getNode(2)) != null);
+    }
+}

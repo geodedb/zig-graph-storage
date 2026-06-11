@@ -5,9 +5,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wal_mod = @import("wal.zig");
 const wal_record = @import("wal_record.zig");
+const config_mod = @import("config.zig");
 const WalManager = wal_mod.WalManager;
 const WalRecord = wal_record.WalRecord;
 const WalRecordType = wal_record.WalRecordType;
+const SyncMode = config_mod.SyncMode;
 
 /// State of a transaction.
 pub const TxnState = enum {
@@ -23,15 +25,33 @@ pub const TxnManager = struct {
     active_txns: std.AutoHashMap(u64, TxnState),
     wal: *WalManager,
     allocator: Allocator,
+    /// Commit durability policy. DEFAULT (`sync_each_commit`) fsyncs the WAL
+    /// on every commit; `deferred` skips the per-commit fsync (relaxed
+    /// durability — see `config.SyncMode`). Wired from `GraphConfig.sync_mode`
+    /// at engine init.
+    sync_mode: SyncMode = .sync_each_commit,
 
-    /// Initialize the transaction manager.
+    /// Initialize the transaction manager. Defaults to `sync_each_commit`
+    /// (per-commit fsync). Callers that opt into a relaxed policy should set
+    /// `sync_mode` after init via `initWithSyncMode`.
     pub fn init(allocator: Allocator, wal: *WalManager, start_txn_id: u64) TxnManager {
+        return initWithSyncMode(allocator, wal, start_txn_id, .sync_each_commit);
+    }
+
+    /// Initialize the transaction manager with an explicit commit sync policy.
+    pub fn initWithSyncMode(
+        allocator: Allocator,
+        wal: *WalManager,
+        start_txn_id: u64,
+        sync_mode: SyncMode,
+    ) TxnManager {
         return TxnManager{
             .next_txn_id = start_txn_id,
             .txn_id_mutex = std.Io.Mutex.init,
             .active_txns = std.AutoHashMap(u64, TxnState).init(allocator),
             .wal = wal,
             .allocator = allocator,
+            .sync_mode = sync_mode,
         };
     }
 
@@ -63,7 +83,17 @@ pub const TxnManager = struct {
         return txn_id;
     }
 
-    /// Commit a transaction. Writes a COMMIT record to the WAL and syncs.
+    /// Commit a transaction. Writes a COMMIT record to the WAL.
+    ///
+    /// Durability depends on `sync_mode`:
+    ///   - `sync_each_commit` (DEFAULT): fsync the WAL before returning, so an
+    ///     acknowledged commit is crash-durable when this returns
+    ///     (NFR-SEC-003 — unchanged behavior).
+    ///   - `deferred`: skip the per-commit fsync (relaxed durability). The
+    ///     COMMIT record is appended but only reaches stable storage at the
+    ///     next durability barrier (checkpoint / clean close); commits since
+    ///     the last barrier may be lost on an unclean shutdown. See
+    ///     `config.SyncMode.deferred`.
     pub fn commit(self: *TxnManager, txn_id: u64) !void {
         const state = self.active_txns.get(txn_id) orelse return error.TxnNotFound;
         if (state == .committed) return error.TxnAlreadyCommitted;
@@ -79,7 +109,10 @@ pub const TxnManager = struct {
             .checksum = 0,
         };
         _ = try self.wal.appendRecord(&rec);
-        try self.wal.sync();
+        switch (self.sync_mode) {
+            .sync_each_commit => try self.wal.sync(),
+            .deferred => {},
+        }
 
         _ = self.active_txns.remove(txn_id);
     }

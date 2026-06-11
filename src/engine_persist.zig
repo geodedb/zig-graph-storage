@@ -193,8 +193,15 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     });
     errdefer self.wal.deinit();
 
-    // Transaction manager
-    self.txn_manager = TxnManager.init(allocator, &self.wal, self.manifest.next_txn_id);
+    // Transaction manager. Wire the configured commit durability policy
+    // (PERF-0045). DEFAULT is `sync_each_commit` — per-commit fsync,
+    // byte-for-byte the historical behavior (NFR-SEC-003).
+    self.txn_manager = TxnManager.initWithSyncMode(
+        allocator,
+        &self.wal,
+        self.manifest.next_txn_id,
+        cfg.sync_mode,
+    );
     errdefer self.txn_manager.deinit();
 
     // Data stores (non-fallible but clean up if a later init fails)

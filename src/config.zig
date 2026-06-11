@@ -46,6 +46,42 @@ pub const LegacyPolicy = enum {
     read_only,
 };
 
+/// Durability policy for committing a transaction's WAL records.
+///
+/// Controls whether each commit issues its own `fsync` of the WAL. The
+/// DEFAULT (`sync_each_commit`) preserves the strong per-commit durability
+/// contract (NFR-SEC-003): once `commit` returns, the COMMIT record is on
+/// stable storage and the transaction survives a crash. The alternate mode
+/// is OPT-IN and trades durability for throughput; it must be chosen
+/// explicitly and its weaker guarantee is documented below.
+pub const SyncMode = enum {
+    /// DEFAULT. fsync the WAL on every commit. An acknowledged commit (one
+    /// for which `commit` has returned) is guaranteed durable across a crash
+    /// before its caller continues. This is the historical, unchanged
+    /// behavior and the only mode that satisfies NFR-SEC-003 by itself.
+    sync_each_commit,
+
+    /// RELAXED DURABILITY — OPT-IN ONLY. The COMMIT record is appended to the
+    /// WAL but the per-commit `fsync` is skipped. Acknowledged commits live
+    /// only in the OS page cache until the next durability barrier and MAY BE
+    /// LOST if the process or machine crashes before one occurs.
+    ///
+    /// A commit becomes durable when any of the following runs successfully:
+    ///   - an explicit `checkpoint()` (flushes and fsyncs the modified data
+    ///     pages to their store files, independent of the WAL), or
+    ///   - a clean `close()` (which checkpoints when there are pending
+    ///     writes), or
+    ///   - an automatic checkpoint triggered by the configured byte/time
+    ///     thresholds.
+    ///
+    /// Choose this only for bulk-load / replayable-ingest workloads that
+    /// checkpoint (or cleanly close) before treating data as durable, and
+    /// that can tolerate losing the most recent un-checkpointed commits on
+    /// an unclean shutdown. Throughput improves because fsync no longer
+    /// dominates write wall time (see PERF-0045).
+    deferred,
+};
+
 pub const GraphConfig = struct {
     page_size: u32 = 8192,
     buffer_pool_pages: u32 = 1024,
@@ -61,6 +97,14 @@ pub const GraphConfig = struct {
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
     /// Policy for handling legacy (V1) graph formats during recovery.
     legacy_policy: LegacyPolicy = .reject,
+    /// Durability policy for transaction commits. DEFAULT
+    /// (`sync_each_commit`) fsyncs the WAL on every commit so an
+    /// acknowledged commit is crash-durable before the caller continues
+    /// (NFR-SEC-003). The `deferred` mode is opt-in and explicitly relaxes
+    /// this guarantee for throughput — see `SyncMode` for the exact
+    /// semantics and the durability barriers that make deferred commits
+    /// durable. Wired into the per-shard `TxnManager` at open/create time.
+    sync_mode: SyncMode = .sync_each_commit,
     /// Bootstrap paths may create missing on-disk artifacts. Steady-state
     /// open/recovery flows must leave this disabled so damage fails closed.
     allow_create_missing_artifacts: bool = false,

@@ -142,6 +142,7 @@ pub const FileId = types.FileId;
 pub const PropertyValue = types.PropertyValue;
 pub const StorageError = errors.StorageError;
 pub const GraphConfig = config.GraphConfig;
+pub const SyncMode = config.SyncMode;
 pub const Metrics = metrics.Metrics;
 
 pub const version = "0.2.0";
