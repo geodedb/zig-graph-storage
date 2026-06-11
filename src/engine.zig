@@ -750,11 +750,21 @@ pub const GraphEngine = struct {
         };
     }
 
+    /// Zero-copy outgoing-edge iterator (no result-sized allocation). The
+    /// returned `AdjEdgeIterator` borrows the source node's adjacency pages and
+    /// pins the current page; the caller MUST call `deinit()` to unpin it.
+    /// Yielded `EdgeEntry` values are copies and remain valid after `deinit()`.
     pub fn expandOutIter(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
         const rec = try self.node_store.getNode(id);
         return self.adj_out.expand(if (rec) |r| r.out_head else 0, rel_type);
     }
 
+    /// Collect all outgoing edges into a heap-allocated slice.
+    /// Caller owns the returned `[]EdgeEntry` and must free it with the same
+    /// `allocator` passed in (e.g. `allocator.free(result)`). Each `EdgeEntry`
+    /// is a plain value with no inner heap pointers, so freeing the slice is
+    /// sufficient. For a zero-copy alternative that allocates no result slice,
+    /// use `expandOutIter`.
     pub fn expandOut(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
         var __obs_span = observability.startOperationSpan("expand_out");
         defer __obs_span.end(null);
@@ -767,11 +777,17 @@ pub const GraphEngine = struct {
         return result;
     }
 
+    /// Zero-copy incoming-edge iterator (no result-sized allocation).
+    /// Ownership/lifetime rules match `expandOutIter`: the iterator pins a page
+    /// and the caller MUST call `deinit()` to unpin it.
     pub fn expandInIter(self: *GraphEngine, id: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
         const rec = try self.node_store.getNode(id);
         return self.adj_in.expand(if (rec) |r| r.in_head else 0, rel_type);
     }
 
+    /// Collect all incoming edges into a heap-allocated slice.
+    /// Caller owns the returned `[]EdgeEntry` and must free it with the same
+    /// `allocator` passed in. For a zero-copy alternative use `expandInIter`.
     pub fn expandIn(self: *GraphEngine, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror![]EdgeEntry {
         var __obs_span = observability.startOperationSpan("expand_in");
         defer __obs_span.end(null);
@@ -913,6 +929,12 @@ pub const GraphEngine = struct {
         observability.endOperationSpan(__obs_span, true, "");
     }
 
+    /// Look up a single property value by key.
+    /// The returned `PropertyValue` is fully owned by the caller: `.string` and
+    /// `.ext` payloads are heap-copied with `alloc`. Release them with
+    /// `property.freeDecoded(alloc, value)` (scalar variants own no heap memory,
+    /// so the call is a no-op for them). For a borrow-based, zero-copy path use
+    /// `getAllProperties` together with `interface.wrapPropIteratorView`.
     pub fn getProperty(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
         var __obs_span = observability.startOperationSpan("get_property");
         defer __obs_span.end(null);
@@ -1077,6 +1099,10 @@ pub const GraphEngine = struct {
         observability.endOperationSpan(__obs_span, true, "");
     }
 
+    /// Return every node id carrying `label` as a heap-allocated slice.
+    /// Caller owns the returned `[]NodeId` and must free it with the same
+    /// `alloc` passed in (e.g. `alloc.free(result)`). For a streaming,
+    /// zero-copy alternative that allocates no result slice, use `scanLabelIter`.
     pub fn scanLabel(self: *GraphEngine, label: LabelId, alloc: Allocator) anyerror![]NodeId {
         var __obs_span = observability.startOperationSpan("scan_label");
         defer __obs_span.end(null);
@@ -1088,6 +1114,10 @@ pub const GraphEngine = struct {
         return result;
     }
 
+    /// Zero-copy streaming label scan (no result-sized allocation). The
+    /// returned iterator borrows from the in-memory label index, so it takes no
+    /// allocator. The vtable's `scanLabelIter` keeps an `allocator` parameter
+    /// only to heap-box the type-erased iterator state.
     pub fn scanLabelIter(self: *GraphEngine, label: LabelId) !LabelIndex.Iterator {
         return self.label_index.iterator(label);
     }
@@ -1176,6 +1206,10 @@ pub const GraphEngine = struct {
         observability.endOperationSpan(__obs_span, true, "");
     }
 
+    /// Look up a single edge property value by key.
+    /// Ownership matches `getProperty`: the returned `PropertyValue`'s `.string`
+    /// and `.ext` payloads are heap-copied with `allocator` and must be released
+    /// with `property.freeDecoded(allocator, value)`.
     pub fn getEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
         var __obs_span = observability.startOperationSpan("get_edge_property");
         defer __obs_span.end(null);

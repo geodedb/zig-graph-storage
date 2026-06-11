@@ -553,7 +553,10 @@ test "GAP-0088: GraphStorage iterators do not require result-sized allocations" 
 
     var edge_iter_buf: [96]u8 = undefined;
     var edge_iter_alloc = std.heap.FixedBufferAllocator.init(&edge_iter_buf);
-    var edge_iter = try storage.expandOut(hub, null, edge_iter_alloc.allocator());
+    // expandOutIter is the first-class zero-copy vtable entry: it heap-boxes only
+    // the iterator state, never a result-sized buffer, so a tiny fixed buffer
+    // suffices regardless of edge count.
+    var edge_iter = try storage.expandOutIter(hub, null, edge_iter_alloc.allocator());
     defer edge_iter.deinit();
 
     var edge_count: usize = 0;
@@ -572,6 +575,161 @@ test "GAP-0088: GraphStorage iterators do not require result-sized allocations" 
         label_count += 1;
     }
     try testing.expectEqual(@as(usize, 24), label_count);
+}
+
+test "QUAL-0043/PERF-0041: expandOutIter/expandInIter dispatch through GraphStorage vtable" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x43} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    const n3 = try engine.allocNode();
+    try engine.putNode(n3, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+
+    const e1 = try engine.addEdge(n1, n2, 5);
+    const e2 = try engine.addEdge(n1, n3, 5);
+
+    // Dispatch the zero-copy iterator THROUGH the type-erased vtable, not the
+    // concrete engine. This proves expandOutIter is a first-class vtable method
+    // reachable without @hasDecl reflection on the concrete type.
+    const gs = engine.storage();
+
+    // A tiny fixed buffer is enough: the iterator state is heap-boxed once, but
+    // NO result-sized slice is allocated regardless of edge count.
+    var out_buf: [128]u8 = undefined;
+    var out_fba = std.heap.FixedBufferAllocator.init(&out_buf);
+    var out_iter = try gs.expandOutIter(n1, null, out_fba.allocator());
+    defer out_iter.deinit();
+
+    var saw_e1 = false;
+    var saw_e2 = false;
+    var out_count: usize = 0;
+    while (try out_iter.next()) |entry| {
+        out_count += 1;
+        if (entry.edge_id == e1) saw_e1 = true;
+        if (entry.edge_id == e2) saw_e2 = true;
+    }
+    try testing.expectEqual(@as(usize, 2), out_count);
+    try testing.expect(saw_e1);
+    try testing.expect(saw_e2);
+
+    // expandInIter through the vtable as well.
+    var in_buf: [128]u8 = undefined;
+    var in_fba = std.heap.FixedBufferAllocator.init(&in_buf);
+    var in_iter = try gs.expandInIter(n2, null, in_fba.allocator());
+    defer in_iter.deinit();
+
+    var in_count: usize = 0;
+    while (try in_iter.next()) |entry| {
+        in_count += 1;
+        try testing.expectEqual(n1, entry.neighbor);
+        try testing.expectEqual(e1, entry.edge_id);
+    }
+    try testing.expectEqual(@as(usize, 1), in_count);
+}
+
+test "QUAL-0043: expandOut ownership contract — caller frees returned slice, no leak" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x44} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    _ = try engine.addEdge(n1, n2, 5);
+
+    // Per the documented contract, expandOut returns an owned slice that the
+    // caller must free with the SAME allocator. std.testing.allocator fails the
+    // test if that contract is violated (leak or double-free).
+    const out_edges = try engine.expandOut(n1, null, testing.allocator);
+    defer testing.allocator.free(out_edges);
+    try testing.expectEqual(@as(usize, 1), out_edges.len);
+    try testing.expectEqual(n2, out_edges[0].neighbor);
+}
+
+test "QUAL-0043: scanLabel ownership contract — caller frees returned slice, no leak" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x45} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    const label_id: u32 = 11;
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    try engine.addLabel(n1, label_id);
+
+    // Per the documented contract, scanLabel returns an owned []NodeId that the
+    // caller must free with the SAME allocator. std.testing.allocator enforces
+    // no leak / no double-free.
+    const nodes = try engine.scanLabel(label_id, testing.allocator);
+    defer testing.allocator.free(nodes);
+    try testing.expectEqualSlices(NodeId, &[_]NodeId{n1}, nodes);
 }
 
 test "PERF-0005: nodeCount/edgeCount are O(1) via manifest counters" {

@@ -121,6 +121,11 @@ pub const GraphStorage = struct {
         getEdge: *const fn (ptr: *anyopaque, edge_id: EdgeId) anyerror!?EdgeEntry,
         expandOut: *const fn (ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator,
         expandIn: *const fn (ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator,
+        // Zero-copy traversal: stream outgoing/incoming edges without ever
+        // allocating a result-sized slice. The allocator only heap-boxes the
+        // small iterator state; iteration itself borrows from pinned pages.
+        expandOutIter: *const fn (ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator,
+        expandInIter: *const fn (ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator,
         addEdge: *const fn (ptr: *anyopaque, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId,
         removeEdge: *const fn (ptr: *anyopaque, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void,
         // Properties
@@ -168,11 +173,31 @@ pub const GraphStorage = struct {
     pub fn getEdge(self: GraphStorage, edge_id: EdgeId) anyerror!?EdgeEntry {
         return self.vtable.getEdge(self.ptr, edge_id);
     }
+    /// Outgoing-edge iterator. The returned `EdgeIterator` owns any backing
+    /// memory the implementation allocated with `allocator`; the caller must
+    /// release it by calling `deinit()` on the iterator with that same
+    /// allocator's lifetime in scope. Each yielded `EdgeEntry` is a value copy
+    /// and remains valid after the iterator is dropped.
     pub fn expandOut(self: GraphStorage, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
         return self.vtable.expandOut(self.ptr, id, rel_type, allocator);
     }
+    /// Incoming-edge iterator. Ownership/lifetime rules match `expandOut`:
+    /// call `deinit()` on the returned iterator to free its backing state.
     pub fn expandIn(self: GraphStorage, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
         return self.vtable.expandIn(self.ptr, id, rel_type, allocator);
+    }
+    /// Zero-copy outgoing traversal. Unlike `expandOut`, this never allocates a
+    /// result-sized buffer: `allocator` only heap-boxes the small type-erased
+    /// iterator state. Yielded `EdgeEntry` values are copies, so they outlive
+    /// the iterator, but the caller MUST call `deinit()` to free the boxed
+    /// state and unpin the backing page.
+    pub fn expandOutIter(self: GraphStorage, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
+        return self.vtable.expandOutIter(self.ptr, id, rel_type, allocator);
+    }
+    /// Zero-copy incoming traversal. Ownership/lifetime rules match
+    /// `expandOutIter`: call `deinit()` on the returned iterator.
+    pub fn expandInIter(self: GraphStorage, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
+        return self.vtable.expandInIter(self.ptr, id, rel_type, allocator);
     }
     pub fn addEdge(self: GraphStorage, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
         return self.vtable.addEdge(self.ptr, from, to, rel_type);
@@ -180,6 +205,12 @@ pub const GraphStorage = struct {
     pub fn removeEdge(self: GraphStorage, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
         return self.vtable.removeEdge(self.ptr, from, to, edge_id);
     }
+    /// Look up a single property value by key. On success the returned
+    /// `PropertyValue` is fully owned by the caller: `.string`/`.ext` payloads
+    /// are heap-copied with `allocator`. Free them with
+    /// `property.freeDecoded(allocator, value)` (scalar variants need no free).
+    /// For a borrow-based, zero-copy alternative use `getAllProperties` with a
+    /// `PropertyIteratorView`.
     pub fn getProperty(self: GraphStorage, prop_head: u64, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
         return self.vtable.getProperty(self.ptr, prop_head, key, allocator);
     }
@@ -198,6 +229,10 @@ pub const GraphStorage = struct {
     pub fn removeEdgeProperty(self: GraphStorage, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {
         return self.vtable.removeEdgeProperty(self.ptr, from, edge_id, key);
     }
+    /// Look up a single edge property value by key. Ownership matches
+    /// `getProperty`: the returned `PropertyValue`'s `.string`/`.ext` payloads
+    /// are heap-copied with `allocator` and must be released with
+    /// `property.freeDecoded(allocator, value)`.
     pub fn getEdgeProperty(self: GraphStorage, from: NodeId, edge_id: EdgeId, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
         return self.vtable.getEdgeProperty(self.ptr, from, edge_id, key, allocator);
     }
@@ -210,9 +245,16 @@ pub const GraphStorage = struct {
     pub fn removeLabel(self: GraphStorage, node_id: NodeId, label: LabelId) anyerror!void {
         return self.vtable.removeLabel(self.ptr, node_id, label);
     }
+    /// Return every node carrying `label` as an owned slice. The caller owns
+    /// the returned `[]NodeId` and must free it with the same `allocator`
+    /// passed in. For a streaming, zero-copy alternative that allocates no
+    /// result slice, use `scanLabelIter`.
     pub fn scanLabel(self: GraphStorage, label: LabelId, allocator: Allocator) anyerror![]NodeId {
         return self.vtable.scanLabel(self.ptr, label, allocator);
     }
+    /// Streaming label scan. `allocator` only heap-boxes the type-erased
+    /// iterator state — no result-sized slice is allocated. The caller must
+    /// call `deinit()` on the returned iterator to free that state.
     pub fn scanLabelIter(self: GraphStorage, label: LabelId, allocator: Allocator) anyerror!NodeIterator {
         return self.vtable.scanLabelIter(self.ptr, label, allocator);
     }
@@ -254,6 +296,8 @@ pub const GraphStorage = struct {
                 .getEdge = typeErasedFn(T, "getEdge"),
                 .expandOut = typeErasedFn(T, "expandOut"),
                 .expandIn = typeErasedFn(T, "expandIn"),
+                .expandOutIter = typeErasedFn(T, "expandOutIter"),
+                .expandInIter = typeErasedFn(T, "expandInIter"),
                 .addEdge = typeErasedFn(T, "addEdge"),
                 .removeEdge = typeErasedFn(T, "removeEdge"),
                 .getProperty = typeErasedFn(T, "getProperty"),
@@ -314,21 +358,26 @@ pub const GraphStorage = struct {
             }
             fn expandOutFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                if (@hasDecl(T, "expandOutIter")) {
-                    const concrete_iter = try @call(.auto, @field(T, "expandOutIter"), .{ self, id, rel_type });
-                    return wrapEdgeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
-                }
                 const result = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
                 return adaptEdgeResult(@TypeOf(result), result, allocator);
             }
             fn expandInFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                if (@hasDecl(T, "expandInIter")) {
-                    const concrete_iter = try @call(.auto, @field(T, "expandInIter"), .{ self, id, rel_type });
-                    return wrapEdgeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
-                }
                 const result = try @call(.auto, @field(T, method_name), .{ self, id, rel_type, allocator });
                 return adaptEdgeResult(@TypeOf(result), result, allocator);
+            }
+            // Zero-copy variants: forward to the implementation's allocator-free
+            // `expandOutIter`/`expandInIter`, then heap-box the concrete iterator
+            // into a type-erased EdgeIterator. No result-sized slice is built.
+            fn expandOutIterFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                const concrete_iter = try @call(.auto, @field(T, method_name), .{ self, id, rel_type });
+                return wrapEdgeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
+            }
+            fn expandInIterFn(ptr: *anyopaque, id: NodeId, rel_type: ?u32, allocator: Allocator) anyerror!EdgeIterator {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                const concrete_iter = try @call(.auto, @field(T, method_name), .{ self, id, rel_type });
+                return wrapEdgeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
             }
             fn addEdgeFn(ptr: *anyopaque, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
                 const self: *T = @ptrCast(@alignCast(ptr));
@@ -385,14 +434,15 @@ pub const GraphStorage = struct {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return @call(.auto, @field(T, method_name), .{ self, label, allocator });
             }
+            // `scanLabelIter` is intentionally asymmetric: the implementation's
+            // method is allocator-free (`scanLabelIter(self, label)`) because
+            // the streaming scan borrows from the in-memory label index, while
+            // the vtable keeps an `allocator` parameter solely to heap-box the
+            // type-erased NodeIterator state. The shim bridges the two.
             fn scanLabelIterFn(ptr: *anyopaque, label: LabelId, allocator: Allocator) anyerror!NodeIterator {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                if (@hasDecl(T, "scanLabelIter")) {
-                    const concrete_iter = try @call(.auto, @field(T, "scanLabelIter"), .{ self, label });
-                    return wrapNodeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
-                }
-                const slice = try @call(.auto, @field(T, "scanLabel"), .{ self, label, allocator });
-                return sliceToNodeIterator(slice, allocator);
+                const concrete_iter = try @call(.auto, @field(T, method_name), .{ self, label });
+                return wrapNodeIterator(@TypeOf(concrete_iter), concrete_iter, allocator);
             }
             fn beginTxnFn(ptr: *anyopaque) anyerror!TxnId {
                 const self: *T = @ptrCast(@alignCast(ptr));
@@ -437,6 +487,8 @@ pub const GraphStorage = struct {
             .{ "getEdge", Wrapper.getEdgeFn },
             .{ "expandOut", Wrapper.expandOutFn },
             .{ "expandIn", Wrapper.expandInFn },
+            .{ "expandOutIter", Wrapper.expandOutIterFn },
+            .{ "expandInIter", Wrapper.expandInIterFn },
             .{ "addEdge", Wrapper.addEdgeFn },
             .{ "removeEdge", Wrapper.removeEdgeFn },
             .{ "getProperty", Wrapper.getPropertyFn },
@@ -709,9 +761,9 @@ fn sliceToNodeIterator(slice: []NodeId, allocator: Allocator) anyerror!NodeItera
 // Unit Tests
 // ============================================================================
 
-test "VTable has exactly 29 method fields" {
+test "VTable has exactly 31 method fields" {
     const fields = std.meta.fields(GraphStorage.VTable);
-    try std.testing.expectEqual(@as(usize, 29), fields.len);
+    try std.testing.expectEqual(@as(usize, 31), fields.len);
 }
 
 test "PropertyEntry can be constructed" {
@@ -741,6 +793,8 @@ test "GraphStorage with mock vtable dispatches close" {
         .getEdge = undefined,
         .expandOut = undefined,
         .expandIn = undefined,
+        .expandOutIter = undefined,
+        .expandInIter = undefined,
         .addEdge = undefined,
         .removeEdge = undefined,
         .getProperty = undefined,
