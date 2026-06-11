@@ -62,7 +62,12 @@ pub fn getStorageStats(engine: *GraphEngine) StorageStats {
 
 /// Walk the node and edge stores and compare actual live counts against
 /// the manifest counters. Returns a report with any inconsistencies.
-pub fn checkIntegrity(engine: *GraphEngine) IntegrityReport {
+///
+/// A genuine I/O error encountered while scanning a node's outgoing
+/// adjacency chain is propagated to the caller rather than being silently
+/// counted as a clean end-of-iteration: a truncated chain would otherwise
+/// undercount edges and could be reported as "consistent" by accident.
+pub fn checkIntegrity(engine: *GraphEngine) anyerror!IntegrityReport {
     var report = IntegrityReport{
         .node_count_consistent = true,
         .edge_count_consistent = true,
@@ -101,12 +106,7 @@ pub fn checkIntegrity(engine: *GraphEngine) IntegrityReport {
             if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec) and rec.out_head != 0) {
                 var iter = engine.adj_out.expand(rec.out_head, null);
                 defer iter.deinit();
-                while (true) {
-                    const entry = iter.next() catch {
-                        report.io_errors += 1;
-                        break;
-                    };
-                    if (entry == null) break;
+                while (try iter.next()) |_| {
                     actual_edges += 1;
                 }
             }

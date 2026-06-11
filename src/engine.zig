@@ -198,12 +198,7 @@ pub const GraphEngine = struct {
         // 5. Create buffer pool, register pagers
         self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
         errdefer self.buffer_pool.deinit();
-        if (self.file_manager.getPager(.nodes)) |p| self.buffer_pool.registerPager(.nodes, p);
-        if (self.file_manager.getPager(.adj_out)) |p| self.buffer_pool.registerPager(.adj_out, p);
-        if (self.file_manager.getPager(.adj_in)) |p| self.buffer_pool.registerPager(.adj_in, p);
-        if (self.file_manager.getPager(.props)) |p| self.buffer_pool.registerPager(.props, p);
-        if (self.file_manager.getPager(.var_store)) |p| self.buffer_pool.registerPager(.var_store, p);
-        if (self.file_manager.getPager(.free)) |p| self.buffer_pool.registerPager(.free, p);
+        self.registerDataPagers();
 
         // 6. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         var bootstrap_cfg = cfg;
@@ -283,12 +278,7 @@ pub const GraphEngine = struct {
             // Re-create buffer pool with larger capacity, re-register pagers
             self.buffer_pool.deinit();
             self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, effective);
-            if (self.file_manager.getPager(.nodes)) |p| self.buffer_pool.registerPager(.nodes, p);
-            if (self.file_manager.getPager(.adj_out)) |p| self.buffer_pool.registerPager(.adj_out, p);
-            if (self.file_manager.getPager(.adj_in)) |p| self.buffer_pool.registerPager(.adj_in, p);
-            if (self.file_manager.getPager(.props)) |p| self.buffer_pool.registerPager(.props, p);
-            if (self.file_manager.getPager(.var_store)) |p| self.buffer_pool.registerPager(.var_store, p);
-            if (self.file_manager.getPager(.free)) |p| self.buffer_pool.registerPager(.free, p);
+            self.registerDataPagers();
         }
 
         // 5. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
@@ -338,6 +328,18 @@ pub const GraphEngine = struct {
         self.persistence_dirty = false;
 
         return self;
+    }
+
+    /// Register the six data-store pagers (nodes/adj_out/adj_in/props/var_store/free)
+    /// with the buffer pool. The label/prop/edge index pagers are managed
+    /// separately, so they are intentionally excluded here.
+    fn registerDataPagers(self: *GraphEngine) void {
+        if (self.file_manager.getPager(.nodes)) |p| self.buffer_pool.registerPager(.nodes, p);
+        if (self.file_manager.getPager(.adj_out)) |p| self.buffer_pool.registerPager(.adj_out, p);
+        if (self.file_manager.getPager(.adj_in)) |p| self.buffer_pool.registerPager(.adj_in, p);
+        if (self.file_manager.getPager(.props)) |p| self.buffer_pool.registerPager(.props, p);
+        if (self.file_manager.getPager(.var_store)) |p| self.buffer_pool.registerPager(.var_store, p);
+        if (self.file_manager.getPager(.free)) |p| self.buffer_pool.registerPager(.free, p);
     }
 
     fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]u8, cfg: GraphConfig, wal_start_lsn: u64) !void {
@@ -626,7 +628,7 @@ pub const GraphEngine = struct {
         return engine_integrity.getStorageStats(self);
     }
 
-    pub fn checkIntegrity(self: *GraphEngine) IntegrityReport {
+    pub fn checkIntegrity(self: *GraphEngine) anyerror!IntegrityReport {
         return engine_integrity.checkIntegrity(self);
     }
 

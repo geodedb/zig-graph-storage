@@ -24,9 +24,11 @@ const adj_store_mod = @import("adj_store.zig");
 const label_index_mod = @import("label_index.zig");
 const two_pc = @import("sharded_engine_2pc.zig");
 const sharded_recovery = @import("sharded_recovery.zig");
+const prop_store_mod = @import("prop_store.zig");
 
 const GraphConfig = config_mod.GraphConfig;
 const GraphEngine = engine_mod.GraphEngine;
+const PropStore = prop_store_mod.PropStore;
 const GraphStorage = interface_mod.GraphStorage;
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -401,7 +403,7 @@ pub const ShardedGraphEngine = struct {
         return self.shards[shard_count_mod.shardOfNode(owner)].removeProperty(owner, key);
     }
 
-    pub fn getAllProperties(self: *ShardedGraphEngine, prop_head: u64) anyerror!@TypeOf(self.shards[0].getAllProperties(prop_head) catch unreachable) {
+    pub fn getAllProperties(self: *ShardedGraphEngine, prop_head: u64) anyerror!PropStore.PropIterator {
         return self.shards[shard_count_mod.shardOfNode(prop_head)].getAllProperties(prop_head);
     }
 
@@ -417,7 +419,7 @@ pub const ShardedGraphEngine = struct {
         return self.shards[shard_count_mod.shardOfNode(from)].getEdgeProperty(from, edge_id, key, allocator);
     }
 
-    pub fn getAllEdgeProperties(self: *ShardedGraphEngine, from: NodeId, edge_id: EdgeId) anyerror!@TypeOf(self.shards[0].getAllEdgeProperties(from, edge_id) catch unreachable) {
+    pub fn getAllEdgeProperties(self: *ShardedGraphEngine, from: NodeId, edge_id: EdgeId) anyerror!?PropStore.PropIterator {
         return self.shards[shard_count_mod.shardOfNode(from)].getAllEdgeProperties(from, edge_id);
     }
 

@@ -11,6 +11,8 @@ const config_mod = @import("config.zig");
 const manifest_mod = @import("manifest.zig");
 const graph_dir_mod = @import("graph_dir.zig");
 const node_mod = @import("node.zig");
+const page_mod = @import("page.zig");
+const edge_mod = @import("edge.zig");
 const test_support = @import("testing_support.zig");
 const engine_mod = @import("engine.zig");
 
@@ -885,7 +887,7 @@ test "checkIntegrity reports consistent state" {
     defer engine.close() catch {};
 
     // Empty engine should be consistent
-    const r0 = engine.checkIntegrity();
+    const r0 = try engine.checkIntegrity();
     try testing.expect(r0.node_count_consistent);
     try testing.expect(r0.edge_count_consistent);
     try testing.expectEqual(@as(u64, 0), r0.total_errors);
@@ -916,7 +918,7 @@ test "checkIntegrity reports consistent state" {
     _ = try engine.addEdge(n1, n2, 1);
 
     // Should still be consistent
-    const r1 = engine.checkIntegrity();
+    const r1 = try engine.checkIntegrity();
     try testing.expect(r1.node_count_consistent);
     try testing.expect(r1.edge_count_consistent);
     try testing.expectEqual(@as(u64, 0), r1.total_errors);
@@ -924,10 +926,70 @@ test "checkIntegrity reports consistent state" {
     // Remove the edge, then delete a node -- counts should stay consistent
     try engine.removeEdge(n1, n2, 1);
     try engine.deleteNode(n1);
-    const r2 = engine.checkIntegrity();
+    const r2 = try engine.checkIntegrity();
     try testing.expect(r2.node_count_consistent);
     try testing.expect(r2.edge_count_consistent);
     try testing.expectEqual(@as(u64, 0), r2.total_errors);
+}
+
+// QUAL-0047(c): a genuine I/O / corruption error encountered while scanning a
+// node's outgoing adjacency chain must propagate to the caller rather than
+// being silently swallowed as a clean end-of-iteration (which previously left
+// the edge undercounted and could be reported as "consistent" by accident).
+test "checkIntegrity propagates adjacency-scan I/O errors" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x73} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // Two nodes with a single edge so node n1 has a non-empty out_head chain.
+    const n1 = try engine.allocNode();
+    try engine.putNode(n1, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    const n2 = try engine.allocNode();
+    try engine.putNode(n2, NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    });
+    _ = try engine.addEdge(n1, n2, 1);
+
+    // Locate n1's outgoing adjacency head page.
+    const rec = (try engine.node_store.getNode(n1)).?;
+    try testing.expect(rec.out_head != 0);
+
+    // Corrupt the head block so its next_block points back to itself. The
+    // adjacency iterator trips its hop guard and returns CircularChainDetected,
+    // simulating an I/O/corruption fault mid-scan. The EdgeBlockHeader begins
+    // at PAGE_HEADER_SIZE in the page and is read/written via @bitCast, so we
+    // mutate it through the same representation here.
+    const frame = try engine.adj_out.buffer_pool.pin(engine.adj_out.file_id, rec.out_head);
+    const frame_idx = engine.adj_out.buffer_pool.frameIndex(frame);
+    const data = frame.dataSlice();
+    const off = page_mod.PAGE_HEADER_SIZE;
+    const hdr_bytes = data[off..][0..@sizeOf(edge_mod.EdgeBlockHeader)];
+    var bh: edge_mod.EdgeBlockHeader = @bitCast(hdr_bytes.*);
+    bh.next_block = rec.out_head; // point the chain at itself
+    hdr_bytes.* = @bitCast(bh);
+    engine.adj_out.buffer_pool.unpin(frame_idx, true);
+
+    // The integrity scan must surface the error instead of counting it clean.
+    try testing.expectError(error.CircularChainDetected, engine.checkIntegrity());
 }
 
 test "V1 format detection returns V1FormatRequiresRecreation" {
