@@ -36,6 +36,7 @@ const PropertyValue = types.PropertyValue;
 const NodeRec = node_mod.NodeRec;
 const IndexCatalog = index_catalog_mod.IndexCatalog;
 const IndexType = index_catalog_mod.IndexType;
+const IndexKind = index_catalog_mod.IndexKind;
 const IndexState = index_catalog_mod.IndexState;
 const PropertyIndex = property_index_mod.PropertyIndex;
 const GraphEngine = engine_mod.GraphEngine;
@@ -220,7 +221,7 @@ pub fn createPropertyIndex(engine: *GraphEngine, label_id: LabelId, property_key
     try set.catalog.addIndex(.{
         .label_id = label_id,
         .property_key = property_key,
-        .index_type = .btree_property,
+        .index_type = .{ .builtin = .btree_property },
         .state = .active,
     });
 
@@ -363,7 +364,7 @@ pub fn load(engine: *GraphEngine) !void {
     };
 
     for (set.catalog.indexes.items) |def| {
-        if (def.index_type != .btree_property) continue;
+        if (!def.index_type.eql(.{ .builtin = .btree_property })) continue;
         if (def.state == .inactive or def.state == .failed) continue;
 
         const tree_path = try indexTreePath(engine, def.label_id, def.property_key);
