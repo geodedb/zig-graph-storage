@@ -122,6 +122,16 @@ pub const Backup = struct {
     /// CRC-only V1 backups remain readable for validation but are not restored
     /// unless the caller explicitly opts in.
     allow_legacy_v1_restore: bool = false,
+    /// Test-only seam used to model a same-inode mutation occurring between the
+    /// authentication pass and the extraction pass (SEC-0038 TOCTOU). Never set
+    /// in production; the extraction pass re-verifies the bytes it reads, so an
+    /// in-place rewrite here is detected and the restore fails closed.
+    test_post_auth_hook: ?TestHook = null,
+
+    pub const TestHook = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque) void,
+    };
 
     pub fn init(allocator: Allocator) Backup {
         return .{ .allocator = allocator };
@@ -279,23 +289,52 @@ pub const Backup = struct {
         // tampered or truncated archive can never poison the destination.
         try self.authenticateArchive(&file, header, layout, header_buf, archive_size);
 
+        // Test-only seam to model a same-inode mutation landing between the
+        // authentication and extraction passes. The extraction pass below
+        // re-verifies the bytes it reads, so any such mutation fails closed.
+        if (self.test_post_auth_hook) |hook| hook.func(hook.ctx);
+
         // Authentication succeeded; only now do we mutate the filesystem.
         try ensureDirectoryMode(target_dir, 0o700);
-        try self.ensureRestoreWalArtifacts(target_dir, header.graph_uuid);
+        try ensureRestoreWalArtifacts(target_dir, header.graph_uuid);
 
-        // SEC-0049: Hold an open handle to the destination and create every
-        // file relative to it. `exclusive` refuses a pre-existing file or
-        // symlink at the name, and `resolve_beneath` (where supported) blocks
-        // any path that would resolve outside the destination.
+        // SEC-0049: Hold an open handle to the destination and create every file
+        // relative to it. `resolve_beneath` is a SILENT NO-OP on Linux (std
+        // gates it on FreeBSD-only `O_RESOLVE_BENEATH`), so it cannot be relied
+        // upon. The real defenses are: (1) every intermediate path component is
+        // opened one at a time with `O_NOFOLLOW | O_DIRECTORY` (a symlinked
+        // intermediate dir yields `error.SymLinkLoop`), and (2) the final file
+        // is created with `O_EXCL`, which refuses a pre-existing file or symlink
+        // at the leaf. See `createFileNoFollow`.
         const io = std.Io.Threaded.global_single_threaded.io();
         var target = try std.Io.Dir.cwd().openDir(io, target_dir, .{ .iterate = false, .follow_symlinks = false });
         defer target.close(io);
 
-        // Pass 2 — extract. The bytes were already authenticated above, so the
-        // integrity trackers are unnecessary here. A throwaway CRC and a null
-        // HMAC let us reuse the shared read/copy helpers without recomputing.
-        var no_crc = Crc32.init();
-        var no_hmac: ?HmacSha256 = null;
+        // SEC-0038: re-verify the bytes ACTUALLY read during extraction. Pass 1
+        // proved the archive was authentic at that instant, but it shares the fd
+        // with this pass, so an attacker rewriting the same inode in place could
+        // slip unauthenticated bytes into the extract. Recomputing the CRC (and
+        // HMAC for V2) over the extracted bytes and comparing to the stored tags
+        // makes extraction tamper-evident; on mismatch we fail closed and remove
+        // everything we wrote so no poisoned output survives.
+        var crc = Crc32.init();
+        var hmac_ctx: ?HmacSha256 = if (self.encryption_key) |key|
+            if (header.version >= BACKUP_VERSION_HMAC) HmacSha256.init(&key) else null
+        else
+            null;
+        updateIntegrityBytes(0, &header_buf, layout, &crc, &hmac_ctx);
+
+        // Track what we create so a verification failure can be cleaned up,
+        // leaving the target directory free of poisoned, partial output.
+        var created_files: std.ArrayList([]u8) = .empty;
+        var created_dirs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (created_files.items) |p| self.allocator.free(p);
+            created_files.deinit(self.allocator);
+            for (created_dirs.items) |p| self.allocator.free(p);
+            created_dirs.deinit(self.allocator);
+        }
+        errdefer cleanupCreatedPaths(io, target, created_files.items, created_dirs.items);
 
         var pos: usize = header_buf.len;
         var files_restored: u32 = 0;
@@ -304,32 +343,59 @@ pub const Backup = struct {
         var i: u32 = 0;
         while (i < header.file_count) : (i += 1) {
             var name_len_buf: [2]u8 = undefined;
-            try readTrackedExact(&file, &pos, &name_len_buf, layout, &no_crc, &no_hmac);
+            try readTrackedExact(&file, &pos, &name_len_buf, layout, &crc, &hmac_ctx);
             const name_len = std.mem.readInt(u16, &name_len_buf, .little);
 
             const name = try self.allocator.alloc(u8, name_len);
             defer self.allocator.free(name);
-            try readTrackedExact(&file, &pos, name, layout, &no_crc, &no_hmac);
+            try readTrackedExact(&file, &pos, name, layout, &crc, &hmac_ctx);
             if (!isValidBackupFilename(name)) return error.InvalidBackupFilename;
 
             var size_buf: [8]u8 = undefined;
-            try readTrackedExact(&file, &pos, &size_buf, layout, &no_crc, &no_hmac);
+            try readTrackedExact(&file, &pos, &size_buf, layout, &crc, &hmac_ctx);
             const file_size = std.mem.readInt(u64, &size_buf, .little);
 
-            if (std.mem.lastIndexOfScalar(u8, name, '/')) |sep| {
-                try target.createDirPath(io, name[0..sep]);
+            // Record the intermediate directory (if any) BEFORE creating the
+            // file so cleanup can remove an empty directory we materialised.
+            if (std.mem.indexOfScalar(u8, name, '/')) |sep| {
+                const dir_copy = try self.allocator.dupe(u8, name[0..sep]);
+                errdefer self.allocator.free(dir_copy);
+                try created_dirs.append(self.allocator, dir_copy);
             }
 
-            const out_file = try target.createFile(io, name, .{
-                .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
-                .exclusive = true,
-                .resolve_beneath = true,
-            });
-            defer out_file.close(io);
-            _ = try copyTrackedToFile(&file, &out_file, &pos, file_size, layout, &no_crc, &no_hmac);
+            var dir_handle: ?std.Io.Dir = null;
+            const out_file = try createFileNoFollow(io, target, name, &dir_handle);
+            defer {
+                out_file.close(io);
+                if (dir_handle) |*d| d.close(io);
+            }
+            const name_copy = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(name_copy);
+            try created_files.append(self.allocator, name_copy);
+
+            _ = try copyTrackedToFile(&file, &out_file, &pos, file_size, layout, &crc, &hmac_ctx);
 
             files_restored += 1;
             total_bytes += file_size;
+        }
+
+        // Compare the recomputed integrity tags against the stored trailer. A
+        // mismatch means the file changed under us during extraction (SEC-0038);
+        // the errdefer above removes the partial output before we return.
+        if (pos != layout.crc_offset) return error.InvalidData;
+        var stored_crc_buf: [4]u8 = undefined;
+        try readTrackedExact(&file, &pos, &stored_crc_buf, layout, &crc, &hmac_ctx);
+        const stored_crc = std.mem.readInt(u32, &stored_crc_buf, .little);
+        if (stored_crc != crc.final()) return error.ChecksumMismatch;
+
+        if (layout.hmac_offset) |_| {
+            var stored_hmac: [HmacSha256.mac_length]u8 = undefined;
+            try readNoEof(&file, @intCast(pos), &stored_hmac);
+            var computed_hmac: [HmacSha256.mac_length]u8 = undefined;
+            hmac_ctx.?.final(&computed_hmac);
+            if (!timing_safe.eql([HmacSha256.mac_length]u8, stored_hmac, computed_hmac)) {
+                return error.HmacMismatch;
+            }
         }
 
         return .{
@@ -523,31 +589,45 @@ pub const Backup = struct {
         }
     }
 
-    fn ensureRestoreWalArtifacts(self: *Backup, target_dir: []const u8, graph_uuid: [16]u8) !void {
-        const wal_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/wal", .{target_dir});
-        defer self.allocator.free(wal_dir_path);
-        try ensureDirectoryMode(wal_dir_path, 0o700);
+    fn ensureRestoreWalArtifacts(target_dir: []const u8, graph_uuid: [16]u8) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
 
-        const graph_uuid_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ wal_dir_path, GRAPH_IDENTITY_FILE });
-        defer self.allocator.free(graph_uuid_path);
-        const uuid_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), graph_uuid_path, .{
+        // SEC-0049: open the target and its `wal` subdir with no-follow
+        // semantics. A symlinked `wal/` (the same intermediate-directory escape
+        // the extract loop defends against) yields `error.SymLinkLoop` here
+        // instead of the plain `createFile` silently writing through it.
+        var target = try std.Io.Dir.cwd().openDir(io, target_dir, .{ .iterate = false, .follow_symlinks = false });
+        defer target.close(io);
+        var wal_dir = try openOrCreateDirNoFollow(io, target, "wal", true);
+        defer wal_dir.close(io);
+        wal_dir.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {};
+
+        // Create the identity file relative to the verified `wal` handle. A
+        // pre-planted symlink at the leaf is refused by the no-follow delete +
+        // exclusive create below.
+        wal_dir.deleteFile(io, GRAPH_IDENTITY_FILE) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        const uuid_file = try wal_dir.createFile(io, GRAPH_IDENTITY_FILE, .{
             .read = true,
-            .truncate = false,
+            .exclusive = true,
             .permissions = std.Io.File.Permissions.fromMode(0o600),
         });
-        defer uuid_file.close(std.Io.Threaded.global_single_threaded.io());
-        try uuid_file.setLength(std.Io.Threaded.global_single_threaded.io(), 0);
-        try uuid_file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &graph_uuid, 0);
-        try uuid_file.sync(std.Io.Threaded.global_single_threaded.io());
+        defer uuid_file.close(io);
+        try uuid_file.writePositionalAll(io, &graph_uuid, 0);
+        try uuid_file.sync(io);
 
-        const wal_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ wal_dir_path, WAL_FILE });
-        defer self.allocator.free(wal_path);
-        const wal_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), wal_path, .{
+        const wal_file = wal_dir.createFile(io, WAL_FILE, .{
             .read = true,
             .truncate = false,
+            .exclusive = true,
             .permissions = std.Io.File.Permissions.fromMode(0o600),
-        });
-        wal_file.close(std.Io.Threaded.global_single_threaded.io());
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => return,
+            else => return err,
+        };
+        wal_file.close(io);
     }
 
     fn resolveExpectedGraphUuid(self: *const Backup, target_dir: []const u8) ![16]u8 {
@@ -763,6 +843,93 @@ fn copyTrackedToFile(
         remaining -= want;
     }
     return copied;
+}
+
+/// SEC-0049: Open (creating if absent) a single intermediate directory component
+/// relative to `parent`, refusing to traverse a symlink.
+///
+/// `resolve_beneath` is a silent no-op on Linux (std gates it on
+/// `@hasField(posix.O, "RESOLVE_BENEATH")`, which is FreeBSD-only via openat2),
+/// and `O_EXCL` only guards the final path component. To stop an attacker who
+/// pre-plants a symlinked intermediate directory, every component is opened one
+/// at a time with `follow_symlinks = false` (`O_NOFOLLOW | O_DIRECTORY`): a
+/// symlinked component yields `error.SymLinkLoop`, and `mkdirat` never follows a
+/// trailing symlink so a pre-existing symlink at the name yields
+/// `error.PathAlreadyExists` rather than a write-through.
+///
+/// `component` must be a single path segment (no '/'). Caller owns the returned
+/// `Dir` and must `close` it. When `iterate` is true the handle is opened
+/// without `O_PATH`, so metadata operations such as `setPermissions` work.
+fn openOrCreateDirNoFollow(io: std.Io, parent: std.Io.Dir, component: []const u8, iterate: bool) !std.Io.Dir {
+    if (parent.openDir(io, component, .{ .iterate = iterate, .follow_symlinks = false })) |dir| {
+        return dir;
+    } else |err| switch (err) {
+        error.FileNotFound => {
+            // Create the real directory, then open it without following symlinks.
+            // A racing attacker who swaps in a symlink between the two calls is
+            // caught by the no-follow open below (it would yield SymLinkLoop).
+            try parent.createDir(io, component, std.Io.File.Permissions.fromMode(0o700));
+            return parent.openDir(io, component, .{ .iterate = iterate, .follow_symlinks = false });
+        },
+        // error.SymLinkLoop  -> a symlink occupies this component (the attack).
+        // error.NotDir       -> a non-directory file occupies this component.
+        else => return err,
+    }
+}
+
+/// SEC-0049: Resolve `name`'s parent directory under `target` by walking each
+/// intermediate component with no-follow semantics, then create the final
+/// component as an exclusive file (`O_EXCL` covers a symlinked final component).
+///
+/// Returns the created file. The returned `dir_handle` (when non-null) is an
+/// open handle to the deepest intermediate directory and is owned by the caller,
+/// which must close it after the file is closed. When the name has no '/', the
+/// file is created directly under `target` and `dir_handle.*` stays null.
+fn createFileNoFollow(
+    io: std.Io,
+    target: std.Io.Dir,
+    name: []const u8,
+    dir_handle: *?std.Io.Dir,
+) !std.Io.File {
+    dir_handle.* = null;
+    var cursor = target;
+    var owns_cursor = false;
+    errdefer if (owns_cursor) cursor.close(io);
+
+    var iter = std.mem.splitScalar(u8, name, '/');
+    var component = iter.next() orelse return error.InvalidBackupFilename;
+    while (iter.next()) |next_component| {
+        // `component` is an intermediate directory; descend into it no-follow.
+        const child = try openOrCreateDirNoFollow(io, cursor, component, false);
+        if (owns_cursor) cursor.close(io);
+        cursor = child;
+        owns_cursor = true;
+        component = next_component;
+    }
+
+    const out_file = try cursor.createFile(io, component, .{
+        .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+        .exclusive = true,
+    });
+    if (owns_cursor) dir_handle.* = cursor;
+    return out_file;
+}
+
+/// SEC-0038: best-effort removal of the files (and the intermediate directories
+/// we created for them) after a verification failure, so no partial, poisoned
+/// output is left behind. Files are removed before directories; deletes are
+/// no-follow because every component was created no-follow during extraction.
+/// Errors are swallowed — cleanup runs on an already-failing path and must not
+/// mask the original error, and a directory that still holds caller-owned files
+/// (e.g. wal/graph.uuid written by ensureRestoreWalArtifacts) is simply kept.
+fn cleanupCreatedPaths(io: std.Io, target: std.Io.Dir, files: []const []const u8, dirs: []const []const u8) void {
+    for (files) |name| target.deleteFile(io, name) catch {};
+    // Remove deepest directories first so nested ones can become empty.
+    var idx: usize = dirs.len;
+    while (idx > 0) {
+        idx -= 1;
+        target.deleteDir(io, dirs[idx]) catch {};
+    }
 }
 
 // ============================================================================
@@ -1634,6 +1801,252 @@ test "SEC-0038/0049: valid V2 restore still round-trips into a clean target" {
     defer allocator.free(restored_labels);
     try expectFileContents(restored_labels, "Person:1");
     try expectOwnerOnlyMode(restored_labels);
+}
+
+/// Build an in-memory V1 (CRC-only) backup archive with caller-supplied entries.
+/// V1 is the legacy, opt-in restore path where filenames are attacker-craftable
+/// and only CRC-protected, which is exactly the threat model for SEC-0049's
+/// intermediate-directory symlink escape.
+fn buildV1Archive(
+    allocator: Allocator,
+    uuid: [16]u8,
+    entries: []const struct { name: []const u8, data: []const u8 },
+) ![]u8 {
+    var total: usize = 26; // header
+    for (entries) |e| total += 2 + e.name.len + 8 + e.data.len;
+    total += 4; // crc
+
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    @memcpy(buf[0..4], &BACKUP_MAGIC);
+    @memcpy(buf[4..6], &std.mem.toBytes(std.mem.nativeToLittle(u16, BACKUP_VERSION)));
+    @memcpy(buf[6..22], &uuid);
+    @memcpy(buf[22..26], &std.mem.toBytes(std.mem.nativeToLittle(u32, @as(u32, @intCast(entries.len)))));
+
+    var pos: usize = 26;
+    for (entries) |e| {
+        @memcpy(buf[pos..][0..2], &std.mem.toBytes(std.mem.nativeToLittle(u16, @as(u16, @intCast(e.name.len)))));
+        pos += 2;
+        @memcpy(buf[pos..][0..e.name.len], e.name);
+        pos += e.name.len;
+        @memcpy(buf[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, e.data.len))));
+        pos += 8;
+        @memcpy(buf[pos..][0..e.data.len], e.data);
+        pos += e.data.len;
+    }
+
+    const crc = Crc32.hash(buf[0..pos]);
+    @memcpy(buf[pos..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, crc)));
+    return buf;
+}
+
+test "SEC-0049: ensureRestoreWalArtifacts refuses a symlinked wal/graph.uuid" {
+    // RESIDUAL EXPLOIT (the one that actually reproduced): ensureRestoreWalArtifacts
+    // used plain `createFile` (follow_symlinks defaults true) on the absolute path
+    // `<target>/wal/graph.uuid`. An attacker who pre-plants `wal/graph.uuid` as a
+    // SYMLINK pointing outside the target causes the restore to follow it and
+    // overwrite the victim file with the 16-byte graph UUID. `resolve_beneath` is
+    // a no-op on Linux, so only no-follow discipline closes this.
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(base);
+
+    const uuid = [_]u8{0x42} ** 16;
+    const archive = try buildV1Archive(allocator, uuid, &.{
+        .{ .name = "nodes.store", .data = "node payload" },
+    });
+    defer allocator.free(archive);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/legacy.geob", .{base});
+    defer allocator.free(backup_path);
+    try writeTestFile(backup_path, archive);
+
+    // Outside victim that the symlink targets.
+    const victim_path = try std.fmt.allocPrint(allocator, "{s}/victim.txt", .{base});
+    defer allocator.free(victim_path);
+    try writeTestFile(victim_path, "victim contents");
+
+    // Target with a real `wal/` but `wal/graph.uuid` pre-planted as a symlink.
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{base});
+    defer allocator.free(restore_path);
+    try ensureDirectoryMode(restore_path, 0o700);
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{restore_path});
+    defer allocator.free(wal_path);
+    try ensureDirectoryMode(wal_path, 0o700);
+    const uuid_link = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ wal_path, GRAPH_IDENTITY_FILE });
+    defer allocator.free(uuid_link);
+    try std.Io.Dir.cwd().symLink(std.Io.Threaded.global_single_threaded.io(), victim_path, uuid_link, .{});
+
+    var backup = Backup.init(allocator);
+    backup.setExpectedGraphUuid(uuid);
+    backup.enableLegacyV1Restore();
+
+    // The restore must NOT follow the symlink. Whether it errors or replaces the
+    // symlink with a real file, the load-bearing guarantee is that the outside
+    // victim is never written through.
+    _ = backup.restoreBackupResult(backup_path, restore_path) catch {};
+
+    try expectFileContents(victim_path, "victim contents");
+}
+
+test "SEC-0049: restore refuses a pre-planted symlinked intermediate directory" {
+    // Defense-in-depth: a legacy V1 archive whose entry name legitimately
+    // contains a subdirectory component, restored into a target where that
+    // subdirectory is a pre-planted symlink, must not write through the link.
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(base);
+
+    const uuid = [_]u8{0x42} ** 16;
+    const archive = try buildV1Archive(allocator, uuid, &.{
+        .{ .name = "indexes/catalog.bin", .data = "poison payload" },
+    });
+    defer allocator.free(archive);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/legacy.geob", .{base});
+    defer allocator.free(backup_path);
+    try writeTestFile(backup_path, archive);
+
+    // The directory the attacker wants the restore to write through. It is empty,
+    // so the leaf name is free and `O_EXCL` alone would not save us — only the
+    // per-component no-follow walk refuses the symlinked `indexes` component.
+    const outside_dir = try std.fmt.allocPrint(allocator, "{s}/outside", .{base});
+    defer allocator.free(outside_dir);
+    try ensureDirectoryMode(outside_dir, 0o700);
+
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{base});
+    defer allocator.free(restore_path);
+    try ensureDirectoryMode(restore_path, 0o700);
+    const link_path = try std.fmt.allocPrint(allocator, "{s}/indexes", .{restore_path});
+    defer allocator.free(link_path);
+    try std.Io.Dir.cwd().symLink(std.Io.Threaded.global_single_threaded.io(), outside_dir, link_path, .{});
+
+    var backup = Backup.init(allocator);
+    backup.setExpectedGraphUuid(uuid);
+    backup.enableLegacyV1Restore();
+
+    // Restore must REFUSE the symlinked intermediate component. The exact errno
+    // is kernel-dependent (a trailing symlink opened with O_NOFOLLOW|O_DIRECTORY
+    // surfaces as ELOOP on some kernels and ENOTDIR on others); both mean "did
+    // not traverse the symlink".
+    if (backup.restoreBackupResult(backup_path, restore_path)) |_| {
+        return error.RestoreShouldHaveFailed;
+    } else |err| switch (err) {
+        error.SymLinkLoop, error.NotDir => {},
+        else => return err,
+    }
+
+    // Nothing was created through the symlink: the outside directory stays empty.
+    const leaked = try std.fmt.allocPrint(allocator, "{s}/catalog.bin", .{outside_dir});
+    defer allocator.free(leaked);
+    const probe = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), leaked, .{});
+    if (probe) |f| {
+        f.close(std.Io.Threaded.global_single_threaded.io());
+        return error.WroteThroughSymlink;
+    } else |_| {}
+}
+
+test "SEC-0038: content changing between auth and extract is caught, no poisoned output" {
+    const allocator = testing.allocator;
+
+    var env = try createTestGraphDir(allocator);
+    defer {
+        env.graph_dir.deinit();
+        env.tmp_dir.cleanup();
+    }
+
+    const nodes_path = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{env.graph_dir.path});
+    defer allocator.free(nodes_path);
+    try writeTestFile(nodes_path, "authentic node data");
+
+    var out_tmp = testing.tmpDir(.{});
+    defer out_tmp.cleanup();
+    const out_path_base = try out_tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(out_path_base);
+
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}/backup_toctou.geob", .{out_path_base});
+    defer allocator.free(backup_path);
+
+    const key = [_]u8{0x77} ** 32;
+    var backup = Backup.initWithKey(allocator, key);
+    _ = try backup.createBackup(&env.graph_dir, backup_path);
+
+    // Simulate a same-inode mutation that happens AFTER the archive passes the
+    // authentication pass but BEFORE/DURING the extraction pass. The hook flips
+    // a byte inside a file's data region (and repairs the CRC so only the
+    // re-verification of authenticated bytes can notice), modelling an attacker
+    // who rewrites the backup file in place between the two reads.
+    const Hook = struct {
+        path: []const u8,
+        fn run(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            mutate(self.path) catch {};
+        }
+        fn mutate(path: []const u8) !void {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+            defer f.close(io);
+            const len = try f.length(io);
+            const data = try testing.allocator.alloc(u8, @intCast(len));
+            defer testing.allocator.free(data);
+            _ = try f.readPositionalAll(io, data, 0);
+
+            const crc_offset = data.len - HmacSha256.mac_length - 4;
+            // Flip the first byte of the first non-empty file's data region.
+            var scan: usize = 26;
+            while (scan < crc_offset) {
+                const nlen = std.mem.readInt(u16, data[scan..][0..2], .little);
+                scan += 2 + nlen;
+                const fsize = std.mem.readInt(u64, data[scan..][0..8], .little);
+                scan += 8;
+                if (fsize > 0) {
+                    data[scan] ^= 0xFF;
+                    break;
+                }
+                scan += @intCast(fsize);
+            }
+            const new_crc = Crc32.hash(data[0..crc_offset]);
+            @memcpy(data[crc_offset..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+            try f.writePositionalAll(io, data, 0);
+        }
+    };
+    var hook = Hook{ .path = backup_path };
+    backup.test_post_auth_hook = .{ .ctx = &hook, .func = Hook.run };
+
+    const restore_path = try std.fmt.allocPrint(allocator, "{s}/restored", .{out_path_base});
+    defer allocator.free(restore_path);
+    try ensureDirectoryMode(restore_path, 0o700);
+    const sentinel_path = try std.fmt.allocPrint(allocator, "{s}/sentinel.txt", .{restore_path});
+    defer allocator.free(sentinel_path);
+    try writeTestFile(sentinel_path, "do-not-touch");
+
+    backup.setExpectedGraphUuid(env.graph_dir.graph_uuid);
+
+    const result = backup.restoreBackupResult(backup_path, restore_path);
+    // Extraction re-verifies the bytes it actually wrote; the post-auth mutation
+    // breaks the HMAC over the extracted bytes, so the restore fails closed.
+    try testing.expectError(error.HmacMismatch, result);
+
+    // The sentinel that predated the restore is untouched.
+    try expectFileContents(sentinel_path, "do-not-touch");
+
+    // No poisoned store file remains: partial output is cleaned up on failure.
+    const poisoned_nodes = try std.fmt.allocPrint(allocator, "{s}/nodes.store", .{restore_path});
+    defer allocator.free(poisoned_nodes);
+    const probe = std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), poisoned_nodes, .{});
+    if (probe) |f| {
+        f.close(std.Io.Threaded.global_single_threaded.io());
+        return error.PoisonedFileCreated;
+    } else |err| {
+        try testing.expectEqual(error.FileNotFound, err);
+    }
 }
 
 test {
