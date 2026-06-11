@@ -1131,12 +1131,13 @@ pub const GraphEngine = struct {
         return result;
     }
 
-    /// Zero-copy streaming label scan (no result-sized allocation). The
-    /// returned iterator borrows from the in-memory label index, so it takes no
-    /// allocator. The vtable's `scanLabelIter` keeps an `allocator` parameter
-    /// only to heap-box the type-erased iterator state.
+    /// Streaming label scan. Returns a sorted Iterator that owns its backing
+    /// slice; the caller must call deinit() to release it.  The vtable's
+    /// scanLabelIter keeps an allocator parameter only to heap-box the
+    /// type-erased iterator state; the posting-list slice itself is allocated
+    /// on the engine allocator (PERF-0054).
     pub fn scanLabelIter(self: *GraphEngine, label: LabelId) !LabelIndex.Iterator {
-        return self.label_index.iterator(label);
+        return self.label_index.iterator(label, self.allocator);
     }
 
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {

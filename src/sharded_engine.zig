@@ -644,6 +644,8 @@ pub const FanOutNodeIterator = struct {
         while (true) {
             if (self.current) |*inner| {
                 if (try inner.next()) |nid| return nid;
+                // Exhausted — release the owned posting-list slice (PERF-0054).
+                inner.deinit();
                 self.current = null;
             }
             if (self.shard_idx >= SHARD_COUNT) return null;
@@ -652,8 +654,11 @@ pub const FanOutNodeIterator = struct {
         }
     }
 
-    pub fn deinit(_: *FanOutNodeIterator) void {
-        // LabelIndex.Iterator is a lightweight cursor; nothing to free.
+    pub fn deinit(self: *FanOutNodeIterator) void {
+        // Release the active shard's owned posting-list slice if iteration
+        // was abandoned before the iterator was exhausted (PERF-0054).
+        if (self.current) |*inner| inner.deinit();
+        self.current = null;
     }
 };
 

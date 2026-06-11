@@ -16,7 +16,11 @@ const NodeStore = node_store_mod.NodeStore;
 const LabelId = types.LabelId;
 const NodeId = types.NodeId;
 
-const NodeList = std.ArrayList(NodeId);
+// PERF-0054: posting lists backed by a hash set for O(1) add/remove/contains.
+// scan() and iterator() materialise a sorted []NodeId on demand so callers
+// that need ordered output (tests, snapshot round-trips) continue to work.
+const NodeSet = std.AutoHashMapUnmanaged(NodeId, void);
+
 // SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
 const SNAPSHOT_MAGIC = "GSLIDX2\x00";
 
@@ -27,7 +31,7 @@ const LABEL_RECORD_MIN_SIZE: usize = 4 + 8;
 // SEC-0044/SEC-0048: bytes a single node id consumes on disk.
 const NODE_RECORD_SIZE: usize = 8;
 
-/// Label posting lists — maps LabelId to sorted arrays of NodeId.
+/// Label posting lists — maps LabelId to membership sets of NodeId.
 /// For v1, the posting lists are kept in memory and rebuilt from the
 /// node store on startup.
 pub const LabelIndex = struct {
@@ -36,20 +40,26 @@ pub const LabelIndex = struct {
     free_space: *FreeSpaceManager,
     page_size: u32,
 
-    /// In-memory index: LabelId -> list of NodeId
-    index: std.AutoHashMap(LabelId, NodeList),
+    /// In-memory index: LabelId -> set of NodeId (PERF-0054: O(1) add/remove).
+    index: std.AutoHashMapUnmanaged(LabelId, NodeSet),
 
+    /// Streaming iterator over a materialised, sorted posting list.
+    /// The iterator owns the backing slice; call deinit() to release it.
     pub const Iterator = struct {
-        items: []const NodeId,
-        index: usize = 0,
+        items: []NodeId,
+        pos: usize = 0,
+        allocator: Allocator,
 
         pub fn next(self: *Iterator) !?NodeId {
-            if (self.index >= self.items.len) return null;
-            defer self.index += 1;
-            return self.items[self.index];
+            if (self.pos >= self.items.len) return null;
+            defer self.pos += 1;
+            return self.items[self.pos];
         }
 
-        pub fn deinit(_: *Iterator) void {}
+        pub fn deinit(self: *Iterator) void {
+            self.allocator.free(self.items);
+            self.items = &.{};
+        }
     };
 
     pub fn init(
@@ -63,86 +73,67 @@ pub const LabelIndex = struct {
             .buffer_pool = buffer_pool,
             .free_space = free_space,
             .page_size = page_size,
-            .index = std.AutoHashMap(LabelId, NodeList).init(allocator),
+            .index = .empty,
         };
     }
 
     pub fn clear(self: *LabelIndex) void {
         var it = self.index.valueIterator();
-        while (it.next()) |list| {
-            @constCast(list).deinit(self.allocator);
+        while (it.next()) |set| {
+            @constCast(set).deinit(self.allocator);
         }
-        self.index.clearAndFree();
+        self.index.clearAndFree(self.allocator);
     }
 
     pub fn deinit(self: *LabelIndex) void {
         self.clear();
-        self.index.deinit();
+        self.index.deinit(self.allocator);
     }
 
-    /// Add a node to a label's posting list.
+    /// Add a node to a label's posting list.  O(1) amortised; idempotent.
     pub fn addNode(self: *LabelIndex, label_id: LabelId, node_id: NodeId) !void {
-        const gop = try self.index.getOrPut(label_id);
+        const gop = try self.index.getOrPut(self.allocator, label_id);
         if (!gop.found_existing) {
             gop.value_ptr.* = .empty;
         }
-        // Insert in sorted order using binary search; skip duplicates.
-        const list = gop.value_ptr;
-        const items = list.items;
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid] < node_id) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo < items.len and items[lo] == node_id) return;
-        try list.insert(self.allocator, lo, node_id);
+        _ = try gop.value_ptr.getOrPut(self.allocator, node_id);
     }
 
-    /// Remove a node from a label's posting list.
+    /// Remove a node from a label's posting list.  O(1).
     pub fn removeNode(self: *LabelIndex, label_id: LabelId, node_id: NodeId) void {
-        const list = self.index.getPtr(label_id) orelse return;
-        const items = list.items;
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid] < node_id) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo < items.len and items[lo] == node_id) {
-            _ = list.orderedRemove(lo);
-        }
+        const set = self.index.getPtr(label_id) orelse return;
+        _ = set.remove(node_id);
     }
 
-    /// Scan all node IDs for a label. Returns a copy (caller owns).
+    /// Scan all node IDs for a label. Returns a sorted, owned slice (caller frees).
     pub fn scan(self: *const LabelIndex, label_id: LabelId, allocator: Allocator) ![]NodeId {
-        const list = self.index.getPtr(label_id) orelse return try allocator.alloc(NodeId, 0);
-        const result = try allocator.alloc(NodeId, list.items.len);
-        @memcpy(result, list.items);
+        const set = self.index.getPtr(label_id) orelse return try allocator.alloc(NodeId, 0);
+        const result = try allocator.alloc(NodeId, set.count());
+        var i: usize = 0;
+        var kit = set.keyIterator();
+        while (kit.next()) |key| {
+            result[i] = key.*;
+            i += 1;
+        }
+        std.mem.sort(NodeId, result, {}, std.sort.asc(NodeId));
         return result;
     }
 
-    /// Iterate node IDs for a label without copying the posting list.
-    pub fn iterator(self: *const LabelIndex, label_id: LabelId) Iterator {
-        const empty = &[_]NodeId{};
-        const list = self.index.getPtr(label_id);
+    /// Iterate node IDs for a label without a result-sized caller allocation.
+    /// The returned Iterator owns its backing slice; call deinit() to release it.
+    pub fn iterator(self: *const LabelIndex, label_id: LabelId, allocator: Allocator) !Iterator {
+        const items = try self.scan(label_id, allocator);
         return .{
-            .items = if (list) |posting| posting.items else empty,
+            .items = items,
+            .pos = 0,
+            .allocator = allocator,
         };
     }
 
     /// Number of nodes with a given label.
     pub fn count(self: *const LabelIndex, label_id: LabelId) u64 {
-        const list = self.index.getPtr(label_id) orelse return 0;
-        return @intCast(list.items.len);
+        const set = self.index.getPtr(label_id) orelse return 0;
+        return set.count();
     }
 
     /// Rebuild the index from a node store by scanning all nodes.
@@ -176,11 +167,16 @@ pub const LabelIndex = struct {
             try file.writePositionalAll(io, &u32_buf, write_offset);
             write_offset += 4;
 
-            std.mem.writeInt(u64, &u64_buf, entry.value_ptr.items.len, .little);
+            const set = entry.value_ptr;
+            std.mem.writeInt(u64, &u64_buf, set.count(), .little);
             try file.writePositionalAll(io, &u64_buf, write_offset);
             write_offset += 8;
 
-            for (entry.value_ptr.items) |node_id| {
+            // Collect and sort node IDs for deterministic snapshot output.
+            const sorted = try self.scan(entry.key_ptr.*, self.allocator);
+            defer self.allocator.free(sorted);
+
+            for (sorted) |node_id| {
                 std.mem.writeInt(u64, &u64_buf, node_id, .little);
                 try file.writePositionalAll(io, &u64_buf, write_offset);
                 write_offset += 8;
@@ -218,7 +214,7 @@ pub const LabelIndex = struct {
             // against the bytes still available before reserving capacity.
             if (node_count > remaining / NODE_RECORD_SIZE) return error.InvalidFormat;
 
-            const gop = try self.index.getOrPut(label_id);
+            const gop = try self.index.getOrPut(self.allocator, label_id);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .empty;
             }
@@ -229,7 +225,7 @@ pub const LabelIndex = struct {
             while (j < node_count) : (j += 1) {
                 try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
                 const node_id = std.mem.readInt(u64, &u64_buf, .little);
-                gop.value_ptr.appendAssumeCapacity(node_id);
+                try gop.value_ptr.put(self.allocator, node_id, {});
             }
         }
 
@@ -302,7 +298,7 @@ test "large label — add 1000 nodes, scan returns all" {
     var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
     defer idx.deinit();
 
-    // Insert in reverse order to exercise sorted insertion.
+    // Insert in reverse order to exercise that scan always returns sorted output.
     var i: u64 = 1000;
     while (i > 0) {
         i -= 1;
@@ -313,6 +309,101 @@ test "large label — add 1000 nodes, scan returns all" {
     defer testing.allocator.free(result);
 
     try testing.expectEqual(@as(usize, 1000), result.len);
+    for (result, 0..) |v, j| {
+        try testing.expectEqual(@as(NodeId, j), v);
+    }
+}
+
+// PERF-0054: bulk add 5000 nodes to a single label, assert membership,
+// remove a subset, assert correctness, assert idempotent re-add.
+test "PERF-0054: bulk 5000-node label — add/remove/dedup correctness" {
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
+    defer env.deinit();
+
+    var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer idx.deinit();
+
+    const N = 5000;
+    const label: LabelId = 42;
+
+    // Bulk-add in reverse order; O(1) per insert with hash-set backing.
+    var n: u64 = N;
+    while (n > 0) {
+        n -= 1;
+        try idx.addNode(label, n);
+    }
+
+    try testing.expectEqual(@as(u64, N), idx.count(label));
+
+    // scan() returns all nodes in sorted order.
+    const all = try idx.scan(label, testing.allocator);
+    defer testing.allocator.free(all);
+    try testing.expectEqual(@as(usize, N), all.len);
+    for (all, 0..) |v, j| {
+        try testing.expectEqual(@as(NodeId, j), v);
+    }
+
+    // Idempotent re-add: count must not grow.
+    try idx.addNode(label, 0);
+    try idx.addNode(label, N - 1);
+    try testing.expectEqual(@as(u64, N), idx.count(label));
+
+    // Remove even-numbered nodes (half of N).
+    var k: u64 = 0;
+    while (k < N) : (k += 2) {
+        idx.removeNode(label, k);
+    }
+    try testing.expectEqual(@as(u64, N / 2), idx.count(label));
+
+    // Remaining nodes must all be odd and sorted.
+    const remaining = try idx.scan(label, testing.allocator);
+    defer testing.allocator.free(remaining);
+    try testing.expectEqual(@as(usize, N / 2), remaining.len);
+    for (remaining, 0..) |v, j| {
+        try testing.expectEqual(@as(NodeId, j * 2 + 1), v);
+    }
+
+    // Remove of an absent node must be a no-op.
+    idx.removeNode(label, 0); // already removed
+    try testing.expectEqual(@as(u64, N / 2), idx.count(label));
+}
+
+// PERF-0054: snapshot round-trip with large posting list preserves contents.
+test "PERF-0054: snapshot round-trip with large posting list" {
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
+    defer env.deinit();
+
+    var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer idx.deinit();
+
+    const N: u64 = 500;
+    const label: LabelId = 7;
+
+    var n: u64 = 0;
+    while (n < N) : (n += 1) {
+        try idx.addNode(label, n);
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try env.tmp_dir.dir.createFile(io, "labels_perf.idx", .{ .read = true, .truncate = true });
+    defer file.close(io);
+
+    try idx.saveToFile(&file, 99);
+
+    var loaded = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer loaded.deinit();
+
+    const ctr = try loaded.loadFromFile(&file);
+    try testing.expect(ctr != null);
+    try testing.expectEqual(@as(u64, 99), ctr.?);
+
+    try testing.expectEqual(@as(u64, N), loaded.count(label));
+
+    const result = try loaded.scan(label, testing.allocator);
+    defer testing.allocator.free(result);
+    try testing.expectEqual(@as(usize, N), result.len);
     for (result, 0..) |v, j| {
         try testing.expectEqual(@as(NodeId, j), v);
     }
