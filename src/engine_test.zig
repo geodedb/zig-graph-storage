@@ -993,6 +993,47 @@ test "checkIntegrity propagates adjacency-scan I/O errors" {
     try testing.expectError(error.CircularChainDetected, engine.checkIntegrity());
 }
 
+// PERF-0060: verify checkIntegrity reports are correct for a graph that spans
+// multiple node-store pages (more than 84 nodes on a 4 KiB page).
+test "checkIntegrity correct on multi-page node store" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x74} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    defer engine.close() catch {};
+
+    // testConfig uses page_size=4096; with PAGE_HEADER_SIZE=32 and NodeRec=48 bytes,
+    // nodes_per_page = (4096-32)/48 = 84. Allocate 170 nodes to span at least
+    // two full node pages, then add edges across the page boundary.
+    const total_nodes: usize = 170;
+    var node_ids: [total_nodes]NodeId = undefined;
+    for (0..total_nodes) |i| {
+        const nid = try engine.allocNode();
+        try engine.putNode(nid, NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        });
+        node_ids[i] = nid;
+    }
+
+    // Add edges between nodes on different pages (first node -> last node and back).
+    _ = try engine.addEdge(node_ids[0], node_ids[total_nodes - 1], 1);
+    _ = try engine.addEdge(node_ids[total_nodes - 1], node_ids[0], 2);
+
+    const report = try engine.checkIntegrity();
+    try testing.expect(report.node_count_consistent);
+    try testing.expect(report.edge_count_consistent);
+    try testing.expectEqual(@as(u64, 0), report.total_errors);
+    try testing.expectEqual(@as(u64, 0), report.io_errors);
+}
+
 test "V1 format detection returns V1FormatRequiresRecreation" {
     var td = try testDataDir();
     defer td.deinit();

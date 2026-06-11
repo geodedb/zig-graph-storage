@@ -7,8 +7,11 @@ const std = @import("std");
 
 const metrics_mod = @import("metrics.zig");
 const node_mod = @import("node.zig");
+const types = @import("types.zig");
 const engine_mod = @import("engine.zig");
 
+const NodeId = types.NodeId;
+const NodeRec = node_mod.NodeRec;
 const GraphEngine = engine_mod.GraphEngine;
 const Metrics = metrics_mod.Metrics;
 
@@ -67,7 +70,39 @@ pub fn getStorageStats(engine: *GraphEngine) StorageStats {
 /// adjacency chain is propagated to the caller rather than being silently
 /// counted as a clean end-of-iteration: a truncated chain would otherwise
 /// undercount edges and could be reported as "consistent" by accident.
+///
+/// PERF-0060: Uses scanNodes batch API to perform a single page-level pass
+/// over the node store, counting live nodes and walking outgoing adjacency
+/// chains simultaneously. This eliminates the two sequential per-id getNode
+/// full scans and their associated per-id re-pinning overhead.
 pub fn checkIntegrity(engine: *GraphEngine) anyerror!IntegrityReport {
+    const Ctx = struct {
+        engine: *GraphEngine,
+        actual_nodes: u64 = 0,
+        actual_edges: u64 = 0,
+        err: ?anyerror = null,
+
+        fn callback(self: *@This(), _: NodeId, rec: NodeRec) void {
+            if (self.err != null) return;
+            // scanNodes already filters empty and deleted records; every
+            // visited slot is a live node.
+            self.actual_nodes += 1;
+            if (rec.out_head == 0) return;
+            var iter = self.engine.adj_out.expand(rec.out_head, null);
+            defer iter.deinit();
+            while (iter.next() catch |e| {
+                self.err = e;
+                return;
+            }) |_| {
+                self.actual_edges += 1;
+            }
+        }
+    };
+
+    var ctx = Ctx{ .engine = engine };
+    try engine.node_store.scanNodes(engine.manifest.next_node_id, &ctx, Ctx.callback);
+    if (ctx.err) |e| return e;
+
     var report = IntegrityReport{
         .node_count_consistent = true,
         .edge_count_consistent = true,
@@ -75,44 +110,11 @@ pub fn checkIntegrity(engine: *GraphEngine) anyerror!IntegrityReport {
         .total_errors = 0,
     };
 
-    // Count actual live nodes (not deleted, not empty)
-    var actual_nodes: u64 = 0;
-    var id: u64 = 1;
-    while (id < engine.manifest.next_node_id) : (id += 1) {
-        const maybe_rec = engine.node_store.getNode(id) catch {
-            report.io_errors += 1;
-            continue;
-        };
-        if (maybe_rec) |rec| {
-            if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec)) {
-                actual_nodes += 1;
-            }
-        }
-    }
-    if (actual_nodes != engine.manifest.node_count) {
+    if (ctx.actual_nodes != engine.manifest.node_count) {
         report.node_count_consistent = false;
         report.total_errors += 1;
     }
-
-    // Count actual edges by scanning outgoing adjacency lists of all live nodes
-    var actual_edges: u64 = 0;
-    var nid: u64 = 1;
-    while (nid < engine.manifest.next_node_id) : (nid += 1) {
-        const maybe_rec = engine.node_store.getNode(nid) catch {
-            report.io_errors += 1;
-            continue;
-        };
-        if (maybe_rec) |rec| {
-            if (!node_mod.isDeleted(&rec) and !node_mod.isEmpty(&rec) and rec.out_head != 0) {
-                var iter = engine.adj_out.expand(rec.out_head, null);
-                defer iter.deinit();
-                while (try iter.next()) |_| {
-                    actual_edges += 1;
-                }
-            }
-        }
-    }
-    if (actual_edges != engine.manifest.edge_count) {
+    if (ctx.actual_edges != engine.manifest.edge_count) {
         report.edge_count_consistent = false;
         report.total_errors += 1;
     }
