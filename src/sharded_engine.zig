@@ -304,6 +304,50 @@ pub const ShardedGraphEngine = struct {
         return total;
     }
 
+    // PERF-0058: one side of a cross-shard prepare. Begins a local txn on its
+    // (single, disjoint) shard engine and appends+fsyncs the prepare record.
+    // The result (`local_txn`) and any `err` are read by the coordinator only
+    // after the WaitGroup join, which provides the necessary happens-before.
+    const PrepareCtx = struct {
+        eng: *GraphEngine,
+        payload: [two_pc.PREPARE_PAYLOAD_SIZE]u8,
+        local_txn: TxnId = 0,
+        err: ?anyerror = null,
+    };
+
+    fn prepareTaskFn(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+        const ctx: *PrepareCtx = @ptrCast(@alignCast(ctx_ptr));
+        const local_txn = ctx.eng.beginTxn() catch |e| {
+            ctx.err = e;
+            return;
+        };
+        ctx.local_txn = local_txn;
+        _ = two_pc.appendPrepare(ctx.eng, ctx.payload, local_txn) catch |e| {
+            ctx.err = e;
+        };
+    }
+
+    // PERF-0058: one side of a cross-shard commit. Appends+fsyncs the commit
+    // decision and commits the local txn on its (single, disjoint) shard
+    // engine. Any `err` is read by the coordinator only after the join.
+    const CommitCtx = struct {
+        eng: *GraphEngine,
+        global_txn_id: u64,
+        local_txn: TxnId,
+        err: ?anyerror = null,
+    };
+
+    fn commitTaskFn(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+        const ctx: *CommitCtx = @ptrCast(@alignCast(ctx_ptr));
+        _ = two_pc.appendDecision(ctx.eng, .cross_shard_commit, ctx.global_txn_id, ctx.local_txn) catch |e| {
+            ctx.err = e;
+            return;
+        };
+        ctx.eng.commitTxn(ctx.local_txn) catch |e| {
+            ctx.err = e;
+        };
+    }
+
     fn crossShardAddEdge(
         self: *ShardedGraphEngine,
         from: NodeId,
@@ -325,15 +369,57 @@ pub const ShardedGraphEngine = struct {
         const global_txn_id = self.coordinator_txn_counter.fetchAdd(1, .monotonic) + 1;
 
         // 2. Prepare on both shards (durable before any data mutation).
+        //
+        // PERF-0058: the two prepares write to disjoint per-shard state — `src`
+        // and `dst` are distinct GraphEngine instances (s_from != s_to is
+        // guaranteed by the caller `addEdge`), each with its OWN WAL, txn
+        // manager, buffer pool and mutex. `beginTxn` mutates only
+        // `eng.txn_manager`; `appendPrepare` mutates only `eng.wal` and fsyncs
+        // it. Nothing crosses between the two engines, and `edge_id` /
+        // `global_txn_id` are computed serially BEFORE this point, so no shared
+        // mutable coordinator state is touched inside the parallel region. We
+        // therefore run the source prepare inline on the calling thread while
+        // the target prepare runs on the shared thread pool, joining via a
+        // WaitGroup. This turns the cross-shard prepare cost from
+        // sum(2 fsync) into max(2 fsync). The WaitGroup's done()/wait()
+        // acquire-release pair publishes the worker's writes (the assigned
+        // local txn id and any error) to the calling thread after the join.
         var src_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
         two_pc.encodePreparePayload(&src_prepare, global_txn_id, .source, @intCast(s_to), edge_id, from, to, rel_type);
-        const src_local_txn = try src.beginTxn();
-        _ = try two_pc.appendPrepare(src, src_prepare, src_local_txn);
 
         var dst_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
         two_pc.encodePreparePayload(&dst_prepare, global_txn_id, .target, @intCast(s_from), edge_id, from, to, rel_type);
-        const dst_local_txn = try dst.beginTxn();
-        _ = try two_pc.appendPrepare(dst, dst_prepare, dst_local_txn);
+
+        var dst_ctx = PrepareCtx{ .eng = dst, .payload = dst_prepare };
+        var wg = self.shared_thread_pool.waitGroup();
+        const submitted = self.shared_thread_pool.submit(
+            prepareTaskFn,
+            &dst_ctx,
+            .{ .wait_group = &wg },
+        ) catch null;
+
+        // Source prepare runs inline regardless of whether the dst task was
+        // enqueued (it may run inline below as a fallback). Capture rather than
+        // `try` so a src failure does not skip joining the in-flight dst task.
+        var src_ctx = PrepareCtx{ .eng = src, .payload = src_prepare };
+        prepareTaskFn(&src_ctx, undefined);
+
+        // If submit failed (e.g. queue full / pool draining), run the target
+        // prepare inline on this thread BEFORE waiting so we never block on a
+        // WaitGroup that was never armed.
+        if (submitted == null) {
+            prepareTaskFn(&dst_ctx, undefined);
+        } else {
+            wg.wait();
+        }
+
+        // Surface either prepare's error only after the join, so a failure on
+        // one side cannot leave the other prepare task running with a freed
+        // stack context.
+        if (src_ctx.err) |e| return e;
+        if (dst_ctx.err) |e| return e;
+        const src_local_txn = src_ctx.local_txn;
+        const dst_local_txn = dst_ctx.local_txn;
 
         // 3. Write source outgoing adjacency.
         var from_rec = try src.getNode(from) orelse return error.NodeNotFound;
@@ -366,11 +452,36 @@ pub const ShardedGraphEngine = struct {
         try dst.node_store.putNode(to, to_rec);
 
         // 5. Commit on both shards — WAL-durable before acknowledging.
-        _ = try two_pc.appendDecision(src, .cross_shard_commit, global_txn_id, src_local_txn);
-        _ = try two_pc.appendDecision(dst, .cross_shard_commit, global_txn_id, dst_local_txn);
+        //
+        // PERF-0058: symmetric to the prepare phase, the two commits write to
+        // disjoint per-shard state. `appendDecision` mutates only `eng.wal`
+        // (plus its fsync) and `commitTxn` mutates only `eng.txn_manager` /
+        // `eng.metrics`. `global_txn_id`, `src_local_txn` and `dst_local_txn`
+        // are read-only inputs here. We run the source commit inline and the
+        // target commit on the shared pool, joining via a WaitGroup so the two
+        // fsyncs overlap (max instead of sum). `src.manifest.edge_count` is
+        // bumped on the calling thread after the join — it is coordinator-side
+        // single-writer state, never touched by the worker task.
+        var src_commit = CommitCtx{ .eng = src, .global_txn_id = global_txn_id, .local_txn = src_local_txn };
+        var dst_commit = CommitCtx{ .eng = dst, .global_txn_id = global_txn_id, .local_txn = dst_local_txn };
 
-        try src.commitTxn(src_local_txn);
-        try dst.commitTxn(dst_local_txn);
+        var commit_wg = self.shared_thread_pool.waitGroup();
+        const commit_submitted = self.shared_thread_pool.submit(
+            commitTaskFn,
+            &dst_commit,
+            .{ .wait_group = &commit_wg },
+        ) catch null;
+
+        commitTaskFn(&src_commit, undefined);
+
+        if (commit_submitted == null) {
+            commitTaskFn(&dst_commit, undefined);
+        } else {
+            commit_wg.wait();
+        }
+
+        if (src_commit.err) |e| return e;
+        if (dst_commit.err) |e| return e;
 
         src.manifest.edge_count += 1;
         return edge_id;
