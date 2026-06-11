@@ -846,6 +846,60 @@ test "PERF-0008: open respects buffer_pool_auto_size=false" {
     }
 }
 
+test "PERF-0051: create auto-sizes buffer pool (not left at tiny default)" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x51} ** 16;
+
+    // Tiny configured pool, auto-size enabled (the default).
+    var cfg = testConfig();
+    cfg.buffer_pool_pages = 16;
+    cfg.buffer_pool_auto_size = true;
+
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    // create() must apply the same auto-size floor open() uses instead of the
+    // tiny configured 16 frames.
+    try testing.expect(engine.buffer_pool.capacity >= 1024);
+    try testing.expect(engine.buffer_pool.capacity > cfg.buffer_pool_pages);
+}
+
+test "PERF-0051: create respects buffer_pool_auto_size=false" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x52} ** 16;
+
+    var cfg = testConfig();
+    cfg.buffer_pool_pages = 64;
+    cfg.buffer_pool_auto_size = false;
+
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    // With auto-size disabled, create() keeps the configured size verbatim.
+    try testing.expectEqual(@as(u32, 64), engine.buffer_pool.capacity);
+}
+
+test "PERF-0051: create reserves frames for the hot node store" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x53} ** 16;
+    const cfg = testConfig();
+
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    // The node store must have a non-zero reservation floor so cold scans
+    // cannot evict every cached node page.
+    const reserve = engine.buffer_pool.reserved_frames[@intFromEnum(types.FileId.nodes)];
+    try testing.expect(reserve > 0);
+    try testing.expect(reserve <= engine.buffer_pool.capacity);
+}
+
 test "getStorageStats returns correct counters" {
     var td = try testDataDir();
     defer td.deinit();

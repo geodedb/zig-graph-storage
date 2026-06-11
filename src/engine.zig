@@ -196,8 +196,16 @@ pub const GraphEngine = struct {
         _ = try self.file_manager.openFile(.edge_idx, .create_if_missing);
 
         // 5. Create buffer pool, register pagers
-        self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
+        // PERF-0051: size the pool with the same auto-size logic open() uses
+        // instead of taking cfg.buffer_pool_pages verbatim. A freshly created
+        // graph has an empty manifest (0 pages), so this applies the auto-size
+        // floor rather than leaving the pool at a tiny configured default.
+        const create_pages = cfg.effectiveBufferPoolPages(0);
+        self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, create_pages);
         errdefer self.buffer_pool.deinit();
+        // PERF-0051: reserve a floor of frames for the hot node store so cold
+        // prop/var/adj scans cannot evict every cached node page.
+        self.buffer_pool.setReservedFrames(.nodes, reservedNodeFrames(create_pages));
         self.registerDataPagers();
 
         // 6. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
@@ -280,6 +288,9 @@ pub const GraphEngine = struct {
             self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, effective);
             self.registerDataPagers();
         }
+        // PERF-0051: reserve a floor of frames for the hot node store so cold
+        // prop/var/adj scans cannot evict every cached node page.
+        self.buffer_pool.setReservedFrames(.nodes, reservedNodeFrames(self.buffer_pool.capacity));
 
         // 5. Init all shared subsystems (free space, WAL, txn, stores, labels, checkpointer)
         try self.initSubsystems(allocator, graph_uuid, cfg, self.manifest.last_checkpoint_lsn);
@@ -328,6 +339,21 @@ pub const GraphEngine = struct {
         self.persistence_dirty = false;
 
         return self;
+    }
+
+    /// PERF-0051: Number of frames reserved for the hot node store.
+    ///
+    /// Point lookups (`getNode`) and most graph traversals touch a node page
+    /// first. Cold prop/var/adj scans walk far more pages than the node store
+    /// has, so without a floor they evict every cached node page and turn each
+    /// post-seed `getNode` into a disk read. Reserving a quarter of the pool
+    /// (capped so it never starves the other stores) keeps the hot node working
+    /// set resident. The reservation is a *soft* floor: eviction still succeeds
+    /// when the reserved class is the only source of evictable frames, so it can
+    /// never deadlock or return BufferPoolFull spuriously.
+    fn reservedNodeFrames(capacity: u32) u32 {
+        // Reserve at most one quarter of the pool for node pages.
+        return capacity / 4;
     }
 
     /// Register the six data-store pagers (nodes/adj_out/adj_in/props/var_store/free)

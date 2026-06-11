@@ -192,6 +192,11 @@ const TierResult = struct {
     open_ms_stats: MetricStats = .{},
     mixed_ops_sec: f64,
     mixed_ops_sec_stats: MetricStats = .{},
+    // PERF-0061: buffer-pool thrash metrics for the point-lookup loop.
+    point_lookup_misses_per_op: f64 = 0,
+    point_lookup_misses_per_op_stats: MetricStats = .{},
+    point_lookup_reads_per_op: f64 = 0,
+    point_lookup_reads_per_op_stats: MetricStats = .{},
     skipped: bool = false,
     skip_reason: ?[]const u8 = null,
 };
@@ -214,6 +219,11 @@ const SampleMetrics = struct {
     checkpoint_ms: f64,
     open_ms: f64,
     mixed_ops_sec: f64,
+    // PERF-0061: buffer-pool thrash visibility. Misses/reads attributed to the
+    // point-lookup loop, expressed per operation so cache thrash shows up
+    // directly in the JSON output regardless of graph size.
+    point_lookup_misses_per_op: f64,
+    point_lookup_reads_per_op: f64,
 };
 
 // ---------------------------------------------------------------------------
@@ -757,7 +767,21 @@ fn runTierSample(
     else
         seeded_items / (@as(f64, @floatFromInt(seed_elapsed)) / 1_000_000_000.0);
 
+    // PERF-0061: snapshot buffer-pool counters around the point-lookup loop so
+    // cache thrash (misses/reads per op) is visible in the JSON output.
+    const m_before = engine.getMetrics().*;
     const point_lookup_ns = try benchPointLookupOnSeeded(allocator, engine, sr, iterations);
+    const m_after = engine.getMetrics().*;
+    const point_iters_f: f64 = @floatFromInt(@min(iterations, @as(usize, @intCast(sr.node_count))));
+    const point_lookup_misses_per_op = if (point_iters_f > 0)
+        @as(f64, @floatFromInt(m_after.buffer_misses - m_before.buffer_misses)) / point_iters_f
+    else
+        0;
+    const point_lookup_reads_per_op = if (point_iters_f > 0)
+        @as(f64, @floatFromInt(m_after.page_reads - m_before.page_reads)) / point_iters_f
+    else
+        0;
+
     const prop_read_ns = try benchPropReadOnSeeded(allocator, engine, sr, iterations);
     const expand_out_ns = try benchExpandOutOnSeeded(engine, sr, iterations);
     const label_scan_ns = try benchLabelScanOnSeeded(engine, sr, iterations);
@@ -778,6 +802,8 @@ fn runTierSample(
         .checkpoint_ms = checkpoint_ms,
         .open_ms = open_ms,
         .mixed_ops_sec = mixed_ops_sec,
+        .point_lookup_misses_per_op = point_lookup_misses_per_op,
+        .point_lookup_reads_per_op = point_lookup_reads_per_op,
     };
 }
 
@@ -817,6 +843,10 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
     defer allocator.free(open_samples);
     var mixed_samples = allocator.alloc(f64, sample_count) catch return skipResult(tier, "alloc mixed samples failed");
     defer allocator.free(mixed_samples);
+    var point_miss_samples = allocator.alloc(f64, sample_count) catch return skipResult(tier, "alloc point-miss samples failed");
+    defer allocator.free(point_miss_samples);
+    var point_read_samples = allocator.alloc(f64, sample_count) catch return skipResult(tier, "alloc point-read samples failed");
+    defer allocator.free(point_read_samples);
 
     for (0..sample_count) |sample_idx| {
         const sample = runTierSample(allocator, base_path, tier, sample_idx, iters) catch |err| {
@@ -831,6 +861,8 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
         checkpoint_samples[sample_idx] = sample.checkpoint_ms;
         open_samples[sample_idx] = sample.open_ms;
         mixed_samples[sample_idx] = sample.mixed_ops_sec;
+        point_miss_samples[sample_idx] = sample.point_lookup_misses_per_op;
+        point_read_samples[sample_idx] = sample.point_lookup_reads_per_op;
 
         if (checkTimeout(&tier_start, tier)) |r| return r;
     }
@@ -843,6 +875,8 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
     const checkpoint_ms_stats = summarizeSamples(allocator, checkpoint_samples) catch return skipResult(tier, "summarize checkpoint failed");
     const open_ms_stats = summarizeSamples(allocator, open_samples) catch return skipResult(tier, "summarize open failed");
     const mixed_ops_sec_stats = summarizeSamples(allocator, mixed_samples) catch return skipResult(tier, "summarize mixed failed");
+    const point_miss_stats = summarizeSamples(allocator, point_miss_samples) catch return skipResult(tier, "summarize point-miss failed");
+    const point_read_stats = summarizeSamples(allocator, point_read_samples) catch return skipResult(tier, "summarize point-read failed");
 
     return TierResult{
         .name = tier.name,
@@ -864,6 +898,10 @@ fn runTier(allocator: std.mem.Allocator, base_path: []const u8, tier: Tier) Tier
         .open_ms_stats = open_ms_stats,
         .mixed_ops_sec = mixed_ops_sec_stats.avg,
         .mixed_ops_sec_stats = mixed_ops_sec_stats,
+        .point_lookup_misses_per_op = point_miss_stats.avg,
+        .point_lookup_misses_per_op_stats = point_miss_stats,
+        .point_lookup_reads_per_op = point_read_stats.avg,
+        .point_lookup_reads_per_op_stats = point_read_stats,
     };
 }
 
@@ -970,6 +1008,11 @@ fn writeJsonOutput(out: *StdoutWriter, results: []const TierResult) !void {
         try writeMetricStats(out, "seed_ops_sec", r.seed_ops_sec_stats, true);
         try out.writeFmt("      \"point_lookup_ns\": {d:.0},\n", .{r.point_lookup_ns});
         try writeMetricStats(out, "point_lookup_ns", r.point_lookup_ns_stats, true);
+        // PERF-0061: per-op buffer-pool thrash counters for the point-lookup loop.
+        try out.writeFmt("      \"point_lookup_misses_per_op\": {d:.3},\n", .{r.point_lookup_misses_per_op});
+        try writeMetricStats(out, "point_lookup_misses_per_op", r.point_lookup_misses_per_op_stats, true);
+        try out.writeFmt("      \"point_lookup_reads_per_op\": {d:.3},\n", .{r.point_lookup_reads_per_op});
+        try writeMetricStats(out, "point_lookup_reads_per_op", r.point_lookup_reads_per_op_stats, true);
         try out.writeFmt("      \"prop_read_ns\": {d:.0},\n", .{r.prop_read_ns});
         try writeMetricStats(out, "prop_read_ns", r.prop_read_ns_stats, true);
         try out.writeFmt("      \"expand_out_ns\": {d:.0},\n", .{r.expand_out_ns});
@@ -999,15 +1042,15 @@ fn writeJsonOutput(out: *StdoutWriter, results: []const TierResult) !void {
 
 fn writeSummary(results: []const TierResult) void {
     print("\n", .{});
-    print("{s}\n", .{"=" ** 110});
+    print("{s}\n", .{"=" ** 121});
     print("  graph-storage incremental scale benchmark\n", .{});
-    print("{s}\n\n", .{"=" ** 110});
+    print("{s}\n\n", .{"=" ** 121});
 
-    print("  {s:<6} {s:>8} {s:>8} {s:>12} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>12}\n", .{
-        "Tier", "Nodes", "Edges", "Seed ops/s", "Lookup", "PropRd", "Expand", "LblScan", "Ckpt(ms)", "Open(ms)", "Mixed ops/s",
+    print("  {s:<6} {s:>8} {s:>8} {s:>12} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>12} {s:>10}\n", .{
+        "Tier", "Nodes", "Edges", "Seed ops/s", "Lookup", "PropRd", "Expand", "LblScan", "Ckpt(ms)", "Open(ms)", "Mixed ops/s", "Miss/op",
     });
-    print("  {s:<6} {s:>8} {s:>8} {s:>12} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>12}\n", .{
-        "-" ** 6, "-" ** 8, "-" ** 8, "-" ** 12, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 12,
+    print("  {s:<6} {s:>8} {s:>8} {s:>12} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>12} {s:>10}\n", .{
+        "-" ** 6, "-" ** 8, "-" ** 8, "-" ** 12, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 10, "-" ** 12, "-" ** 10,
     });
 
     for (results) |r| {
@@ -1016,7 +1059,7 @@ fn writeSummary(results: []const TierResult) void {
                 r.name, r.node_count, r.edge_count, r.skip_reason orelse "unknown",
             });
         } else {
-            print("  {s:<6} {d:>8} {d:>8} {d:>12.0} {d:>10.0} {d:>10.0} {d:>10.0} {d:>10.0} {d:>10.1} {d:>10.1} {d:>12.0}\n", .{
+            print("  {s:<6} {d:>8} {d:>8} {d:>12.0} {d:>10.0} {d:>10.0} {d:>10.0} {d:>10.0} {d:>10.1} {d:>10.1} {d:>12.0} {d:>10.3}\n", .{
                 r.name,
                 r.node_count,
                 r.edge_count,
@@ -1028,11 +1071,12 @@ fn writeSummary(results: []const TierResult) void {
                 r.checkpoint_ms,
                 r.open_ms,
                 r.mixed_ops_sec,
+                r.point_lookup_misses_per_op,
             });
         }
     }
 
-    print("\n{s}\n\n", .{"=" ** 110});
+    print("\n{s}\n\n", .{"=" ** 121});
 }
 
 // ---------------------------------------------------------------------------

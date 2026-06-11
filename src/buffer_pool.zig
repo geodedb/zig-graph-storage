@@ -43,6 +43,17 @@ pub const BufferPool = struct {
     free_list: std.ArrayList(u32),
     // Pagers: one per FileId
     pagers: [FILE_COUNT]?*Pager, // indexed by @intFromEnum(FileId)
+    // PERF-0051: per-FileId minimum number of resident frames. Eviction will
+    // not drop a class below its floor while any non-reserved frame is
+    // evictable. The floor is *soft*: when the only evictable frames belong to
+    // a class at/over its floor, eviction still proceeds (no deadlock / no
+    // spurious BufferPoolFull). Indexed by @intFromEnum(FileId); zero == no
+    // reservation (classic behaviour).
+    reserved_frames: [FILE_COUNT]u32 = [_]u32{0} ** FILE_COUNT,
+    // PERF-0051: per-FileId count of currently resident (cached) pages. Kept in
+    // lockstep with page_table insert/remove so eviction can enforce the floor
+    // without scanning the table.
+    resident_counts: [FILE_COUNT]u32 = [_]u32{0} ** FILE_COUNT,
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
     // Concurrency protection for multi-threaded access
@@ -113,6 +124,39 @@ pub const BufferPool = struct {
         self.pagers[@intFromEnum(file_id)] = p;
     }
 
+    /// PERF-0051: Reserve a minimum number of resident frames for `file_id`.
+    ///
+    /// While any non-reserved frame is evictable, eviction will avoid dropping
+    /// `file_id` below `count` resident frames. The floor is clamped to the pool
+    /// capacity so it can never make the pool unusable. Passing 0 clears the
+    /// reservation. Safe to call before or after pages are loaded.
+    pub fn setReservedFrames(self: *BufferPool, file_id: FileId, count: u32) void {
+        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        self.reserved_frames[@intFromEnum(file_id)] = @min(count, self.capacity);
+    }
+
+    /// Increment the resident-page counter for `file_id`. Caller holds the mutex.
+    fn incrResident(self: *BufferPool, file_id: FileId) void {
+        self.resident_counts[@intFromEnum(file_id)] += 1;
+    }
+
+    /// Decrement the resident-page counter for `file_id`. Caller holds the mutex.
+    fn decrResident(self: *BufferPool, file_id: FileId) void {
+        const slot = &self.resident_counts[@intFromEnum(file_id)];
+        std.debug.assert(slot.* > 0);
+        slot.* -= 1;
+    }
+
+    /// Whether evicting one frame of `file_id` would drop it below its reserved
+    /// floor. Caller holds the mutex.
+    fn wouldUnderflowReserve(self: *const BufferPool, file_id: FileId) bool {
+        const idx = @intFromEnum(file_id);
+        const reserve = self.reserved_frames[idx];
+        if (reserve == 0) return false;
+        return self.resident_counts[idx] <= reserve;
+    }
+
     /// Attach a metrics struct for recording buffer hit/miss and page I/O counters.
     pub fn setMetrics(self: *BufferPool, m: *Metrics) void {
         self.metrics = m;
@@ -161,6 +205,7 @@ pub const BufferPool = struct {
             frame.lsn = 0;
 
             try self.page_table.put(key, frame_idx);
+            self.incrResident(file_id);
             self.moveToHead(frame_idx);
 
             self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
@@ -180,6 +225,7 @@ pub const BufferPool = struct {
                 frame.lsn = 0;
                 self.removeFromLru(frame_idx);
                 _ = self.page_table.remove(key);
+                self.decrResident(file_id);
                 self.free_list.appendAssumeCapacity(frame_idx);
                 self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
                 self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
@@ -226,6 +272,7 @@ pub const BufferPool = struct {
         frame.lsn = 0;
 
         try self.page_table.put(key, frame_idx);
+        self.incrResident(file_id);
         self.moveToHead(frame_idx);
 
         return frame;
@@ -494,37 +541,71 @@ pub const BufferPool = struct {
     }
 
     /// Evict the least recently used unpinned frame.
-    /// Walks from LRU tail towards head to find first evictable frame.
+    ///
+    /// PERF-0051: Two-pass walk from the LRU tail towards the head:
+    ///   1. Prefer the least-recently-used evictable frame whose eviction does
+    ///      NOT drop its FileId below its reserved floor. This keeps hot
+    ///      reserved classes (e.g. node pages) resident under a flood of cold
+    ///      scans from other classes.
+    ///   2. If pass 1 finds nothing (every evictable frame belongs to a class
+    ///      at/under its floor), fall back to evicting the least-recently-used
+    ///      evictable frame regardless of reservation. This guarantees the
+    ///      floor can never cause a deadlock or a spurious BufferPoolFull: if
+    ///      ANY unpinned frame exists, eviction succeeds.
     fn evict(self: *BufferPool) !u32 {
+        // Pass 1: honour reservation floors.
         var current = self.lru_tail;
         while (current) |idx| {
             const frame = &self.frames[idx];
-            if (frame.isEvictable()) {
-                // Flush if dirty
-                if (frame.dirty) {
-                    try self.flushFrame(frame);
-                }
-
-                // Remove from page table
-                const key = PageKey{ .file_id = frame.file_id, .page_id = frame.page_id };
-                _ = self.page_table.remove(key);
-
-                // Remove from LRU list
-                self.removeFromLru(idx);
-
-                // Reset frame
-                frame.valid = false;
-                frame.pin_count = 0;
-                frame.dirty = false;
-                frame.loading = false;
-                frame.lsn = 0;
-
+            const prev = frame.lru_prev;
+            if (frame.isEvictable() and !self.wouldUnderflowReserve(frame.file_id)) {
+                try self.evictFrame(idx);
                 return idx;
             }
-            current = frame.lru_prev;
+            current = prev;
+        }
+
+        // Pass 2: reservation floor is the only thing left standing; evicting a
+        // reserved frame is required to make progress, so allow it.
+        current = self.lru_tail;
+        while (current) |idx| {
+            const frame = &self.frames[idx];
+            const prev = frame.lru_prev;
+            if (frame.isEvictable()) {
+                try self.evictFrame(idx);
+                return idx;
+            }
+            current = prev;
         }
 
         return error.BufferPoolFull;
+    }
+
+    /// Flush (if dirty), drop from the page table / LRU list, and reset a frame
+    /// so it can be reused. Caller holds the mutex and has confirmed the frame
+    /// is evictable. Keeps `resident_counts` in lockstep with the page table.
+    fn evictFrame(self: *BufferPool, idx: u32) !void {
+        const frame = &self.frames[idx];
+
+        // Flush if dirty
+        if (frame.dirty) {
+            try self.flushFrame(frame);
+        }
+
+        // Remove from page table
+        const key = PageKey{ .file_id = frame.file_id, .page_id = frame.page_id };
+        _ = self.page_table.remove(key);
+        self.decrResident(frame.file_id);
+
+        // Remove from LRU list
+        self.removeFromLru(idx);
+
+        // Reset frame
+        frame.valid = false;
+        frame.pin_count = 0;
+        frame.dirty = false;
+        frame.loading = false;
+        frame.lsn = 0;
     }
 
     /// Move a frame to the head of the LRU list (most recently used).
@@ -1105,6 +1186,128 @@ test "SEC-0037: re-flushing a cached encrypted page advances write_count under p
     const wc2 = page_mod.readWriteCount(&raw2);
 
     try testing.expect(wc2 > wc1);
+}
+
+test "PERF-0051: reserved node frames survive a flood of cold prop-page accesses" {
+    const node_file = try createTempFile(".test_bp_perf0051_nodes");
+    defer cleanupTempFile(node_file, ".test_bp_perf0051_nodes");
+    const prop_file = try createTempFile(".test_bp_perf0051_props");
+    defer cleanupTempFile(prop_file, ".test_bp_perf0051_props");
+
+    const page_size: u32 = 4096;
+    var node_pager = Pager.init(node_file, page_size);
+    var prop_pager = Pager.init(prop_file, page_size);
+
+    // One hot node page (page 0) and many cold prop pages (0..15).
+    try writeTestPage(&node_pager, 0, 0xAA);
+    var i: PageId = 0;
+    while (i < 16) : (i += 1) {
+        try writeTestPage(&prop_pager, i, 0xBB);
+    }
+
+    // Pool of 8 frames; reserve 2 frames for node pages.
+    var pool = try BufferPool.init(testing.allocator, page_size, 8);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &node_pager);
+    pool.registerPager(.props, &prop_pager);
+    pool.setReservedFrames(.nodes, 2);
+
+    // Bring the hot node page resident and unpin it (eviction-eligible).
+    const nf = try pool.pin(.nodes, 0);
+    const nf_idx = pool.frameIndex(nf);
+    pool.unpin(nf_idx, false);
+
+    // Flood the pool with cold prop-page reads, far more than the pool holds.
+    i = 0;
+    while (i < 16) : (i += 1) {
+        const pf = try pool.pin(.props, i);
+        pool.unpin(pool.frameIndex(pf), false);
+    }
+
+    // The reserved hot node page must still be cached despite the flood.
+    const node_key = PageKey{ .file_id = .nodes, .page_id = 0 };
+    try testing.expect(pool.page_table.get(node_key) != null);
+    // Re-pinning the node page must return the cached data.
+    const nf2 = try pool.pin(.nodes, 0);
+    const body = nf2.dataSlice()[page_mod.PAGE_HEADER_SIZE..];
+    for (body) |byte| try testing.expectEqual(@as(u8, 0xAA), byte);
+    pool.unpin(pool.frameIndex(nf2), false);
+
+    // resident_counts must stay in lockstep with the page table.
+    try testing.expectEqual(@as(u32, 1), pool.resident_counts[@intFromEnum(FileId.nodes)]);
+}
+
+test "PERF-0051: reservation does not deadlock when the reserved class fills the pool" {
+    const node_file = try createTempFile(".test_bp_perf0051_full_nodes");
+    defer cleanupTempFile(node_file, ".test_bp_perf0051_full_nodes");
+    const prop_file = try createTempFile(".test_bp_perf0051_full_props");
+    defer cleanupTempFile(prop_file, ".test_bp_perf0051_full_props");
+
+    const page_size: u32 = 4096;
+    var node_pager = Pager.init(node_file, page_size);
+    var prop_pager = Pager.init(prop_file, page_size);
+
+    var i: PageId = 0;
+    while (i < 8) : (i += 1) {
+        try writeTestPage(&node_pager, i, 0xAA);
+    }
+    try writeTestPage(&prop_pager, 0, 0xCC);
+
+    // Pool of 4 frames, reserve ALL 4 for node pages.
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &node_pager);
+    pool.registerPager(.props, &prop_pager);
+    pool.setReservedFrames(.nodes, 4);
+
+    // Fill the pool entirely with (unpinned) node pages, exactly at the floor.
+    i = 0;
+    while (i < 4) : (i += 1) {
+        const f = try pool.pin(.nodes, i);
+        pool.unpin(pool.frameIndex(f), false);
+    }
+    try testing.expectEqual(@as(u32, 4), pool.resident_counts[@intFromEnum(FileId.nodes)]);
+
+    // Pinning a prop page now requires evicting a reserved node frame. The
+    // soft-floor fallback (pass 2) MUST allow this rather than deadlocking or
+    // returning BufferPoolFull.
+    const pf = try pool.pin(.props, 0);
+    try testing.expect(pf.valid);
+    const body = pf.dataSlice()[page_mod.PAGE_HEADER_SIZE..];
+    for (body) |byte| try testing.expectEqual(@as(u8, 0xCC), byte);
+    pool.unpin(pool.frameIndex(pf), false);
+
+    // One node frame was sacrificed; counts remain consistent.
+    try testing.expectEqual(@as(u32, 3), pool.resident_counts[@intFromEnum(FileId.nodes)]);
+    try testing.expectEqual(@as(u32, 1), pool.resident_counts[@intFromEnum(FileId.props)]);
+}
+
+test "PERF-0051: BufferPoolFull still raised when reserved frames are all pinned" {
+    const node_file = try createTempFile(".test_bp_perf0051_pinned");
+    defer cleanupTempFile(node_file, ".test_bp_perf0051_pinned");
+    const prop_file = try createTempFile(".test_bp_perf0051_pinned_props");
+    defer cleanupTempFile(prop_file, ".test_bp_perf0051_pinned_props");
+
+    const page_size: u32 = 4096;
+    var node_pager = Pager.init(node_file, page_size);
+    var prop_pager = Pager.init(prop_file, page_size);
+    try writeTestPage(&node_pager, 0, 0xAA);
+    try writeTestPage(&node_pager, 1, 0xAB);
+    try writeTestPage(&prop_pager, 0, 0xCC);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 2);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &node_pager);
+    pool.registerPager(.props, &prop_pager);
+    pool.setReservedFrames(.nodes, 2);
+
+    // Pin both frames with node pages and keep them pinned.
+    _ = try pool.pin(.nodes, 0);
+    _ = try pool.pin(.nodes, 1);
+
+    // No evictable frame exists in either pass -> must still surface the error
+    // rather than spin or corrupt the floor accounting.
+    try testing.expectError(error.BufferPoolFull, pool.pin(.props, 0));
 }
 
 test {
