@@ -34,6 +34,7 @@ const engine_edge_props = @import("engine_edge_props.zig");
 const engine_integrity = @import("engine_integrity.zig");
 const engine_index = @import("engine_index.zig");
 const engine_persist = @import("engine_persist.zig");
+const engine_property_index = @import("engine_property_index.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -63,6 +64,7 @@ const LabelStore = label_store_mod.LabelStore;
 const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
 const EdgeEntry = edge_mod.EdgeEntry;
+const PropertyIndexSet = engine_property_index.PropertyIndexSet;
 
 /// In-memory index entry for O(1) edge lookup by EdgeId.
 pub const EdgeIndexEntry = struct {
@@ -109,6 +111,11 @@ pub const GraphEngine = struct {
     label_index: LabelIndex,
     property_index: PropertyChainIndex,
     edge_index: std.AutoHashMap(EdgeId, EdgeIndexEntry),
+    /// GAP-0027 / FR-016 / FR-017: opt-in B+tree property indexes plus the
+    /// per-graph index catalog. Empty unless an index is declared via
+    /// `createPropertyIndex`; a graph with no declared index writes no catalog
+    /// file and behaves exactly as before.
+    property_index_set: PropertyIndexSet,
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.Io.Dir,
@@ -132,6 +139,10 @@ pub const GraphEngine = struct {
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     edge_index_dirty: bool = true,
+    /// GAP-0027: set when the index catalog or a declared B+tree property index
+    /// has changed since the last persist, so the next checkpoint/close writes
+    /// the catalog + tree snapshots.
+    property_catalog_dirty: bool = false,
 
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
@@ -146,6 +157,7 @@ pub const GraphEngine = struct {
         self.label_index_dirty = true;
         self.property_index_dirty = true;
         self.edge_index_dirty = true;
+        self.property_catalog_dirty = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -243,6 +255,7 @@ pub const GraphEngine = struct {
         self.label_index_dirty = false;
         self.property_index_dirty = false;
         self.edge_index_dirty = false;
+        self.property_catalog_dirty = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -329,6 +342,11 @@ pub const GraphEngine = struct {
             self.edge_index_dirty = true;
         }
 
+        // 7b. GAP-0027: load the opt-in index catalog and rehydrate declared
+        // B+tree property indexes. A missing catalog means "no indexes"
+        // (backward compat). Snapshots that fail verification are rebuilt.
+        try engine_property_index.load(self);
+
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
         self.wireMetricsCounters();
@@ -402,6 +420,13 @@ pub const GraphEngine = struct {
     }
 
     fn markDirty(self: *GraphEngine) void {
+        self.persistence_dirty = true;
+    }
+
+    /// GAP-0027: public alias of markDirty used by the property-index module so
+    /// that declaring/building/dropping a B+tree property index makes the next
+    /// checkpoint persist the catalog and tree snapshots.
+    pub fn markPersistenceDirty(self: *GraphEngine) void {
         self.persistence_dirty = true;
     }
 
@@ -539,6 +564,7 @@ pub const GraphEngine = struct {
         self.label_index.deinit();
         self.property_index.deinit();
         self.edge_index.deinit();
+        self.property_index_set.deinit();
     }
 
     /// Close the engine (flush, checkpoint, close files).
@@ -575,6 +601,12 @@ pub const GraphEngine = struct {
             }
             if (close_err == null) {
                 self.saveLabelDictionary() catch |err| {
+                    if (close_err == null) close_err = err;
+                };
+            }
+            if (close_err == null) {
+                // GAP-0027: persist catalog + B+tree property indexes on close.
+                engine_property_index.save(self) catch |err| {
                     if (close_err == null) close_err = err;
                 };
             }
@@ -626,6 +658,7 @@ pub const GraphEngine = struct {
         self.label_index.deinit();
         self.property_index.deinit();
         self.edge_index.deinit();
+        self.property_index_set.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
@@ -1228,6 +1261,55 @@ pub const GraphEngine = struct {
         return id;
     }
 
+    // ── B+tree property indexes (delegated to engine_property_index.zig) ─
+
+    /// GAP-0027 / FR-016: declare and build an opt-in B+tree property index on
+    /// `(label, property_key)`. Records it in the per-graph index catalog,
+    /// builds it offline from the primary stores, and persists it on the next
+    /// checkpoint/close. Idempotent for an already-declared index.
+    pub fn createPropertyIndex(self: *GraphEngine, label: LabelId, property_key: []const u8) anyerror!void {
+        var __obs_span = observability.startOperationSpan("create_property_index");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        try self.ensureWritable();
+        try engine_property_index.createPropertyIndex(self, label, property_key);
+        observability.endOperationSpan(__obs_span, true, "");
+    }
+
+    /// GAP-0027 / FR-016: drop a declared B+tree property index. Returns true if
+    /// it existed. Removes the catalog entry, the live tree, and the on-disk
+    /// snapshot.
+    pub fn dropPropertyIndex(self: *GraphEngine, label: LabelId, property_key: []const u8) anyerror!bool {
+        try self.ensureWritable();
+        return engine_property_index.dropPropertyIndex(self, label, property_key);
+    }
+
+    /// Report whether a B+tree property index is declared for `(label, key)`.
+    pub fn hasPropertyIndex(self: *GraphEngine, label: LabelId, property_key: []const u8) bool {
+        return self.property_index_set.catalog.findIndex(label, property_key) != null;
+    }
+
+    /// GAP-0027 / FR-017: equality lookup through a declared B+tree property
+    /// index. Returns the matching node id, or null when no index is declared or
+    /// no node carries that value.
+    pub fn lookupPropertyIndex(self: *GraphEngine, label: LabelId, property_key: []const u8, value: PropertyValue) anyerror!?NodeId {
+        var __obs_span = observability.startOperationSpan("lookup_property_index");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        const result = try engine_property_index.lookupPropertyIndex(self, label, property_key, value);
+        observability.endOperationSpan(__obs_span, true, "");
+        return result;
+    }
+
+    /// GAP-0027 / FR-017: range lookup over the declared index's hash-keyed
+    /// B+tree. Caller owns the returned slice (free with `allocator`). See
+    /// `engine_property_index.rangePropertyIndex` for hash-space ordering caveat.
+    pub fn rangePropertyIndex(self: *GraphEngine, label: LabelId, property_key: []const u8, lo: u64, hi: u64, allocator: Allocator) anyerror![]NodeId {
+        return engine_property_index.rangePropertyIndex(self, label, property_key, lo, hi, allocator);
+    }
+
     // ── Edge property helpers (delegated to engine_edge_props.zig) ─────
 
     pub fn setEdgeProperty(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue) anyerror!void {
@@ -1282,4 +1364,5 @@ test {
     _ = @import("engine_integrity.zig");
     _ = @import("engine_index.zig");
     _ = @import("engine_persist.zig");
+    _ = @import("engine_property_index.zig");
 }

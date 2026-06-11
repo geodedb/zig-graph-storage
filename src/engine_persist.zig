@@ -24,6 +24,7 @@ const property_chain_index_mod = @import("property_chain_index.zig");
 const label_store_mod = @import("label_store.zig");
 const engine_mod = @import("engine.zig");
 const engine_index = @import("engine_index.zig");
+const engine_property_index = @import("engine_property_index.zig");
 
 const EdgeId = types.EdgeId;
 const GraphConfig = config_mod.GraphConfig;
@@ -232,6 +233,12 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.edge_index = std.AutoHashMap(EdgeId, EdgeIndexEntry).init(allocator);
     errdefer self.edge_index.deinit();
 
+    // GAP-0027 / FR-016 / FR-017: opt-in B+tree property indexes + catalog.
+    // Starts empty; create() leaves it empty (no catalog file), open() loads it.
+    self.property_index_set = engine_property_index.PropertyIndexSet.init(allocator);
+    errdefer self.property_index_set.deinit();
+    self.property_catalog_dirty = false;
+
     // Checkpointer
     self.checkpointer = Checkpointer.init(
         allocator,
@@ -283,6 +290,9 @@ pub fn checkpoint(engine: *GraphEngine) anyerror!void {
     engine.property_index_dirty = false;
     engine.edge_index_dirty = false;
     try saveLabelDictionary(engine);
+    // GAP-0027: persist the index catalog + declared B+tree property indexes.
+    // No-op when no index is declared (opt-in / backward compat).
+    try engine_property_index.save(engine);
 
     const end_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
     const elapsed = start_ts.durationTo(end_ts);

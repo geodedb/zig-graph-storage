@@ -9,11 +9,15 @@ const Allocator = std.mem.Allocator;
 const LabelId = types.LabelId;
 const NodeId = types.NodeId;
 
+/// Concrete B+tree instantiation backing a property index: value-hash -> node-id.
+/// Exposed so engine integration can load/save the underlying tree snapshot.
+pub const BPlusTreeU64U64 = btree_mod.BPlusTree(u64, u64);
+
 /// Property index backed by a B+tree.
 /// Keys are hashes of property values; values are node IDs.
 pub const PropertyIndex = struct {
     allocator: Allocator,
-    tree: btree_mod.BPlusTree(u64, u64),
+    tree: BPlusTreeU64U64,
     label_id: LabelId,
     property_key: []const u8,
 

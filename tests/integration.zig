@@ -1240,3 +1240,202 @@ test "PERF-0045: deferred mode — data is durable after a clean close" {
         try std.testing.expect((try eng.getNode(2)) != null);
     }
 }
+
+// ============================================================================
+// GAP-0027 / FR-016 / FR-017: B+tree property index lifecycle
+// ============================================================================
+
+const epi = lib.engine_property_index;
+
+test "integration: GAP-0027 declare B+tree property index, persist, reopen, equality lookup" {
+    const allocator = std.testing.allocator;
+    const cfg = testConfig();
+    const uuid = [_]u8{0x70} ** 16;
+    const PERSON: lib.LabelId = 0;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    var alice_id: NodeId = 0;
+    var bob_id: NodeId = 0;
+    var carol_id: NodeId = 0;
+
+    // Phase 1: build a small graph, declare an index on (Person, "name"),
+    // checkpoint, and close.
+    {
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        alice_id = try eng.allocNode();
+        try eng.putNode(alice_id, makeNode(0));
+        bob_id = try eng.allocNode();
+        try eng.putNode(bob_id, makeNode(0));
+        carol_id = try eng.allocNode();
+        try eng.putNode(carol_id, makeNode(0));
+
+        var alice_rec = (try eng.getNode(alice_id)).?;
+        alice_rec.prop_head = try eng.putProperty(alice_rec.prop_head, "name", .{ .string = "Alice" });
+        try eng.putNode(alice_id, alice_rec);
+
+        var bob_rec = (try eng.getNode(bob_id)).?;
+        bob_rec.prop_head = try eng.putProperty(bob_rec.prop_head, "name", .{ .string = "Bob" });
+        try eng.putNode(bob_id, bob_rec);
+
+        var carol_rec = (try eng.getNode(carol_id)).?;
+        carol_rec.prop_head = try eng.putProperty(carol_rec.prop_head, "name", .{ .string = "Carol" });
+        try eng.putNode(carol_id, carol_rec);
+
+        // All three carry the Person label.
+        try eng.addLabel(alice_id, PERSON);
+        try eng.addLabel(bob_id, PERSON);
+        try eng.addLabel(carol_id, PERSON);
+
+        // No index before declaration.
+        try std.testing.expect(!eng.hasPropertyIndex(PERSON, "name"));
+
+        // FR-016: opt-in declaration + offline build (FR-017).
+        try eng.createPropertyIndex(PERSON, "name");
+        try std.testing.expect(eng.hasPropertyIndex(PERSON, "name"));
+
+        // Equality lookup works immediately after build.
+        const found_alice = try eng.lookupPropertyIndex(PERSON, "name", .{ .string = "Alice" });
+        try std.testing.expectEqual(@as(?NodeId, alice_id), found_alice);
+
+        try eng.checkpoint();
+        try eng.close();
+    }
+
+    // The catalog file must exist on disk after persistence.
+    {
+        const catalog_path = try catalogFilePath(allocator, td.path, uuid);
+        defer allocator.free(catalog_path);
+        const f = try std.Io.Dir.cwd().openFile(gs_io(), catalog_path, .{});
+        f.close(gs_io());
+    }
+
+    // Phase 2: reopen and verify the index survived + still serves lookups.
+    {
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Catalog lists the declared index.
+        try std.testing.expect(eng.hasPropertyIndex(PERSON, "name"));
+
+        // Equality lookups return the correct nodes post-reopen.
+        try std.testing.expectEqual(@as(?NodeId, alice_id), try eng.lookupPropertyIndex(PERSON, "name", .{ .string = "Alice" }));
+        try std.testing.expectEqual(@as(?NodeId, bob_id), try eng.lookupPropertyIndex(PERSON, "name", .{ .string = "Bob" }));
+        try std.testing.expectEqual(@as(?NodeId, carol_id), try eng.lookupPropertyIndex(PERSON, "name", .{ .string = "Carol" }));
+
+        // A value that was never indexed returns null.
+        try std.testing.expectEqual(@as(?NodeId, null), try eng.lookupPropertyIndex(PERSON, "name", .{ .string = "Nobody" }));
+
+        // An undeclared (label, key) returns null rather than erroring.
+        try std.testing.expectEqual(@as(?NodeId, null), try eng.lookupPropertyIndex(PERSON, "age", .{ .int = 1 }));
+    }
+}
+
+test "integration: GAP-0027 B+tree property index range lookup over hash space" {
+    const allocator = std.testing.allocator;
+    const cfg = testConfig();
+    const uuid = [_]u8{0x71} ** 16;
+    const PERSON: lib.LabelId = 0;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    {
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Index 5 distinct values.
+        var ids: [5]NodeId = undefined;
+        const names = [_][]const u8{ "a", "b", "c", "d", "e" };
+        for (names, 0..) |name, i| {
+            const nid = try eng.allocNode();
+            try eng.putNode(nid, makeNode(0));
+            var rec = (try eng.getNode(nid)).?;
+            rec.prop_head = try eng.putProperty(rec.prop_head, "name", .{ .string = name });
+            try eng.putNode(nid, rec);
+            try eng.addLabel(nid, PERSON);
+            ids[i] = nid;
+        }
+
+        try eng.createPropertyIndex(PERSON, "name");
+
+        // A full-hash-space range returns every indexed node.
+        const all = try eng.rangePropertyIndex(PERSON, "name", 0, std.math.maxInt(u64), allocator);
+        defer allocator.free(all);
+        try std.testing.expectEqual(@as(usize, 5), all.len);
+
+        // A tight range around a single value's hash returns exactly that node.
+        const c_encoded = try encodeName(allocator, "c");
+        defer allocator.free(c_encoded);
+        const c_hash = epi.hashEncodedValue(c_encoded);
+        const one = try eng.rangePropertyIndex(PERSON, "name", c_hash, c_hash, allocator);
+        defer allocator.free(one);
+        try std.testing.expectEqual(@as(usize, 1), one.len);
+        try std.testing.expectEqual(ids[2], one[0]);
+    }
+}
+
+test "integration: GAP-0027 backward compat — no declared index, no catalog file, unchanged lifecycle" {
+    const allocator = std.testing.allocator;
+    const cfg = testConfig();
+    const uuid = [_]u8{0x72} ** 16;
+
+    var td = try testDataDir();
+    defer td.deinit();
+
+    // Phase 1: a normal graph with NO declared index.
+    {
+        const eng = try GraphEngine.create(allocator, td.path, uuid, cfg);
+
+        const n1 = try eng.allocNode();
+        try eng.putNode(n1, makeNode(0));
+        const n2 = try eng.allocNode();
+        try eng.putNode(n2, makeNode(0));
+        _ = try eng.addEdge(n1, n2, 1);
+
+        try eng.checkpoint();
+        try eng.close();
+    }
+
+    // No catalog file must be written when no index is declared.
+    {
+        const catalog_path = try catalogFilePath(allocator, td.path, uuid);
+        defer allocator.free(catalog_path);
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().openFile(gs_io(), catalog_path, .{}),
+        );
+    }
+
+    // Phase 2: reopen succeeds exactly as before; no index is declared.
+    {
+        const eng = try GraphEngine.open(allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        try std.testing.expectEqual(@as(u64, 2), try eng.nodeCount());
+        try std.testing.expectEqual(@as(u64, 1), try eng.edgeCount());
+        try std.testing.expect(!eng.hasPropertyIndex(0, "name"));
+
+        // Lookups against an undeclared index are a clean null, never an error.
+        try std.testing.expectEqual(@as(?NodeId, null), try eng.lookupPropertyIndex(0, "name", .{ .string = "x" }));
+    }
+}
+
+/// Encode a string property value into an owned buffer (test helper for hashing).
+fn encodeName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return lib.property.encode(allocator, .{ .string = name });
+}
+
+/// Build the on-disk path to a graph's props.catalog file. The graph directory
+/// is `<data_dir>/graphs/<uuid_hex>` (see graph_dir.zig). Caller owns the slice.
+fn catalogFilePath(allocator: std.mem.Allocator, data_dir: []const u8, uuid: [16]u8) ![]u8 {
+    const hex_chars = "0123456789abcdef";
+    var uuid_hex: [32]u8 = undefined;
+    for (uuid, 0..) |byte, i| {
+        uuid_hex[i * 2] = hex_chars[byte >> 4];
+        uuid_hex[i * 2 + 1] = hex_chars[byte & 0x0F];
+    }
+    return std.fmt.allocPrint(allocator, "{s}/graphs/{s}/props.catalog", .{ data_dir, uuid_hex });
+}

@@ -101,6 +101,7 @@ pub const property_index = @import("property_index.zig");
 pub const property_chain_index = @import("property_chain_index.zig");
 pub const index_catalog = @import("index_catalog.zig");
 pub const index_snapshot = @import("index_snapshot.zig");
+pub const engine_property_index = @import("engine_property_index.zig");
 
 // Encryption and integrity
 pub const encryption = @import("encryption.zig");
