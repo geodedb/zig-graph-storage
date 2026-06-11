@@ -153,66 +153,57 @@ pub const LabelIndex = struct {
     ///   repeated label_count times:
     ///     [u32 label_id][u64 node_count][node_count * u64 node_id]
     pub fn saveToFile(self: *const LabelIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        try file.setLength(io, 0);
-        var write_offset: u64 = 0;
-        try index_snapshot_mod.writeHeader(file.*, &write_offset, SNAPSHOT_MAGIC, checkpoint_counter, self.index.count());
+        // PERF-0052: serialize the whole snapshot into one in-memory buffer and
+        // flush it with a single positional write instead of one syscall per
+        // node id. Byte layout and trailing CRC32 (SEC-0051) are unchanged.
+        var w = index_snapshot_mod.SnapshotWriter.init(self.allocator);
+        defer w.deinit();
 
-        var u32_buf: [4]u8 = undefined;
-        var u64_buf: [8]u8 = undefined;
+        try w.writeHeader(SNAPSHOT_MAGIC, checkpoint_counter, self.index.count());
 
         var it = self.index.iterator();
         while (it.next()) |entry| {
-            std.mem.writeInt(u32, &u32_buf, entry.key_ptr.*, .little);
-            try file.writePositionalAll(io, &u32_buf, write_offset);
-            write_offset += 4;
+            try w.writeU32(entry.key_ptr.*);
 
             const set = entry.value_ptr;
-            std.mem.writeInt(u64, &u64_buf, set.count(), .little);
-            try file.writePositionalAll(io, &u64_buf, write_offset);
-            write_offset += 8;
+            try w.writeU64(set.count());
 
             // Collect and sort node IDs for deterministic snapshot output.
             const sorted = try self.scan(entry.key_ptr.*, self.allocator);
             defer self.allocator.free(sorted);
 
             for (sorted) |node_id| {
-                std.mem.writeInt(u64, &u64_buf, node_id, .little);
-                try file.writePositionalAll(io, &u64_buf, write_offset);
-                write_offset += 8;
+                try w.writeU64(node_id);
             }
         }
 
-        // SEC-0051: append a CRC32 over the header + payload.
-        try index_snapshot_mod.finalizeChecksum(self.allocator, file.*, write_offset);
+        try w.finalize(file.*);
     }
 
     /// Load a previously persisted labels.idx snapshot.
     /// Returns the checkpoint counter embedded in the snapshot, or null when
     /// the file is empty.
     pub fn loadFromFile(self: *LabelIndex, file: *std.Io.File) !?u64 {
-        const snapshot = (try index_snapshot_mod.loadHeader(file, SNAPSHOT_MAGIC, LABEL_RECORD_MIN_SIZE)) orelse return null;
+        // PERF-0052: read + validate the whole snapshot once (CRC32 per SEC-0051,
+        // label_count bounded vs payload per SEC-0044/0048), then walk the
+        // resident payload instead of one positional read per node id.
+        var snapshot = (try index_snapshot_mod.loadPayload(self.allocator, file, SNAPSHOT_MAGIC, LABEL_RECORD_MIN_SIZE)) orelse return null;
+        defer snapshot.deinit();
 
         self.clear();
         errdefer self.clear();
 
-        var file_offset: u64 = SNAPSHOT_MAGIC.len + 16;
-        var remaining = snapshot.payload_size;
+        var r = index_snapshot_mod.SnapshotReader.init(snapshot.payload());
 
         var i: u64 = 0;
         const label_count = snapshot.item_count;
-        var u32_buf: [4]u8 = undefined;
-        var u64_buf: [8]u8 = undefined;
         while (i < label_count) : (i += 1) {
-            try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
-            const label_id = std.mem.readInt(u32, &u32_buf, .little);
-
-            try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
-            const node_count = std.mem.readInt(u64, &u64_buf, .little);
+            const label_id = try r.readU32();
+            const node_count = try r.readU64();
 
             // SEC-0044/SEC-0048: bound the per-label posting-list reservation
             // against the bytes still available before reserving capacity.
-            if (node_count > remaining / NODE_RECORD_SIZE) return error.InvalidFormat;
+            if (node_count > r.remaining() / NODE_RECORD_SIZE) return error.InvalidFormat;
 
             const gop = try self.index.getOrPut(self.allocator, label_id);
             if (!gop.found_existing) {
@@ -223,13 +214,12 @@ pub const LabelIndex = struct {
 
             var j: u64 = 0;
             while (j < node_count) : (j += 1) {
-                try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
-                const node_id = std.mem.readInt(u64, &u64_buf, .little);
+                const node_id = try r.readU64();
                 try gop.value_ptr.put(self.allocator, node_id, {});
             }
         }
 
-        if (remaining != 0) return error.InvalidFormat;
+        if (r.remaining() != 0) return error.InvalidFormat;
         return snapshot.checkpoint_counter;
     }
 

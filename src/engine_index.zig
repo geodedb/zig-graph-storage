@@ -206,69 +206,48 @@ pub fn saveDerivedIndexesConditional(
 }
 
 fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    try file.setLength(io, 0);
-    var write_offset: u64 = 0;
-    try index_snapshot_mod.writeHeader(file.*, &write_offset, EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_index.count());
+    // PERF-0052: serialize the entire snapshot into one in-memory buffer and
+    // flush it with a single positional write instead of ~5 syscalls per edge.
+    // The byte layout (magic | counter | item_count | payload | crc32) is
+    // identical to the previous per-field path; CRC32 (SEC-0051) is appended by
+    // finalize().
+    var w = index_snapshot_mod.SnapshotWriter.init(engine.allocator);
+    defer w.deinit();
 
-    var u64_buf: [8]u8 = undefined;
-    var u32_buf: [4]u8 = undefined;
+    try w.writeHeader(EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_index.count());
 
     var it = engine.edge_index.iterator();
     while (it.next()) |entry| {
-        std.mem.writeInt(u64, &u64_buf, entry.key_ptr.*, .little);
-        try file.writePositionalAll(io, &u64_buf, write_offset);
-        write_offset += 8;
-
-        std.mem.writeInt(u64, &u64_buf, entry.value_ptr.from, .little);
-        try file.writePositionalAll(io, &u64_buf, write_offset);
-        write_offset += 8;
-
-        std.mem.writeInt(u64, &u64_buf, entry.value_ptr.neighbor, .little);
-        try file.writePositionalAll(io, &u64_buf, write_offset);
-        write_offset += 8;
-
-        std.mem.writeInt(u32, &u32_buf, entry.value_ptr.rel_type, .little);
-        try file.writePositionalAll(io, &u32_buf, write_offset);
-        write_offset += 4;
-
-        std.mem.writeInt(u32, &u32_buf, entry.value_ptr.prop_head, .little);
-        try file.writePositionalAll(io, &u32_buf, write_offset);
-        write_offset += 4;
+        try w.writeU64(entry.key_ptr.*);
+        try w.writeU64(entry.value_ptr.from);
+        try w.writeU64(entry.value_ptr.neighbor);
+        try w.writeU32(entry.value_ptr.rel_type);
+        try w.writeU32(entry.value_ptr.prop_head);
     }
 
-    // SEC-0051: append a CRC32 over the header + payload.
-    try index_snapshot_mod.finalizeChecksum(engine.allocator, file.*, write_offset);
+    try w.finalize(file.*);
 }
 
 fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
-    const snapshot = (try index_snapshot_mod.loadHeader(file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_MIN_SIZE)) orelse return null;
-    var file_offset: u64 = EDGE_SNAPSHOT_MAGIC.len + 16;
-    var remaining = snapshot.payload_size;
+    // PERF-0052: read + validate the whole snapshot once (CRC32 verified per
+    // SEC-0051; item_count bounded vs payload per SEC-0044/0048), then walk the
+    // resident payload instead of issuing ~5 positional reads per edge.
+    var snapshot = (try index_snapshot_mod.loadPayload(engine.allocator, file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_MIN_SIZE)) orelse return null;
+    defer snapshot.deinit();
+
+    var r = index_snapshot_mod.SnapshotReader.init(snapshot.payload());
 
     // SEC-0044/SEC-0048: item_count was bounded against payload_size in
-    // loadHeader, so this reservation cannot be driven past the available bytes.
+    // loadPayload, so this reservation cannot be driven past the available bytes.
     try engine.edge_index.ensureTotalCapacity(@intCast(snapshot.item_count));
-
-    var u32_buf: [4]u8 = undefined;
-    var u64_buf: [8]u8 = undefined;
 
     var i: u64 = 0;
     while (i < snapshot.item_count) : (i += 1) {
-        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
-        const edge_id = std.mem.readInt(u64, &u64_buf, .little);
-
-        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
-        const from = std.mem.readInt(u64, &u64_buf, .little);
-
-        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u64_buf);
-        const neighbor = std.mem.readInt(u64, &u64_buf, .little);
-
-        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
-        const rel_type = std.mem.readInt(u32, &u32_buf, .little);
-
-        try index_snapshot_mod.readBounded(file, &file_offset, &remaining, &u32_buf);
-        const prop_head = std.mem.readInt(u32, &u32_buf, .little);
+        const edge_id = try r.readU64();
+        const from = try r.readU64();
+        const neighbor = try r.readU64();
+        const rel_type = try r.readU32();
+        const prop_head = try r.readU32();
 
         try engine.edge_index.put(edge_id, .{
             .from = from,
@@ -278,6 +257,6 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
         });
     }
 
-    if (remaining != 0) return error.InvalidFormat;
+    if (r.remaining() != 0) return error.InvalidFormat;
     return snapshot.checkpoint_counter;
 }
