@@ -102,6 +102,10 @@ pub const VerifyTool = struct {
     allocator: Allocator,
     /// Optional log callback for structured event emission.
     log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
+    /// SEC-0043: When TDE is active, thread the encryption key through manifest
+    /// verification so the HMAC trailer is authenticated. When null, falls back
+    /// to CRC-only verification (unchanged behavior for non-TDE graphs).
+    encryption_key: ?[32]u8 = null,
 
     pub fn init(allocator: Allocator) VerifyTool {
         return .{ .allocator = allocator };
@@ -145,12 +149,14 @@ pub const VerifyTool = struct {
         const path_a = try graph_dir.manifestPath(self.allocator, .a);
         defer self.allocator.free(path_a);
 
-        if (Manifest.readFromFile(self.allocator, path_a) catch null) |m| {
+        // SEC-0043: use keyed read when encryption_key is configured so the HMAC
+        // trailer is authenticated; fall back to CRC-only when no key is set.
+        if (Manifest.readFromFileWithKey(self.allocator, path_a, self.encryption_key) catch null) |m| {
             if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
                 const msg = try std.fmt.allocPrint(self.allocator, "manifest.a: graph UUID mismatch", .{});
                 try result.addError(msg);
                 try result.addArtifact(.{ .name = "manifest.a", .status = .invalid, .issue_count = 1 });
-            } else if (Integrity.verifyManifest(&m, self.allocator)) {
+            } else if (Integrity.verifyManifestWithKey(&m, self.allocator, self.encryption_key)) {
                 any_valid = true;
                 try result.addArtifact(.{ .name = "manifest.a", .status = .ok });
             } else {
@@ -168,12 +174,12 @@ pub const VerifyTool = struct {
         const path_b = try graph_dir.manifestPath(self.allocator, .b);
         defer self.allocator.free(path_b);
 
-        if (Manifest.readFromFile(self.allocator, path_b) catch null) |m| {
+        if (Manifest.readFromFileWithKey(self.allocator, path_b, self.encryption_key) catch null) |m| {
             if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
                 const msg = try std.fmt.allocPrint(self.allocator, "manifest.b: graph UUID mismatch", .{});
                 try result.addError(msg);
                 try result.addArtifact(.{ .name = "manifest.b", .status = .invalid, .issue_count = 1 });
-            } else if (Integrity.verifyManifest(&m, self.allocator)) {
+            } else if (Integrity.verifyManifestWithKey(&m, self.allocator, self.encryption_key)) {
                 any_valid = true;
                 try result.addArtifact(.{ .name = "manifest.b", .status = .ok });
             } else {
@@ -819,6 +825,127 @@ test "NFR-OBS-002: verifyGraph emits verify_start and verify_end events" {
     try testing.expectEqual(@as(usize, 2), verify_event_count);
     try testing.expectEqualStrings("verify_start", verify_event_labels[0]);
     try testing.expectEqualStrings("verify_end", verify_event_labels[1]);
+}
+
+test "SEC-0043: verifyGraph with key detects HMAC-forged manifest (CRC recomputed)" {
+    // A tampered manifest whose CRC32 has been recomputed must NOT be accepted
+    // by VerifyTool when an encryption key is configured. Without threading the
+    // key, only the CRC is checked and the forgery passes silently (false OK).
+    const allocator = testing.allocator;
+    const Crc32 = std.hash.crc.Crc32Iscsi;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var uuid: [16]u8 = undefined;
+    @memset(&uuid, 0x43);
+
+    var gd = try GraphDir.create(allocator, tmp_path, uuid);
+    defer gd.deinit();
+
+    const key = [_]u8{0x43} ** 32;
+
+    // Write an authenticated (TDE) manifest.
+    const m = Manifest{
+        .graph_uuid = uuid,
+        .page_size = 4096,
+        .counter = 5,
+        .last_checkpoint_lsn = 9000,
+    };
+    const path_a = try gd.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try m.writeToFileWithKey(allocator, path_a, key);
+
+    const path_b = try gd.manifestPath(allocator, .b);
+    defer allocator.free(path_b);
+    try m.writeToFileWithKey(allocator, path_b, key);
+
+    try setupWalArtifacts(allocator, gd.path, uuid);
+
+    // Tamper slot A: roll back last_checkpoint_lsn, recompute CRC32 so a
+    // CRC-only check would pass, but the HMAC trailer no longer matches.
+    {
+        const f = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path_a, .{ .mode = .read_write });
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const flen = try f.length(io);
+        const buf = try allocator.alloc(u8, @intCast(flen));
+        defer allocator.free(buf);
+        _ = try f.readPositionalAll(io, buf, 0);
+        const lsn_offset: usize = 8 + 4 + 16 + 4 + 8; // magic+fmt+uuid+page_size+counter
+        @memcpy(buf[lsn_offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, 0))));
+        const new_crc = Crc32.hash(buf[0 .. manifest_mod.SERIALIZED_SIZE - 4]);
+        @memcpy(buf[manifest_mod.SERIALIZED_SIZE - 4 ..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+        try f.writePositionalAll(io, buf, 0);
+    }
+
+    // With a key configured, tampered slot A must be rejected (HMAC fails) and
+    // tampered-B is untouched, so B remains valid — but we tamper B too so
+    // that neither slot passes and manifest_valid is false.
+    {
+        const f = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path_b, .{ .mode = .read_write });
+        defer f.close(std.Io.Threaded.global_single_threaded.io());
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const flen = try f.length(io);
+        const buf = try allocator.alloc(u8, @intCast(flen));
+        defer allocator.free(buf);
+        _ = try f.readPositionalAll(io, buf, 0);
+        const lsn_offset: usize = 8 + 4 + 16 + 4 + 8;
+        @memcpy(buf[lsn_offset..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(u64, @as(u64, 0))));
+        const new_crc = Crc32.hash(buf[0 .. manifest_mod.SERIALIZED_SIZE - 4]);
+        @memcpy(buf[manifest_mod.SERIALIZED_SIZE - 4 ..][0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, new_crc)));
+        try f.writePositionalAll(io, buf, 0);
+    }
+
+    // Verify with the encryption key: both forged manifests must be rejected.
+    var tool = VerifyTool.init(allocator);
+    tool.encryption_key = key;
+    var result = try tool.verifyGraph(&gd, 4096);
+    defer result.deinit();
+
+    try testing.expect(!result.manifest_valid);
+    try testing.expect(!result.isClean());
+}
+
+test "SEC-0043: verifyGraph without key passes on plaintext manifest (regression)" {
+    // Without a key, the CRC-only path is used. A valid plaintext manifest
+    // must still pass (no regression from threading the key field).
+    const allocator = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var uuid: [16]u8 = undefined;
+    @memset(&uuid, 0x44);
+
+    var gd = try GraphDir.create(allocator, tmp_path, uuid);
+    defer gd.deinit();
+
+    const m = Manifest{
+        .graph_uuid = uuid,
+        .page_size = 4096,
+        .counter = 1,
+    };
+    const path_a = try gd.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try m.writeToFile(allocator, path_a);
+    const path_b = try gd.manifestPath(allocator, .b);
+    defer allocator.free(path_b);
+    try m.writeToFile(allocator, path_b);
+    try setupWalArtifacts(allocator, gd.path, uuid);
+
+    var tool = VerifyTool.init(allocator);
+    var result = try tool.verifyGraph(&gd, 4096);
+    defer result.deinit();
+
+    try testing.expect(result.manifest_valid);
+    try testing.expect(result.isClean());
 }
 
 test {

@@ -242,6 +242,9 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
 
     // SEC-0044/SEC-0048: item_count was bounded against payload_size in
     // loadPayload, so this reservation cannot be driven past the available bytes.
+    // Guard the u64-to-u32 cast: a crafted snapshot with item_count > maxInt(u32)
+    // would panic in ReleaseSafe without this check (DoS via integer overflow).
+    if (snapshot.item_count > std.math.maxInt(u32)) return error.InvalidFormat;
     try engine.edge_index.ensureTotalCapacity(@intCast(snapshot.item_count));
 
     var i: u64 = 0;

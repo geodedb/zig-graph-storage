@@ -31,12 +31,20 @@ pub const Integrity = struct {
 
     /// Verify a manifest's integrity by serializing it and checking that
     /// the round-trip produces valid data (magic + CRC32 pass).
+    /// When a key is provided, also verifies the HMAC-SHA256 trailer (SEC-0043).
     pub fn verifyManifest(m: *const Manifest, allocator: std.mem.Allocator) bool {
-        const data = m.serialize(allocator) catch return false;
+        return verifyManifestWithKey(m, allocator, null);
+    }
+
+    /// SEC-0043: Verify a manifest read from disk against the given path and key.
+    /// When `key` is non-null, reads via the keyed path so the HMAC trailer is
+    /// verified; when null, falls back to CRC-only (unchanged behavior).
+    pub fn verifyManifestWithKey(m: *const Manifest, allocator: std.mem.Allocator, key: ?[32]u8) bool {
+        const data = m.serializeWithKey(allocator, key) catch return false;
         defer allocator.free(data);
 
-        // Attempt deserialization which validates magic + CRC32
-        _ = Manifest.deserialize(allocator, data) catch return false;
+        // Attempt deserialization which validates magic + CRC32 (+ HMAC when keyed).
+        _ = Manifest.deserializeWithKey(allocator, data, key) catch return false;
         return true;
     }
 };

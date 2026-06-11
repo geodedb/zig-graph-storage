@@ -240,7 +240,7 @@ pub const Recovery = struct {
                 // to max(on-disk, logged) so the AES-GCM nonce counter never
                 // regresses. write_count stays plaintext in the header, so it can
                 // be read from the raw on-disk bytes without decrypting.
-                if (copy_len > page_mod.WRITE_COUNT_OFFSET) {
+                if (copy_len >= page_mod.WRITE_COUNT_OFFSET + 3) {
                     if (ctx.file_manager.getPager(file_id)) |pager_ptr| {
                         const on_disk_wc = pager_ptr.readWriteCountOnDisk(rec.page_id) catch 0;
                         const logged_wc = page_mod.readWriteCount(data);
