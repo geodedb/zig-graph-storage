@@ -1249,6 +1249,23 @@ pub const GraphEngine = struct {
         observability.endOperationSpan(__obs_span, true, "");
     }
 
+    /// GAP-0900 L2: incremental/bounded checkpoint. Does the memory-bounding
+    /// work (flush dirty pages, sync, manifest, WAL truncate, free store, label
+    /// dict, declared B+tree indexes) but SKIPS the O(graph-size) derived-index
+    /// snapshot save. Recovery rebuilds derived indexes from the durable pages
+    /// when the snapshots are stale, so this is safe and O(dirty). Use this for
+    /// the periodic load-driven checkpoint; use checkpoint() (full) at clean
+    /// shutdown so a restart loads fast without a rebuild.
+    pub fn checkpointLight(self: *GraphEngine) anyerror!void {
+        var __obs_span = observability.startOperationSpan("checkpoint_light");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        try self.ensureWritable();
+        try engine_persist.checkpointLight(self);
+        observability.endOperationSpan(__obs_span, true, "");
+    }
+
     pub fn getOrAssignLabel(self: *GraphEngine, label: []const u8) !LabelId {
         var __obs_span = observability.startOperationSpan("get_or_assign_label");
         defer __obs_span.end(null);
