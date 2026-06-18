@@ -1605,3 +1605,134 @@ test "NFR-OBS-002: GraphEngine.open emits index_build_start and index_build_end 
     }
     try testing.expect(start_pos < end_pos);
 }
+
+test "GAP-0900 L2: checkpointLight is O(dirty) — skips derived-index save, truncates WAL, recovery rebuilds correctly" {
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x9C} ** 16;
+    var cfg = testConfig();
+    // Deferred mode mirrors the bulk-ingest path that triggers GAP-0900.
+    cfg.sync_mode = .deferred;
+    // Small buffer pool so dirty pages must flush (memory-bounded path is real).
+    cfg.buffer_pool_pages = 64;
+
+    const N: usize = 3000;
+    const label_a: u32 = 11;
+    const label_b: u32 = 22;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        // Hub node every edge points from, so edges have an out-list.
+        const hub = try engine.allocNode();
+        try engine.putNode(hub, NodeRec{
+            .out_head = 0,
+            .in_head = 0,
+            .prop_head = 0,
+            .label_head = 0,
+            .label_count = 0,
+            .flags = 0,
+            ._pad = .{ 0, 0, 0, 0 },
+            .txn_stamp = 1,
+        });
+
+        var prev_wal_bytes: u64 = 0;
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            const nid = try engine.allocNode();
+            var rec = NodeRec{
+                .out_head = 0,
+                .in_head = 0,
+                .prop_head = 0,
+                .label_head = 0,
+                .label_count = 0,
+                .flags = 0,
+                ._pad = .{ 0, 0, 0, 0 },
+                .txn_stamp = 1,
+            };
+            try engine.putNode(nid, rec);
+            // Every node gets label_a; even nodes also get label_b.
+            try engine.addLabel(nid, label_a);
+            if (i % 2 == 0) try engine.addLabel(nid, label_b);
+
+            // A unique property keyed by index so we can verify lookups later.
+            rec = (try engine.getNode(nid)).?;
+            var keybuf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&keybuf, "k{d}", .{i});
+            rec.prop_head = try engine.putProperty(rec.prop_head, key, .{ .int = @intCast(i) });
+            try engine.putNode(nid, rec);
+
+            _ = try engine.addEdge(hub, nid, @intCast(i % 4));
+
+            // Periodically run a LIGHT checkpoint, as the load-driven path does.
+            if (i % 500 == 499) {
+                const before = engine.getMetrics().*;
+                try engine.checkpointLight();
+                const after = engine.getMetrics().*;
+
+                // (b1) A derived-index save did NOT occur on the light path.
+                try testing.expectEqual(before.derived_index_saves, after.derived_index_saves);
+                // The light checkpoint still counts as a completed checkpoint.
+                try testing.expect(after.checkpoints_completed > before.checkpoints_completed);
+
+                // (b2) The WAL was truncated: bytes-since-compact is bounded and
+                // does not grow unboundedly across checkpoints.
+                const wal_bytes = engine.wal.bytesSinceCompact();
+                if (prev_wal_bytes != 0) {
+                    // After each light checkpoint the WAL is compacted, so the
+                    // residual never balloons to O(total writes).
+                    try testing.expect(wal_bytes <= prev_wal_bytes + 4096);
+                }
+                prev_wal_bytes = wal_bytes;
+            }
+        }
+
+        // No full checkpoint ran, so NO derived-index save happened at all.
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_saves);
+        try testing.expect(engine.getMetrics().checkpoints_completed > 0);
+
+        // The label-index snapshot file must be stale relative to the manifest
+        // counter (light checkpoints advanced the manifest but skipped the save).
+        // Confirm by reopening below: recovery must rebuild from pages.
+    }
+
+    // (c) Reopen on the same data dir. The derived-index snapshots are stale, so
+    // tryLoadDerivedIndexes() returns false and rebuildDerivedIndexes() runs.
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        // The rebuild path sets index_rebuild_progress to 100% (10000).
+        try testing.expectEqual(@as(u64, 10000), engine.getMetrics().index_rebuild_progress);
+
+        // Scan by label_a returns ALL N nodes.
+        const a_nodes = try engine.scanLabel(label_a, testing.allocator);
+        defer testing.allocator.free(a_nodes);
+        try testing.expectEqual(N, a_nodes.len);
+
+        // Scan by label_b returns exactly the even-indexed nodes.
+        const b_nodes = try engine.scanLabel(label_b, testing.allocator);
+        defer testing.allocator.free(b_nodes);
+        try testing.expectEqual((N + 1) / 2, b_nodes.len);
+
+        // Property lookups return the right values after rebuild.
+        // Node ids are hub=1, then 2..N+1 for i=0..N-1.
+        var i: usize = 0;
+        while (i < N) : (i += 100) {
+            const nid: NodeId = @intCast(i + 2);
+            const rec = (try engine.getNode(nid)).?;
+            var keybuf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&keybuf, "k{d}", .{i});
+            const val = try engine.getProperty(rec.prop_head, key, testing.allocator);
+            try testing.expect(val != null);
+            try testing.expectEqual(@as(i64, @intCast(i)), val.?.int);
+        }
+
+        // Edges are intact: the hub fans out to all N nodes.
+        const out = try engine.expandOut(1, null, testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqual(N, out.len);
+    }
+}
