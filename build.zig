@@ -314,6 +314,18 @@ fn addBenchmarks(
     if (b.args) |args| run_load_bench.addArgs(args);
     load_bench_step.dependOn(&run_load_bench.step);
 
+    // GAP-0900: WAL-batch A/B microbench (deferred multi-page txns).
+    const wal_batch_ab_step = b.step("bench-wal-batch-ab", "GAP-0900 WAL-batch A/B: deferred multi-page txn throughput + syscall count");
+    const wal_batch_ab_exe = b.addExecutable(.{
+        .name = "wal-batch-ab",
+        .root_module = createModule(b, "benchmarks/wal_batch_ab.zig", target, bench_optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_wal_batch_ab = b.addRunArtifact(wal_batch_ab_exe);
+    if (b.args) |args| run_wal_batch_ab.addArgs(args);
+    wal_batch_ab_step.dependOn(&run_wal_batch_ab.step);
+
     const scale_bench_step = b.step("scale-bench", "Run incremental scale benchmarks with JSON output");
     const scale_bench_exe = b.addExecutable(.{
         .name = "scale-bench",
