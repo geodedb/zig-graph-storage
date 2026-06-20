@@ -43,6 +43,25 @@ pub const LabelIndex = struct {
     /// In-memory index: LabelId -> set of NodeId (PERF-0054: O(1) add/remove).
     index: std.AutoHashMapUnmanaged(LabelId, NodeSet),
 
+    /// SEC/CONC: serialises readers (scan/count/iterator) against mutators
+    /// (addNode/removeNode/clear/loadFromFile/rebuild). The posting-list sets
+    /// and the outer index map are plain unmanaged HashMaps: a concurrent
+    /// `getOrPut` can rehash and free the backing store mid-iteration, which a
+    /// scanning reader would then read out of bounds or after free (the
+    /// "index out of bounds: index 64, len 64" panic / segfault). A SHARED
+    /// reader lock at the engine/shard layer does NOT exclude a writer that
+    /// also holds the shard lock SHARED, so the exclusion must live here, on
+    /// the data structure itself. Readers take it SHARED (concurrent scans are
+    /// fine — they only read); mutators take it EXCLUSIVE so no scan can ever
+    /// observe a mid-rehash set. A scan therefore returns a consistent
+    /// snapshot that may miss nodes added during the scan; it never tears or
+    /// reads freed memory.
+    rwlock: std.Io.RwLock = std.Io.RwLock.init,
+
+    fn io() std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
+    }
+
     /// Streaming iterator over a materialised, sorted posting list.
     /// The iterator owns the backing slice; call deinit() to release it.
     pub const Iterator = struct {
@@ -78,6 +97,13 @@ pub const LabelIndex = struct {
     }
 
     pub fn clear(self: *LabelIndex) void {
+        self.rwlock.lockUncancelable(io());
+        defer self.rwlock.unlock(io());
+        self.clearLocked();
+    }
+
+    /// Internal: assumes the caller already holds `rwlock` EXCLUSIVE.
+    fn clearLocked(self: *LabelIndex) void {
         var it = self.index.valueIterator();
         while (it.next()) |set| {
             @constCast(set).deinit(self.allocator);
@@ -86,12 +112,20 @@ pub const LabelIndex = struct {
     }
 
     pub fn deinit(self: *LabelIndex) void {
-        self.clear();
+        // deinit is single-threaded teardown; no concurrent access is possible
+        // once a caller is destroying the index, so take the lock to satisfy
+        // any in-flight ordering then tear down without holding it.
+        self.clearLocked();
         self.index.deinit(self.allocator);
     }
 
     /// Add a node to a label's posting list.  O(1) amortised; idempotent.
+    /// Takes `rwlock` EXCLUSIVE: the `getOrPut` calls below may rehash/grow
+    /// either the outer index map or the posting set, which must never happen
+    /// while a `scan` is iterating those structures.
     pub fn addNode(self: *LabelIndex, label_id: LabelId, node_id: NodeId) !void {
+        self.rwlock.lockUncancelable(io());
+        defer self.rwlock.unlock(io());
         const gop = try self.index.getOrPut(self.allocator, label_id);
         if (!gop.found_existing) {
             gop.value_ptr.* = .empty;
@@ -100,29 +134,54 @@ pub const LabelIndex = struct {
     }
 
     /// Remove a node from a label's posting list.  O(1).
+    /// Takes `rwlock` EXCLUSIVE: `remove` mutates the posting set's slots, which
+    /// must be excluded from a concurrent `scan`/`count`.
     pub fn removeNode(self: *LabelIndex, label_id: LabelId, node_id: NodeId) void {
+        self.rwlock.lockUncancelable(io());
+        defer self.rwlock.unlock(io());
         const set = self.index.getPtr(label_id) orelse return;
         _ = set.remove(node_id);
     }
 
     /// Scan all node IDs for a label. Returns a sorted, owned slice (caller frees).
-    pub fn scan(self: *const LabelIndex, label_id: LabelId, allocator: Allocator) ![]NodeId {
+    /// Takes `rwlock` SHARED so concurrent scans run in parallel but no mutator
+    /// can rehash/free the set mid-iteration.
+    pub fn scan(self: *LabelIndex, label_id: LabelId, allocator: Allocator) ![]NodeId {
+        self.rwlock.lockSharedUncancelable(io());
+        defer self.rwlock.unlockShared(io());
+        return self.scanLocked(label_id, allocator);
+    }
+
+    /// Internal: assumes the caller already holds `rwlock` (SHARED or EXCLUSIVE).
+    fn scanLocked(self: *LabelIndex, label_id: LabelId, allocator: Allocator) ![]NodeId {
         const set = self.index.getPtr(label_id) orelse return try allocator.alloc(NodeId, 0);
         const result = try allocator.alloc(NodeId, set.count());
         var i: usize = 0;
         var kit = set.keyIterator();
         while (kit.next()) |key| {
+            // Defense-in-depth: even under the lock, never write past the
+            // buffer we sized from set.count(). Bounds the fill so a logic or
+            // future-locking regression can degrade to a short read instead of
+            // a heap overflow.
+            if (i >= result.len) break;
             result[i] = key.*;
             i += 1;
         }
-        std.mem.sort(NodeId, result, {}, std.sort.asc(NodeId));
-        return result;
+        const filled = result[0..i];
+        std.mem.sort(NodeId, filled, {}, std.sort.asc(NodeId));
+        if (i == result.len) return result;
+        // count() and the iteration disagreed (must not happen under the lock);
+        // return exactly what we read and release the unused tail.
+        return try allocator.realloc(result, i);
     }
 
     /// Iterate node IDs for a label without a result-sized caller allocation.
     /// The returned Iterator owns its backing slice; call deinit() to release it.
-    pub fn iterator(self: *const LabelIndex, label_id: LabelId, allocator: Allocator) !Iterator {
-        const items = try self.scan(label_id, allocator);
+    /// Takes `rwlock` SHARED via scanLocked (same snapshot guarantee as scan).
+    pub fn iterator(self: *LabelIndex, label_id: LabelId, allocator: Allocator) !Iterator {
+        self.rwlock.lockSharedUncancelable(io());
+        defer self.rwlock.unlockShared(io());
+        const items = try self.scanLocked(label_id, allocator);
         return .{
             .items = items,
             .pos = 0,
@@ -131,7 +190,11 @@ pub const LabelIndex = struct {
     }
 
     /// Number of nodes with a given label.
-    pub fn count(self: *const LabelIndex, label_id: LabelId) u64 {
+    /// Takes `rwlock` SHARED: reads the set's count field, which a concurrent
+    /// mutator could otherwise be updating mid-rehash.
+    pub fn count(self: *LabelIndex, label_id: LabelId) u64 {
+        self.rwlock.lockSharedUncancelable(io());
+        defer self.rwlock.unlockShared(io());
         const set = self.index.getPtr(label_id) orelse return 0;
         return set.count();
     }
@@ -140,10 +203,16 @@ pub const LabelIndex = struct {
     /// Uses page-level scanning to pin each page once instead of
     /// per-ID pin/unpin cycles (PERF-0012).
     pub fn rebuild(self: *LabelIndex, node_store: *NodeStore, max_node_id: NodeId) !void {
+        self.rwlock.lockUncancelable(io());
+        defer self.rwlock.unlock(io());
+
         // Clear existing data.
-        self.clear();
+        self.clearLocked();
 
         // Use page-scan to iterate all live nodes efficiently.
+        // rebuildCallback is a no-op (see below), so no addNode re-entry occurs
+        // here; if it ever mutates the index it must call the *Locked helpers
+        // since this holds rwlock EXCLUSIVE.
         try node_store.scanNodes(max_node_id, self, &rebuildCallback);
     }
 
@@ -152,7 +221,13 @@ pub const LabelIndex = struct {
     ///   [8 bytes magic][u64 checkpoint_counter][u64 label_count]
     ///   repeated label_count times:
     ///     [u32 label_id][u64 node_count][node_count * u64 node_id]
-    pub fn saveToFile(self: *const LabelIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
+    pub fn saveToFile(self: *LabelIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
+        // Take rwlock SHARED for the whole snapshot: a concurrent addNode could
+        // otherwise rehash the index or a posting set mid-serialization and the
+        // entry/key iterators below would read freed backing.
+        self.rwlock.lockSharedUncancelable(io());
+        defer self.rwlock.unlockShared(io());
+
         // PERF-0052: serialize the whole snapshot into one in-memory buffer and
         // flush it with a single positional write instead of one syscall per
         // node id. Byte layout and trailing CRC32 (SEC-0051) are unchanged.
@@ -169,7 +244,9 @@ pub const LabelIndex = struct {
             try w.writeU64(set.count());
 
             // Collect and sort node IDs for deterministic snapshot output.
-            const sorted = try self.scan(entry.key_ptr.*, self.allocator);
+            // Use scanLocked: we already hold rwlock SHARED, and the public
+            // scan would re-acquire it (std.Io.RwLock is not reentrant).
+            const sorted = try self.scanLocked(entry.key_ptr.*, self.allocator);
             defer self.allocator.free(sorted);
 
             for (sorted) |node_id| {
@@ -190,8 +267,13 @@ pub const LabelIndex = struct {
         var snapshot = (try index_snapshot_mod.loadPayload(self.allocator, file, SNAPSHOT_MAGIC, LABEL_RECORD_MIN_SIZE)) orelse return null;
         defer snapshot.deinit();
 
-        self.clear();
-        errdefer self.clear();
+        // Take rwlock EXCLUSIVE for the whole load: it both clears and
+        // repopulates the index via getOrPut, which must exclude every scan.
+        self.rwlock.lockUncancelable(io());
+        defer self.rwlock.unlock(io());
+
+        self.clearLocked();
+        errdefer self.clearLocked();
 
         var r = index_snapshot_mod.SnapshotReader.init(snapshot.payload());
 
@@ -256,6 +338,90 @@ test "addNode + scan returns the node" {
     try testing.expectEqual(@as(usize, 2), result.len);
     try testing.expectEqual(@as(NodeId, 100), result[0]);
     try testing.expectEqual(@as(NodeId, 200), result[1]);
+}
+
+// CONC/SEC: concurrent scan against a rehashing addNode must never crash,
+// tear, or read freed HashMap backing. Before the rwlock fix this raced the
+// posting-set rehash and panicked with "index out of bounds: index N, len N"
+// (or segfaulted reading freed backing). With the fix, scan takes the lock
+// SHARED and addNode EXCLUSIVE, so each scan returns a consistent snapshot:
+// strictly-sorted, duplicate-free, and a subset of [0, N).
+test "CONC: concurrent scan + addNode never tears (rwlock serialization)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 16);
+    env.register();
+    defer env.deinit();
+
+    var idx = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
+    defer idx.deinit();
+
+    const label: LabelId = 1;
+    const N: u64 = 20_000; // large enough to force many rehash/grow cycles
+
+    const Writer = struct {
+        fn run(index: *LabelIndex, total: u64, out_err: *?anyerror) void {
+            var n: u64 = 0;
+            while (n < total) : (n += 1) {
+                index.addNode(label, n) catch |err| {
+                    out_err.* = err;
+                    return;
+                };
+            }
+        }
+    };
+
+    const Reader = struct {
+        fn run(index: *LabelIndex, total: u64, out_err: *?anyerror) void {
+            var rounds: usize = 0;
+            while (rounds < 2000) : (rounds += 1) {
+                const result = index.scan(label, testing.allocator) catch |err| {
+                    out_err.* = err;
+                    return;
+                };
+                defer testing.allocator.free(result);
+                // Snapshot must be internally consistent: strictly ascending
+                // (so: sorted AND duplicate-free) and every id in [0, total).
+                var prev: ?NodeId = null;
+                for (result) |v| {
+                    if (v >= total) {
+                        out_err.* = error.NodeIdOutOfRange;
+                        return;
+                    }
+                    if (prev) |p| {
+                        if (v <= p) {
+                            out_err.* = error.TornOrUnsortedSnapshot;
+                            return;
+                        }
+                    }
+                    prev = v;
+                }
+            }
+        }
+    };
+
+    var writer_err: ?anyerror = null;
+    var reader_errs: [4]?anyerror = .{null} ** 4;
+    var reader_threads: [4]std.Thread = undefined;
+
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{ &idx, N, &writer_err });
+    for (&reader_threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Reader.run, .{ &idx, N, &reader_errs[i] });
+    }
+
+    writer_thread.join();
+    for (reader_threads) |t| t.join();
+
+    if (writer_err) |err| return err;
+    for (reader_errs) |maybe_err| {
+        if (maybe_err) |err| return err;
+    }
+
+    // After all writes, scan must observe exactly N entries, fully sorted.
+    const final = try idx.scan(label, testing.allocator);
+    defer testing.allocator.free(final);
+    try testing.expectEqual(@as(usize, N), final.len);
+    for (final, 0..) |v, j| {
+        try testing.expectEqual(@as(NodeId, j), v);
+    }
 }
 
 test "removeNode + scan excludes the node" {
