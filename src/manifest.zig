@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+// fips-exempt: non-security — CRC32C record-integrity (corruption detection)
+// for on-disk format; not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const timing_safe = std.crypto.timing_safe;

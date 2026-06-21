@@ -55,6 +55,7 @@ pub const WalRecord = struct {
         const total_size = self.serializedSize();
         if (buf.len < total_size) return error.BufferTooSmall;
 
+        // fips-exempt: non-security — WAL record CRC32C corruption check.
         var hasher = std.hash.crc.Crc32Iscsi.init();
         var offset: usize = 0;
 
@@ -175,6 +176,7 @@ pub const WalRecord = struct {
     /// Compute CRC32C checksum over all fields except the checksum itself.
     /// The checksum covers: lsn + txn_id + record_type + file_id + page_id + payload_len + payload.
     pub fn computeChecksum(self: *const WalRecord) u32 {
+        // fips-exempt: non-security — WAL record CRC32C corruption check.
         var hasher = std.hash.crc.Crc32Iscsi.init();
         hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.lsn)));
         hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.txn_id)));
