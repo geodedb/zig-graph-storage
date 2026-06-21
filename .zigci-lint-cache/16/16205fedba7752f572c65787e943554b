@@ -1,0 +1,12 @@
+90:21:2:ZL104.no_zeroes_struct_pointers:std.mem.zeroes creates null pointers in structs with non-nullable pointer fields; consider explicit initialization
+7:11:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+10:11:1:ZL203.const_snakecase:constant 'NODE_FLAG_DELETED' should use snake_case (or PascalCase for types)
+13:11:1:ZL203.const_snakecase:constant 'NODE_FLAG_HAS_OVERFLOW' should use snake_case (or PascalCase for types)
+28:29:1:ZL010.magic_number:magic number 48; consider using a named constant
+58:44:1:ZL010.magic_number:magic number 48; consider using a named constant
+79:22:1:ZL010.magic_number:magic number 3; consider using a named constant
+80:23:1:ZL010.magic_number:magic number 4; consider using a named constant
+84:22:1:ZL010.magic_number:magic number 5; consider using a named constant
+110:42:1:ZL010.magic_number:magic number 170; consider using a named constant
+110:61:1:ZL010.magic_number:magic number 8192; consider using a named constant
+7:1:1:ZL011.missing_doc_comment:public declaration 'PAGE_HEADER_SIZE' is missing documentation

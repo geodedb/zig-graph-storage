@@ -100,6 +100,8 @@ pub const PropertyChainIndex = struct {
 
         for (gop.value_ptr.entries.items) |*entry| {
             if (std.mem.eql(u8, entry.key, key)) {
+                // fips-exempt: non-security — property value fingerprint for index
+                // equality lookup; not a secret.
                 entry.value_hash = std.hash.Wyhash.hash(0, encoded_value);
                 return;
             }
@@ -109,6 +111,8 @@ pub const PropertyChainIndex = struct {
         errdefer self.allocator.free(key_copy);
         try gop.value_ptr.entries.append(self.allocator, .{
             .key = key_copy,
+            // fips-exempt: non-security — property value fingerprint for index
+            // equality lookup; not a secret.
             .value_hash = std.hash.Wyhash.hash(0, encoded_value),
         });
     }
@@ -156,6 +160,8 @@ pub const PropertyChainIndex = struct {
 
             try gop.value_ptr.entries.append(self.allocator, .{
                 .key = key_copy,
+                // fips-exempt: non-security — property value fingerprint for index
+                // equality lookup; not a secret.
                 .value_hash = std.hash.Wyhash.hash(0, entry.encoded_value),
             });
         }

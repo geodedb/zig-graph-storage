@@ -79,6 +79,21 @@ pub const TxnManager = struct {
         };
         _ = try self.wal.appendRecord(&rec);
 
+        // GAP-0900: open a WAL record batch for this txn AFTER its begin_txn
+        // record is written. Subsequent page-update records for this txn are
+        // collected and flushed in one syscall at commit (see `commit`),
+        // preserving LSN order: begin_txn, page_update*, commit_txn.
+        //
+        // The WalManager carries a single batch buffer, so only ONE txn can
+        // batch at a time. If another txn already holds the batch (rare —
+        // concurrent/nested txns on the same engine), this txn silently uses
+        // the per-record write path; correctness and durability are unchanged,
+        // only the syscall amortisation is skipped for the overlapping txn.
+        self.wal.beginBatch(txn_id) catch |err| switch (err) {
+            error.BatchAlreadyOpen => {},
+        };
+        errdefer self.wal.abortBatchFor(txn_id);
+
         try self.active_txns.put(txn_id, .active);
         return txn_id;
     }
@@ -98,6 +113,14 @@ pub const TxnManager = struct {
         const state = self.active_txns.get(txn_id) orelse return error.TxnNotFound;
         if (state == .committed) return error.TxnAlreadyCommitted;
         if (state == .aborted) return error.TxnAlreadyAborted;
+
+        // GAP-0900: flush this txn's batched page-update records to the log
+        // (one syscall) BEFORE the commit record, preserving on-disk order
+        // begin_txn, page_update*, commit_txn. After flush all records are in
+        // the OS page cache; the commit record + sync decision below give the
+        // same durability as the per-record path. A flush error aborts the
+        // commit (the inner log already truncated any partial write).
+        try self.wal.flushBatchFor(txn_id);
 
         var rec = WalRecord{
             .lsn = 0,
@@ -122,6 +145,10 @@ pub const TxnManager = struct {
         const state = self.active_txns.get(txn_id) orelse return error.TxnNotFound;
         if (state == .committed) return error.TxnAlreadyCommitted;
         if (state == .aborted) return error.TxnAlreadyAborted;
+
+        // GAP-0900: discard this txn's batched page-update records — a
+        // rolled-back txn must leave none of them in the log.
+        self.wal.abortBatchFor(txn_id);
 
         var rec = WalRecord{
             .lsn = 0,
@@ -302,6 +329,11 @@ test "logPageUpdate appends page_update record with correct txn_id" {
 
     try std.testing.expect(lsn > 0);
 
+    // GAP-0900: page-update records are batched and become durable at commit.
+    // Commit flushes them (preserving order begin_txn, page_update, commit_txn)
+    // before reading the WAL back.
+    try txn_mgr.commit(txn_id);
+
     // Read WAL records and verify
     const records = try wal.readFrom(1, allocator);
     defer {
@@ -309,7 +341,7 @@ test "logPageUpdate appends page_update record with correct txn_id" {
         allocator.free(records);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expectEqual(@as(usize, 3), records.len);
     // First record is BEGIN
     try std.testing.expectEqual(WalRecordType.begin_txn, records[0].record_type);
     // Second record is page_update
@@ -318,6 +350,8 @@ test "logPageUpdate appends page_update record with correct txn_id" {
     try std.testing.expectEqual(@as(u8, 3), records[1].file_id);
     try std.testing.expectEqual(@as(u64, 42), records[1].page_id);
     try std.testing.expectEqualStrings(page_data, records[1].payload);
+    // Third record is COMMIT
+    try std.testing.expectEqual(WalRecordType.commit_txn, records[2].record_type);
 }
 
 test {

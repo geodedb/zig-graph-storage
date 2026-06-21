@@ -1,0 +1,30 @@
+19:13:1:ZL010.magic_number:magic number 3; consider using a named constant
+20:17:1:ZL010.magic_number:magic number 4; consider using a named constant
+21:12:1:ZL010.magic_number:magic number 5; consider using a named constant
+22:17:1:ZL010.magic_number:magic number 6; consider using a named constant
+23:16:1:ZL010.magic_number:magic number 7; consider using a named constant
+48:41:1:ZL010.magic_number:magic number 3; consider using a named constant
+49:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+50:41:1:ZL010.magic_number:magic number 5; consider using a named constant
+51:41:1:ZL010.magic_number:magic number 6; consider using a named constant
+52:41:1:ZL010.magic_number:magic number 7; consider using a named constant
+60:44:1:ZL010.magic_number:magic number 42; consider using a named constant
+61:43:1:ZL010.magic_number:magic number 42; consider using a named constant
+72:59:1:ZL010.magic_number:magic number 12345; consider using a named constant
+73:43:1:ZL010.magic_number:magic number 12345; consider using a named constant
+76:58:1:ZL010.magic_number:magic number 99; consider using a named constant
+77:42:1:ZL010.magic_number:magic number 99; consider using a named constant
+83:77:1:ZL010.magic_number:magic number 255; consider using a named constant
+85:41:1:ZL010.magic_number:magic number 255; consider using a named constant
+6:1:1:ZL011.missing_doc_comment:public declaration 'NodeId' is missing documentation
+7:1:1:ZL011.missing_doc_comment:public declaration 'EdgeId' is missing documentation
+8:1:1:ZL011.missing_doc_comment:public declaration 'PageId' is missing documentation
+9:1:1:ZL011.missing_doc_comment:public declaration 'SlotId' is missing documentation
+10:1:1:ZL011.missing_doc_comment:public declaration 'Lsn' is missing documentation
+11:1:1:ZL011.missing_doc_comment:public declaration 'TxnId' is missing documentation
+12:1:1:ZL011.missing_doc_comment:public declaration 'LabelId' is missing documentation
+13:1:1:ZL011.missing_doc_comment:public declaration 'GraphUuid' is missing documentation
+15:1:1:ZL011.missing_doc_comment:public declaration 'FileId' is missing documentation
+27:1:1:ZL011.missing_doc_comment:public declaration 'PropertyValue' is missing documentation
+36:5:1:ZL011.missing_doc_comment:public declaration 'Decimal' is missing documentation
+37:5:1:ZL011.missing_doc_comment:public declaration 'ExtValue' is missing documentation

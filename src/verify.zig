@@ -832,6 +832,8 @@ test "SEC-0043: verifyGraph with key detects HMAC-forged manifest (CRC recompute
     // by VerifyTool when an encryption key is configured. Without threading the
     // key, only the CRC is checked and the forgery passes silently (false OK).
     const allocator = testing.allocator;
+    // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
+    // for on-disk format; not authentication.
     const Crc32 = std.hash.crc.Crc32Iscsi;
 
     var tmp_dir = testing.tmpDir(.{});

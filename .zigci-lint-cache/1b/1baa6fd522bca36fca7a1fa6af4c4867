@@ -1,0 +1,15 @@
+16:83:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+16:77:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+32:26:2:ZL204.no_dupe_import:duplicate import of 'shard_uuid.zig' (first at line 31)
+33:20:2:ZL204.no_dupe_import:duplicate import of 'shard_uuid.zig' (first at line 31)
+42:22:2:ZL204.no_dupe_import:duplicate import of 'shard_uuid.zig' (first at line 31)
+43:22:2:ZL204.no_dupe_import:duplicate import of 'shard_uuid.zig' (first at line 31)
+49:101:2:ZL300.max_line_length:line exceeds 100 characters (123)
+13:9:1:ZL009.var_should_be_const:variable 'hasher' is never reassigned; consider using 'const'
+15:9:1:ZL009.var_should_be_const:variable 'tag_buf' is never reassigned; consider using 'const'
+18:9:1:ZL009.var_should_be_const:variable 'digest' is never reassigned; consider using 'const'
+20:9:1:ZL009.var_should_be_const:variable 'out' is never reassigned; consider using 'const'
+30:30:1:ZL010.magic_number:magic number 0xA1; consider using a named constant
+40:25:1:ZL010.magic_number:magic number 0xA1; consider using a named constant
+41:25:1:ZL010.magic_number:magic number 0xB2; consider using a named constant
+10:1:1:ZL011.missing_doc_comment:public declaration 'deriveShardUuid' is missing documentation

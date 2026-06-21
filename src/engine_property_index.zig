@@ -90,6 +90,8 @@ pub const PropertyIndexSet = struct {
 /// as property_chain_index so equality lookups are consistent regardless of how
 /// the value entered the index (build scan vs. live insert vs. query).
 pub fn hashEncodedValue(encoded_value: []const u8) u64 {
+    // fips-exempt: non-security — non-cryptographic Wyhash mapping a value
+    // into the B+tree key space for equality lookups.
     return std.hash.Wyhash.hash(0, encoded_value);
 }
 
@@ -188,6 +190,8 @@ fn catalogPath(engine: *GraphEngine) ![]u8 {
 /// path-traversal characters even for arbitrary property keys (defense in depth:
 /// the key never reaches the filesystem verbatim).
 fn indexTreePath(engine: *GraphEngine, label_id: LabelId, property_key: []const u8) ![]u8 {
+    // fips-exempt: non-security — non-cryptographic Wyhash folding the key
+    // into a bounded, traversal-safe filename component.
     const key_hash = std.hash.Wyhash.hash(0, property_key);
     return std.fmt.allocPrint(
         engine.allocator,
@@ -422,6 +426,7 @@ const testing = std.testing;
 
 test "hashEncodedValue is stable + matches property_chain hashing" {
     const a = hashEncodedValue("hello");
+    // fips-exempt: non-security — test KAT asserting the non-cryptographic index hash is stable.
     const b = std.hash.Wyhash.hash(0, "hello");
     try testing.expectEqual(b, a);
 }

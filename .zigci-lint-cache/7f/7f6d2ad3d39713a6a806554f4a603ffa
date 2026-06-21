@@ -1,0 +1,69 @@
+10:7:1:ZL203.const_snakecase:constant 'GRAPH_IDENTITY_FILE' should use snake_case (or PascalCase for types)
+120:11:1:ZL203.const_snakecase:constant 'STACK_BUF_SIZE' should use snake_case (or PascalCase for types)
+390:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+394:101:2:ZL300.max_line_length:line exceeds 100 characters (152)
+561:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+705:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+706:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+331:9:2:ZL302.max_params:function has too many parameters (7 > 6)
+350:30:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+273:13:1:ZL009.var_should_be_const:variable 'all_records' is never reassigned; consider using 'const'
+342:13:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+346:17:1:ZL009.var_should_be_const:variable 'entry' is never reassigned; consider using 'const'
+401:9:1:ZL009.var_should_be_const:variable 'stored_uuid' is never reassigned; consider using 'const'
+427:9:1:ZL009.var_should_be_const:variable 'rec1' is never reassigned; consider using 'const'
+440:9:1:ZL009.var_should_be_const:variable 'rec2' is never reassigned; consider using 'const'
+676:13:1:ZL009.var_should_be_const:variable 'failure' is never reassigned; consider using 'const'
+694:13:1:ZL009.var_should_be_const:variable 'ctx' is never reassigned; consider using 'const'
+729:9:1:ZL009.var_should_be_const:variable 'dir_a' is never reassigned; consider using 'const'
+732:9:1:ZL009.var_should_be_const:variable 'dir_b' is never reassigned; consider using 'const'
+739:13:1:ZL009.var_should_be_const:variable 'a' is never reassigned; consider using 'const'
+756:13:1:ZL009.var_should_be_const:variable 'b' is never reassigned; consider using 'const'
+805:9:1:ZL009.var_should_be_const:variable 'begin' is never reassigned; consider using 'const'
+818:13:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+845:9:1:ZL009.var_should_be_const:variable 'tmp_dir' is never reassigned; consider using 'const'
+849:9:1:ZL009.var_should_be_const:variable 'mgr' is never reassigned; consider using 'const'
+855:9:1:ZL009.var_should_be_const:variable 'other' is never reassigned; consider using 'const'
+394:143:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+421:24:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+445:20:1:ZL010.magic_number:magic number 42; consider using a named constant
+473:24:1:ZL010.magic_number:magic number 0xCC; consider using a named constant
+479:13:1:ZL010.magic_number:magic number 5; consider using a named constant
+501:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+502:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+503:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+504:42:1:ZL010.magic_number:magic number 5; consider using a named constant
+512:24:1:ZL010.magic_number:magic number 0xDD; consider using a named constant
+518:13:1:ZL010.magic_number:magic number 10; consider using a named constant
+534:22:1:ZL010.magic_number:magic number 5; consider using a named constant
+545:43:1:ZL010.magic_number:magic number 6; consider using a named constant
+547:44:1:ZL010.magic_number:magic number 5; consider using a named constant
+555:26:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+556:26:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+569:24:1:ZL010.magic_number:magic number 0xEE; consider using a named constant
+573:13:1:ZL010.magic_number:magic number 4; consider using a named constant
+599:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+600:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+608:24:1:ZL010.magic_number:magic number 0x91; consider using a named constant
+617:23:1:ZL010.magic_number:magic number 7; consider using a named constant
+628:28:1:ZL010.magic_number:magic number 7; consider using a named constant
+638:27:1:ZL010.magic_number:magic number 7; consider using a named constant
+660:23:1:ZL010.magic_number:magic number 7; consider using a named constant
+704:48:1:ZL010.magic_number:magic number 6; consider using a named constant
+735:24:1:ZL010.magic_number:magic number 0x92; consider using a named constant
+744:27:1:ZL010.magic_number:magic number 3; consider using a named constant
+758:26:1:ZL010.magic_number:magic number 3; consider using a named constant
+762:27:1:ZL010.magic_number:magic number 3; consider using a named constant
+800:24:1:ZL010.magic_number:magic number 0x93; consider using a named constant
+807:19:1:ZL010.magic_number:magic number 9; consider using a named constant
+816:24:1:ZL010.magic_number:magic number 9; consider using a named constant
+817:13:1:ZL010.magic_number:magic number 3; consider using a named constant
+820:23:1:ZL010.magic_number:magic number 9; consider using a named constant
+848:24:1:ZL010.magic_number:magic number 0x94; consider using a named constant
+860:20:1:ZL010.magic_number:magic number 5; consider using a named constant
+18:1:1:ZL011.missing_doc_comment:public declaration 'ReplayFailureKind' is missing documentation
+23:1:1:ZL011.missing_doc_comment:public declaration 'ReplayFailure' is missing documentation
+24:28:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+390:25:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+786:25:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+33:22:1:ZL605.large_struct_copy:struct 'WalManager' has 56 fields; consider passing by pointer to avoid copies

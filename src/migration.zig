@@ -13,6 +13,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+// fips-exempt: non-security — CRC32C record-integrity (corruption detection)
+// for on-disk format; not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const operation_result_mod = @import("operation_result.zig");
 const GraphOperationSummary = operation_result_mod.GraphOperationSummary;

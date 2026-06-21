@@ -1,0 +1,71 @@
+24:11:1:ZL203.const_snakecase:constant 'PER_GRAPH_MAGIC' should use snake_case (or PascalCase for types)
+28:11:1:ZL203.const_snakecase:constant 'PER_GRAPH_HEADER_SIZE' should use snake_case (or PascalCase for types)
+113:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+117:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+156:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+202:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+234:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+247:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+251:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+264:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+268:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+281:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+285:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+287:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+300:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+304:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+306:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+308:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+321:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+341:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+359:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+379:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+393:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+413:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+427:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+453:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+162:24:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+116:13:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+124:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+128:13:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+172:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+200:9:1:ZL009.var_should_be_const:variable 'path_buf' is never reassigned; consider using 'const'
+324:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+334:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+362:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+365:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+396:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+399:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+439:5:1:ZL009.var_should_be_const:variable 'migration_event_labels' is never reassigned; consider using 'const'
+450:9:1:ZL009.var_should_be_const:variable 'tmp_dir' is never reassigned; consider using 'const'
+457:9:1:ZL009.var_should_be_const:variable 'm' is never reassigned; consider using 'const'
+473:9:1:ZL009.var_should_be_const:variable 'aw' is never reassigned; consider using 'const'
+126:16:1:ZL010.magic_number:magic number 4; consider using a named constant
+208:29:1:ZL010.magic_number:magic number 4; consider using a named constant
+209:14:1:ZL010.magic_number:magic number 4; consider using a named constant
+218:67:1:ZL010.magic_number:magic number 4; consider using a named constant
+325:20:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+331:23:1:ZL010.magic_number:magic number 200; consider using a named constant
+351:42:1:ZL010.magic_number:magic number 200; consider using a named constant
+363:20:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+397:20:1:ZL010.magic_number:magic number 0xCD; consider using a named constant
+403:23:1:ZL010.magic_number:magic number 50; consider using a named constant
+404:23:1:ZL010.magic_number:magic number 75; consider using a named constant
+408:16:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+469:24:1:ZL010.magic_number:magic number 15; consider using a named constant
+470:24:1:ZL010.magic_number:magic number 27; consider using a named constant
+49:5:1:ZL011.missing_doc_comment:public declaration 'writeJson' is missing documentation
+84:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+479:68:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+480:65:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+431:44:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+459:33:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+431:44:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+459:33:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+479:54:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+480:54:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+481:54:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+482:54:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+483:54:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+113:42:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+202:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer

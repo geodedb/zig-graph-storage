@@ -70,6 +70,8 @@ pub const Recovery = struct {
     /// in memory.
     pub fn deinit(self: *Recovery) void {
         if (self.encryption_key) |*key| {
+            // fips-exempt: non-security — defensive key-material zeroing on
+            // teardown, not a cryptographic algorithm operation.
             std.crypto.secureZero(u8, key);
         }
     }
@@ -1162,6 +1164,8 @@ test "SEC-0043: recovery rejects forged TDE manifest (rolled-back LSN, recompute
     // CRC-only check would pass. The keyed HMAC must catch the forgery and
     // recovery must fail closed instead of redirecting replay.
     const allocator = testing.allocator;
+    // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
+    // for on-disk format; not authentication.
     const Crc32 = std.hash.crc.Crc32Iscsi;
     var setup = try setupTestGraph(allocator);
     defer {

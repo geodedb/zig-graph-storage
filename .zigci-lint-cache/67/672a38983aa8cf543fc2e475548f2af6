@@ -1,0 +1,71 @@
+92:38:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+92:32:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+314:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+372:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+146:53:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+371:9:1:ZL009.var_should_be_const:variable 'tiny' is never reassigned; consider using 'const'
+15:13:1:ZL010.magic_number:magic number 3; consider using a named constant
+16:14:1:ZL010.magic_number:magic number 4; consider using a named constant
+17:15:1:ZL010.magic_number:magic number 5; consider using a named constant
+18:11:1:ZL010.magic_number:magic number 6; consider using a named constant
+32:17:1:ZL010.magic_number:magic number 9; consider using a named constant
+33:19:1:ZL010.magic_number:magic number 9; consider using a named constant
+34:28:1:ZL010.magic_number:magic number 4; consider using a named constant
+35:21:1:ZL010.magic_number:magic number 18; consider using a named constant
+36:29:1:ZL010.magic_number:magic number 4; consider using a named constant
+58:28:1:ZL010.magic_number:magic number 9; consider using a named constant
+62:28:1:ZL010.magic_number:magic number 9; consider using a named constant
+67:28:1:ZL010.magic_number:magic number 5; consider using a named constant
+68:30:1:ZL010.magic_number:magic number 5; consider using a named constant
+72:28:1:ZL010.magic_number:magic number 17; consider using a named constant
+77:28:1:ZL010.magic_number:magic number 3; consider using a named constant
+79:28:1:ZL010.magic_number:magic number 7; consider using a named constant
+80:30:1:ZL010.magic_number:magic number 7; consider using a named constant
+115:29:1:ZL010.magic_number:magic number 9; consider using a named constant
+119:31:1:ZL010.magic_number:magic number 9; consider using a named constant
+123:29:1:ZL010.magic_number:magic number 9; consider using a named constant
+127:31:1:ZL010.magic_number:magic number 9; consider using a named constant
+131:29:1:ZL010.magic_number:magic number 5; consider using a named constant
+142:29:1:ZL010.magic_number:magic number 18; consider using a named constant
+147:31:1:ZL010.magic_number:magic number 18; consider using a named constant
+151:29:1:ZL010.magic_number:magic number 7; consider using a named constant
+185:29:1:ZL010.magic_number:magic number 9; consider using a named constant
+189:31:1:ZL010.magic_number:magic number 9; consider using a named constant
+193:29:1:ZL010.magic_number:magic number 9; consider using a named constant
+197:31:1:ZL010.magic_number:magic number 9; consider using a named constant
+201:29:1:ZL010.magic_number:magic number 5; consider using a named constant
+211:29:1:ZL010.magic_number:magic number 18; consider using a named constant
+216:31:1:ZL010.magic_number:magic number 18; consider using a named constant
+220:29:1:ZL010.magic_number:magic number 7; consider using a named constant
+275:66:1:ZL010.magic_number:magic number 9999999; consider using a named constant
+278:43:1:ZL010.magic_number:magic number 9999999; consider using a named constant
+279:44:1:ZL010.magic_number:magic number 9; consider using a named constant
+288:44:1:ZL010.magic_number:magic number 9; consider using a named constant
+298:48:1:ZL010.magic_number:magic number 4; consider using a named constant
+298:52:1:ZL010.magic_number:magic number 11; consider using a named constant
+303:55:1:ZL010.magic_number:magic number 123456789; consider using a named constant
+303:75:1:ZL010.magic_number:magic number 4; consider using a named constant
+307:43:1:ZL010.magic_number:magic number 123456789; consider using a named constant
+308:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+309:44:1:ZL010.magic_number:magic number 18; consider using a named constant
+314:54:1:ZL010.magic_number:magic number 42; consider using a named constant
+314:74:1:ZL010.magic_number:magic number 0xDE; consider using a named constant
+314:80:1:ZL010.magic_number:magic number 0xAD; consider using a named constant
+314:86:1:ZL010.magic_number:magic number 0xBE; consider using a named constant
+314:92:1:ZL010.magic_number:magic number 0xEF; consider using a named constant
+319:42:1:ZL010.magic_number:magic number 42; consider using a named constant
+320:51:1:ZL010.magic_number:magic number 0xDE; consider using a named constant
+320:57:1:ZL010.magic_number:magic number 0xAD; consider using a named constant
+320:63:1:ZL010.magic_number:magic number 0xBE; consider using a named constant
+320:69:1:ZL010.magic_number:magic number 0xEF; consider using a named constant
+321:52:1:ZL010.magic_number:magic number 4; consider using a named constant
+321:56:1:ZL010.magic_number:magic number 4; consider using a named constant
+330:31:1:ZL010.magic_number:magic number 42; consider using a named constant
+356:32:1:ZL010.magic_number:magic number 42; consider using a named constant
+358:47:1:ZL010.magic_number:magic number 999; consider using a named constant
+358:61:1:ZL010.magic_number:magic number 3; consider using a named constant
+372:95:1:ZL010.magic_number:magic number 42; consider using a named constant
+7:1:1:ZL011.missing_doc_comment:public declaration 'PropertyValue' is missing documentation
+8:1:1:ZL011.missing_doc_comment:public declaration 'Allocator' is missing documentation
+379:30:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+379:21:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator

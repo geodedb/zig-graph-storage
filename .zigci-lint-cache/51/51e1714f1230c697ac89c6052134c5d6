@@ -1,0 +1,22 @@
+164:11:1:ZL201.type_pascalcase:type 'assertMember' should use PascalCase
+164:11:1:ZL203.const_snakecase:constant 'assertMember' should use snake_case (or PascalCase for types)
+128:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+129:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+130:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+131:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+134:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+135:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+136:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+139:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+140:101:2:ZL300.max_line_length:line exceeds 100 characters (124)
+143:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+144:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+145:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+148:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+150:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+153:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+154:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+155:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+169:55:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+120:42:1:ZL010.magic_number:magic number 42; consider using a named constant
+6:1:1:ZL011.missing_doc_comment:public declaration 'StorageError' is missing documentation

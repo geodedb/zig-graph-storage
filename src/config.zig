@@ -152,6 +152,8 @@ pub const GraphConfig = struct {
     /// engine shutdown to prevent key material from lingering in memory.
     pub fn zeroKey(self: *GraphConfig) void {
         if (self.encryption_key) |*key| {
+            // fips-exempt: non-security — defensive key-material zeroing on
+            // shutdown, not a cryptographic algorithm operation.
             std.crypto.secureZero(u8, key);
             self.encryption_key = null;
         }

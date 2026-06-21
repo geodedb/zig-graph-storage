@@ -1,0 +1,24 @@
+331:7:1:ZL203.const_snakecase:constant 'FILE_COUNT' should use snake_case (or PascalCase for types)
+140:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+148:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+149:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+40:9:2:ZL302.max_params:function has too many parameters (7 > 6)
+151:13:1:ZL009.var_should_be_const:variable 'fm' is never reassigned; consider using 'const'
+284:13:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+363:9:1:ZL009.var_should_be_const:variable 'read_buf' is never reassigned; consider using 'const'
+391:9:1:ZL009.var_should_be_const:variable 'env' is never reassigned; consider using 'const'
+395:9:1:ZL009.var_should_be_const:variable 'cp' is never reassigned; consider using 'const'
+143:67:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+151:55:1:ZL010.magic_number:magic number 4096; consider using a named constant
+156:71:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+159:33:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+160:26:1:ZL010.magic_number:magic number 4096; consider using a named constant
+235:13:1:ZL010.magic_number:magic number 5; consider using a named constant
+283:13:1:ZL010.magic_number:magic number 50; consider using a named constant
+343:57:1:ZL010.magic_number:magic number 0x5A; consider using a named constant
+366:41:1:ZL010.magic_number:magic number 0x5A; consider using a named constant
+412:57:1:ZL010.magic_number:magic number 0x6B; consider using a named constant
+40:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+152:19:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+149:45:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+143:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

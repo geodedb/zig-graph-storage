@@ -23,6 +23,8 @@ const VarStore = gs.var_store.VarStore;
 const DualStoreEnv = gs.test_support.DualStoreEnv;
 const PropertyValue = gs.PropertyValue;
 
+// fips-exempt: non-security — type alias only; CRC32C record-integrity
+// (corruption detection) for on-disk format, not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 
 test "fuzz regression: free-space metadata with oversized page counts is rejected" {

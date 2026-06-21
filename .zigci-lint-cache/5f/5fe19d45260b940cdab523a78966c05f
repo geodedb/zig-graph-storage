@@ -1,0 +1,70 @@
+24:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+64:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+79:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+103:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+124:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+149:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+192:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+216:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+245:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+264:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+287:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+320:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+359:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+385:61:3:ZL003.no_empty_catch:empty catch block suppresses errors
+399:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+423:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+374:16:2:ZL204.no_dupe_import:duplicate import of 'thread_pool' (first at line 347)
+38:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+440:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+105:9:1:ZL009.var_should_be_const:variable 'created' is never reassigned; consider using 'const'
+159:9:1:ZL009.var_should_be_const:variable 'out_iter' is never reassigned; consider using 'const'
+170:9:1:ZL009.var_should_be_const:variable 'in_iter' is never reassigned; consider using 'const'
+221:9:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+290:9:1:ZL009.var_should_be_const:variable 'shard_nodes' is never reassigned; consider using 'const'
+298:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+301:9:1:ZL009.var_should_be_const:variable 'seen' is never reassigned; consider using 'const'
+379:9:1:ZL009.var_should_be_const:variable 'caller_pool' is never reassigned; consider using 'const'
+389:9:1:ZL009.var_should_be_const:variable 'cfg' is never reassigned; consider using 'const'
+413:9:1:ZL009.var_should_be_const:variable 'td' is never reassigned; consider using 'const'
+440:9:1:ZL009.var_should_be_const:variable 'thread_errs' is never reassigned; consider using 'const'
+441:9:1:ZL009.var_should_be_const:variable 'threads' is never reassigned; consider using 'const'
+16:24:1:ZL010.magic_number:magic number 0x11; consider using a named constant
+46:24:1:ZL010.magic_number:magic number 0x22; consider using a named constant
+72:24:1:ZL010.magic_number:magic number 0x33; consider using a named constant
+96:24:1:ZL010.magic_number:magic number 0x34; consider using a named constant
+142:24:1:ZL010.magic_number:magic number 0x70; consider using a named constant
+185:24:1:ZL010.magic_number:magic number 0x50; consider using a named constant
+198:26:1:ZL010.magic_number:magic number 7; consider using a named constant
+199:26:1:ZL010.magic_number:magic number 7; consider using a named constant
+209:24:1:ZL010.magic_number:magic number 0x51; consider using a named constant
+238:24:1:ZL010.magic_number:magic number 0x52; consider using a named constant
+257:24:1:ZL010.magic_number:magic number 0x60; consider using a named constant
+269:24:1:ZL010.magic_number:magic number 42; consider using a named constant
+280:24:1:ZL010.magic_number:magic number 0x62; consider using a named constant
+294:29:1:ZL010.magic_number:magic number 7; consider using a named constant
+298:36:1:ZL010.magic_number:magic number 7; consider using a named constant
+313:24:1:ZL010.magic_number:magic number 0x90; consider using a named constant
+329:23:1:ZL010.magic_number:magic number 7; consider using a named constant
+352:24:1:ZL010.magic_number:magic number 0x99; consider using a named constant
+382:24:1:ZL010.magic_number:magic number 4; consider using a named constant
+385:38:1:ZL010.magic_number:magic number 5; consider using a named constant
+392:24:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+416:24:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+18:56:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+49:60:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+73:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+97:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+118:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+143:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+186:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+210:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+239:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+258:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+281:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+314:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+353:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+393:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+417:58:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+444:19:1:ZL603.missing_defer_cleanup:resource 'std.Thread.spawn(' may not be properly cleaned up; consider using defer
+450:13:1:ZL604.expensive_operation:'std.debug.print(' in loop may impact performance

@@ -1,0 +1,33 @@
+70:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+104:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+259:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+22:9:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+136:9:1:ZL009.var_should_be_const:variable 'decision_payload' is never reassigned; consider using 'const'
+171:9:1:ZL009.var_should_be_const:variable 'prepare_payload' is never reassigned; consider using 'const'
+175:9:1:ZL009.var_should_be_const:variable 'decision_payload' is never reassigned; consider using 'const'
+205:13:1:ZL009.var_should_be_const:variable 'decision_payload' is never reassigned; consider using 'const'
+221:9:1:ZL009.var_should_be_const:variable 'td' is never reassigned; consider using 'const'
+243:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+253:9:1:ZL009.var_should_be_const:variable 'eng' is never reassigned; consider using 'const'
+36:15:1:ZL010.magic_number:magic number 4; consider using a named constant
+36:21:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+37:15:1:ZL010.magic_number:magic number 3; consider using a named constant
+37:21:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+38:21:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+39:21:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+78:24:1:ZL010.magic_number:magic number 0x81; consider using a named constant
+119:24:1:ZL010.magic_number:magic number 0x82; consider using a named constant
+138:67:1:ZL010.magic_number:magic number 7; consider using a named constant
+151:24:1:ZL010.magic_number:magic number 0x83; consider using a named constant
+172:65:1:ZL010.magic_number:magic number 5; consider using a named constant
+173:68:1:ZL010.magic_number:magic number 99; consider using a named constant
+177:67:1:ZL010.magic_number:magic number 99; consider using a named constant
+193:24:1:ZL010.magic_number:magic number 0x85; consider using a named constant
+207:71:1:ZL010.magic_number:magic number 7; consider using a named constant
+223:24:1:ZL010.magic_number:magic number 0x84; consider using a named constant
+50:55:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+84:55:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+121:51:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+153:51:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+196:55:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+229:55:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

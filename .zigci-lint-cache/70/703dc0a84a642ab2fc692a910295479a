@@ -1,0 +1,79 @@
+307:7:1:ZL203.const_snakecase:constant 'emptyNode' should use snake_case (or PascalCase for types)
+232:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+280:101:2:ZL300.max_line_length:line exceeds 100 characters (134)
+470:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+506:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+84:55:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+346:9:1:ZL009.var_should_be_const:variable 'called' is never reassigned; consider using 'const'
+362:9:1:ZL009.var_should_be_const:variable 'dummy' is never reassigned; consider using 'const'
+379:9:1:ZL009.var_should_be_const:variable 'store' is never reassigned; consider using 'const'
+385:9:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+397:9:1:ZL009.var_should_be_const:variable 'env' is never reassigned; consider using 'const'
+408:9:1:ZL009.var_should_be_const:variable 'maint' is never reassigned; consider using 'const'
+413:9:1:ZL009.var_should_be_const:variable 'dirty_count' is never reassigned; consider using 'const'
+475:9:1:ZL009.var_should_be_const:variable 'result' is never reassigned; consider using 'const'
+498:9:1:ZL009.var_should_be_const:variable 'aw' is never reassigned; consider using 'const'
+67:11:1:ZL010.magic_number:magic number 4; consider using a named constant
+293:30:1:ZL010.magic_number:magic number 5; consider using a named constant
+294:30:1:ZL010.magic_number:magic number 160; consider using a named constant
+311:25:1:ZL010.magic_number:magic number 42; consider using a named constant
+313:32:1:ZL010.magic_number:magic number 999; consider using a named constant
+314:24:1:ZL010.magic_number:magic number 10; consider using a named constant
+315:26:1:ZL010.magic_number:magic number 20; consider using a named constant
+316:25:1:ZL010.magic_number:magic number 30; consider using a named constant
+317:24:1:ZL010.magic_number:magic number 40; consider using a named constant
+318:22:1:ZL010.magic_number:magic number 50; consider using a named constant
+324:38:1:ZL010.magic_number:magic number 42; consider using a named constant
+326:38:1:ZL010.magic_number:magic number 999; consider using a named constant
+327:38:1:ZL010.magic_number:magic number 10; consider using a named constant
+328:38:1:ZL010.magic_number:magic number 20; consider using a named constant
+329:38:1:ZL010.magic_number:magic number 30; consider using a named constant
+330:38:1:ZL010.magic_number:magic number 40; consider using a named constant
+331:38:1:ZL010.magic_number:magic number 50; consider using a named constant
+375:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+379:68:1:ZL010.magic_number:magic number 4096; consider using a named constant
+385:71:1:ZL010.magic_number:magic number 4096; consider using a named constant
+393:52:1:ZL010.magic_number:magic number 10; consider using a named constant
+397:87:1:ZL010.magic_number:magic number 4096; consider using a named constant
+402:13:1:ZL010.magic_number:magic number 3; consider using a named constant
+425:32:1:ZL010.magic_number:magic number 5; consider using a named constant
+431:29:1:ZL010.magic_number:magic number 10; consider using a named constant
+432:29:1:ZL010.magic_number:magic number 20; consider using a named constant
+433:36:1:ZL010.magic_number:magic number 30; consider using a named constant
+436:29:1:ZL010.magic_number:magic number 3; consider using a named constant
+437:28:1:ZL010.magic_number:magic number 4; consider using a named constant
+438:26:1:ZL010.magic_number:magic number 5; consider using a named constant
+442:33:1:ZL010.magic_number:magic number 10; consider using a named constant
+443:33:1:ZL010.magic_number:magic number 20; consider using a named constant
+444:40:1:ZL010.magic_number:magic number 30; consider using a named constant
+447:33:1:ZL010.magic_number:magic number 3; consider using a named constant
+448:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+449:30:1:ZL010.magic_number:magic number 5; consider using a named constant
+456:26:1:ZL010.magic_number:magic number 5; consider using a named constant
+457:26:1:ZL010.magic_number:magic number 160; consider using a named constant
+487:36:1:ZL010.magic_number:magic number 4; consider using a named constant
+46:1:1:ZL011.missing_doc_comment:public declaration 'MaintenanceResult' is missing documentation
+70:5:1:ZL011.missing_doc_comment:public declaration 'addArtifact' is missing documentation
+76:5:1:ZL011.missing_doc_comment:public declaration 'writeJson' is missing documentation
+134:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+151:5:1:ZL011.missing_doc_comment:public declaration 'forceCheckpointResult' is missing documentation
+191:5:1:ZL011.missing_doc_comment:public declaration 'rebuildLabelIndexResult' is missing documentation
+232:5:1:ZL011.missing_doc_comment:public declaration 'flushDirtyPagesResult' is missing documentation
+264:5:1:ZL011.missing_doc_comment:public declaration 'getStatsResult' is missing documentation
+97:47:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+102:47:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+108:47:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+114:47:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+466:64:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+468:75:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+470:72:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+504:64:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+506:72:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+80:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+94:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+466:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+467:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+471:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+504:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+505:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+507:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path

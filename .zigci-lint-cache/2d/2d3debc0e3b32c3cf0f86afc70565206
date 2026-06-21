@@ -1,0 +1,66 @@
+97:8:1:ZL200.fn_camelcase:function 'ShardedStore' should use camelCase
+75:11:1:ZL203.const_snakecase:constant 'SHARD_COUNT' should use snake_case (or PascalCase for types)
+67:101:2:ZL300.max_line_length:line exceeds 100 characters (167)
+97:5:2:ZL301.max_function_lines:function exceeds 80 lines (159)
+231:30:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+173:17:1:ZL009.var_should_be_const:variable 'total' is never reassigned; consider using 'const'
+278:9:1:ZL009.var_should_be_const:variable 'populated' is never reassigned; consider using 'const'
+293:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+355:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+367:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+378:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+391:9:1:ZL009.var_should_be_const:variable 'seen' is never reassigned; consider using 'const'
+394:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+407:9:1:ZL009.var_should_be_const:variable 'store' is never reassigned; consider using 'const'
+410:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+413:9:1:ZL009.var_should_be_const:variable 'sum' is never reassigned; consider using 'const'
+414:9:1:ZL009.var_should_be_const:variable 'visited' is never reassigned; consider using 'const'
+415:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+428:9:1:ZL009.var_should_be_const:variable 'counts' is never reassigned; consider using 'const'
+429:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+87:20:1:ZL010.magic_number:magic number 30; consider using a named constant
+88:20:1:ZL010.magic_number:magic number 27; consider using a named constant
+89:19:1:ZL010.magic_number:magic number 31; consider using a named constant
+270:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+274:55:1:ZL010.magic_number:magic number 3; consider using a named constant
+287:40:1:ZL010.magic_number:magic number 42; consider using a named constant
+287:56:1:ZL010.magic_number:magic number 42; consider using a named constant
+294:16:1:ZL010.magic_number:magic number 10000; consider using a named constant
+303:19:1:ZL010.magic_number:magic number 7; consider using a named constant
+303:22:1:ZL010.magic_number:magic number 99; consider using a named constant
+305:39:1:ZL010.magic_number:magic number 99; consider using a named constant
+306:34:1:ZL010.magic_number:magic number 7; consider using a named constant
+315:19:1:ZL010.magic_number:magic number 3; consider using a named constant
+315:22:1:ZL010.magic_number:magic number 3; consider using a named constant
+316:40:1:ZL010.magic_number:magic number 3; consider using a named constant
+323:19:1:ZL010.magic_number:magic number 11; consider using a named constant
+323:23:1:ZL010.magic_number:magic number 22; consider using a named constant
+325:38:1:ZL010.magic_number:magic number 11; consider using a named constant
+326:38:1:ZL010.magic_number:magic number 22; consider using a named constant
+327:42:1:ZL010.magic_number:magic number 11; consider using a named constant
+342:26:1:ZL010.magic_number:magic number 200; consider using a named constant
+344:38:1:ZL010.magic_number:magic number 200; consider using a named constant
+344:54:1:ZL010.magic_number:magic number 7; consider using a named constant
+368:16:1:ZL010.magic_number:magic number 50; consider using a named constant
+369:36:1:ZL010.magic_number:magic number 500; consider using a named constant
+370:16:1:ZL010.magic_number:magic number 550; consider using a named constant
+371:40:1:ZL010.magic_number:magic number 550; consider using a named constant
+395:17:1:ZL010.magic_number:magic number 200; consider using a named constant
+402:40:1:ZL010.magic_number:magic number 200; consider using a named constant
+411:17:1:ZL010.magic_number:magic number 50; consider using a named constant
+411:71:1:ZL010.magic_number:magic number 10; consider using a named constant
+420:40:1:ZL010.magic_number:magic number 50; consider using a named constant
+422:38:1:ZL010.magic_number:magic number 12750; consider using a named constant
+106:9:1:ZL011.missing_doc_comment:public declaration 'Shard' is missing documentation
+116:9:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+122:9:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+126:9:1:ZL011.missing_doc_comment:public declaration 'put' is missing documentation
+131:9:1:ZL011.missing_doc_comment:public declaration 'get' is missing documentation
+136:9:1:ZL011.missing_doc_comment:public declaration 'getPtr' is missing documentation
+159:9:1:ZL011.missing_doc_comment:public declaration 'contains' is missing documentation
+172:9:1:ZL011.missing_doc_comment:public declaration 'count' is missing documentation
+225:9:1:ZL011.missing_doc_comment:public declaration 'Iterator' is missing documentation
+230:13:1:ZL011.missing_doc_comment:public declaration 'next' is missing documentation
+240:9:1:ZL011.missing_doc_comment:public declaration 'KeyIterator' is missing documentation
+245:13:1:ZL011.missing_doc_comment:public declaration 'next' is missing documentation
+180:56:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path

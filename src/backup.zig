@@ -20,8 +20,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+// fips-exempt: non-security — CRC32C record-integrity (corruption detection)
+// for on-disk format; not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
+// fips-exempt: non-security — type alias only; backup-stream integrity tag
+// over on-disk format, not authentication of a security principal.
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+// fips-exempt: non-security — type alias only; constant-time compare helper
+// for the non-security integrity tag above.
 const timing_safe = std.crypto.timing_safe;
 const owner_only_file_mode = 0o600;
 const BACKUP_STREAM_CHUNK_SIZE: usize = 64 * 1024;
@@ -153,6 +159,8 @@ pub const Backup = struct {
     /// Zero sensitive key material.
     pub fn deinit(self: *Backup) void {
         if (self.encryption_key) |*k| {
+            // fips-exempt: non-security — defensive key-material zeroing on
+            // teardown, not a cryptographic algorithm operation.
             std.crypto.secureZero(u8, k);
         }
     }

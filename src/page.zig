@@ -49,6 +49,7 @@ comptime {
 
 /// Compute CRC32C checksum over body bytes.
 pub fn computeChecksum(body: []const u8) u32 {
+    // fips-exempt: non-security — page-body CRC32C corruption check.
     return std.hash.crc.Crc32Iscsi.hash(body);
 }
 

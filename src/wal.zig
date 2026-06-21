@@ -35,6 +35,46 @@ pub const WalManager = struct {
     inner: wal_lib.WriteAheadLog,
     current_lsn: u64,
 
+    // ------------------------------------------------------------------
+    // GAP-0900: per-transaction WAL record batching.
+    //
+    // When a caller opens a batch (`beginBatch`) the page-update records
+    // produced while applying that ONE transaction are serialized into
+    // owned buffers and collected here instead of being written one
+    // syscall at a time. `flushBatch` writes the whole collection with a
+    // SINGLE `inner.appendBatch` — byte-identical on-disk output to N
+    // `inner.append` calls, same LSN scheme — right before the commit
+    // record + fsync decision. This drops the writev syscall count from
+    // O(pages) to O(1) per coordinator batch WITHOUT changing durability:
+    // every record still reaches the OS page cache before the batch is
+    // acknowledged (the buffer never survives the commit/abort boundary).
+    //
+    // Buffering is scoped to a single txn id (`batch_txn_id`). Records for
+    // any OTHER txn — or any caller that never opened a batch — fall
+    // straight through to the per-record `inner.append` path, so recovery,
+    // addLabel, auto-commit, and concurrent txns are unaffected.
+    /// True while a batch is open and collecting records for `batch_txn_id`.
+    batch_active: bool = false,
+    /// The txn id whose page-update records are collected into the arena.
+    batch_txn_id: u64 = 0,
+    /// Contiguous byte arena holding all serialized records of the open
+    /// batch back-to-back. Retained (capacity kept) across batches so steady
+    /// state incurs no per-record heap allocation — matching the per-record
+    /// stack-buffer fast path's allocation profile (PERF-0055).
+    batch_arena: std.ArrayList(u8) = .empty,
+    /// (offset, len) of each record within `batch_arena`. Resolved into the
+    /// `[]const []const u8` that `inner.appendBatch` needs at flush time.
+    /// Retained across batches alongside the arena.
+    batch_spans: std.ArrayList(Span) = .empty,
+    /// Scratch slice array materialized at flush time from `batch_spans` +
+    /// `batch_arena` and handed to `inner.appendBatch`. Retained across
+    /// batches to avoid a per-flush allocation. Held separately from the
+    /// arena because the arena pointer can only be resolved once it has
+    /// stopped growing (i.e. at flush, not during collection).
+    batch_ptrs: std.ArrayList([]const u8) = .empty,
+
+    const Span = struct { off: usize, len: usize };
+
     /// Initialize the WAL manager. Delegates segment management to the external
     /// wal library.
     ///
@@ -66,6 +106,12 @@ pub const WalManager = struct {
 
     /// Clean up resources.
     pub fn deinit(self: *WalManager) void {
+        // Drop any records buffered but never flushed (e.g. a batch left
+        // open at shutdown). These were NEVER written to the log, so this
+        // is consistent with abort semantics — no durability is lost.
+        self.batch_arena.deinit(self.allocator);
+        self.batch_spans.deinit(self.allocator);
+        self.batch_ptrs.deinit(self.allocator);
         self.inner.deinit();
     }
 
@@ -82,6 +128,24 @@ pub const WalManager = struct {
 
         const needed = record.serializedSize();
 
+        // GAP-0900: when a batch is open for THIS record's txn, serialize
+        // into an owned buffer and collect it instead of issuing a syscall.
+        // The LSN is assigned above exactly as in the per-record path, so
+        // ordering/contiguity are preserved; `flushBatch` later writes the
+        // whole collection via `inner.appendBatch`. Any record for a
+        // different txn — or when no batch is open — takes the immediate
+        // write path below.
+        if (self.batch_active and record.txn_id == self.batch_txn_id) {
+            const off = self.batch_arena.items.len;
+            // Grow the arena in place (capacity retained across batches), then
+            // serialize directly into the freshly appended region. No per-record
+            // heap allocation once the arena has warmed to steady-state size.
+            try self.batch_arena.resize(self.allocator, off + needed);
+            const n = try record.serializeInto(self.batch_arena.items[off..][0..needed]);
+            try self.batch_spans.append(self.allocator, .{ .off = off, .len = n });
+            return self.current_lsn;
+        }
+
         if (needed <= STACK_BUF_SIZE) {
             // Fast path: use stack buffer, no heap allocation
             var buf: [STACK_BUF_SIZE]u8 = undefined;
@@ -94,6 +158,96 @@ pub const WalManager = struct {
             const n = try record.serializeInto(buf);
             return try self.inner.append(buf[0..n]);
         }
+    }
+
+    /// GAP-0900: open a WAL record batch scoped to `txn_id`. While open,
+    /// `appendRecord` calls for `txn_id` collect serialized records instead
+    /// of writing each one; `flushBatch` writes them all in one syscall.
+    ///
+    /// Callers MUST pair this with exactly one `flushBatch` (success path)
+    /// or `abortBatch` (rollback) before the transaction is acknowledged —
+    /// records buffered here are NOT durable until flushed. Returns
+    /// `error.BatchAlreadyOpen` if a batch is already active (no nesting).
+    pub fn beginBatch(self: *WalManager, txn_id: u64) !void {
+        if (self.batch_active) return error.BatchAlreadyOpen;
+        std.debug.assert(self.batch_spans.items.len == 0);
+        self.batch_active = true;
+        self.batch_txn_id = txn_id;
+    }
+
+    /// GAP-0900: write all records collected since `beginBatch` with a
+    /// single `inner.appendBatch`, then close the batch. The on-disk bytes
+    /// and the inner log's LSN advancement are identical to having issued
+    /// one `inner.append` per record. Idempotent for an empty batch (just
+    /// closes it). After this returns every record has reached the OS page
+    /// cache — the same point-in-time durability as the per-record path.
+    ///
+    /// On a write error the records are dropped and the batch is closed
+    /// (the inner log already truncated any partial write, SEC-0030); the
+    /// error propagates so the caller aborts the transaction.
+    pub fn flushBatch(self: *WalManager) !void {
+        if (!self.batch_active) return;
+        defer self.closeBatch();
+        const n_records = self.batch_spans.items.len;
+        if (n_records == 0) return;
+
+        const base = self.batch_arena.items;
+
+        // Single-record batch: a one-element appendBatch buys nothing (no
+        // syscall amortisation) and is heavier than a plain append (the
+        // batch path allocates an LSN array + a coalescing buffer). Route it
+        // through the per-record append so the common single-page auto-commit
+        // txn keeps its lean allocation profile (PERF-0055). On-disk output
+        // is identical either way.
+        if (n_records == 1) {
+            const s = self.batch_spans.items[0];
+            _ = try self.inner.append(base[s.off..][0..s.len]);
+            return;
+        }
+
+        // Multi-record batch: materialize the slice array now that the arena
+        // has stopped growing (its base pointer is stable) and write all
+        // records in one syscall. appendBatch produces byte-identical on-disk
+        // records, in span order, to N sequential appends.
+        self.batch_ptrs.clearRetainingCapacity();
+        try self.batch_ptrs.ensureTotalCapacity(self.allocator, n_records);
+        for (self.batch_spans.items) |s| {
+            self.batch_ptrs.appendAssumeCapacity(base[s.off..][0..s.len]);
+        }
+        _ = try self.inner.appendBatch(self.batch_ptrs.items);
+    }
+
+    /// GAP-0900: flush the batch only if it is owned by `txn_id`. A no-op
+    /// when no batch is open or the open batch belongs to a different txn
+    /// (that txn used the per-record path). Lets callers commit a txn
+    /// without disturbing an unrelated concurrent batch.
+    pub fn flushBatchFor(self: *WalManager, txn_id: u64) !void {
+        if (!self.batch_active or self.batch_txn_id != txn_id) return;
+        try self.flushBatch();
+    }
+
+    /// GAP-0900: discard all records collected since `beginBatch` WITHOUT
+    /// writing them, then close the batch. Used on transaction abort so a
+    /// rolled-back txn leaves no page-update records in the log.
+    pub fn abortBatch(self: *WalManager) void {
+        if (!self.batch_active) return;
+        self.closeBatch();
+    }
+
+    /// GAP-0900: abort the batch only if it is owned by `txn_id`. A no-op
+    /// otherwise (see `flushBatchFor`).
+    pub fn abortBatchFor(self: *WalManager, txn_id: u64) void {
+        if (!self.batch_active or self.batch_txn_id != txn_id) return;
+        self.closeBatch();
+    }
+
+    /// Reset batch state, retaining arena/span/ptr capacity for reuse. Internal.
+    fn closeBatch(self: *WalManager) void {
+        self.batch_arena.clearRetainingCapacity();
+        self.batch_spans.clearRetainingCapacity();
+        self.batch_ptrs.clearRetainingCapacity();
+        self.batch_active = false;
+        self.batch_txn_id = 0;
     }
 
     /// Sync the WAL to disk (fsync).
@@ -444,6 +598,280 @@ test "forEachFrom streams records in order" {
     try mgr.forEachFrom(2, allocator, &ctx, Ctx.visit);
     try std.testing.expectEqual(@as(usize, 3), ctx.count);
     try std.testing.expectEqual(@as(u64, 4), ctx.last_lsn);
+}
+
+test "GAP-0900: batched records recover identically and in order after reopen" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const uuid = [_]u8{0x91} ** 16;
+
+    // --- Write phase: one begin, a multi-record batch, one commit ---
+    {
+        var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
+        defer mgr.deinit();
+
+        var begin = WalRecord{
+            .lsn = 0,
+            .txn_id = 7,
+            .record_type = .begin_txn,
+            .file_id = 0,
+            .page_id = 0,
+            .payload = &[_]u8{},
+            .checksum = 0,
+        };
+        _ = try mgr.appendRecord(&begin);
+
+        // Open the batch for txn 7 and append several page updates. They are
+        // buffered (not yet on disk) until flushBatch.
+        try mgr.beginBatch(7);
+        const payloads = [_][]const u8{
+            "page-update-A",
+            "page-update-B-longer-content",
+            "C",
+            "page-update-D",
+        };
+        for (payloads, 0..) |p, i| {
+            var rec = WalRecord{
+                .lsn = 0,
+                .txn_id = 7,
+                .record_type = .page_update,
+                .file_id = 2,
+                .page_id = 100 + i,
+                .payload = p,
+                .checksum = 0,
+            };
+            _ = try mgr.appendRecord(&rec);
+        }
+
+        // Records must NOT be visible before flush (buffered in memory only).
+        const pre = try mgr.readFrom(1, allocator);
+        defer {
+            for (pre) |*r| r.deinit(allocator);
+            allocator.free(pre);
+        }
+        try std.testing.expectEqual(@as(usize, 1), pre.len); // only begin_txn
+
+        // Flush the batch (single appendBatch), then commit.
+        try mgr.flushBatch();
+        var commit = WalRecord{
+            .lsn = 0,
+            .txn_id = 7,
+            .record_type = .commit_txn,
+            .file_id = 0,
+            .page_id = 0,
+            .payload = &[_]u8{},
+            .checksum = 0,
+        };
+        _ = try mgr.appendRecord(&commit);
+        try mgr.sync();
+    }
+
+    // --- Recovery phase: reopen and verify every record survives intact ---
+    {
+        var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
+        defer mgr.deinit();
+
+        var failure: ?ReplayFailure = null;
+        const Ctx = struct {
+            recs: std.ArrayList(WalRecord) = .empty,
+            alloc: Allocator,
+            fn visit(self: *@This(), rec: *const WalRecord) !void {
+                // Validate checksum integrity of every recovered record.
+                try std.testing.expectEqual(rec.checksum, rec.computeChecksum());
+                try self.recs.append(self.alloc, .{
+                    .lsn = rec.lsn,
+                    .txn_id = rec.txn_id,
+                    .record_type = rec.record_type,
+                    .file_id = rec.file_id,
+                    .page_id = rec.page_id,
+                    .payload = try self.alloc.dupe(u8, rec.payload),
+                    .checksum = rec.checksum,
+                });
+            }
+        };
+        var ctx = Ctx{ .alloc = allocator };
+        defer {
+            for (ctx.recs.items) |*r| allocator.free(@constCast(r.payload));
+            ctx.recs.deinit(allocator);
+        }
+
+        try mgr.forEachFromStrict(0, allocator, &failure, &ctx, Ctx.visit);
+        try std.testing.expect(failure == null);
+
+        // begin + 4 page_update + commit = 6 records, contiguous LSN 1..6.
+        try std.testing.expectEqual(@as(usize, 6), ctx.recs.items.len);
+        try std.testing.expectEqual(wal_record.WalRecordType.begin_txn, ctx.recs.items[0].record_type);
+        try std.testing.expectEqual(wal_record.WalRecordType.commit_txn, ctx.recs.items[5].record_type);
+        for (ctx.recs.items, 0..) |r, i| {
+            try std.testing.expectEqual(@as(u64, i + 1), r.lsn);
+        }
+        const expect = [_][]const u8{
+            "page-update-A",
+            "page-update-B-longer-content",
+            "C",
+            "page-update-D",
+        };
+        for (expect, 0..) |p, i| {
+            const r = ctx.recs.items[i + 1];
+            try std.testing.expectEqual(wal_record.WalRecordType.page_update, r.record_type);
+            try std.testing.expectEqual(@as(u64, 100 + i), r.page_id);
+            try std.testing.expectEqualStrings(p, r.payload);
+        }
+    }
+}
+
+test "GAP-0900: batched flush is byte-identical to per-record append" {
+    const allocator = std.testing.allocator;
+
+    // Path A: per-record appends.
+    var dir_a = std.testing.tmpDir(.{});
+    defer dir_a.cleanup();
+    // Path B: batched flush.
+    var dir_b = std.testing.tmpDir(.{});
+    defer dir_b.cleanup();
+
+    const uuid = [_]u8{0x92} ** 16;
+    const payloads = [_][]const u8{ "alpha", "bravo-payload", "c", "delta-delta-delta", "echo" };
+
+    {
+        var a = try WalManager.init(allocator, dir_a.dir, uuid, 0, .{});
+        defer a.deinit();
+        for (payloads, 0..) |p, i| {
+            var rec = WalRecord{
+                .lsn = 0,
+                .txn_id = 3,
+                .record_type = .page_update,
+                .file_id = 1,
+                .page_id = i,
+                .payload = p,
+                .checksum = 0,
+            };
+            _ = try a.appendRecord(&rec);
+        }
+        try a.sync();
+    }
+    {
+        var b = try WalManager.init(allocator, dir_b.dir, uuid, 0, .{});
+        defer b.deinit();
+        try b.beginBatch(3);
+        for (payloads, 0..) |p, i| {
+            var rec = WalRecord{
+                .lsn = 0,
+                .txn_id = 3,
+                .record_type = .page_update,
+                .file_id = 1,
+                .page_id = i,
+                .payload = p,
+                .checksum = 0,
+            };
+            _ = try b.appendRecord(&rec);
+        }
+        try b.flushBatch();
+        try b.sync();
+    }
+
+    // The raw on-disk WAL files must be byte-for-byte identical.
+    const bytes_a = try readWholeFile(allocator, dir_a.dir, "graph.wal");
+    defer allocator.free(bytes_a);
+    const bytes_b = try readWholeFile(allocator, dir_b.dir, "graph.wal");
+    defer allocator.free(bytes_b);
+    try std.testing.expectEqualSlices(u8, bytes_a, bytes_b);
+}
+
+/// TEST-ONLY: read an entire file from `dir` into a freshly allocated buffer.
+fn readWholeFile(allocator: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try dir.openFile(io, name, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const buf = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(buf);
+    const n = try file.readPositionalAll(io, buf, 0);
+    return buf[0..n];
+}
+
+test "GAP-0900: aborted batch leaves no page-update records in the log" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const uuid = [_]u8{0x93} ** 16;
+
+    var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
+    defer mgr.deinit();
+
+    var begin = WalRecord{
+        .lsn = 0,
+        .txn_id = 9,
+        .record_type = .begin_txn,
+        .file_id = 0,
+        .page_id = 0,
+        .payload = &[_]u8{},
+        .checksum = 0,
+    };
+    _ = try mgr.appendRecord(&begin);
+
+    try mgr.beginBatch(9);
+    for (0..3) |i| {
+        var rec = WalRecord{
+            .lsn = 0,
+            .txn_id = 9,
+            .record_type = .page_update,
+            .file_id = 1,
+            .page_id = i,
+            .payload = "discarded",
+            .checksum = 0,
+        };
+        _ = try mgr.appendRecord(&rec);
+    }
+    // Abort: buffered records must be dropped, never written.
+    mgr.abortBatch();
+    try mgr.sync();
+
+    const records = try mgr.readFrom(1, allocator);
+    defer {
+        for (records) |*r| r.deinit(allocator);
+        allocator.free(records);
+    }
+    // Only the begin_txn record was actually written.
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(wal_record.WalRecordType.begin_txn, records[0].record_type);
+}
+
+test "GAP-0900: records for a non-batched txn fall through to immediate write" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const uuid = [_]u8{0x94} ** 16;
+    var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
+    defer mgr.deinit();
+
+    // Open a batch for txn 1, but append a record for txn 2 — it must NOT be
+    // buffered (different txn) and must be immediately visible.
+    try mgr.beginBatch(1);
+    var other = WalRecord{
+        .lsn = 0,
+        .txn_id = 2,
+        .record_type = .page_update,
+        .file_id = 1,
+        .page_id = 5,
+        .payload = "other-txn",
+        .checksum = 0,
+    };
+    _ = try mgr.appendRecord(&other);
+
+    const seen = try mgr.readFrom(1, allocator);
+    defer {
+        for (seen) |*r| r.deinit(allocator);
+        allocator.free(seen);
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen.len);
+    try std.testing.expectEqual(@as(u64, 2), seen[0].txn_id);
+
+    mgr.abortBatch();
 }
 
 test {

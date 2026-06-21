@@ -1,0 +1,10 @@
+185:13:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+317:9:1:ZL009.var_should_be_const:variable 'tmp_dir' is never reassigned; consider using 'const'
+320:9:1:ZL009.var_should_be_const:variable 'wal' is never reassigned; consider using 'const'
+323:9:1:ZL009.var_should_be_const:variable 'txn_mgr' is never reassigned; consider using 'const'
+203:24:1:ZL010.magic_number:magic number 0xEE; consider using a named constant
+224:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+312:46:1:ZL010.magic_number:magic number 999; consider using a named constant
+344:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+350:41:1:ZL010.magic_number:magic number 3; consider using a named constant
+351:42:1:ZL010.magic_number:magic number 42; consider using a named constant

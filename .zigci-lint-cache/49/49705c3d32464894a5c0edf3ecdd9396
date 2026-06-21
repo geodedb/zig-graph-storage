@@ -1,0 +1,99 @@
+13:11:1:ZL203.const_snakecase:constant 'MANIFEST_MAGIC' should use snake_case (or PascalCase for types)
+14:11:1:ZL203.const_snakecase:constant 'MANIFEST_VERSION' should use snake_case (or PascalCase for types)
+27:11:1:ZL203.const_snakecase:constant 'MANIFEST_HMAC_SIZE' should use snake_case (or PascalCase for types)
+32:11:1:ZL203.const_snakecase:constant 'MANIFEST_VERSION_V1' should use snake_case (or PascalCase for types)
+36:7:1:ZL203.const_snakecase:constant 'FIELD_SIZE' should use snake_case (or PascalCase for types)
+38:11:1:ZL203.const_snakecase:constant 'SERIALIZED_SIZE' should use snake_case (or PascalCase for types)
+40:11:1:ZL203.const_snakecase:constant 'SERIALIZED_SIZE_HMAC' should use snake_case (or PascalCase for types)
+9:101:2:ZL300.max_line_length:line exceeds 100 characters (193)
+10:101:2:ZL300.max_line_length:line exceeds 100 characters (163)
+36:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+214:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+226:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+236:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+248:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+401:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+418:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+421:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+487:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+536:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+541:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+550:101:2:ZL300.max_line_length:line exceeds 100 characters (130)
+558:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+560:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+80:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+114:17:1:ZL009.var_should_be_const:variable 'tag' is never reassigned; consider using 'const'
+152:17:1:ZL009.var_should_be_const:variable 'expected' is never reassigned; consider using 'const'
+154:17:1:ZL009.var_should_be_const:variable 'stored' is never reassigned; consider using 'const'
+161:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+301:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+407:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+442:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+534:9:1:ZL009.var_should_be_const:variable 'tmp_dir' is never reassigned; consider using 'const'
+45:22:1:ZL010.magic_number:magic number 8192; consider using a named constant
+165:16:1:ZL010.magic_number:magic number 4; consider using a named constant
+169:16:1:ZL010.magic_number:magic number 4; consider using a named constant
+185:16:1:ZL010.magic_number:magic number 4; consider using a named constant
+278:29:1:ZL010.magic_number:magic number 4; consider using a named constant
+279:14:1:ZL010.magic_number:magic number 4; consider using a named constant
+288:67:1:ZL010.magic_number:magic number 4; consider using a named constant
+302:20:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+306:20:1:ZL010.magic_number:magic number 42; consider using a named constant
+308:25:1:ZL010.magic_number:magic number 200; consider using a named constant
+309:24:1:ZL010.magic_number:magic number 300; consider using a named constant
+310:24:1:ZL010.magic_number:magic number 5; consider using a named constant
+311:24:1:ZL010.magic_number:magic number 10; consider using a named constant
+312:26:1:ZL010.magic_number:magic number 20; consider using a named constant
+313:25:1:ZL010.magic_number:magic number 30; consider using a named constant
+314:24:1:ZL010.magic_number:magic number 40; consider using a named constant
+315:22:1:ZL010.magic_number:magic number 50; consider using a named constant
+316:23:1:ZL010.magic_number:magic number 60; consider using a named constant
+317:23:1:ZL010.magic_number:magic number 70; consider using a named constant
+318:23:1:ZL010.magic_number:magic number 80; consider using a named constant
+351:17:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+371:36:1:ZL010.magic_number:magic number 10; consider using a named constant
+372:36:1:ZL010.magic_number:magic number 20; consider using a named constant
+374:42:1:ZL010.magic_number:magic number 20; consider using a named constant
+377:42:1:ZL010.magic_number:magic number 20; consider using a named constant
+381:36:1:ZL010.magic_number:magic number 5; consider using a named constant
+383:42:1:ZL010.magic_number:magic number 5; consider using a named constant
+386:42:1:ZL010.magic_number:magic number 5; consider using a named constant
+408:20:1:ZL010.magic_number:magic number 0xCD; consider using a named constant
+412:20:1:ZL010.magic_number:magic number 99; consider using a named constant
+413:25:1:ZL010.magic_number:magic number 500; consider using a named constant
+421:99:1:ZL010.magic_number:magic number 0o7777; consider using a named constant
+440:23:1:ZL010.magic_number:magic number 0x43; consider using a named constant
+443:20:1:ZL010.magic_number:magic number 0xCD; consider using a named constant
+447:20:1:ZL010.magic_number:magic number 7; consider using a named constant
+448:32:1:ZL010.magic_number:magic number 1234; consider using a named constant
+449:25:1:ZL010.magic_number:magic number 500; consider using a named constant
+450:23:1:ZL010.magic_number:magic number 9; consider using a named constant
+451:23:1:ZL010.magic_number:magic number 11; consider using a named constant
+471:23:1:ZL010.magic_number:magic number 0x43; consider using a named constant
+474:29:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+475:20:1:ZL010.magic_number:magic number 10; consider using a named constant
+476:32:1:ZL010.magic_number:magic number 9999; consider using a named constant
+487:36:1:ZL010.magic_number:magic number 4; consider using a named constant
+487:45:1:ZL010.magic_number:magic number 4; consider using a named constant
+500:23:1:ZL010.magic_number:magic number 0x43; consider using a named constant
+502:45:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+502:69:1:ZL010.magic_number:magic number 3; consider using a named constant
+513:45:1:ZL010.magic_number:magic number 0x11; consider using a named constant
+513:69:1:ZL010.magic_number:magic number 42; consider using a named constant
+532:23:1:ZL010.magic_number:magic number 0x77; consider using a named constant
+541:45:1:ZL010.magic_number:magic number 0xEE; consider using a named constant
+541:69:1:ZL010.magic_number:magic number 21; consider using a named constant
+541:96:1:ZL010.magic_number:magic number 555; consider using a named constant
+546:42:1:ZL010.magic_number:magic number 555; consider using a named constant
+560:39:1:ZL010.magic_number:magic number 4; consider using a named constant
+560:48:1:ZL010.magic_number:magic number 4; consider using a named constant
+13:1:1:ZL011.missing_doc_comment:public declaration 'MANIFEST_MAGIC' is missing documentation
+14:1:1:ZL011.missing_doc_comment:public declaration 'MANIFEST_VERSION' is missing documentation
+42:1:1:ZL011.missing_doc_comment:public declaration 'Manifest' is missing documentation
+434:57:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+434:57:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+248:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+418:44:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+550:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+115:23:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+153:23:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

@@ -254,7 +254,38 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
 
 /// Run a full checkpoint: update manifest counters, flush dirty pages,
 /// persist free space bitmaps, derived indexes, and label dictionary.
+///
+/// Backward-compatible wrapper: existing callers get the full behavior
+/// (save_derived = true).
 pub fn checkpoint(engine: *GraphEngine) anyerror!void {
+    return checkpointEx(engine, true);
+}
+
+/// Run a "light" (incremental/bounded) checkpoint: do the memory-bounding work
+/// (flush dirty pages, sync dirty files, write manifest, TRUNCATE the WAL,
+/// persist free space + label dictionary + declared B+tree indexes) but SKIP
+/// the O(graph-size) derived-index snapshot save.
+///
+/// GAP-0900 Layer-2: the full checkpoint re-saves label_index + property_index
+/// + edge_index by iterating ALL entries every time, which is O(nodes/edges)
+/// and cannot keep pace during a 13M ingest -> checkpoints fall behind -> WAL +
+/// dirty pages grow -> RSS climbs -> OOM. The light checkpoint is O(dirty).
+///
+/// This is SAFE: skipping the derived-index save leaves the on-disk snapshots
+/// stale (their saved counter stays behind manifest.counter, which doCheckpoint
+/// advances). On reopen, tryLoadDerivedIndexes() compares each snapshot's
+/// counter to manifest.counter, finds them stale, returns false, and
+/// rebuildDerivedIndexes() reconstructs them from the durable node/edge pages.
+/// The pages are flushed and the WAL is truncated, so no data is lost.
+pub fn checkpointLight(engine: *GraphEngine) anyerror!void {
+    return checkpointEx(engine, false);
+}
+
+/// Core checkpoint implementation. When `save_derived` is false the
+/// O(graph-size) derived-index snapshot save is skipped and the index dirty
+/// flags are PRESERVED so a later full checkpoint (e.g. clean shutdown) still
+/// persists them.
+pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     if (!engine.persistence_dirty) {
         return;
     }
@@ -280,15 +311,23 @@ pub fn checkpoint(engine: *GraphEngine) anyerror!void {
 
     // Persist free space bitmaps so freed pages survive restart.
     try saveFreeStore(engine);
-    try engine_index.saveDerivedIndexesConditional(
-        engine,
-        engine.label_index_dirty,
-        engine.property_index_dirty,
-        engine.edge_index_dirty,
-    );
-    engine.label_index_dirty = false;
-    engine.property_index_dirty = false;
-    engine.edge_index_dirty = false;
+    // GAP-0900 L2: the derived-index snapshot save is the only O(graph-size)
+    // step here. The light path skips it (recovery rebuilds from pages) and
+    // leaves the dirty flags set so a later full checkpoint still persists them.
+    if (save_derived) {
+        try engine_index.saveDerivedIndexesConditional(
+            engine,
+            engine.label_index_dirty,
+            engine.property_index_dirty,
+            engine.edge_index_dirty,
+        );
+        engine.label_index_dirty = false;
+        engine.property_index_dirty = false;
+        engine.edge_index_dirty = false;
+        engine.metrics.derived_index_saves += 1;
+    }
+    // Label dictionary is O(labels) and is NOT rebuildable from pages (it maps
+    // name<->id), so it is persisted on every checkpoint, light or full.
     try saveLabelDictionary(engine);
     // GAP-0027: persist the index catalog + declared B+tree property indexes.
     // No-op when no index is declared (opt-in / backward compat).

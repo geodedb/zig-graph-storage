@@ -1,0 +1,110 @@
+254:39:3:ZL003.no_empty_catch:empty catch block suppresses errors
+179:15:1:ZL203.const_snakecase:constant 'MEMBER_OF' should use snake_case (or PascalCase for types)
+180:15:1:ZL203.const_snakecase:constant 'LOGGED_INTO' should use snake_case (or PascalCase for types)
+181:15:1:ZL203.const_snakecase:constant 'SIGNED_IN_FROM' should use snake_case (or PascalCase for types)
+182:15:1:ZL203.const_snakecase:constant 'SIGNED_IN_TO' should use snake_case (or PascalCase for types)
+184:15:1:ZL203.const_snakecase:constant 'LOCATED_AT' should use snake_case (or PascalCase for types)
+186:15:1:ZL203.const_snakecase:constant 'RISK_DETECTED' should use snake_case (or PascalCase for types)
+267:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+268:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+303:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+304:101:2:ZL300.max_line_length:line exceeds 100 characters (122)
+305:101:2:ZL300.max_line_length:line exceeds 100 characters (134)
+306:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+307:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+308:101:2:ZL300.max_line_length:line exceeds 100 characters (130)
+309:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+310:101:2:ZL300.max_line_length:line exceeds 100 characters (138)
+311:101:2:ZL300.max_line_length:line exceeds 100 characters (131)
+501:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+506:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+510:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+515:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+520:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+277:5:2:ZL301.max_function_lines:function exceeds 80 lines (152)
+434:1:2:ZL302.max_params:function has too many parameters (8 > 6)
+455:1:2:ZL302.max_params:function has too many parameters (8 > 6)
+489:1:2:ZL302.max_params:function has too many parameters (9 > 6)
+278:9:1:ZL009.var_should_be_const:variable 'rng' is never reassigned; consider using 'const'
+294:9:1:ZL009.var_should_be_const:variable 'total_edges' is never reassigned; consider using 'const'
+295:9:1:ZL009.var_should_be_const:variable 'total_props' is never reassigned; consider using 'const'
+296:9:1:ZL009.var_should_be_const:variable 'node_batch' is never reassigned; consider using 'const'
+325:9:1:ZL009.var_should_be_const:variable 'edge_batch' is never reassigned; consider using 'const'
+384:13:1:ZL009.var_should_be_const:variable 'item_cursor' is never reassigned; consider using 'const'
+447:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+466:9:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+500:9:1:ZL009.var_should_be_const:variable 'name_buf' is never reassigned; consider using 'const'
+36:20:1:ZL010.magic_number:magic number 200; consider using a named constant
+37:25:1:ZL010.magic_number:magic number 50; consider using a named constant
+38:19:1:ZL010.magic_number:magic number 30; consider using a named constant
+39:18:1:ZL010.magic_number:magic number 10; consider using a named constant
+40:22:1:ZL010.magic_number:magic number 20; consider using a named constant
+41:19:1:ZL010.magic_number:magic number 50; consider using a named constant
+42:24:1:ZL010.magic_number:magic number 500; consider using a named constant
+46:33:1:ZL010.magic_number:magic number 3; consider using a named constant
+48:29:1:ZL010.magic_number:magic number 5; consider using a named constant
+49:28:1:ZL010.magic_number:magic number 10; consider using a named constant
+52:24:1:ZL010.magic_number:magic number 42; consider using a named constant
+57:22:1:ZL010.magic_number:magic number 10; consider using a named constant
+58:24:1:ZL010.magic_number:magic number 20; consider using a named constant
+59:29:1:ZL010.magic_number:magic number 5; consider using a named constant
+60:23:1:ZL010.magic_number:magic number 5; consider using a named constant
+62:26:1:ZL010.magic_number:magic number 3; consider using a named constant
+63:23:1:ZL010.magic_number:magic number 5; consider using a named constant
+64:28:1:ZL010.magic_number:magic number 30; consider using a named constant
+65:29:1:ZL010.magic_number:magic number 10; consider using a named constant
+69:32:1:ZL010.magic_number:magic number 3; consider using a named constant
+70:28:1:ZL010.magic_number:magic number 42; consider using a named constant
+78:24:1:ZL010.magic_number:magic number 2_000; consider using a named constant
+79:29:1:ZL010.magic_number:magic number 500; consider using a named constant
+80:23:1:ZL010.magic_number:magic number 200; consider using a named constant
+81:22:1:ZL010.magic_number:magic number 50; consider using a named constant
+83:23:1:ZL010.magic_number:magic number 500; consider using a named constant
+84:28:1:ZL010.magic_number:magic number 10_000; consider using a named constant
+85:29:1:ZL010.magic_number:magic number 500; consider using a named constant
+86:37:1:ZL010.magic_number:magic number 3; consider using a named constant
+88:33:1:ZL010.magic_number:magic number 5; consider using a named constant
+89:32:1:ZL010.magic_number:magic number 10; consider using a named constant
+90:28:1:ZL010.magic_number:magic number 42; consider using a named constant
+97:22:1:ZL010.magic_number:magic number 10_000; consider using a named constant
+98:24:1:ZL010.magic_number:magic number 20_000; consider using a named constant
+99:29:1:ZL010.magic_number:magic number 5_000; consider using a named constant
+100:23:1:ZL010.magic_number:magic number 2_000; consider using a named constant
+101:22:1:ZL010.magic_number:magic number 500; consider using a named constant
+103:23:1:ZL010.magic_number:magic number 5_000; consider using a named constant
+104:28:1:ZL010.magic_number:magic number 100_000; consider using a named constant
+105:29:1:ZL010.magic_number:magic number 5_000; consider using a named constant
+106:37:1:ZL010.magic_number:magic number 3; consider using a named constant
+108:33:1:ZL010.magic_number:magic number 5; consider using a named constant
+109:32:1:ZL010.magic_number:magic number 10; consider using a named constant
+110:28:1:ZL010.magic_number:magic number 42; consider using a named constant
+117:22:1:ZL010.magic_number:magic number 50_000; consider using a named constant
+118:24:1:ZL010.magic_number:magic number 100_000; consider using a named constant
+119:29:1:ZL010.magic_number:magic number 25_000; consider using a named constant
+120:23:1:ZL010.magic_number:magic number 5_000; consider using a named constant
+121:22:1:ZL010.magic_number:magic number 2_500; consider using a named constant
+122:26:1:ZL010.magic_number:magic number 5_000; consider using a named constant
+123:23:1:ZL010.magic_number:magic number 25_000; consider using a named constant
+124:28:1:ZL010.magic_number:magic number 500_000; consider using a named constant
+125:29:1:ZL010.magic_number:magic number 25_000; consider using a named constant
+126:37:1:ZL010.magic_number:magic number 3; consider using a named constant
+128:33:1:ZL010.magic_number:magic number 5; consider using a named constant
+129:32:1:ZL010.magic_number:magic number 10; consider using a named constant
+130:28:1:ZL010.magic_number:magic number 42; consider using a named constant
+562:35:1:ZL010.magic_number:magic number 5; consider using a named constant
+562:45:1:ZL010.magic_number:magic number 15; consider using a named constant
+563:42:1:ZL010.magic_number:magic number 10; consider using a named constant
+33:1:1:ZL011.missing_doc_comment:public declaration 'SeedConfig' is missing documentation
+162:1:1:ZL011.missing_doc_comment:public declaration 'Labels' is missing documentation
+178:1:1:ZL011.missing_doc_comment:public declaration 'RelType' is missing documentation
+179:5:1:ZL011.missing_doc_comment:public declaration 'MEMBER_OF' is missing documentation
+180:5:1:ZL011.missing_doc_comment:public declaration 'LOGGED_INTO' is missing documentation
+181:5:1:ZL011.missing_doc_comment:public declaration 'SIGNED_IN_FROM' is missing documentation
+182:5:1:ZL011.missing_doc_comment:public declaration 'SIGNED_IN_TO' is missing documentation
+183:5:1:ZL011.missing_doc_comment:public declaration 'CONTAINS' is missing documentation
+184:5:1:ZL011.missing_doc_comment:public declaration 'LOCATED_AT' is missing documentation
+185:5:1:ZL011.missing_doc_comment:public declaration 'OWNS' is missing documentation
+186:5:1:ZL011.missing_doc_comment:public declaration 'RISK_DETECTED' is missing documentation
+193:1:1:ZL011.missing_doc_comment:public declaration 'NodeRange' is missing documentation
+197:5:1:ZL011.missing_doc_comment:public declaration 'count' is missing documentation
+202:1:1:ZL011.missing_doc_comment:public declaration 'SeedResult' is missing documentation

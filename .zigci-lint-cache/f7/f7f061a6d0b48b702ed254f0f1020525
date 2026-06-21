@@ -1,0 +1,71 @@
+14:11:1:ZL203.const_snakecase:constant 'FILE_COUNT' should use snake_case (or PascalCase for types)
+17:11:1:ZL203.const_snakecase:constant 'FILE_NAMES' should use snake_case (or PascalCase for types)
+168:7:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+383:25:2:ZL204.no_dupe_import:duplicate import of 'types.zig' (first at line 5)
+467:24:2:ZL204.no_dupe_import:duplicate import of 'types.zig' (first at line 5)
+472:25:2:ZL204.no_dupe_import:duplicate import of 'types.zig' (first at line 5)
+62:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+66:101:2:ZL300.max_line_length:line exceeds 100 characters (137)
+67:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+179:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+185:101:2:ZL300.max_line_length:line exceeds 100 characters (137)
+196:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+205:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+216:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+223:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+225:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+227:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+249:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+264:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+270:101:2:ZL300.max_line_length:line exceeds 100 characters (137)
+302:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+308:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+310:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+336:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+342:101:2:ZL300.max_line_length:line exceeds 100 characters (137)
+367:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+428:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+437:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+447:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+454:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+456:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+276:9:1:ZL009.var_should_be_const:variable 'write_buf' is never reassigned; consider using 'const'
+290:9:1:ZL009.var_should_be_const:variable 'read_buf' is never reassigned; consider using 'const'
+444:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+450:9:1:ZL009.var_should_be_const:variable 'fm' is never reassigned; consider using 'const'
+463:9:1:ZL009.var_should_be_const:variable 'dirty' is never reassigned; consider using 'const'
+471:9:1:ZL009.var_should_be_const:variable 'dirty2' is never reassigned; consider using 'const'
+70:65:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+182:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+189:47:1:ZL010.magic_number:magic number 4096; consider using a named constant
+199:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+219:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+252:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+267:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+284:44:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+305:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+339:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+351:40:1:ZL010.magic_number:magic number 9; consider using a named constant
+370:23:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+372:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+431:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+440:38:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+450:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+29:1:1:ZL011.missing_doc_comment:public declaration 'OpenMode' is missing documentation
+34:1:1:ZL011.missing_doc_comment:public declaration 'FileManager' is missing documentation
+42:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+66:51:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+188:29:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+202:15:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+230:31:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+231:33:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+232:31:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+273:29:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+313:15:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+314:15:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+345:22:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+346:22:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+387:19:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+434:15:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+459:15:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+460:15:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer

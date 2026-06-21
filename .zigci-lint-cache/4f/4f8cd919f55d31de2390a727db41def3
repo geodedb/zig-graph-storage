@@ -1,0 +1,333 @@
+611:77:3:ZL003.no_empty_catch:empty catch block suppresses errors
+779:68:3:ZL003.no_empty_catch:empty catch block suppresses errors
+934:52:3:ZL003.no_empty_catch:empty catch block suppresses errors
+939:41:3:ZL003.no_empty_catch:empty catch block suppresses errors
+1899:63:3:ZL003.no_empty_catch:empty catch block suppresses errors
+1998:31:3:ZL003.no_empty_catch:empty catch block suppresses errors
+33:7:1:ZL203.const_snakecase:constant 'BACKUP_STREAM_CHUNK_SIZE' should use snake_case (or PascalCase for types)
+34:7:1:ZL203.const_snakecase:constant 'GRAPH_IDENTITY_FILE' should use snake_case (or PascalCase for types)
+35:7:1:ZL203.const_snakecase:constant 'WAL_FILE' should use snake_case (or PascalCase for types)
+42:11:1:ZL203.const_snakecase:constant 'BACKUP_MAGIC' should use snake_case (or PascalCase for types)
+43:11:1:ZL203.const_snakecase:constant 'BACKUP_VERSION' should use snake_case (or PascalCase for types)
+44:11:1:ZL203.const_snakecase:constant 'BACKUP_VERSION_HMAC' should use snake_case (or PascalCase for types)
+47:7:1:ZL203.const_snakecase:constant 'BACKUP_FILES' should use snake_case (or PascalCase for types)
+63:7:1:ZL203.const_snakecase:constant 'OPTIONAL_BACKUP_FILES' should use snake_case (or PascalCase for types)
+683:11:1:ZL203.const_snakecase:constant 'MAX_BACKUP_FILE_SIZE' should use snake_case (or PascalCase for types)
+171:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+172:101:2:ZL300.max_line_length:line exceeds 100 characters (191)
+175:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+205:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+216:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+217:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+236:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+269:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+270:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+318:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+478:101:2:ZL300.max_line_length:line exceeds 100 characters (129)
+504:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+533:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+552:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+578:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+607:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+646:101:2:ZL300.max_line_length:line exceeds 100 characters (122)
+649:101:2:ZL300.max_line_length:line exceeds 100 characters (138)
+661:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+672:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+788:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+828:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+847:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+871:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+933:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+949:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+951:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+962:101:2:ZL300.max_line_length:line exceeds 100 characters (176)
+968:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+981:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1000:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1014:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+1035:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+1039:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1043:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+1050:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1068:101:2:ZL300.max_line_length:line exceeds 100 characters (153)
+1076:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1081:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+1103:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1127:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1153:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1164:101:2:ZL300.max_line_length:line exceeds 100 characters (135)
+1233:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+1237:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+1249:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+1255:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+1286:101:2:ZL300.max_line_length:line exceeds 100 characters (122)
+1300:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+1308:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+1314:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+1342:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1353:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+1378:101:2:ZL300.max_line_length:line exceeds 100 characters (131)
+1385:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1388:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+1412:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+1415:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+1437:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1468:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1496:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1526:101:2:ZL300.max_line_length:line exceeds 100 characters (186)
+1534:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+1541:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1544:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+1566:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1576:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+1640:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1643:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+1684:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+1686:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+1710:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+1734:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1737:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1755:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+1779:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+1785:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1788:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+1833:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+1837:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+1841:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1863:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+1888:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1890:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+1912:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+1937:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+1957:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+1979:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1982:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+2024:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+2051:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+171:9:2:ZL301.max_function_lines:function exceeds 80 lines (91)
+269:9:2:ZL301.max_function_lines:function exceeds 80 lines (146)
+420:5:2:ZL302.max_params:function has too many parameters (7 > 6)
+565:5:2:ZL302.max_params:function has too many parameters (9 > 6)
+803:1:2:ZL302.max_params:function has too many parameters (7 > 6)
+817:1:2:ZL302.max_params:function has too many parameters (7 > 6)
+834:1:2:ZL302.max_params:function has too many parameters (8 > 6)
+2017:32:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+179:13:1:ZL009.var_should_be_const:variable 'hmac_ctx' is never reassigned; consider using 'const'
+187:13:1:ZL009.var_should_be_const:variable 'entries' is never reassigned; consider using 'const'
+215:17:1:ZL009.var_should_be_const:variable 'name_len_buf' is never reassigned; consider using 'const'
+229:17:1:ZL009.var_should_be_const:variable 'size_buf' is never reassigned; consider using 'const'
+242:13:1:ZL009.var_should_be_const:variable 'crc_buf' is never reassigned; consider using 'const'
+250:17:1:ZL009.var_should_be_const:variable 'hmac_tag' is never reassigned; consider using 'const'
+277:13:1:ZL009.var_should_be_const:variable 'header_buf' is never reassigned; consider using 'const'
+329:13:1:ZL009.var_should_be_const:variable 'hmac_ctx' is never reassigned; consider using 'const'
+337:13:1:ZL009.var_should_be_const:variable 'created_files' is never reassigned; consider using 'const'
+338:13:1:ZL009.var_should_be_const:variable 'created_dirs' is never reassigned; consider using 'const'
+347:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+351:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+353:17:1:ZL009.var_should_be_const:variable 'name_len_buf' is never reassigned; consider using 'const'
+362:17:1:ZL009.var_should_be_const:variable 'size_buf' is never reassigned; consider using 'const'
+374:17:1:ZL009.var_should_be_const:variable 'dir_handle' is never reassigned; consider using 'const'
+394:13:1:ZL009.var_should_be_const:variable 'stored_crc_buf' is never reassigned; consider using 'const'
+400:17:1:ZL009.var_should_be_const:variable 'stored_hmac' is never reassigned; consider using 'const'
+402:17:1:ZL009.var_should_be_const:variable 'computed_hmac' is never reassigned; consider using 'const'
+429:13:1:ZL009.var_should_be_const:variable 'hmac_ctx' is never reassigned; consider using 'const'
+435:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+436:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+438:17:1:ZL009.var_should_be_const:variable 'name_len_buf' is never reassigned; consider using 'const'
+447:17:1:ZL009.var_should_be_const:variable 'size_buf' is never reassigned; consider using 'const'
+456:13:1:ZL009.var_should_be_const:variable 'stored_crc_buf' is never reassigned; consider using 'const'
+462:17:1:ZL009.var_should_be_const:variable 'stored_hmac' is never reassigned; consider using 'const'
+466:17:1:ZL009.var_should_be_const:variable 'computed_hmac' is never reassigned; consider using 'const'
+485:13:1:ZL009.var_should_be_const:variable 'header_buf' is never reassigned; consider using 'const'
+491:13:1:ZL009.var_should_be_const:variable 'hmac_ctx' is never reassigned; consider using 'const'
+500:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+501:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+503:17:1:ZL009.var_should_be_const:variable 'name_len_buf' is never reassigned; consider using 'const'
+512:17:1:ZL009.var_should_be_const:variable 'size_buf' is never reassigned; consider using 'const'
+521:13:1:ZL009.var_should_be_const:variable 'stored_crc_buf' is never reassigned; consider using 'const'
+527:17:1:ZL009.var_should_be_const:variable 'stored_hmac' is never reassigned; consider using 'const'
+531:17:1:ZL009.var_should_be_const:variable 'computed_hmac' is never reassigned; consider using 'const'
+584:13:1:ZL009.var_should_be_const:variable 'read_offset' is never reassigned; consider using 'const'
+607:13:1:ZL009.var_should_be_const:variable 'target' is never reassigned; consider using 'const'
+609:13:1:ZL009.var_should_be_const:variable 'wal_dir' is never reassigned; consider using 'const'
+777:9:1:ZL009.var_should_be_const:variable 'dir' is never reassigned; consider using 'const'
+843:9:1:ZL009.var_should_be_const:variable 'copied' is never reassigned; consider using 'const'
+844:9:1:ZL009.var_should_be_const:variable 'remaining' is never reassigned; consider using 'const'
+907:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+936:9:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+1016:9:1:ZL009.var_should_be_const:variable 'magic' is never reassigned; consider using 'const'
+1232:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+1294:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+1355:9:1:ZL009.var_should_be_const:variable 'header' is never reassigned; consider using 'const'
+1445:9:1:ZL009.var_should_be_const:variable 'backup_with_key' is never reassigned; consider using 'const'
+1449:9:1:ZL009.var_should_be_const:variable 'backup_no_key' is never reassigned; consider using 'const'
+1529:13:1:ZL009.var_should_be_const:variable 'chunk' is never reassigned; consider using 'const'
+1531:13:1:ZL009.var_should_be_const:variable 'remaining' is never reassigned; consider using 'const'
+1547:9:1:ZL009.var_should_be_const:variable 'scratch' is never reassigned; consider using 'const'
+1548:9:1:ZL009.var_should_be_const:variable 'fba' is never reassigned; consider using 'const'
+1578:9:1:ZL009.var_should_be_const:variable 'header' is never reassigned; consider using 'const'
+1612:9:1:ZL009.var_should_be_const:variable 'aw' is never reassigned; consider using 'const'
+1667:13:1:ZL009.var_should_be_const:variable 'scan' is never reassigned; consider using 'const'
+1823:9:1:ZL009.var_should_be_const:variable 'total' is never reassigned; consider using 'const'
+1835:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+1910:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+1967:9:1:ZL009.var_should_be_const:variable 'env' is never reassigned; consider using 'const'
+1977:9:1:ZL009.var_should_be_const:variable 'out_tmp' is never reassigned; consider using 'const'
+1986:9:1:ZL009.var_should_be_const:variable 'backup' is never reassigned; consider using 'const'
+2011:17:1:ZL009.var_should_be_const:variable 'scan' is never reassigned; consider using 'const'
+2028:9:1:ZL009.var_should_be_const:variable 'hook' is never reassigned; consider using 'const'
+202:27:1:ZL010.magic_number:magic number 4; consider using a named constant
+203:27:1:ZL010.magic_number:magic number 6; consider using a named constant
+204:27:1:ZL010.magic_number:magic number 22; consider using a named constant
+205:28:1:ZL010.magic_number:magic number 26; consider using a named constant
+246:24:1:ZL010.magic_number:magic number 4; consider using a named constant
+306:45:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+611:69:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+623:61:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+633:61:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+727:67:1:ZL010.magic_number:magic number 4; consider using a named constant
+735:40:1:ZL010.magic_number:magic number 4; consider using a named constant
+743:40:1:ZL010.magic_number:magic number 22; consider using a named constant
+748:44:1:ZL010.magic_number:magic number 22; consider using a named constant
+762:63:1:ZL010.magic_number:magic number 4; consider using a named constant
+769:35:1:ZL010.magic_number:magic number 4; consider using a named constant
+879:82:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+955:20:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+985:89:1:ZL010.magic_number:magic number 0o7777; consider using a named constant
+1067:57:1:ZL010.magic_number:magic number 4; consider using a named constant
+1133:23:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+1166:93:1:ZL010.magic_number:magic number 10; consider using a named constant
+1226:20:1:ZL010.magic_number:magic number 4; consider using a named constant
+1227:20:1:ZL010.magic_number:magic number 6; consider using a named constant
+1228:20:1:ZL010.magic_number:magic number 22; consider using a named constant
+1228:25:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+1229:21:1:ZL010.magic_number:magic number 26; consider using a named constant
+1232:22:1:ZL010.magic_number:magic number 26; consider using a named constant
+1244:27:1:ZL010.magic_number:magic number 4; consider using a named constant
+1264:39:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+1273:53:1:ZL010.magic_number:magic number 30; consider using a named constant
+1289:20:1:ZL010.magic_number:magic number 4; consider using a named constant
+1290:20:1:ZL010.magic_number:magic number 6; consider using a named constant
+1291:20:1:ZL010.magic_number:magic number 22; consider using a named constant
+1291:25:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+1292:21:1:ZL010.magic_number:magic number 26; consider using a named constant
+1294:22:1:ZL010.magic_number:magic number 26; consider using a named constant
+1300:85:1:ZL010.magic_number:magic number 0xFFFF_FFFF_FFFF; consider using a named constant
+1304:27:1:ZL010.magic_number:magic number 4; consider using a named constant
+1323:39:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+1348:23:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+1391:23:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+1401:24:1:ZL010.magic_number:magic number 30; consider using a named constant
+1407:29:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+1412:47:1:ZL010.magic_number:magic number 4; consider using a named constant
+1444:23:1:ZL010.magic_number:magic number 0xCC; consider using a named constant
+1504:39:1:ZL010.magic_number:magic number 0x11; consider using a named constant
+1530:25:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+1589:30:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+1589:36:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+1589:42:1:ZL010.magic_number:magic number 0xCC; consider using a named constant
+1589:48:1:ZL010.magic_number:magic number 0xDD; consider using a named constant
+1589:73:1:ZL010.magic_number:magic number 12; consider using a named constant
+1590:28:1:ZL010.magic_number:magic number 7; consider using a named constant
+1591:24:1:ZL010.magic_number:magic number 123456; consider using a named constant
+1607:30:1:ZL010.magic_number:magic number 0x11; consider using a named constant
+1607:36:1:ZL010.magic_number:magic number 0x22; consider using a named constant
+1607:42:1:ZL010.magic_number:magic number 0x33; consider using a named constant
+1607:48:1:ZL010.magic_number:magic number 0x44; consider using a named constant
+1607:73:1:ZL010.magic_number:magic number 12; consider using a named constant
+1608:27:1:ZL010.magic_number:magic number 5; consider using a named constant
+1609:24:1:ZL010.magic_number:magic number 654321; consider using a named constant
+1646:23:1:ZL010.magic_number:magic number 0xDD; consider using a named constant
+1655:39:1:ZL010.magic_number:magic number 30; consider using a named constant
+1667:27:1:ZL010.magic_number:magic number 26; consider using a named constant
+1681:37:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+1684:43:1:ZL010.magic_number:magic number 4; consider using a named constant
+1694:43:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+1740:23:1:ZL010.magic_number:magic number 0xEE; consider using a named constant
+1752:43:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+1791:23:1:ZL010.magic_number:magic number 0x5A; consider using a named constant
+1823:24:1:ZL010.magic_number:magic number 26; consider using a named constant
+1825:14:1:ZL010.magic_number:magic number 4; consider using a named constant
+1830:20:1:ZL010.magic_number:magic number 4; consider using a named constant
+1831:20:1:ZL010.magic_number:magic number 6; consider using a named constant
+1832:20:1:ZL010.magic_number:magic number 22; consider using a named constant
+1833:21:1:ZL010.magic_number:magic number 26; consider using a named constant
+1835:22:1:ZL010.magic_number:magic number 26; consider using a named constant
+1848:27:1:ZL010.magic_number:magic number 4; consider using a named constant
+1866:24:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+1884:43:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+1887:39:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+1915:24:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+1930:42:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+1934:43:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+1985:23:1:ZL010.magic_number:magic number 0x77; consider using a named constant
+2011:31:1:ZL010.magic_number:magic number 26; consider using a named constant
+2018:35:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+2024:43:1:ZL010.magic_number:magic number 4; consider using a named constant
+2033:43:1:ZL010.magic_number:magic number 0o700; consider using a named constant
+42:1:1:ZL011.missing_doc_comment:public declaration 'BACKUP_MAGIC' is missing documentation
+43:1:1:ZL011.missing_doc_comment:public declaration 'BACKUP_VERSION' is missing documentation
+44:1:1:ZL011.missing_doc_comment:public declaration 'BACKUP_VERSION_HMAC' is missing documentation
+94:1:1:ZL011.missing_doc_comment:public declaration 'RestoreResult' is missing documentation
+99:5:1:ZL011.missing_doc_comment:public declaration 'writeJson' is missing documentation
+137:5:1:ZL011.missing_doc_comment:public declaration 'TestHook' is missing documentation
+142:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+151:5:1:ZL011.missing_doc_comment:public declaration 'setExpectedGraphUuid' is missing documentation
+155:5:1:ZL011.missing_doc_comment:public declaration 'enableLegacyV1Restore' is missing documentation
+1186:50:2:ZL500.os_specific_code:Linux-specific code '/etc/' may cause portability issues; consider adding OS detection guards
+1187:57:2:ZL500.os_specific_code:Linux-specific code '/etc/' may cause portability issues; consider adding OS detection guards
+1192:48:2:ZL500.os_specific_code:Linux-specific code '/etc/' may cause portability issues; consider adding OS detection guards
+1218:37:2:ZL500.os_specific_code:Linux-specific code '/etc/' may cause portability issues; consider adding OS detection guards
+1602:65:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+1618:64:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+1621:65:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+1176:45:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+64:5:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+86:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+88:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+111:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+113:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+715:60:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1176:45:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1186:47:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1187:47:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1189:47:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1192:47:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1195:47:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1196:47:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1205:47:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1210:46:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1218:28:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1600:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1601:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1602:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1618:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1619:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1620:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1621:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1852:6:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1917:20:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+1945:76:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+270:42:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+478:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+552:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+578:42:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+649:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+661:42:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+968:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+981:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1014:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1164:42:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1353:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1378:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1576:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1710:35:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1957:35:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+2002:43:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+2051:35:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+318:42:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+607:42:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+777:35:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+872:15:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+880:26:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+957:28:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

@@ -34,6 +34,11 @@ pub const Metrics = struct {
     // Checkpoint
     checkpoints_completed: u64 = 0,
     last_checkpoint_duration_ns: u64 = 0,
+    // GAP-0900 L2: count of full derived-index saves performed by checkpoints.
+    // A "light" checkpoint (save_derived=false) skips the O(graph) derived-index
+    // save and does NOT bump this counter; a full checkpoint does. Tests assert
+    // this stays flat across light checkpoints to prove the bounded path.
+    derived_index_saves: u64 = 0,
 
     // Recovery
     recovery_duration_ns: u64 = 0,

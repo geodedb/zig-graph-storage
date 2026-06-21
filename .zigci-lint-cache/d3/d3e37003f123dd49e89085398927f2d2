@@ -1,0 +1,6 @@
+7:11:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+18:31:1:ZL010.magic_number:magic number 24; consider using a named constant
+46:44:1:ZL010.magic_number:magic number 24; consider using a named constant
+55:42:1:ZL010.magic_number:magic number 339; consider using a named constant
+55:64:1:ZL010.magic_number:magic number 8192; consider using a named constant
+7:1:1:ZL011.missing_doc_comment:public declaration 'PAGE_HEADER_SIZE' is missing documentation

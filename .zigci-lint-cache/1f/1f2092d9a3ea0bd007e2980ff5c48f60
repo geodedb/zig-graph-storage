@@ -1,0 +1,23 @@
+114:62:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+114:56:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+11:11:1:ZL203.const_snakecase:constant 'NONCE_SIZE' should use snake_case (or PascalCase for types)
+12:11:1:ZL203.const_snakecase:constant 'TAG_SIZE' should use snake_case (or PascalCase for types)
+13:11:1:ZL203.const_snakecase:constant 'KEY_SIZE' should use snake_case (or PascalCase for types)
+15:11:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+56:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+85:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+65:13:1:ZL009.var_should_be_const:variable 'tag' is never reassigned; consider using 'const'
+211:9:1:ZL009.var_should_be_const:variable 'original_header' is never reassigned; consider using 'const'
+293:9:1:ZL009.var_should_be_const:variable 'enc' is never reassigned; consider using 'const'
+204:23:1:ZL010.magic_number:magic number 0x03; consider using a named constant
+278:23:1:ZL010.magic_number:magic number 0x05; consider using a named constant
+285:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+293:41:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+11:1:1:ZL011.missing_doc_comment:public declaration 'NONCE_SIZE' is missing documentation
+12:1:1:ZL011.missing_doc_comment:public declaration 'TAG_SIZE' is missing documentation
+13:1:1:ZL011.missing_doc_comment:public declaration 'KEY_SIZE' is missing documentation
+14:1:1:ZL011.missing_doc_comment:public declaration 'OVERHEAD' is missing documentation
+15:1:1:ZL011.missing_doc_comment:public declaration 'PAGE_HEADER_SIZE' is missing documentation
+17:1:1:ZL011.missing_doc_comment:public declaration 'PageEncryption' is missing documentation
+20:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+114:34:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer

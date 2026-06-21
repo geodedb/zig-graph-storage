@@ -6,6 +6,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// Same CRC used by the manifest (manifest.zig) for on-disk integrity.
+// fips-exempt: non-security — CRC32C record-integrity (corruption detection)
+// for on-disk format; not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 
 /// Header bytes preceding the payload: checkpoint_counter(u64) + item_count(u64).

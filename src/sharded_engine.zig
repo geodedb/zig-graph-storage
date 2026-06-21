@@ -603,6 +603,19 @@ pub const ShardedGraphEngine = struct {
         if (first_err) |err| return err;
     }
 
+    /// GAP-0900 L2: run the light (incremental/bounded) checkpoint on every
+    /// shard. Mirrors checkpoint() but skips the O(graph-size) derived-index
+    /// save on each shard. Use for the periodic load-driven trigger.
+    pub fn checkpointLight(self: *ShardedGraphEngine) anyerror!void {
+        var first_err: ?anyerror = null;
+        for (self.shards) |eng| {
+            eng.checkpointLight() catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
+    }
+
     /// Aggregated metrics snapshot. Refreshes an internal buffer on each
     /// call and returns a pointer to it — valid until the next call.
     pub fn getMetrics(self: *ShardedGraphEngine) *const Metrics {

@@ -1,0 +1,112 @@
+11:11:1:ZL203.const_snakecase:constant 'CATALOG_MAGIC' should use snake_case (or PascalCase for types)
+12:11:1:ZL203.const_snakecase:constant 'CATALOG_VERSION' should use snake_case (or PascalCase for types)
+103:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+222:101:2:ZL300.max_line_length:line exceeds 100 characters (180)
+292:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+299:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+423:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+451:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+454:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+504:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+543:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+557:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+593:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+607:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+628:101:2:ZL300.max_line_length:line exceeds 100 characters (133)
+634:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+636:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+648:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+655:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+673:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+680:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+726:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+789:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+819:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+284:9:2:ZL301.max_function_lines:function exceeds 80 lines (85)
+346:33:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+128:5:1:ZL009.var_should_be_const:variable 'global_registry' is never reassigned; consider using 'const'
+226:13:1:ZL009.var_should_be_const:variable 'data' is never reassigned; consider using 'const'
+313:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+325:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+512:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+513:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+563:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+564:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+633:13:1:ZL009.var_should_be_const:variable 'byte' is never reassigned; consider using 'const'
+656:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+694:9:1:ZL009.var_should_be_const:variable 'reg' is never reassigned; consider using 'const'
+705:9:1:ZL009.var_should_be_const:variable 'reg' is never reassigned; consider using 'const'
+716:9:1:ZL009.var_should_be_const:variable 'reg' is never reassigned; consider using 'const'
+733:9:1:ZL009.var_should_be_const:variable 'reg' is never reassigned; consider using 'const'
+786:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+797:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+798:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+824:9:1:ZL009.var_should_be_const:variable 'empty_reg' is never reassigned; consider using 'const'
+827:9:1:ZL009.var_should_be_const:variable 'catalog' is never reassigned; consider using 'const'
+61:14:1:ZL010.magic_number:magic number 3; consider using a named constant
+303:27:1:ZL010.magic_number:magic number 20; consider using a named constant
+316:52:1:ZL010.magic_number:magic number 4; consider using a named constant
+317:16:1:ZL010.magic_number:magic number 4; consider using a named constant
+320:16:1:ZL010.magic_number:magic number 4; consider using a named constant
+329:20:1:ZL010.magic_number:magic number 4; consider using a named constant
+454:99:1:ZL010.magic_number:magic number 0o7777; consider using a named constant
+518:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+519:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+521:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+522:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+524:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+525:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+527:16:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+533:45:1:ZL010.magic_number:magic number 3; consider using a named constant
+536:27:1:ZL010.magic_number:magic number 3; consider using a named constant
+537:12:1:ZL010.magic_number:magic number 3; consider using a named constant
+540:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+541:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+569:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+570:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+572:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+573:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+575:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+576:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+581:16:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+584:45:1:ZL010.magic_number:magic number 3; consider using a named constant
+586:27:1:ZL010.magic_number:magic number 3; consider using a named constant
+587:12:1:ZL010.magic_number:magic number 3; consider using a named constant
+590:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+591:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+635:20:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+658:34:1:ZL010.magic_number:magic number 12; consider using a named constant
+660:35:1:ZL010.magic_number:magic number 20; consider using a named constant
+700:51:1:ZL010.magic_number:magic number 127; consider using a named constant
+719:35:1:ZL010.magic_number:magic number 200; consider using a named constant
+736:57:1:ZL010.magic_number:magic number 200; consider using a named constant
+745:25:1:ZL010.magic_number:magic number 10; consider using a named constant
+747:43:1:ZL010.magic_number:magic number 200; consider using a named constant
+751:25:1:ZL010.magic_number:magic number 11; consider using a named constant
+772:71:1:ZL010.magic_number:magic number 200; consider using a named constant
+801:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+802:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+803:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+804:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+805:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+805:45:1:ZL010.magic_number:magic number 99; consider using a named constant
+806:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+807:16:1:ZL010.magic_number:magic number 200; consider using a named constant
+811:45:1:ZL010.magic_number:magic number 3; consider using a named constant
+813:27:1:ZL010.magic_number:magic number 3; consider using a named constant
+814:12:1:ZL010.magic_number:magic number 3; consider using a named constant
+816:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+817:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+837:49:1:ZL010.magic_number:magic number 200; consider using a named constant
+838:37:1:ZL010.magic_number:magic number 200; consider using a named constant
+843:53:1:ZL010.magic_number:magic number 200; consider using a named constant
+844:54:1:ZL010.magic_number:magic number 201; consider using a named constant
+11:1:1:ZL011.missing_doc_comment:public declaration 'CATALOG_MAGIC' is missing documentation
+12:1:1:ZL011.missing_doc_comment:public declaration 'CATALOG_VERSION' is missing documentation
+57:1:1:ZL011.missing_doc_comment:public declaration 'IndexState' is missing documentation
+64:1:1:ZL011.missing_doc_comment:public declaration 'IndexDef' is missing documentation
+150:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+170:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+292:42:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+451:48:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+628:42:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer

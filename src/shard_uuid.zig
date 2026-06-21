@@ -8,6 +8,8 @@
 const std = @import("std");
 
 pub fn deriveShardUuid(parent: [16]u8, shard_index: usize) [16]u8 {
+    // fips-exempt: non-security — deterministic per-shard UUID derivation for
+    // collision-resistant naming; not a secret, key, or authentication tag.
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(&parent);
     var tag_buf: [16]u8 = undefined;
@@ -40,4 +42,9 @@ test "deriveShardUuid differs across parents for the same shard" {
     const shard0_a = @import("shard_uuid.zig").deriveShardUuid(a, 0);
     const shard0_b = @import("shard_uuid.zig").deriveShardUuid(b, 0);
     try std.testing.expect(!std.mem.eql(u8, &shard0_a, &shard0_b));
+}
+
+test "fips-exempt annotation present on shard-uuid BLAKE3 site" {
+    const src = @embedFile("shard_uuid.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "fips-exempt: non-security — deterministic per-shard UUID") != null);
 }
