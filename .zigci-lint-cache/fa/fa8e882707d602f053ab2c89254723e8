@@ -1,0 +1,140 @@
+789:20:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+790:20:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+791:22:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+792:23:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+793:20:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+794:22:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+795:21:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+796:26:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+797:25:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+798:20:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+799:23:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+800:24:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+801:29:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+802:24:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+803:27:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+804:28:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+805:31:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+806:28:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+807:33:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+808:21:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+809:24:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+810:22:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+811:26:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+812:21:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+813:22:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+814:21:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+815:22:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+816:22:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+817:23:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+818:23:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+122:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+123:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+127:101:2:ZL300.max_line_length:line exceeds 100 characters (123)
+128:101:2:ZL300.max_line_length:line exceeds 100 characters (122)
+129:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+130:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+132:101:2:ZL300.max_line_length:line exceeds 100 characters (128)
+133:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+134:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+137:101:2:ZL300.max_line_length:line exceeds 100 characters (147)
+138:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+139:101:2:ZL300.max_line_length:line exceeds 100 characters (147)
+140:101:2:ZL300.max_line_length:line exceeds 100 characters (138)
+144:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+145:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+181:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+186:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+194:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+199:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+214:101:2:ZL300.max_line_length:line exceeds 100 characters (123)
+217:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+220:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+226:101:2:ZL300.max_line_length:line exceeds 100 characters (142)
+229:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+236:101:2:ZL300.max_line_length:line exceeds 100 characters (142)
+239:101:2:ZL300.max_line_length:line exceeds 100 characters (133)
+258:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+337:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+359:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+361:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+364:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+366:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+372:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+374:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+377:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+379:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+386:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+390:101:2:ZL300.max_line_length:line exceeds 100 characters (126)
+394:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+396:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+399:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+407:101:2:ZL300.max_line_length:line exceeds 100 characters (145)
+411:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+415:101:2:ZL300.max_line_length:line exceeds 100 characters (145)
+417:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+419:101:2:ZL300.max_line_length:line exceeds 100 characters (136)
+421:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+423:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+433:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+442:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+525:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+535:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+572:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+614:101:2:ZL300.max_line_length:line exceeds 100 characters (131)
+650:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+337:5:2:ZL301.max_function_lines:function exceeds 80 lines (186)
+341:62:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+822:9:1:ZL009.var_should_be_const:variable 'mock' is never reassigned; consider using 'const'
+330:29:1:ZL010.magic_number:magic number 5000; consider using a named constant
+766:44:1:ZL010.magic_number:magic number 31; consider using a named constant
+23:1:1:ZL011.missing_doc_comment:public declaration 'PropertyEntry' is missing documentation
+35:1:1:ZL011.missing_doc_comment:public declaration 'EdgeIterator' is missing documentation
+39:5:1:ZL011.missing_doc_comment:public declaration 'VTable' is missing documentation
+44:5:1:ZL011.missing_doc_comment:public declaration 'next' is missing documentation
+48:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+53:1:1:ZL011.missing_doc_comment:public declaration 'NodeIterator' is missing documentation
+57:5:1:ZL011.missing_doc_comment:public declaration 'VTable' is missing documentation
+62:5:1:ZL011.missing_doc_comment:public declaration 'next' is missing documentation
+66:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+71:1:1:ZL011.missing_doc_comment:public declaration 'PropertyIterator' is missing documentation
+75:5:1:ZL011.missing_doc_comment:public declaration 'VTable' is missing documentation
+80:5:1:ZL011.missing_doc_comment:public declaration 'next' is missing documentation
+84:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+96:5:1:ZL011.missing_doc_comment:public declaration 'VTable' is missing documentation
+101:5:1:ZL011.missing_doc_comment:public declaration 'next' is missing documentation
+105:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+110:1:1:ZL011.missing_doc_comment:public declaration 'GraphStorage' is missing documentation
+114:5:1:ZL011.missing_doc_comment:public declaration 'VTable' is missing documentation
+161:5:1:ZL011.missing_doc_comment:public declaration 'getNode' is missing documentation
+164:5:1:ZL011.missing_doc_comment:public declaration 'putNode' is missing documentation
+167:5:1:ZL011.missing_doc_comment:public declaration 'allocNode' is missing documentation
+170:5:1:ZL011.missing_doc_comment:public declaration 'deleteNode' is missing documentation
+173:5:1:ZL011.missing_doc_comment:public declaration 'getEdge' is missing documentation
+202:5:1:ZL011.missing_doc_comment:public declaration 'addEdge' is missing documentation
+205:5:1:ZL011.missing_doc_comment:public declaration 'removeEdge' is missing documentation
+217:5:1:ZL011.missing_doc_comment:public declaration 'getAllProperties' is missing documentation
+220:5:1:ZL011.missing_doc_comment:public declaration 'putProperty' is missing documentation
+223:5:1:ZL011.missing_doc_comment:public declaration 'removeProperty' is missing documentation
+226:5:1:ZL011.missing_doc_comment:public declaration 'setEdgeProperty' is missing documentation
+229:5:1:ZL011.missing_doc_comment:public declaration 'removeEdgeProperty' is missing documentation
+239:5:1:ZL011.missing_doc_comment:public declaration 'getAllEdgeProperties' is missing documentation
+242:5:1:ZL011.missing_doc_comment:public declaration 'addLabel' is missing documentation
+245:5:1:ZL011.missing_doc_comment:public declaration 'removeLabel' is missing documentation
+261:5:1:ZL011.missing_doc_comment:public declaration 'beginTxn' is missing documentation
+264:5:1:ZL011.missing_doc_comment:public declaration 'commitTxn' is missing documentation
+267:5:1:ZL011.missing_doc_comment:public declaration 'abortTxn' is missing documentation
+270:5:1:ZL011.missing_doc_comment:public declaration 'nodeCount' is missing documentation
+273:5:1:ZL011.missing_doc_comment:public declaration 'edgeCount' is missing documentation
+276:5:1:ZL011.missing_doc_comment:public declaration 'getMetrics' is missing documentation
+279:5:1:ZL011.missing_doc_comment:public declaration 'doCheckpoint' is missing documentation
+282:5:1:ZL011.missing_doc_comment:public declaration 'close' is missing documentation
+554:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+596:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+638:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+669:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+707:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+744:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+110:24:1:ZL605.large_struct_copy:struct 'GraphStorage' has 101 fields; consider passing by pointer to avoid copies
+114:22:1:ZL605.large_struct_copy:struct 'VTable' has 121 fields; consider passing by pointer to avoid copies
+338:23:1:ZL605.large_struct_copy:struct 'Wrapper' has 91 fields; consider passing by pointer to avoid copies

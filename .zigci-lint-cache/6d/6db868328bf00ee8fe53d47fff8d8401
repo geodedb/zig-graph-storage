@@ -1,0 +1,24 @@
+103:62:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+108:52:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+103:56:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+108:46:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+45:7:1:ZL203.const_snakecase:constant 'CATALOG_FILE_NAME' should use snake_case (or PascalCase for types)
+73:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+119:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+136:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+183:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+206:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+250:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+283:5:2:ZL302.max_params:function has too many parameters (7 > 6)
+159:68:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+93:12:3:ZL109.fips_unguarded_crypto:'std.hash.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+191:22:3:ZL109.fips_unguarded_crypto:'std.hash.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+425:15:3:ZL109.fips_unguarded_crypto:'std.hash.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+100:9:1:ZL009.var_should_be_const:variable 'stack_buf' is never reassigned; consider using 'const'
+151:17:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+169:9:1:ZL009.var_should_be_const:variable 'ctx' is never reassigned; consider using 'const'
+373:13:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+430:37:1:ZL010.magic_number:magic number 42; consider using a named constant
+58:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+66:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+292:77:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer

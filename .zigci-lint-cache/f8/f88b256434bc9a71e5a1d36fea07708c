@@ -1,0 +1,18 @@
+102:9:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+70:25:1:ZL010.magic_number:magic number 0xABCD; consider using a named constant
+81:38:1:ZL010.magic_number:magic number 999; consider using a named constant
+88:20:1:ZL010.magic_number:magic number 10; consider using a named constant
+89:20:1:ZL010.magic_number:magic number 20; consider using a named constant
+89:24:1:ZL010.magic_number:magic number 200; consider using a named constant
+90:20:1:ZL010.magic_number:magic number 30; consider using a named constant
+90:24:1:ZL010.magic_number:magic number 300; consider using a named constant
+91:20:1:ZL010.magic_number:magic number 40; consider using a named constant
+91:24:1:ZL010.magic_number:magic number 400; consider using a named constant
+97:38:1:ZL010.magic_number:magic number 20; consider using a named constant
+98:38:1:ZL010.magic_number:magic number 30; consider using a named constant
+105:20:1:ZL010.magic_number:magic number 42; consider using a named constant
+105:24:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+106:38:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+110:38:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+24:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+34:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation

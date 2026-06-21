@@ -1,0 +1,43 @@
+140:97:3:ZL003.no_empty_catch:empty catch block suppresses errors
+12:7:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+43:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+108:101:2:ZL300.max_line_length:line exceeds 100 characters (125)
+132:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+140:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+201:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+106:13:1:ZL009.var_should_be_const:variable 'header_buf' is never reassigned; consider using 'const'
+151:9:1:ZL009.var_should_be_const:variable 'write_buf' is never reassigned; consider using 'const'
+167:9:1:ZL009.var_should_be_const:variable 'read_buf' is never reassigned; consider using 'const'
+189:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+200:9:1:ZL009.var_should_be_const:variable 'corrupt_byte' is never reassigned; consider using 'const'
+204:9:1:ZL009.var_should_be_const:variable 'read_buf' is never reassigned; consider using 'const'
+217:9:1:ZL009.var_should_be_const:variable 'zero_buf' is never reassigned; consider using 'const'
+222:9:1:ZL009.var_should_be_const:variable 'read_buf' is never reassigned; consider using 'const'
+242:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+266:13:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+280:13:1:ZL009.var_should_be_const:variable 'read_buf' is never reassigned; consider using 'const'
+302:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+314:9:1:ZL009.var_should_be_const:variable 'small_buf' is never reassigned; consider using 'const'
+325:9:1:ZL009.var_should_be_const:variable 'enc' is never reassigned; consider using 'const'
+331:9:1:ZL009.var_should_be_const:variable 'write_buf1' is never reassigned; consider using 'const'
+341:9:1:ZL009.var_should_be_const:variable 'ct1' is never reassigned; consider using 'const'
+354:9:1:ZL009.var_should_be_const:variable 'ct2' is never reassigned; consider using 'const'
+361:9:1:ZL009.var_should_be_const:variable 'read_buf' is never reassigned; consider using 'const'
+374:9:1:ZL009.var_should_be_const:variable 'pager' is never reassigned; consider using 'const'
+377:9:1:ZL009.var_should_be_const:variable 'write_buf' is never reassigned; consider using 'const'
+90:43:1:ZL010.magic_number:magic number 20; consider using a named constant
+161:18:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+194:29:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+200:33:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+245:13:1:ZL010.magic_number:magic number 3; consider using a named constant
+252:38:1:ZL010.magic_number:magic number 3; consider using a named constant
+263:29:1:ZL010.magic_number:magic number 0x11; consider using a named constant
+263:35:1:ZL010.magic_number:magic number 0x22; consider using a named constant
+263:41:1:ZL010.magic_number:magic number 0x33; consider using a named constant
+324:23:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+336:45:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+347:45:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+372:23:1:ZL010.magic_number:magic number 0x24; consider using a named constant
+15:1:1:ZL011.missing_doc_comment:public declaration 'PagerError' is missing documentation
+23:1:1:ZL011.missing_doc_comment:public declaration 'Pager' is missing documentation
+29:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation

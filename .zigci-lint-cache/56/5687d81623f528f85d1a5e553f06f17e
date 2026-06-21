@@ -1,0 +1,15 @@
+59:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+60:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+94:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+83:5:2:ZL301.max_function_lines:function exceeds 80 lines (84)
+76:52:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+105:13:1:ZL009.var_should_be_const:variable 'failure' is never reassigned; consider using 'const'
+119:9:1:ZL009.var_should_be_const:variable 'stats' is never reassigned; consider using 'const'
+127:17:1:ZL009.var_should_be_const:variable 'failure' is never reassigned; consider using 'const'
+128:17:1:ZL009.var_should_be_const:variable 'ctx' is never reassigned; consider using 'const'
+132:13:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+180:17:1:ZL009.var_should_be_const:variable 'from_rec' is never reassigned; consider using 'const'
+199:17:1:ZL009.var_should_be_const:variable 'to_rec' is never reassigned; consider using 'const'
+60:96:1:ZL010.magic_number:magic number 0b100; consider using a named constant
+33:1:1:ZL011.missing_doc_comment:public declaration 'ReconcileStats' is missing documentation
+83:1:1:ZL011.missing_doc_comment:public declaration 'reconcilePendingPrepares' is missing documentation

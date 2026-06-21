@@ -1,0 +1,82 @@
+15:8:1:ZL200.fn_camelcase:function 'BPlusTree' should use camelCase
+375:19:1:ZL203.const_snakecase:constant 'BTREE_SNAPSHOT_MAGIC' should use snake_case (or PascalCase for types)
+376:15:1:ZL203.const_snakecase:constant 'BTREE_SNAPSHOT_VERSION' should use snake_case (or PascalCase for types)
+284:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+326:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+395:101:2:ZL300.max_line_length:line exceeds 100 characters (169)
+402:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+406:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+407:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+412:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+688:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+713:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+738:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+755:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+762:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+764:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+15:5:2:ZL301.max_function_lines:function exceeds 80 lines (417)
+73:43:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+318:17:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+349:17:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+691:9:1:ZL009.var_should_be_const:variable 'bad' is never reassigned; consider using 'const'
+732:9:1:ZL009.var_should_be_const:variable 'tree' is never reassigned; consider using 'const'
+745:9:1:ZL009.var_should_be_const:variable 'loaded' is never reassigned; consider using 'const'
+752:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+317:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+389:42:1:ZL010.magic_number:magic number 12; consider using a named constant
+390:31:1:ZL010.magic_number:magic number 12; consider using a named constant
+393:52:1:ZL010.magic_number:magic number 4; consider using a named constant
+393:61:1:ZL010.magic_number:magic number 4; consider using a named constant
+395:160:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+407:33:1:ZL010.magic_number:magic number 4; consider using a named constant
+407:37:1:ZL010.magic_number:magic number 4; consider using a named constant
+407:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+428:70:1:ZL010.magic_number:magic number 4; consider using a named constant
+443:21:1:ZL010.magic_number:magic number 42; consider using a named constant
+453:24:1:ZL010.magic_number:magic number 10; consider using a named constant
+454:36:1:ZL010.magic_number:magic number 999; consider using a named constant
+462:16:1:ZL010.magic_number:magic number 200; consider using a named constant
+463:32:1:ZL010.magic_number:magic number 10; consider using a named constant
+467:16:1:ZL010.magic_number:magic number 200; consider using a named constant
+470:37:1:ZL010.magic_number:magic number 10; consider using a named constant
+507:40:1:ZL010.magic_number:magic number 10; consider using a named constant
+509:42:1:ZL010.magic_number:magic number 10; consider using a named constant
+517:21:1:ZL010.magic_number:magic number 5; consider using a named constant
+517:24:1:ZL010.magic_number:magic number 50; consider using a named constant
+518:21:1:ZL010.magic_number:magic number 10; consider using a named constant
+522:36:1:ZL010.magic_number:magic number 5; consider using a named constant
+523:36:1:ZL010.magic_number:magic number 10; consider using a named constant
+530:24:1:ZL010.magic_number:magic number 10; consider using a named constant
+531:37:1:ZL010.magic_number:magic number 999; consider using a named constant
+540:24:1:ZL010.magic_number:magic number 10; consider using a named constant
+541:24:1:ZL010.magic_number:magic number 20; consider using a named constant
+552:21:1:ZL010.magic_number:magic number 42; consider using a named constant
+553:21:1:ZL010.magic_number:magic number 42; consider using a named constant
+553:25:1:ZL010.magic_number:magic number 200; consider using a named constant
+556:38:1:ZL010.magic_number:magic number 200; consider using a named constant
+556:56:1:ZL010.magic_number:magic number 42; consider using a named constant
+614:32:1:ZL010.magic_number:magic number 7; consider using a named constant
+628:37:1:ZL010.magic_number:magic number 7; consider using a named constant
+638:16:1:ZL010.magic_number:magic number 50; consider using a named constant
+649:38:1:ZL010.magic_number:magic number 1010; consider using a named constant
+649:59:1:ZL010.magic_number:magic number 10; consider using a named constant
+650:38:1:ZL010.magic_number:magic number 999; consider using a named constant
+655:40:1:ZL010.magic_number:magic number 5; consider using a named constant
+657:42:1:ZL010.magic_number:magic number 1005; consider using a named constant
+669:32:1:ZL010.magic_number:magic number 3; consider using a named constant
+681:37:1:ZL010.magic_number:magic number 3; consider using a named constant
+706:16:1:ZL010.magic_number:magic number 75; consider using a named constant
+707:32:1:ZL010.magic_number:magic number 500; consider using a named constant
+723:40:1:ZL010.magic_number:magic number 75; consider using a named constant
+725:16:1:ZL010.magic_number:magic number 75; consider using a named constant
+726:37:1:ZL010.magic_number:magic number 500; consider using a named constant
+18:9:1:ZL011.missing_doc_comment:public declaration 'ORDER' is missing documentation
+24:9:1:ZL011.missing_doc_comment:public declaration 'Node' is missing documentation
+100:9:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+104:9:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+375:9:1:ZL011.missing_doc_comment:public declaration 'BTREE_SNAPSHOT_MAGIC' is missing documentation
+32:43:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+32:34:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+402:46:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+32:43:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+41:43:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

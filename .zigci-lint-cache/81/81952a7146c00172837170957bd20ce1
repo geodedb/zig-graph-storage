@@ -1,0 +1,22 @@
+19:7:1:ZL203.const_snakecase:constant 'EDGE_SNAPSHOT_MAGIC' should use snake_case (or PascalCase for types)
+23:7:1:ZL203.const_snakecase:constant 'EDGE_RECORD_MIN_SIZE' should use snake_case (or PascalCase for types)
+39:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+170:101:2:ZL300.max_line_length:line exceeds 100 characters (137)
+182:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+183:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+184:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+198:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+202:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+206:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+238:101:2:ZL300.max_line_length:line exceeds 100 characters (142)
+43:78:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+127:17:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+146:9:1:ZL009.var_should_be_const:variable 'ctx' is never reassigned; consider using 'const'
+217:9:1:ZL009.var_should_be_const:variable 'w' is never reassigned; consider using 'const'
+222:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+238:9:1:ZL009.var_should_be_const:variable 'snapshot' is never reassigned; consider using 'const'
+241:9:1:ZL009.var_should_be_const:variable 'r' is never reassigned; consider using 'const'
+250:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+100:45:1:ZL010.magic_number:magic number 3333; consider using a named constant
+102:45:1:ZL010.magic_number:magic number 6666; consider using a named constant
+104:45:1:ZL010.magic_number:magic number 10000; consider using a named constant

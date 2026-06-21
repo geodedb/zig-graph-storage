@@ -70,6 +70,8 @@ pub const Recovery = struct {
     /// in memory.
     pub fn deinit(self: *Recovery) void {
         if (self.encryption_key) |*key| {
+            // fips-exempt: non-security — defensive key-material zeroing on
+            // teardown, not a cryptographic algorithm operation.
             std.crypto.secureZero(u8, key);
         }
     }

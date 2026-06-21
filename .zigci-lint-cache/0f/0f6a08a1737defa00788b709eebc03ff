@@ -1,0 +1,19 @@
+27:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+78:101:2:ZL300.max_line_length:line exceeds 100 characters (141)
+127:101:2:ZL300.max_line_length:line exceeds 100 characters (152)
+128:101:2:ZL300.max_line_length:line exceeds 100 characters (156)
+116:9:2:ZL302.max_params:function has too many parameters (9 > 6)
+43:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+20:1:1:ZL011.missing_doc_comment:public declaration 'TestDataDir' is missing documentation
+25:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+35:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+41:1:1:ZL011.missing_doc_comment:public declaration 'testConfig' is missing documentation
+49:1:1:ZL011.missing_doc_comment:public declaration 'emptyNode' is missing documentation
+62:1:1:ZL011.missing_doc_comment:public declaration 'SingleStoreEnv' is missing documentation
+70:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+92:5:1:ZL011.missing_doc_comment:public declaration 'register' is missing documentation
+97:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+105:1:1:ZL011.missing_doc_comment:public declaration 'DualStoreEnv' is missing documentation
+116:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+145:5:1:ZL011.missing_doc_comment:public declaration 'register' is missing documentation
+151:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation

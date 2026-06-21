@@ -1,0 +1,160 @@
+29:7:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+72:101:2:ZL300.max_line_length:line exceeds 100 characters (157)
+118:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+154:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+156:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+158:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+163:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+165:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+168:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+177:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+179:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+181:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+186:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+188:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+191:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+213:101:2:ZL300.max_line_length:line exceeds 100 characters (122)
+218:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+236:101:2:ZL300.max_line_length:line exceeds 100 characters (127)
+255:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+292:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+313:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+317:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+327:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+345:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+349:101:2:ZL300.max_line_length:line exceeds 100 characters (124)
+360:101:2:ZL300.max_line_length:line exceeds 100 characters (124)
+362:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+364:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+373:101:2:ZL300.max_line_length:line exceeds 100 characters (235)
+374:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+390:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+394:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+405:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+429:101:2:ZL300.max_line_length:line exceeds 100 characters (135)
+463:101:2:ZL300.max_line_length:line exceeds 100 characters (147)
+469:101:2:ZL300.max_line_length:line exceeds 100 characters (145)
+479:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+508:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+544:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+572:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+610:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+647:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+714:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+754:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+778:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+797:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+842:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+873:101:2:ZL300.max_line_length:line exceeds 100 characters (127)
+881:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+883:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+891:101:2:ZL300.max_line_length:line exceeds 100 characters (127)
+899:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+901:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+923:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+345:5:2:ZL301.max_function_lines:function exceeds 80 lines (103)
+821:14:2:ZL301.max_function_lines:function exceeds 80 lines (93)
+295:89:2:ZL303.max_nesting:nesting depth exceeds 4 (7)
+251:13:1:ZL009.var_should_be_const:variable 'page_idx' is never reassigned; consider using 'const'
+324:13:1:ZL009.var_should_be_const:variable 'dict' is never reassigned; consider using 'const'
+349:13:1:ZL009.var_should_be_const:variable 'wal_dir' is never reassigned; consider using 'const'
+372:13:1:ZL009.var_should_be_const:variable 'identity_buf' is never reassigned; consider using 'const'
+402:13:1:ZL009.var_should_be_const:variable 'wal_mgr' is never reassigned; consider using 'const'
+418:13:1:ZL009.var_should_be_const:variable 'failure' is never reassigned; consider using 'const'
+426:13:1:ZL009.var_should_be_const:variable 'ctx' is never reassigned; consider using 'const'
+514:9:1:ZL009.var_should_be_const:variable 'page_buf' is never reassigned; consider using 'const'
+578:9:1:ZL009.var_should_be_const:variable 'page_buf' is never reassigned; consider using 'const'
+698:9:1:ZL009.var_should_be_const:variable 'aw' is never reassigned; consider using 'const'
+719:9:1:ZL009.var_should_be_const:variable 'manifest_uuid' is never reassigned; consider using 'const'
+782:5:1:ZL009.var_should_be_const:variable 'verify_event_labels' is never reassigned; consider using 'const'
+800:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+845:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+920:9:1:ZL009.var_should_be_const:variable 'tmp_dir' is never reassigned; consider using 'const'
+926:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+929:9:1:ZL009.var_should_be_const:variable 'gd' is never reassigned; consider using 'const'
+945:9:1:ZL009.var_should_be_const:variable 'tool' is never reassigned; consider using 'const'
+946:9:1:ZL009.var_should_be_const:variable 'result' is never reassigned; consider using 'const'
+483:20:1:ZL010.magic_number:magic number 0x55; consider using a named constant
+492:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+519:43:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+523:40:1:ZL010.magic_number:magic number 20; consider using a named constant
+548:20:1:ZL010.magic_number:magic number 0x66; consider using a named constant
+556:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+583:43:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+587:40:1:ZL010.magic_number:magic number 20; consider using a named constant
+590:33:1:ZL010.magic_number:magic number 50; consider using a named constant
+590:39:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+614:20:1:ZL010.magic_number:magic number 0x77; consider using a named constant
+622:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+634:44:1:ZL010.magic_number:magic number 4096; consider using a named constant
+651:20:1:ZL010.magic_number:magic number 0x88; consider using a named constant
+659:44:1:ZL010.magic_number:magic number 4096; consider using a named constant
+671:34:1:ZL010.magic_number:magic number 42; consider using a named constant
+694:34:1:ZL010.magic_number:magic number 10; consider using a named constant
+718:26:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+720:29:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+727:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+739:44:1:ZL010.magic_number:magic number 4096; consider using a named constant
+757:24:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+763:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+774:44:1:ZL010.magic_number:magic number 4096; consider using a named constant
+801:20:1:ZL010.magic_number:magic number 0x99; consider using a named constant
+808:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+822:44:1:ZL010.magic_number:magic number 4096; consider using a named constant
+846:20:1:ZL010.magic_number:magic number 0x43; consider using a named constant
+851:23:1:ZL010.magic_number:magic number 0x43; consider using a named constant
+856:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+857:20:1:ZL010.magic_number:magic number 5; consider using a named constant
+858:32:1:ZL010.magic_number:magic number 9000; consider using a named constant
+883:52:1:ZL010.magic_number:magic number 4; consider using a named constant
+883:61:1:ZL010.magic_number:magic number 4; consider using a named constant
+901:52:1:ZL010.magic_number:magic number 4; consider using a named constant
+901:61:1:ZL010.magic_number:magic number 4; consider using a named constant
+908:44:1:ZL010.magic_number:magic number 4096; consider using a named constant
+927:20:1:ZL010.magic_number:magic number 0x44; consider using a named constant
+934:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+946:44:1:ZL010.magic_number:magic number 4096; consider using a named constant
+31:1:1:ZL011.missing_doc_comment:public declaration 'ArtifactStatus' is missing documentation
+32:1:1:ZL011.missing_doc_comment:public declaration 'VerifyArtifact' is missing documentation
+34:1:1:ZL011.missing_doc_comment:public declaration 'VerifyResult' is missing documentation
+42:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+48:5:1:ZL011.missing_doc_comment:public declaration 'isClean' is missing documentation
+52:5:1:ZL011.missing_doc_comment:public declaration 'addError' is missing documentation
+56:5:1:ZL011.missing_doc_comment:public declaration 'addArtifact' is missing documentation
+92:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+101:1:1:ZL011.missing_doc_comment:public declaration 'VerifyTool' is missing documentation
+110:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+362:70:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+364:51:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+374:66:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+377:25:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+385:21:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+392:70:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+394:51:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+408:25:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+432:25:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+442:21:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+682:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+683:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+684:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+685:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+686:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+704:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+705:50:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+213:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+292:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+317:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+360:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+390:33:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+873:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+891:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+349:39:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+486:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+550:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+616:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+653:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+722:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+758:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+803:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+848:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+929:26:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

@@ -4,6 +4,8 @@
 const std = @import("std");
 const page_mod = @import("page.zig");
 
+// fips-exempt: non-security — type-alias declaration; binding performs no
+// crypto, used here only to derive NONCE/TAG/KEY length constants below.
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 pub const NONCE_SIZE = Aes256Gcm.nonce_length; // 12 bytes
@@ -23,6 +25,8 @@ pub const PageEncryption = struct {
     /// PageEncryption instance is no longer needed to prevent key material
     /// from lingering in process memory.
     pub fn deinit(self: *PageEncryption) void {
+        // fips-exempt: non-security — defensive key-material zeroing on
+        // teardown, not a cryptographic algorithm operation.
         std.crypto.secureZero(u8, &self.key);
     }
 

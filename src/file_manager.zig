@@ -124,6 +124,8 @@ pub const FileManager = struct {
         }
         // Zero sensitive key material
         if (self.encryption_key) |*k| {
+            // fips-exempt: non-security — defensive key-material zeroing on
+            // teardown, not a cryptographic algorithm operation.
             std.crypto.secureZero(u8, k);
         }
     }

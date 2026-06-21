@@ -1,0 +1,113 @@
+133:77:3:ZL003.no_empty_catch:empty catch block suppresses errors
+139:62:3:ZL003.no_empty_catch:empty catch block suppresses errors
+195:77:3:ZL003.no_empty_catch:empty catch block suppresses errors
+201:61:3:ZL003.no_empty_catch:empty catch block suppresses errors
+233:77:3:ZL003.no_empty_catch:empty catch block suppresses errors
+245:77:3:ZL003.no_empty_catch:empty catch block suppresses errors
+42:11:1:ZL203.const_snakecase:constant 'SHARD_COUNT' should use snake_case (or PascalCase for types)
+47:7:1:ZL203.const_snakecase:constant 'TXN_SHARD_SHIFT' should use snake_case (or PascalCase for types)
+48:7:1:ZL203.const_snakecase:constant 'TXN_LOCAL_MASK' should use snake_case (or PascalCase for types)
+90:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+144:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+146:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+167:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+206:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+279:101:2:ZL300.max_line_length:line exceeds 100 characters (129)
+283:101:2:ZL300.max_line_length:line exceeds 100 characters (128)
+289:101:2:ZL300.max_line_length:line exceeds 100 characters (130)
+292:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+342:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+388:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+391:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+465:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+466:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+490:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+497:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+504:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+517:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+521:101:2:ZL300.max_line_length:line exceeds 100 characters (149)
+522:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+525:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+526:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+529:101:2:ZL300.max_line_length:line exceeds 100 characters (149)
+530:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+533:101:2:ZL300.max_line_length:line exceeds 100 characters (124)
+545:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+643:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+653:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+686:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+691:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+719:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+724:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+351:5:2:ZL301.max_function_lines:function exceeds 80 lines (138)
+351:5:2:ZL302.max_params:function has too many parameters (7 > 6)
+626:41:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+96:13:1:ZL009.var_should_be_const:variable 'per_shard' is never reassigned; consider using 'const'
+138:13:1:ZL009.var_should_be_const:variable 'created' is never reassigned; consider using 'const'
+200:13:1:ZL009.var_should_be_const:variable 'opened' is never reassigned; consider using 'const'
+204:17:1:ZL009.var_should_be_const:variable 'per_shard_cfg' is never reassigned; consider using 'const'
+296:13:1:ZL009.var_should_be_const:variable 'total' is never reassigned; consider using 'const'
+302:13:1:ZL009.var_should_be_const:variable 'total' is never reassigned; consider using 'const'
+387:13:1:ZL009.var_should_be_const:variable 'src_prepare' is never reassigned; consider using 'const'
+390:13:1:ZL009.var_should_be_const:variable 'dst_prepare' is never reassigned; consider using 'const'
+393:13:1:ZL009.var_should_be_const:variable 'dst_ctx' is never reassigned; consider using 'const'
+394:13:1:ZL009.var_should_be_const:variable 'wg' is never reassigned; consider using 'const'
+404:13:1:ZL009.var_should_be_const:variable 'src_ctx' is never reassigned; consider using 'const'
+449:13:1:ZL009.var_should_be_const:variable 'to_rec' is never reassigned; consider using 'const'
+465:13:1:ZL009.var_should_be_const:variable 'src_commit' is never reassigned; consider using 'const'
+466:13:1:ZL009.var_should_be_const:variable 'dst_commit' is never reassigned; consider using 'const'
+468:13:1:ZL009.var_should_be_const:variable 'commit_wg' is never reassigned; consider using 'const'
+546:13:1:ZL009.var_should_be_const:variable 'out' is never reassigned; consider using 'const'
+625:21:1:ZL009.var_should_be_const:variable 'sum' is never reassigned; consider using 'const'
+646:13:1:ZL009.var_should_be_const:variable 'list' is never reassigned; consider using 'const'
+654:13:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+656:13:1:ZL009.var_should_be_const:variable 'list' is never reassigned; consider using 'const'
+685:13:1:ZL009.var_should_be_const:variable 'src_prepare' is never reassigned; consider using 'const'
+690:13:1:ZL009.var_should_be_const:variable 'dst_prepare' is never reassigned; consider using 'const'
+718:13:1:ZL009.var_should_be_const:variable 'src_prepare' is never reassigned; consider using 'const'
+723:13:1:ZL009.var_should_be_const:variable 'dst_prepare' is never reassigned; consider using 'const'
+729:13:1:ZL009.var_should_be_const:variable 'from_rec' is never reassigned; consider using 'const'
+790:9:1:ZL009.var_should_be_const:variable 'out' is never reassigned; consider using 'const'
+133:54:1:ZL010.magic_number:magic number 5; consider using a named constant
+195:54:1:ZL010.magic_number:magic number 5; consider using a named constant
+233:54:1:ZL010.magic_number:magic number 5; consider using a named constant
+245:54:1:ZL010.magic_number:magic number 5; consider using a named constant
+793:31:1:ZL010.magic_number:magic number 4; consider using a named constant
+794:34:1:ZL010.magic_number:magic number 0x0F; consider using a named constant
+42:1:1:ZL011.missing_doc_comment:public declaration 'SHARD_COUNT' is missing documentation
+60:1:1:ZL011.missing_doc_comment:public declaration 'ShardedGraphEngine' is missing documentation
+76:5:1:ZL011.missing_doc_comment:public declaration 'create' is missing documentation
+153:5:1:ZL011.missing_doc_comment:public declaration 'open' is missing documentation
+222:5:1:ZL011.missing_doc_comment:public declaration 'close' is missing documentation
+242:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+253:5:1:ZL011.missing_doc_comment:public declaration 'getNode' is missing documentation
+257:5:1:ZL011.missing_doc_comment:public declaration 'putNode' is missing documentation
+261:5:1:ZL011.missing_doc_comment:public declaration 'allocNode' is missing documentation
+269:5:1:ZL011.missing_doc_comment:public declaration 'deleteNode' is missing documentation
+273:5:1:ZL011.missing_doc_comment:public declaration 'getEdge' is missing documentation
+279:5:1:ZL011.missing_doc_comment:public declaration 'expandOutIter' is missing documentation
+283:5:1:ZL011.missing_doc_comment:public declaration 'expandInIter' is missing documentation
+289:5:1:ZL011.missing_doc_comment:public declaration 'getProperty' is missing documentation
+295:5:1:ZL011.missing_doc_comment:public declaration 'nodeCount' is missing documentation
+301:5:1:ZL011.missing_doc_comment:public declaration 'edgeCount' is missing documentation
+490:5:1:ZL011.missing_doc_comment:public declaration 'addEdge' is missing documentation
+497:5:1:ZL011.missing_doc_comment:public declaration 'removeEdge' is missing documentation
+504:5:1:ZL011.missing_doc_comment:public declaration 'putProperty' is missing documentation
+513:5:1:ZL011.missing_doc_comment:public declaration 'removeProperty' is missing documentation
+517:5:1:ZL011.missing_doc_comment:public declaration 'getAllProperties' is missing documentation
+521:5:1:ZL011.missing_doc_comment:public declaration 'setEdgeProperty' is missing documentation
+525:5:1:ZL011.missing_doc_comment:public declaration 'removeEdgeProperty' is missing documentation
+529:5:1:ZL011.missing_doc_comment:public declaration 'getEdgeProperty' is missing documentation
+533:5:1:ZL011.missing_doc_comment:public declaration 'getAllEdgeProperties' is missing documentation
+537:5:1:ZL011.missing_doc_comment:public declaration 'addLabel' is missing documentation
+541:5:1:ZL011.missing_doc_comment:public declaration 'removeLabel' is missing documentation
+545:5:1:ZL011.missing_doc_comment:public declaration 'scanLabel' is missing documentation
+568:5:1:ZL011.missing_doc_comment:public declaration 'getOrAssignLabel' is missing documentation
+580:5:1:ZL011.missing_doc_comment:public declaration 'beginTxn' is missing documentation
+586:5:1:ZL011.missing_doc_comment:public declaration 'commitTxn' is missing documentation
+591:5:1:ZL011.missing_doc_comment:public declaration 'abortTxn' is missing documentation
+596:5:1:ZL011.missing_doc_comment:public declaration 'checkpoint' is missing documentation
+767:5:1:ZL011.missing_doc_comment:public declaration 'next' is missing documentation
+781:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+789:1:1:ZL011.missing_doc_comment:public declaration 'uuidHex' is missing documentation
+60:30:1:ZL605.large_struct_copy:struct 'ShardedGraphEngine' has 129 fields; consider passing by pointer to avoid copies

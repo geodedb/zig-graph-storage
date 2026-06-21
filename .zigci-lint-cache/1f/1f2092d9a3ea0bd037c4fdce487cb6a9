@@ -1,0 +1,25 @@
+110:62:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+110:56:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+9:11:1:ZL203.const_snakecase:constant 'NONCE_SIZE' should use snake_case (or PascalCase for types)
+10:11:1:ZL203.const_snakecase:constant 'TAG_SIZE' should use snake_case (or PascalCase for types)
+11:11:1:ZL203.const_snakecase:constant 'KEY_SIZE' should use snake_case (or PascalCase for types)
+13:11:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+7:101:2:ZL300.max_line_length:line exceeds 100 characters (193)
+26:101:2:ZL300.max_line_length:line exceeds 100 characters (162)
+52:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+81:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+61:13:1:ZL009.var_should_be_const:variable 'tag' is never reassigned; consider using 'const'
+207:9:1:ZL009.var_should_be_const:variable 'original_header' is never reassigned; consider using 'const'
+289:9:1:ZL009.var_should_be_const:variable 'enc' is never reassigned; consider using 'const'
+200:23:1:ZL010.magic_number:magic number 0x03; consider using a named constant
+274:23:1:ZL010.magic_number:magic number 0x05; consider using a named constant
+281:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+289:41:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+9:1:1:ZL011.missing_doc_comment:public declaration 'NONCE_SIZE' is missing documentation
+10:1:1:ZL011.missing_doc_comment:public declaration 'TAG_SIZE' is missing documentation
+11:1:1:ZL011.missing_doc_comment:public declaration 'KEY_SIZE' is missing documentation
+12:1:1:ZL011.missing_doc_comment:public declaration 'OVERHEAD' is missing documentation
+13:1:1:ZL011.missing_doc_comment:public declaration 'PAGE_HEADER_SIZE' is missing documentation
+15:1:1:ZL011.missing_doc_comment:public declaration 'PageEncryption' is missing documentation
+18:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+110:34:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer

@@ -1,0 +1,34 @@
+174:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+155:13:3:ZL109.fips_unguarded_crypto:'std.crypto.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+183:9:1:ZL009.var_should_be_const:variable 'key' is never reassigned; consider using 'const'
+258:9:1:ZL009.var_should_be_const:variable 'cfg' is never reassigned; consider using 'const'
+306:5:1:ZL009.var_should_be_const:variable 'test_event_labels' is never reassigned; consider using 'const'
+98:22:1:ZL010.magic_number:magic number 8192; consider using a named constant
+106:41:1:ZL010.magic_number:magic number 60_000; consider using a named constant
+167:42:1:ZL010.magic_number:magic number 8192; consider using a named constant
+171:42:1:ZL010.magic_number:magic number 60_000; consider using a named constant
+184:19:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+187:22:1:ZL010.magic_number:magic number 4096; consider using a named constant
+188:30:1:ZL010.magic_number:magic number 2048; consider using a named constant
+191:41:1:ZL010.magic_number:magic number 120_000; consider using a named constant
+197:42:1:ZL010.magic_number:magic number 4096; consider using a named constant
+198:42:1:ZL010.magic_number:magic number 2048; consider using a named constant
+201:42:1:ZL010.magic_number:magic number 120_000; consider using a named constant
+202:41:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+208:33:1:ZL010.magic_number:magic number 0xBB; consider using a named constant
+232:78:1:ZL010.magic_number:magic number 500; consider using a named constant
+235:42:1:ZL010.magic_number:magic number 4096; consider using a named constant
+235:78:1:ZL010.magic_number:magic number 4096; consider using a named constant
+238:42:1:ZL010.magic_number:magic number 65536; consider using a named constant
+238:79:1:ZL010.magic_number:magic number 100_000; consider using a named constant
+242:30:1:ZL010.magic_number:magic number 8192; consider using a named constant
+245:42:1:ZL010.magic_number:magic number 8192; consider using a named constant
+245:82:1:ZL010.magic_number:magic number 2000; consider using a named constant
+254:77:1:ZL010.magic_number:magic number 50000; consider using a named constant
+334:44:1:ZL010.magic_number:magic number 6; consider using a named constant
+7:1:1:ZL011.missing_doc_comment:public declaration 'LogLevel' is missing documentation
+97:1:1:ZL011.missing_doc_comment:public declaration 'GraphConfig' is missing documentation
+193:21:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+203:40:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+193:21:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+203:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path

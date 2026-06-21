@@ -1,0 +1,19 @@
+9:7:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+42:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+61:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+82:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+102:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+108:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+122:9:1:ZL009.var_should_be_const:variable 'uuid' is never reassigned; consider using 'const'
+70:38:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+75:35:1:ZL010.magic_number:magic number 20; consider using a named constant
+91:38:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+93:35:1:ZL010.magic_number:magic number 20; consider using a named constant
+96:28:1:ZL010.magic_number:magic number 10; consider using a named constant
+96:34:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+115:20:1:ZL010.magic_number:magic number 10; consider using a named constant
+123:20:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+127:20:1:ZL010.magic_number:magic number 42; consider using a named constant
+128:25:1:ZL010.magic_number:magic number 500; consider using a named constant
+129:25:1:ZL010.magic_number:magic number 600; consider using a named constant
+11:1:1:ZL011.missing_doc_comment:public declaration 'Integrity' is missing documentation

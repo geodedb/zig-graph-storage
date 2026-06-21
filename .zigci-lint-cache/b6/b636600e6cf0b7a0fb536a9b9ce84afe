@@ -1,0 +1,67 @@
+7:4:1:ZL200.fn_camelcase:function 'fr_io' should use camelCase
+14:7:1:ZL203.const_snakecase:constant 'BACKUP_MAGIC' should use snake_case (or PascalCase for types)
+15:7:1:ZL203.const_snakecase:constant 'BACKUP_VERSION' should use snake_case (or PascalCase for types)
+18:7:1:ZL203.const_snakecase:constant 'serializePerGraphHeader' should use snake_case (or PascalCase for types)
+19:7:1:ZL203.const_snakecase:constant 'PER_GRAPH_HEADER_SIZE' should use snake_case (or PascalCase for types)
+140:7:1:ZL203.const_snakecase:constant 'FUZZ_SEED' should use snake_case (or PascalCase for types)
+143:7:1:ZL203.const_snakecase:constant 'FUZZ_ITERATIONS' should use snake_case (or PascalCase for types)
+26:101:2:ZL300.max_line_length:line exceeds 100 characters (174)
+49:101:2:ZL300.max_line_length:line exceeds 100 characters (138)
+88:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+92:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+104:101:2:ZL300.max_line_length:line exceeds 100 characters (126)
+120:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+29:9:1:ZL009.var_should_be_const:variable 'pool' is never reassigned; consider using 'const'
+32:9:1:ZL009.var_should_be_const:variable 'free_space' is never reassigned; consider using 'const'
+35:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+47:9:1:ZL009.var_should_be_const:variable 'cwd_buf' is never reassigned; consider using 'const'
+52:9:1:ZL009.var_should_be_const:variable 'header_buf' is never reassigned; consider using 'const'
+80:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+87:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+100:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+102:9:1:ZL009.var_should_be_const:variable 'cwd_buf' is never reassigned; consider using 'const'
+117:9:1:ZL009.var_should_be_const:variable 'backup' is never reassigned; consider using 'const'
+156:9:1:ZL009.var_should_be_const:variable 'heap_buf' is never reassigned; consider using 'const'
+160:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+164:13:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+184:9:1:ZL009.var_should_be_const:variable 'heap_buf' is never reassigned; consider using 'const'
+195:13:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+197:17:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+220:9:1:ZL009.var_should_be_const:variable 'heap_buf' is never reassigned; consider using 'const'
+224:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+228:13:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+245:9:1:ZL009.var_should_be_const:variable 'heap_buf' is never reassigned; consider using 'const'
+249:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+253:13:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+274:9:1:ZL009.var_should_be_const:variable 'base' is never reassigned; consider using 'const'
+287:9:1:ZL009.var_should_be_const:variable 'vs' is never reassigned; consider using 'const'
+288:9:1:ZL009.var_should_be_const:variable 'store' is never reassigned; consider using 'const'
+293:9:1:ZL009.var_should_be_const:variable 'prng' is never reassigned; consider using 'const'
+296:9:1:ZL009.var_should_be_const:variable 'heap_buf' is never reassigned; consider using 'const'
+297:9:1:ZL009.var_should_be_const:variable 'fba' is never reassigned; consider using 'const'
+300:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+29:59:1:ZL010.magic_number:magic number 4096; consider using a named constant
+29:65:1:ZL010.magic_number:magic number 4; consider using a named constant
+38:35:1:ZL010.magic_number:magic number 24; consider using a named constant
+55:29:1:ZL010.magic_number:magic number 0xAB; consider using a named constant
+56:23:1:ZL010.magic_number:magic number 10; consider using a named constant
+57:23:1:ZL010.magic_number:magic number 20; consider using a named constant
+82:20:1:ZL010.magic_number:magic number 4; consider using a named constant
+83:20:1:ZL010.magic_number:magic number 6; consider using a named constant
+84:20:1:ZL010.magic_number:magic number 22; consider using a named constant
+84:25:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+85:21:1:ZL010.magic_number:magic number 26; consider using a named constant
+87:22:1:ZL010.magic_number:magic number 26; consider using a named constant
+98:27:1:ZL010.magic_number:magic number 4; consider using a named constant
+118:39:1:ZL010.magic_number:magic number 0x42; consider using a named constant
+181:56:1:ZL010.magic_number:magic number 0x1111; consider using a named constant
+215:56:1:ZL010.magic_number:magic number 0x2222; consider using a named constant
+242:56:1:ZL010.magic_number:magic number 0x3333; consider using a named constant
+257:39:1:ZL010.magic_number:magic number 30; consider using a named constant
+281:9:1:ZL010.magic_number:magic number 4096; consider using a named constant
+287:51:1:ZL010.magic_number:magic number 4096; consider using a named constant
+288:60:1:ZL010.magic_number:magic number 4096; consider using a named constant
+293:56:1:ZL010.magic_number:magic number 0x4444; consider using a named constant
+75:37:2:ZL500.os_specific_code:Linux-specific code '/etc/' may cause portability issues; consider adding OS detection guards
+75:28:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+178:6:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path

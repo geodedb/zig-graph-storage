@@ -1,0 +1,38 @@
+17:7:1:ZL203.const_snakecase:constant 'PAGE_HEADER_SIZE' should use snake_case (or PascalCase for types)
+145:45:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+122:13:1:ZL009.var_should_be_const:variable 'page_id' is never reassigned; consider using 'const'
+285:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+335:9:1:ZL009.var_should_be_const:variable 'env' is never reassigned; consider using 'const'
+339:9:1:ZL009.var_should_be_const:variable 'store' is never reassigned; consider using 'const'
+353:9:1:ZL009.var_should_be_const:variable 'ctx' is never reassigned; consider using 'const'
+192:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+196:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+208:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+212:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+219:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+223:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+226:23:1:ZL010.magic_number:magic number 3; consider using a named constant
+227:26:1:ZL010.magic_number:magic number 3; consider using a named constant
+234:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+238:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+240:39:1:ZL010.magic_number:magic number 10; consider using a named constant
+241:39:1:ZL010.magic_number:magic number 20; consider using a named constant
+242:39:1:ZL010.magic_number:magic number 30; consider using a named constant
+254:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+258:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+262:38:1:ZL010.magic_number:magic number 84; consider using a named constant
+266:41:1:ZL010.magic_number:magic number 200; consider using a named constant
+276:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+280:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+288:57:1:ZL010.magic_number:magic number 10; consider using a named constant
+292:26:1:ZL010.magic_number:magic number 10; consider using a named constant
+293:26:1:ZL010.magic_number:magic number 200; consider using a named constant
+294:26:1:ZL010.magic_number:magic number 499; consider using a named constant
+310:38:1:ZL010.magic_number:magic number 497; consider using a named constant
+313:38:1:ZL010.magic_number:magic number 124041; consider using a named constant
+317:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+321:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+335:81:1:ZL010.magic_number:magic number 4096; consider using a named constant
+339:53:1:ZL010.magic_number:magic number 4096; consider using a named constant
+343:41:1:ZL010.magic_number:magic number 42; consider using a named constant
+27:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation

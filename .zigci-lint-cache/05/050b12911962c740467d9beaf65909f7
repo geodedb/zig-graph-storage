@@ -1,0 +1,56 @@
+9:7:1:ZL203.const_snakecase:constant 'SNAPSHOT_MAGIC' should use snake_case (or PascalCase for types)
+13:7:1:ZL203.const_snakecase:constant 'CHAIN_RECORD_MIN_SIZE' should use snake_case (or PascalCase for types)
+17:7:1:ZL203.const_snakecase:constant 'ENTRY_RECORD_MIN_SIZE' should use snake_case (or PascalCase for types)
+93:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+181:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+212:101:2:ZL300.max_line_length:line exceeds 100 characters (140)
+313:101:2:ZL300.max_line_length:line exceeds 100 characters (133)
+343:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+128:51:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+185:13:1:ZL009.var_should_be_const:variable 'w' is never reassigned; consider using 'const'
+190:13:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+212:13:1:ZL009.var_should_be_const:variable 'snapshot' is never reassigned; consider using 'const'
+218:13:1:ZL009.var_should_be_const:variable 'r' is never reassigned; consider using 'const'
+221:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+237:17:1:ZL009.var_should_be_const:variable 'j' is never reassigned; consider using 'const'
+342:9:1:ZL009.var_should_be_const:variable 'write_offset' is never reassigned; consider using 'const'
+364:9:1:ZL009.var_should_be_const:variable 'write_offset' is never reassigned; consider using 'const'
+367:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+383:9:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+386:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+393:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+397:9:1:ZL009.var_should_be_const:variable 'file' is never reassigned; consider using 'const'
+404:9:1:ZL009.var_should_be_const:variable 'orig' is never reassigned; consider using 'const'
+409:9:1:ZL009.var_should_be_const:variable 'loaded' is never reassigned; consider using 'const'
+290:33:1:ZL010.magic_number:magic number 99; consider using a named constant
+292:42:1:ZL010.magic_number:magic number 99; consider using a named constant
+293:35:1:ZL010.magic_number:magic number 99; consider using a named constant
+294:35:1:ZL010.magic_number:magic number 99; consider using a named constant
+295:36:1:ZL010.magic_number:magic number 99; consider using a named constant
+308:33:1:ZL010.magic_number:magic number 7; consider using a named constant
+316:31:1:ZL010.magic_number:magic number 123; consider using a named constant
+323:38:1:ZL010.magic_number:magic number 123; consider using a named constant
+324:45:1:ZL010.magic_number:magic number 7; consider using a named constant
+325:38:1:ZL010.magic_number:magic number 7; consider using a named constant
+326:38:1:ZL010.magic_number:magic number 7; consider using a named constant
+327:39:1:ZL010.magic_number:magic number 7; consider using a named constant
+368:38:1:ZL010.magic_number:magic number 7; consider using a named constant
+369:34:1:ZL010.magic_number:magic number 12; consider using a named constant
+391:33:1:ZL010.magic_number:magic number 7; consider using a named constant
+400:31:1:ZL010.magic_number:magic number 123; consider using a named constant
+406:40:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+19:1:1:ZL011.missing_doc_comment:public declaration 'PropertyDigest' is missing documentation
+24:1:1:ZL011.missing_doc_comment:public declaration 'PropertyChain' is missing documentation
+27:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+31:5:1:ZL011.missing_doc_comment:public declaration 'clear' is missing documentation
+38:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+43:5:1:ZL011.missing_doc_comment:public declaration 'hasKey' is missing documentation
+58:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+65:5:1:ZL011.missing_doc_comment:public declaration 'clear' is missing documentation
+73:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+78:5:1:ZL011.missing_doc_comment:public declaration 'containsChain' is missing documentation
+82:5:1:ZL011.missing_doc_comment:public declaration 'hasKey' is missing documentation
+87:5:1:ZL011.missing_doc_comment:public declaration 'removeChain' is missing documentation
+93:5:1:ZL011.missing_doc_comment:public declaration 'upsertKey' is missing documentation
+120:5:1:ZL011.missing_doc_comment:public declaration 'removeKey' is missing documentation
+136:5:1:ZL011.missing_doc_comment:public declaration 'refreshFromIterator' is missing documentation

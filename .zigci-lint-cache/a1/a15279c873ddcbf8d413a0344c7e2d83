@@ -1,0 +1,60 @@
+12:11:1:ZL203.const_snakecase:constant 'SHARD_MANIFEST_VERSION' should use snake_case (or PascalCase for types)
+16:11:1:ZL203.const_snakecase:constant 'SHARD_ALGORITHM_HASH' should use snake_case (or PascalCase for types)
+25:7:1:ZL203.const_snakecase:constant 'FILE_NAME' should use snake_case (or PascalCase for types)
+174:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+208:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+219:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+230:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+241:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+252:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+263:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+274:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+291:16:2:ZL204.no_dupe_import:duplicate import of 'shard_manifest.zig' (first at line 147)
+150:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+169:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+177:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+190:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+198:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+211:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+215:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+222:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+226:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+233:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+237:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+244:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+247:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+248:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+255:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+258:101:2:ZL300.max_line_length:line exceeds 100 characters (114)
+259:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+266:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+269:101:2:ZL300.max_line_length:line exceeds 100 characters (122)
+270:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+277:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+287:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+294:101:2:ZL300.max_line_length:line exceeds 100 characters (120)
+313:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+32:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+58:17:1:ZL009.var_should_be_const:variable 'hex_buf' is never reassigned; consider using 'const'
+87:9:1:ZL009.var_should_be_const:variable 'parsed' is never reassigned; consider using 'const'
+124:9:1:ZL009.var_should_be_const:variable 'per_shard' is never reassigned; consider using 'const'
+129:13:1:ZL009.var_should_be_const:variable 'out' is never reassigned; consider using 'const'
+153:9:1:ZL009.var_should_be_const:variable 'per_shard' is never reassigned; consider using 'const'
+180:9:1:ZL009.var_should_be_const:variable 'per_shard' is never reassigned; consider using 'const'
+292:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+300:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+68:57:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+111:55:1:ZL010.magic_number:magic number 10; consider using a named constant
+201:57:1:ZL010.magic_number:magic number 0o600; consider using a named constant
+310:13:1:ZL010.magic_number:magic number 15; consider using a named constant
+12:1:1:ZL011.missing_doc_comment:public declaration 'SHARD_MANIFEST_VERSION' is missing documentation
+18:1:1:ZL011.missing_doc_comment:public declaration 'ShardManifest' is missing documentation
+27:1:1:ZL011.missing_doc_comment:public declaration 'writeToDir' is missing documentation
+75:1:1:ZL011.missing_doc_comment:public declaration 'readFromDir' is missing documentation
+247:45:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+282:87:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+42:36:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+47:36:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+52:36:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+309:24:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+79:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer

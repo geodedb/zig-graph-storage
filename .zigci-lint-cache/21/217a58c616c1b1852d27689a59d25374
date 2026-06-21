@@ -1,0 +1,97 @@
+1049:68:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+1053:59:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+645:70:3:ZL003.no_empty_catch:empty catch block suppresses errors
+739:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+786:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+942:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+985:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+1076:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+1093:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+1138:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+1170:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+1049:62:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+1053:53:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+755:22:2:ZL204.no_dupe_import:duplicate import of 'sharded_store.zig' (first at line 183)
+879:22:2:ZL204.no_dupe_import:duplicate import of 'sharded_store.zig' (first at line 183)
+1380:9:2:ZL204.no_dupe_import:duplicate import of 'engine_edge_props.zig' (first at line 33)
+1381:9:2:ZL204.no_dupe_import:duplicate import of 'engine_integrity.zig' (first at line 34)
+1382:9:2:ZL204.no_dupe_import:duplicate import of 'engine_index.zig' (first at line 35)
+1383:9:2:ZL204.no_dupe_import:duplicate import of 'engine_persist.zig' (first at line 36)
+1384:9:2:ZL204.no_dupe_import:duplicate import of 'engine_property_index.zig' (first at line 37)
+148:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+246:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+278:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+326:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+385:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+389:101:2:ZL300.max_line_length:line exceeds 100 characters (129)
+451:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+703:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+818:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+829:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+844:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+852:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+865:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+875:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+953:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+999:101:2:ZL300.max_line_length:line exceeds 100 characters (119)
+1009:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+1029:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+1070:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+1113:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1147:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+1287:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+1300:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+1313:101:2:ZL300.max_line_length:line exceeds 100 characters (133)
+1318:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+1326:101:2:ZL300.max_line_length:line exceeds 100 characters (151)
+1327:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+1332:101:2:ZL300.max_line_length:line exceeds 100 characters (144)
+1342:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+1356:101:2:ZL300.max_line_length:line exceeds 100 characters (142)
+1366:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+148:9:2:ZL301.max_function_lines:function exceeds 80 lines (96)
+246:9:2:ZL301.max_function_lines:function exceeds 80 lines (115)
+593:50:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+224:13:1:ZL009.var_should_be_const:variable 'bootstrap_cfg' is never reassigned; consider using 'const'
+275:13:1:ZL009.var_should_be_const:variable 'recovery' is never reassigned; consider using 'const'
+866:13:1:ZL009.var_should_be_const:variable 'list' is never reassigned; consider using 'const'
+1045:17:1:ZL009.var_should_be_const:variable 'stack_buf' is never reassigned; consider using 'const'
+1149:13:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+374:27:1:ZL010.magic_number:magic number 4; consider using a named constant
+411:56:1:ZL010.magic_number:magic number 10000; consider using a named constant
+415:47:1:ZL010.magic_number:magic number 10000; consider using a named constant
+645:47:1:ZL010.magic_number:magic number 5; consider using a named constant
+453:5:1:ZL011.missing_doc_comment:public declaration 'refreshPropertyChainIndex' is missing documentation
+679:5:1:ZL011.missing_doc_comment:public declaration 'StorageStats' is missing documentation
+680:5:1:ZL011.missing_doc_comment:public declaration 'IntegrityReport' is missing documentation
+682:5:1:ZL011.missing_doc_comment:public declaration 'getMetrics' is missing documentation
+686:5:1:ZL011.missing_doc_comment:public declaration 'getStorageStats' is missing documentation
+690:5:1:ZL011.missing_doc_comment:public declaration 'checkIntegrity' is missing documentation
+715:5:1:ZL011.missing_doc_comment:public declaration 'getNode' is missing documentation
+747:5:1:ZL011.missing_doc_comment:public declaration 'allocNode' is missing documentation
+1018:5:1:ZL011.missing_doc_comment:public declaration 'getAllProperties' is missing documentation
+1086:5:1:ZL011.missing_doc_comment:public declaration 'removeProperty' is missing documentation
+1202:5:1:ZL011.missing_doc_comment:public declaration 'beginTxn' is missing documentation
+1214:5:1:ZL011.missing_doc_comment:public declaration 'commitTxn' is missing documentation
+1224:5:1:ZL011.missing_doc_comment:public declaration 'abortTxn' is missing documentation
+1234:5:1:ZL011.missing_doc_comment:public declaration 'nodeCount' is missing documentation
+1238:5:1:ZL011.missing_doc_comment:public declaration 'edgeCount' is missing documentation
+1242:5:1:ZL011.missing_doc_comment:public declaration 'checkpoint' is missing documentation
+1269:5:1:ZL011.missing_doc_comment:public declaration 'getOrAssignLabel' is missing documentation
+1332:5:1:ZL011.missing_doc_comment:public declaration 'setEdgeProperty' is missing documentation
+1342:5:1:ZL011.missing_doc_comment:public declaration 'removeEdgeProperty' is missing documentation
+1366:5:1:ZL011.missing_doc_comment:public declaration 'getAllEdgeProperties' is missing documentation
+200:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+201:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+202:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+203:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+204:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+205:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+206:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+207:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+208:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+281:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+282:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+283:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+165:38:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+90:23:1:ZL605.large_struct_copy:struct 'GraphEngine' has 240 fields; consider passing by pointer to avoid copies

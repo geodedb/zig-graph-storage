@@ -1,0 +1,19 @@
+52:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+84:101:2:ZL300.max_line_length:line exceeds 100 characters (138)
+6:1:1:ZL011.missing_doc_comment:public declaration 'OperationKind' is missing documentation
+16:5:1:ZL011.missing_doc_comment:public declaration 'label' is missing documentation
+21:1:1:ZL011.missing_doc_comment:public declaration 'OperationStatus' is missing documentation
+26:5:1:ZL011.missing_doc_comment:public declaration 'label' is missing documentation
+31:1:1:ZL011.missing_doc_comment:public declaration 'OperationArtifactStatus' is missing documentation
+38:5:1:ZL011.missing_doc_comment:public declaration 'label' is missing documentation
+43:1:1:ZL011.missing_doc_comment:public declaration 'OperationArtifact' is missing documentation
+50:5:1:ZL011.missing_doc_comment:public declaration 'writeJson' is missing documentation
+64:1:1:ZL011.missing_doc_comment:public declaration 'writeArtifactsJson' is missing documentation
+73:1:1:ZL011.missing_doc_comment:public declaration 'GraphOperationSummary' is missing documentation
+82:5:1:ZL011.missing_doc_comment:public declaration 'writeJsonFields' is missing documentation
+105:1:1:ZL011.missing_doc_comment:public declaration 'writeUuidHex' is missing documentation
+52:24:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+52:43:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+84:27:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+84:46:2:ZL500.os_specific_code:Windows-specific code ':\' may cause portability issues; consider adding OS detection guards
+94:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path

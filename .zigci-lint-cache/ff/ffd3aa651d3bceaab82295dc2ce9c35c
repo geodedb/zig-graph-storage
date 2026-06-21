@@ -1,0 +1,35 @@
+27:11:1:ZL203.const_snakecase:constant 'PREPARE_PAYLOAD_SIZE' should use snake_case (or PascalCase for types)
+31:5:2:ZL302.max_params:function has too many parameters (9 > 6)
+87:9:1:ZL009.var_should_be_const:variable 'payload_buf' is never reassigned; consider using 'const'
+111:9:1:ZL009.var_should_be_const:variable 'rec' is never reassigned; consider using 'const'
+127:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+140:9:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+43:34:1:ZL010.magic_number:magic number 11; consider using a named constant
+44:35:1:ZL010.magic_number:magic number 19; consider using a named constant
+45:35:1:ZL010.magic_number:magic number 27; consider using a named constant
+46:35:1:ZL010.magic_number:magic number 35; consider using a named constant
+47:35:1:ZL010.magic_number:magic number 39; consider using a named constant
+67:51:1:ZL010.magic_number:magic number 11; consider using a named constant
+68:49:1:ZL010.magic_number:magic number 19; consider using a named constant
+69:46:1:ZL010.magic_number:magic number 27; consider using a named constant
+70:44:1:ZL010.magic_number:magic number 35; consider using a named constant
+71:50:1:ZL010.magic_number:magic number 39; consider using a named constant
+128:32:1:ZL010.magic_number:magic number 123; consider using a named constant
+128:46:1:ZL010.magic_number:magic number 7; consider using a named constant
+128:49:1:ZL010.magic_number:magic number 42; consider using a named constant
+128:58:1:ZL010.magic_number:magic number 200; consider using a named constant
+128:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+130:42:1:ZL010.magic_number:magic number 123; consider using a named constant
+132:42:1:ZL010.magic_number:magic number 7; consider using a named constant
+133:45:1:ZL010.magic_number:magic number 42; consider using a named constant
+135:45:1:ZL010.magic_number:magic number 200; consider using a named constant
+136:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+141:33:1:ZL010.magic_number:magic number 0xCAFEBABE; consider using a named constant
+142:42:1:ZL010.magic_number:magic number 0xCAFEBABE; consider using a named constant
+29:1:1:ZL011.missing_doc_comment:public declaration 'Role' is missing documentation
+31:1:1:ZL011.missing_doc_comment:public declaration 'encodePreparePayload' is missing documentation
+50:1:1:ZL011.missing_doc_comment:public declaration 'PreparePayload' is missing documentation
+60:1:1:ZL011.missing_doc_comment:public declaration 'decodePreparePayload' is missing documentation
+75:1:1:ZL011.missing_doc_comment:public declaration 'encodeDecisionPayload' is missing documentation
+79:1:1:ZL011.missing_doc_comment:public declaration 'decodeDecisionPayload' is missing documentation
+103:1:1:ZL011.missing_doc_comment:public declaration 'appendDecision' is missing documentation

@@ -1,0 +1,28 @@
+52:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+156:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+216:23:3:ZL003.no_empty_catch:empty catch block suppresses errors
+227:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+109:29:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+27:13:1:ZL009.var_should_be_const:variable 'ids' is never reassigned; consider using 'const'
+78:9:1:ZL009.var_should_be_const:variable 'nodes' is never reassigned; consider using 'const'
+83:9:1:ZL009.var_should_be_const:variable 'edges' is never reassigned; consider using 'const'
+101:13:1:ZL009.var_should_be_const:variable 'e' is never reassigned; consider using 'const'
+122:13:1:ZL009.var_should_be_const:variable 'seen' is never reassigned; consider using 'const'
+183:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+207:9:1:ZL009.var_should_be_const:variable 'td' is never reassigned; consider using 'const'
+210:9:1:ZL009.var_should_be_const:variable 'eng' is never reassigned; consider using 'const'
+224:17:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+232:9:1:ZL009.var_should_be_const:variable 'workers' is never reassigned; consider using 'const'
+235:9:1:ZL009.var_should_be_const:variable 'threads' is never reassigned; consider using 'const'
+17:24:1:ZL010.magic_number:magic number 0xC1; consider using a named constant
+35:17:1:ZL010.magic_number:magic number 50; consider using a named constant
+36:49:1:ZL010.magic_number:magic number 50; consider using a named constant
+40:42:1:ZL010.magic_number:magic number 50; consider using a named constant
+55:38:1:ZL010.magic_number:magic number 50; consider using a named constant
+74:24:1:ZL010.magic_number:magic number 0xC3; consider using a named constant
+209:24:1:ZL010.magic_number:magic number 0xC2; consider using a named constant
+239:38:1:ZL010.magic_number:magic number 400; consider using a named constant
+20:41:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+86:41:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+210:37:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+236:43:1:ZL603.missing_defer_cleanup:resource 'std.Thread.spawn(' may not be properly cleaned up; consider using defer
