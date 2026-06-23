@@ -14,7 +14,30 @@ pub const PageFrame = struct {
     page_id: PageId,
     data: [*]u8, // pointer into the buffer pool's contiguous allocation
     page_size: u32, // so we know the slice length
+    // PERF-0058 (pin-contention): pin_count is the synchronisation pivot between
+    // the lock-free cache-HIT fast path and the structural slow path. EVERY
+    // access that can race is atomic: the fast-path pin CAS-increments it
+    // (refusing the PIN_EVICTING sentinel), `unpin` @atomicRmw-decrements it, and
+    // eviction CAS-claims it 0 -> PIN_EVICTING. Because the pin and the eviction
+    // claim are CAS operations on the SAME word, they are totally ordered by that
+    // word's modification order (exactly one wins) — that is what makes pin-vs-
+    // evict exclusion correct WITHOUT any Dekker/StoreLoad fence. The plain
+    // (non-atomic) stores to this field happen only while the frame is NOT yet
+    // reachable by the fast path: a frame published with loading=true (slow-path
+    // load) or held under the PIN_EVICTING sentinel (eviction teardown), both of
+    // which the fast path's pre-CAS checks (`!loading`, sentinel-refusing CAS)
+    // exclude. See BufferPool.pin (fast path + slow path) / unpin / evictFrame.
     pin_count: u32 = 0,
+    // PERF-0058 (pin-contention): clock/second-chance reference bit. The
+    // cache-HIT pin path sets this to 1 with a single relaxed atomic store
+    // (`@atomicStore(... .monotonic)`) INSTEAD of moving the frame to the LRU
+    // head, so concurrent hits no longer serialize on a pool-wide LRU list
+    // write. Eviction reads/clears it (under the exclusive `table_lock`) to give
+    // recently-touched frames a second chance before reclaiming them. A lost or
+    // stale bit only ever costs eviction *quality* (an approximate-LRU victim),
+    // never correctness. 0 = not referenced since last eviction sweep; 1 =
+    // referenced.
+    referenced: u8 = 0,
     dirty: bool = false,
     loading: bool = false,
     // True while this frame is being torn down for reuse by eviction: its
@@ -41,8 +64,14 @@ pub const PageFrame = struct {
     /// A frame already being torn down by another eviction (`evicting`) is not
     /// a valid victim: a second concurrent eviction must skip it so it never
     /// flushes/repurposes a frame whose teardown is already in flight.
+    ///
+    /// PERF-0058: pin_count is read atomically. The eviction claim then re-checks
+    /// it with a CAS(0 -> PIN_EVICTING), so even if a fast-path pin increments it
+    /// between this scan and the claim, the claim fails and eviction aborts — this
+    /// load only needs to be correct, not exclusive, so the atomic suffices.
     pub fn isEvictable(self: *const PageFrame) bool {
-        return self.pin_count == 0 and self.valid and !self.loading and !self.evicting;
+        return @atomicLoad(u32, &self.pin_count, .acquire) == 0 and
+            self.valid and !self.loading and !self.evicting;
     }
 };
 

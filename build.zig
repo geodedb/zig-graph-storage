@@ -269,6 +269,18 @@ fn addIntegrationTests(
     });
     const run_evict_race = b.addRunArtifact(evict_race_tests);
     evict_race_step.dependOn(&run_evict_race.step);
+
+    // Concurrency SCALING regression for the buffer-pool cache-HIT pin/unpin
+    // path. Own step so it can be run under -Doptimize=ReleaseFast (clean
+    // throughput signal) / ReleaseSafe (invariants armed) and looped.
+    const pin_scaling_step = b.step("test-pin-scaling", "Run buffer-pool cache-hit pin/unpin scaling regression");
+    const pin_scaling_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_pin_scaling.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_pin_scaling = b.addRunArtifact(pin_scaling_tests);
+    pin_scaling_step.dependOn(&run_pin_scaling.step);
 }
 
 fn addExample(

@@ -23,6 +23,25 @@ pub const BufferPoolError = error{
     NoPagerRegistered,
 };
 
+/// The single-threaded blocking Io used for all lock primitives in this file
+/// (same instance used throughout the engine). Centralised so the PERF-0058
+/// `mutex`/`cond` call sites stay readable.
+inline fn bpio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// PERF-0058: sentinel `pin_count` value meaning "exclusively claimed by an
+/// eviction in progress" (flush + teardown). Eviction claims an UNPINNED frame
+/// by atomically CAS-ing `pin_count` 0 -> PIN_EVICTING; while it holds this
+/// sentinel no other thread can pin the frame (the lock-free fast path's pin is
+/// a CAS that fails against the sentinel, and `isEvictable` excludes it). Because
+/// the claim and every pin are CAS operations on the SAME word, they are totally
+/// ordered by that atomic's modification order — exactly one wins — which makes
+/// the pin-vs-evict exclusion provably correct WITHOUT any Dekker/StoreLoad
+/// fence. Chosen as max-u32 so it can never collide with a real pin count (the
+/// pool has at most `capacity` frames, far below 2^32 pins).
+pub const PIN_EVICTING: u32 = std.math.maxInt(u32);
+
 /// PERF-0056: upper bound (in pages) on the reusable parallel-flush scratch
 /// buffer. With a 16 KiB page this caps the transient flush allocation at
 /// 16 MiB regardless of how many pages are dirty in a single checkpoint;
@@ -78,9 +97,56 @@ pub const BufferPool = struct {
     // PERF-0056: cap (in pages) on the reusable scratch buffer. Defaults to
     // PARALLEL_FLUSH_SCRATCH_PAGES; lowered in tests to exercise the wave path.
     max_scratch_pages: usize = PARALLEL_FLUSH_SCRATCH_PAGES,
-    // Concurrency protection for multi-threaded access
+    // Concurrency protection for multi-threaded access.
+    //
+    // `mutex` + `cond` guard ALL structural mutation (the page table, LRU list,
+    // free list, eviction/load coordination, dirty-file flags, reserved-frame
+    // accounting) and the loading/evicting wait protocol — UNCHANGED from the
+    // v0.2.6 dirty-eviction-race fix. Every structural mutator still holds
+    // `mutex` exactly as before.
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     cond: std.Io.Condition = std.Io.Condition.init,
+    // PERF-0058 (pin-contention): a SEQLOCK generation counter that lets the
+    // COMMON cache-HIT pin/unpin path run lock-free, so concurrent readers no
+    // longer serialize on the pool-wide `mutex` (which collapsed aggregate
+    // throughput to BELOW single-thread under many cores). It is the single most
+    // important field for read scaling.
+    //
+    // PROTOCOL:
+    //   * EVEN value  => the page table + frame identities are STABLE (no
+    //     structural writer in its critical region).
+    //   * ODD value   => a structural writer (a page_table insert/remove, a frame
+    //     identity change, an eviction teardown) is IN PROGRESS; the table/frames
+    //     may be momentarily inconsistent and the lock-free fast path must defer.
+    //   Writers (always under `mutex`) bracket every page_table mutation / frame
+    //   identity change with `beginTableWrite()` (gen -> odd, release) ...
+    //   `endTableWrite()` (gen -> even, release).
+    //
+    //   The fast path reads `table_gen` (acquire) BEFORE and AFTER its lock-free
+    //   `page_table.get`; if the value changed or was odd, a writer overlapped the
+    //   lookup, so the result is discarded and the slow (mutex) path is taken.
+    //   "gen stable & even across the get" PROVES no put/remove overlapped the
+    //   get — so the get observed a fully consistent, non-rehashing map and can
+    //   neither tear nor crash. After atomically bumping `pin_count` the fast path
+    //   re-checks the frame identity + gen once more to close the
+    //   lookup->pin window against a writer that starts mid-pin (see `pin`).
+    //
+    // The fast path therefore writes only its own frame's `pin_count`/`referenced`
+    // cachelines and merely READS the shared `table_gen` (shared reads don't
+    // ping-pong), so it scales ~linearly with cores. The page table is pre-sized
+    // to `capacity` at init and never holds more than `capacity` entries, so it
+    // never rehashes — its bucket storage never moves under a lock-free reader.
+    table_gen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // PERF-0058: number of threads currently PARKED on `cond` in the slow-path
+    // loading/evicting wait. Incremented (under `mutex`) right before a
+    // `cond.wait`, decremented right after. `unpin` consults it to decide whether
+    // its pin_count->0 transition needs to wake anyone: in the overwhelmingly
+    // common case (no parked waiter) unpin stays FULLY LOCK-FREE and never
+    // touches the pool mutex — which is what lets pin+unpin scale. Without this,
+    // every unpin that drops a frame to zero (i.e. almost every unpin in a
+    // pin/immediately-unpin read workload) would take the mutex and re-serialise
+    // all readers.
+    pin_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // Optional thread pool for parallel page flushes
     thread_pool: ?*tp.ThreadPool = null,
 
@@ -159,6 +225,32 @@ pub const BufferPool = struct {
         self.reserved_frames[@intFromEnum(file_id)] = @min(count, self.capacity);
     }
 
+    /// PERF-0058: open a structural-write critical region — bump `table_gen` to
+    /// ODD so the lock-free fast path defers while the page table / a frame's
+    /// identity is being mutated. Caller holds `mutex`. MUST be paired with
+    /// `endTableWrite`. Re-entrancy is NOT supported: a writer must not nest these
+    /// (every call site below brackets one contiguous mutation region).
+    /// PERF-0058 CORRECTNESS: the gen->odd store and the eviction's subsequent
+    /// `pin_count` re-check load form a Dekker/StoreLoad handshake with the fast
+    /// path's `pin_count` increment and its `gen` re-load. StoreLoad is the one
+    /// reordering even x86-TSO permits, so BOTH the gen stores here and the
+    /// matching fast-path/eviction accesses use `.seq_cst` to establish a single
+    /// total order — guaranteeing at least one side observes the other (no
+    /// frame is repurposed under a freshly-taken lock-free pin).
+    fn beginTableWrite(self: *BufferPool) void {
+        const g = self.table_gen.load(.monotonic);
+        std.debug.assert(g & 1 == 0); // must be even (no nested writer)
+        self.table_gen.store(g + 1, .seq_cst);
+    }
+
+    /// PERF-0058: close a structural-write critical region — bump `table_gen`
+    /// back to EVEN. Caller holds `mutex`.
+    fn endTableWrite(self: *BufferPool) void {
+        const g = self.table_gen.load(.monotonic);
+        std.debug.assert(g & 1 == 1); // must be odd (inside a writer)
+        self.table_gen.store(g + 1, .seq_cst);
+    }
+
     /// Increment the resident-page counter for `file_id`. Caller holds the mutex.
     fn incrResident(self: *BufferPool, file_id: FileId) void {
         self.resident_counts[@intFromEnum(file_id)] += 1;
@@ -226,11 +318,89 @@ pub const BufferPool = struct {
     }
 
     /// Pin a page: return it from cache or read it from disk.
-    /// If the page is already cached, increments pin_count and moves to LRU head.
-    /// Otherwise, allocates a frame (evicting LRU if necessary) and reads from disk.
+    ///
+    /// CACHE HIT (the common case under concurrent readers) runs LOCK-FREE: it
+    /// reads the `table_gen` seqlock, does a lock-free `page_table.get`, and — if
+    /// no structural writer overlapped the lookup — atomically bumps `pin_count`
+    /// and sets the `referenced` clock bit. No pool-wide `mutex`, no LRU-list
+    /// write: the only memory it WRITES is its own frame's `pin_count`/`referenced`
+    /// cachelines, so concurrent readers scale ~linearly (PERF-0058). Anything
+    /// else — a miss, a frame found mid load/evict, or a writer racing the
+    /// lookup — falls through to the structural slow path, which takes the `mutex`
+    /// and preserves the v0.2.6 loading/evicting cond-var protocol unchanged.
     pub fn pin(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        const io = bpio();
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
+
+        // ---- FAST PATH: lock-free cache hit. --------------------------------
+        // A stable, EVEN `table_gen` ACROSS the lookup proves no page_table
+        // insert/remove overlapped it (writers bracket every such mutation with
+        // begin/endTableWrite -> odd/even), so the lock-free `get` observed a
+        // fully consistent, non-rehashing map. CRUCIAL ORDERING: the `frame_idx`
+        // returned by a `get` that raced a concurrent writer can be a TORN value
+        // (e.g. 0xAAAAAAAA), so we must NOT index `self.frames` with it until the
+        // post-get gen check (g1 == g0) has confirmed no writer overlapped — and
+        // even then bounds-check defensively. The second gen check after the pin
+        // bump closes the lookup->pin window against a writer that starts mid-pin.
+        {
+            const g0 = self.table_gen.load(.acquire);
+            if (g0 & 1 == 0) {
+                const hit = self.page_table.get(key);
+                // Re-read gen BEFORE trusting / using `hit`: if it changed, a
+                // writer overlapped the get and `hit` may be a TORN value ->
+                // slow path without ever indexing the frames array with it.
+                const g1 = self.table_gen.load(.acquire);
+                if (g1 == g0) {
+                    if (hit) |frame_idx| {
+                        if (frame_idx < self.capacity) {
+                            const frame = &self.frames[frame_idx];
+                            if (frame.file_id == file_id and frame.page_id == page_id and
+                                frame.valid and !frame.loading and !frame.evicting)
+                            {
+                                // CAS-increment pin_count, REFUSING the eviction
+                                // sentinel. The claim (evict: CAS 0->PIN_EVICTING)
+                                // and this pin both CAS the SAME word, so they are
+                                // totally ordered and mutually exclusive WITHOUT a
+                                // Dekker fence: if eviction has claimed the frame we
+                                // see PIN_EVICTING and defer; otherwise our pin wins
+                                // and eviction's 0->sentinel CAS then fails.
+                                var c = @atomicLoad(u32, &frame.pin_count, .acquire);
+                                while (c != PIN_EVICTING) {
+                                    if (@cmpxchgWeak(u32, &frame.pin_count, c, c + 1, .acq_rel, .acquire)) |actual| {
+                                        c = actual; // contended; retry with fresh value
+                                        continue;
+                                    }
+                                    // Pinned. Re-validate that the frame still holds
+                                    // OUR page and no structural writer (re)claimed
+                                    // it after the lookup — a repurpose happens under
+                                    // a gen bracket, so a changed gen or identity
+                                    // means we pinned a frame that is being / has been
+                                    // reused: undo and defer.
+                                    if (self.table_gen.load(.acquire) == g0 and
+                                        frame.file_id == file_id and frame.page_id == page_id and
+                                        !frame.evicting and frame.valid)
+                                    {
+                                        @atomicStore(u8, &frame.referenced, 1, .monotonic);
+                                        if (self.metrics) |m| _ = @atomicRmw(u64, &m.buffer_hits, .Add, 1, .monotonic);
+                                        return frame;
+                                    }
+                                    _ = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Miss, writer-overlap, frame loading/evicting, or eviction-claimed:
+            // fall through to the structural slow path.
+        }
+
+        // ---- SLOW PATH: structural, under `mutex`. Page-table / frame-identity
+        // mutations are bracketed by begin/endTableWrite so the fast path defers
+        // while they are in flight. The loading/evicting cond-var protocol is
+        // exactly the v0.2.6 logic. ----------------------------------------
+        self.mutex.lockUncancelable(io);
         while (true) {
             if (self.page_table.get(key)) |frame_idx| {
                 const frame = &self.frames[frame_idx];
@@ -243,13 +413,24 @@ pub const BufferPool = struct {
                 // Either way we never hand back a frame that is about to be — or
                 // has just been — repurposed for a different page.
                 if (frame.loading or frame.evicting) {
-                    self.cond.waitUncancelable(std.Io.Threaded.global_single_threaded.io(), &self.mutex);
+                    // Publish that a waiter is parking (so a lock-free unpin knows
+                    // to wake us). Incremented under the mutex; cond.wait releases
+                    // the mutex while parked.
+                    _ = self.pin_waiters.fetchAdd(1, .acq_rel);
+                    self.cond.waitUncancelable(io, &self.mutex);
+                    _ = self.pin_waiters.fetchSub(1, .acq_rel);
                     continue;
                 }
-                frame.pin_count += 1;
-                self.moveToHead(frame_idx);
-                if (self.metrics) |m| m.buffer_hits += 1;
-                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+                // Hit discovered on the slow path (e.g. a racing loader just
+                // finished). The mutex serialises us against structural writers,
+                // so a bare atomic bump is sufficient; set the clock bit instead
+                // of an LRU move. No gen bracket needed: pin_count is not part of
+                // the seqlock-protected identity (the fast path re-checks it
+                // atomically), and we are not changing the page table.
+                _ = @atomicRmw(u32, &frame.pin_count, .Add, 1, .acq_rel);
+                @atomicStore(u8, &frame.referenced, 1, .monotonic);
+                if (self.metrics) |m| _ = @atomicRmw(u64, &m.buffer_hits, .Add, 1, .monotonic);
+                self.mutex.unlock(io);
                 return frame;
             }
 
@@ -260,31 +441,74 @@ pub const BufferPool = struct {
             // (`pin` again) would re-lock a mutex this thread still holds and
             // self-deadlock. (Pre-existing latent bug; surfaced by tiny-pool
             // concurrent eviction where BufferPoolFull is common.)
+            //
+            // getFrame is NOT wrapped in a gen bracket: it may evict a dirty
+            // victim, which flushes with the mutex (and the gen) released so other
+            // readers keep flowing — evictFrame opens its own fine-grained
+            // brackets around the `evicting` publication and the teardown. The
+            // frame getFrame returns is NOT in the page table (free or just
+            // evicted), so no fast-path reader can reach it until we `put` it.
             const frame_idx = self.getFrame() catch |err| {
-                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+                self.mutex.unlock(io);
                 return err;
             };
+
+            // CORRECTNESS (double-load window): `getFrame` may have DROPPED the
+            // mutex to flush a dirty eviction victim (evictFrame -> writeFrameBytes
+            // releases `mutex` across the blocking write). During that window a
+            // concurrent slow-path `pin` of THIS SAME key can have missed the
+            // table, loaded the page, and inserted it. If we now blindly
+            // `putAssumeCapacity(key, ...)` we would (a) overwrite that entry,
+            // orphaning the other thread's frame (a permanent leak whose pin never
+            // drops), and (b) double-count `resident_counts` (resident > table).
+            // So RE-PROBE the table now that the mutex is held again: if the key
+            // is resident, give our just-obtained frame back to the free list and
+            // restart the loop, which will pin the existing entry via the hit
+            // branch (or re-wait if it is still loading/evicting). The frame from
+            // getFrame is not in the table, not pinned, and not on the LRU list,
+            // so returning it to the free list is safe. (This race PRE-DATES the
+            // PERF-0058 lock-free fast path — it exists in v0.2.6 — but the fast
+            // path widens the window enough to surface it, so it is fixed here.)
+            if (self.page_table.get(key) != null) {
+                self.free_list.appendAssumeCapacity(frame_idx);
+                // A racing loader may still be holding the frame `loading`; wake
+                // semantics are unchanged because the restart re-enters the hit/
+                // wait branch under the mutex.
+                continue;
+            }
+
             const frame = &self.frames[frame_idx];
             const pager = self.pagers[@intFromEnum(file_id)] orelse {
                 self.free_list.appendAssumeCapacity(frame_idx);
-                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+                self.mutex.unlock(io);
                 return error.NoPagerRegistered;
             };
 
+            // Bracket only the step that makes the frame reachable: set its
+            // identity then publish it into the table. The fast path will find it
+            // but see loading=true and defer; it cannot be pinned until load
+            // completes.
+            self.beginTableWrite();
             frame.file_id = file_id;
             frame.page_id = page_id;
             frame.pin_count = 1;
+            frame.referenced = 1;
             frame.dirty = false;
             frame.loading = true;
             frame.evicting = false;
             frame.valid = false;
             frame.lsn = 0;
 
-            try self.page_table.put(key, frame_idx);
+            // putAssumeCapacity (not put): the table is pre-sized to `capacity`
+            // at init and never holds more than `capacity` entries, so it NEVER
+            // rehashes — which is exactly what lets the lock-free fast path read
+            // it without the bucket storage moving underneath it.
+            self.page_table.putAssumeCapacity(key, frame_idx);
             self.incrResident(file_id);
             self.moveToHead(frame_idx);
+            self.endTableWrite();
 
-            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+            self.mutex.unlock(io);
 
             var read_err: ?anyerror = null;
             pager.readPage(page_id, frame.dataSlice()) catch |err| switch (err) {
@@ -292,8 +516,9 @@ pub const BufferPool = struct {
                 else => read_err = err,
             };
 
-            self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+            self.mutex.lockUncancelable(io);
             if (read_err) |err| {
+                self.beginTableWrite();
                 frame.pin_count = 0;
                 frame.dirty = false;
                 frame.loading = false;
@@ -304,85 +529,156 @@ pub const BufferPool = struct {
                 _ = self.page_table.remove(key);
                 self.decrResident(file_id);
                 self.free_list.appendAssumeCapacity(frame_idx);
-                self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
-                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+                self.endTableWrite();
+                self.cond.broadcast(io);
+                self.mutex.unlock(io);
                 return err;
             }
 
+            // Publish the load completion inside a gen bracket so a fast-path pin
+            // observes the loading->resident transition as one atomic step rather
+            // than racing it.
+            self.beginTableWrite();
             frame.loading = false;
             frame.valid = true;
+            self.endTableWrite();
             if (self.metrics) |m| m.page_reads += 1;
-            self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
-            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
             return frame;
         }
     }
 
     /// Pin a new page without reading from disk. Used when creating a new page.
     /// Zeros the data buffer and inserts into cache.
+    ///
+    /// Structural (allocates/repurposes a frame), so it runs under the `mutex`
+    /// and brackets the page-table/identity mutation with begin/endTableWrite
+    /// (PERF-0058) so the lock-free fast path defers while it is in flight.
     pub fn pinNew(self: *BufferPool, file_id: FileId, page_id: PageId) !*PageFrame {
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
-        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
 
-        // If already in cache, just pin it. As in `pin`, a frame still loading
-        // or being torn down by a concurrent eviction is unsafe to alias: wait
-        // on the cond var and re-check rather than handing back a frame that is
-        // about to be (or has just been) repurposed for a different page.
-        while (self.page_table.get(key)) |frame_idx| {
-            const frame = &self.frames[frame_idx];
-            if (frame.loading or frame.evicting) {
-                self.cond.waitUncancelable(std.Io.Threaded.global_single_threaded.io(), &self.mutex);
+        // Looped so the post-getFrame re-probe (below) can restart the cache-hit
+        // check when a concurrent loader inserted `key` while getFrame had the
+        // mutex dropped for a dirty-victim flush.
+        while (true) {
+            // If already in cache, just pin it. As in `pin`, a frame still loading
+            // or being torn down by a concurrent eviction is unsafe to alias: wait
+            // on the cond var and re-check rather than handing back a frame that is
+            // about to be (or has just been) repurposed for a different page.
+            while (self.page_table.get(key)) |frame_idx| {
+                const frame = &self.frames[frame_idx];
+                if (frame.loading or frame.evicting) {
+                    _ = self.pin_waiters.fetchAdd(1, .acq_rel);
+                    self.cond.waitUncancelable(io, &self.mutex);
+                    _ = self.pin_waiters.fetchSub(1, .acq_rel);
+                    continue;
+                }
+                // Hit: bump atomically (consistent with the fast path); no gen
+                // bracket needed since the page table is unchanged.
+                _ = @atomicRmw(u32, &frame.pin_count, .Add, 1, .acq_rel);
+                @atomicStore(u8, &frame.referenced, 1, .monotonic);
+                return frame;
+            }
+
+            // getFrame may evict a dirty victim (flushing with the mutex/gen
+            // released), so it runs OUTSIDE the gen bracket — exactly as in the
+            // `pin` slow path — and evictFrame opens its own fine-grained
+            // brackets. The returned frame is not in the page table, so no
+            // fast-path reader can reach it until the bracketed put below.
+            const frame_idx = try self.getFrame();
+
+            // CORRECTNESS (double-load window): getFrame may have DROPPED the
+            // mutex to flush a dirty victim; during that window a concurrent
+            // loader could have inserted `key`. Re-probe before publishing so we
+            // never overwrite (leak) another thread's frame or double-count
+            // resident_counts. If present now, return our frame to the free list
+            // and restart — the inner loop will pin the existing entry. Same
+            // latent v0.2.6 race as in `pin`, fixed here too.
+            if (self.page_table.get(key) != null) {
+                self.free_list.appendAssumeCapacity(frame_idx);
                 continue;
             }
-            frame.pin_count += 1;
+
+            const frame = &self.frames[frame_idx];
+
+            // Zero the data (new page)
+            @memset(frame.dataSlice(), 0);
+
+            self.beginTableWrite();
+            frame.file_id = file_id;
+            frame.page_id = page_id;
+            frame.pin_count = 1;
+            frame.referenced = 1;
+            frame.dirty = false;
+            frame.loading = false;
+            frame.evicting = false;
+            frame.valid = true;
+            frame.lsn = 0;
+
+            self.page_table.putAssumeCapacity(key, frame_idx);
+            self.incrResident(file_id);
             self.moveToHead(frame_idx);
+            self.endTableWrite();
+
             return frame;
         }
-
-        const frame_idx = try self.getFrame();
-        const frame = &self.frames[frame_idx];
-
-        // Zero the data (new page)
-        @memset(frame.dataSlice(), 0);
-
-        frame.file_id = file_id;
-        frame.page_id = page_id;
-        frame.pin_count = 1;
-        frame.dirty = false;
-        frame.loading = false;
-        frame.evicting = false;
-        frame.valid = true;
-        frame.lsn = 0;
-
-        try self.page_table.put(key, frame_idx);
-        self.incrResident(file_id);
-        self.moveToHead(frame_idx);
-
-        return frame;
     }
 
-    /// Unpin a frame. Decrements pin_count and optionally marks dirty.
+    /// Unpin a frame: decrement pin_count and optionally mark dirty.
+    ///
+    /// PERF-0058: fully LOCK-FREE in the common case — a single atomic decrement
+    /// of `pin_count` and (if dirtying) a monotonic false->true store of `dirty`.
+    /// It touches only the frame's own cachelines, so unpins scale with cores
+    /// alongside cache-hit pins. `dirty` is only ever CLEARED by a flush/eviction
+    /// holding the `mutex` (and the v0.2.6 eviction re-reads it under the mutex),
+    /// and an unpin only ever SETS it, so the relaxed atomic store cannot lose a
+    /// dirty mark. Only when the count reaches zero do we briefly take the `mutex`
+    /// to wake any waiter parked in the structural cond-var protocol (a flush or
+    /// eviction waiting for this frame to become unpinned) — exactly the v0.2.6
+    /// wake, just gated on the zero transition.
     pub fn unpin(self: *BufferPool, frame_idx: u32, dirty: bool) void {
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
-        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
-
+        const io = bpio();
         const frame = &self.frames[frame_idx];
-        std.debug.assert(frame.pin_count > 0);
-        frame.pin_count -= 1;
+
         if (dirty) {
-            frame.dirty = true;
+            @atomicStore(bool, &frame.dirty, true, .monotonic);
         }
-        if (frame.pin_count == 0) {
-            self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
+        const prev = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
+        // prev must be a real pin count (1..): never 0 (underflow) and never the
+        // eviction sentinel (a pinned frame cannot be claimed by eviction). Note
+        // pin_count can legitimately reach the number of concurrent pinners of a
+        // hot page, so there is NO small upper bound to assert.
+        std.debug.assert(prev > 0 and prev != PIN_EVICTING);
+
+        // Wake a parked slow-path waiter ONLY when one actually exists. A waiter
+        // parks while a frame is loading/evicting and (if pool-full) re-attempts
+        // eviction on wake; an unpin freeing a frame may be exactly what lets it
+        // make progress, so we must wake it. But in the common case there are NO
+        // waiters (`pin_waiters == 0`) and unpin stays fully lock-free — never
+        // touching the mutex — which is what makes pin/unpin scale. The
+        // `pin_waiters` load is acquire and the increment side is published under
+        // the mutex before the wait, so a waiter that parked before our decrement
+        // is always observed here. (We broadcast on ANY unpin while waiters
+        // exist, not only the zero transition: a waiter blocked on
+        // BufferPoolFull-style starvation can be unblocked by any frame becoming
+        // less pinned; a spurious wake is harmless — the waiter re-checks.)
+        if (self.pin_waiters.load(.acquire) != 0) {
+            self.mutex.lockUncancelable(io);
+            if (self.pin_waiters.load(.acquire) != 0) self.cond.broadcast(io);
+            self.mutex.unlock(io);
         }
     }
 
     /// Flush all dirty frames with LSN <= up_to_lsn to disk.
     pub fn flushDirty(self: *BufferPool, up_to_lsn: Lsn) !void {
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
-        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         for (self.frames, 0..) |*frame, i| {
             _ = i;
             if (frame.dirty and frame.valid and frame.lsn <= up_to_lsn) {
@@ -398,8 +694,9 @@ pub const BufferPool = struct {
         if (self.thread_pool) |pool| {
             return self.flushAllParallel(pool);
         }
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
-        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         for (self.frames) |*frame| {
             if (frame.dirty and frame.valid) {
                 try self.flushFrame(frame);
@@ -417,7 +714,15 @@ pub const BufferPool = struct {
     /// capacity-sized waves, so peak transient memory stays bounded no matter how
     /// many pages are dirty.
     fn flushAllParallel(self: *BufferPool, pool: *tp.ThreadPool) !void {
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        const io = bpio();
+        // Runs under `mutex`, dropped only during each wave's parallel-I/O window
+        // (as in v0.2.6). PERF-0058: the lock-free fast path is NOT excluded
+        // during that window — but this path never changes a frame's identity or
+        // the page table, only writes page bytes and toggles pin_count/dirty, so a
+        // concurrent fast-path pin of a frame being flushed is safe. Because the
+        // window drops the mutex while frames are pin-bumped, every pin_count/
+        // dirty mutation here is atomic (a concurrent fast-path unpin may race).
+        self.mutex.lockUncancelable(io);
 
         // Count dirty frames
         var dirty_count: usize = 0;
@@ -426,7 +731,7 @@ pub const BufferPool = struct {
         }
 
         if (dirty_count == 0) {
-            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+            self.mutex.unlock(io);
             return;
         }
 
@@ -435,7 +740,7 @@ pub const BufferPool = struct {
         // Descriptor array for every dirty frame (tiny, ~constant per frame).
         // The large page-copy storage is the bounded scratch buffer below.
         const items = self.allocator.alloc(FlushItem, dirty_count) catch {
-            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+            self.mutex.unlock(io);
             return error.OutOfMemory;
         };
 
@@ -443,7 +748,7 @@ pub const BufferPool = struct {
         const wave_pages: usize = @min(dirty_count, @max(self.max_scratch_pages, 1));
         self.ensureFlushScratch(wave_pages * ps) catch {
             self.allocator.free(items);
-            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+            self.mutex.unlock(io);
             return error.OutOfMemory;
         };
         const data_buf = self.flush_scratch;
@@ -458,16 +763,16 @@ pub const BufferPool = struct {
                 const p = self.pagers[@intFromEnum(fid)] orelse {
                     // Undo previously pinned frames and bail
                     for (items[0..idx]) |item| {
-                        self.frames[item.frame_idx].pin_count -= 1;
-                        self.frames[item.frame_idx].dirty = true;
+                        _ = @atomicRmw(u32, &self.frames[item.frame_idx].pin_count, .Sub, 1, .acq_rel);
+                        @atomicStore(bool, &self.frames[item.frame_idx].dirty, true, .monotonic);
                     }
                     self.allocator.free(items);
-                    self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+                    self.mutex.unlock(io);
                     return error.NoPagerRegistered;
                 };
 
-                frame.pin_count += 1;
-                frame.dirty = false;
+                _ = @atomicRmw(u32, &frame.pin_count, .Add, 1, .acq_rel);
+                @atomicStore(bool, &frame.dirty, false, .monotonic);
 
                 items[idx] = .{
                     .pager = p,
@@ -493,13 +798,16 @@ pub const BufferPool = struct {
             const wave = items[wave_start..wave_end];
             const wave_len = wave.len;
 
-            // Copy this wave's page bytes into the scratch buffer (mutex held).
+            // Copy this wave's page bytes into the scratch buffer (locks held).
             for (wave, 0..) |*item, w| {
                 const offset = w * ps;
                 item.data_offset = offset;
                 @memcpy(data_buf[offset..][0..ps], self.frames[item.frame_idx].dataSlice());
             }
-            self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+            // Drop the mutex for the parallel I/O window so cache-hit pins keep
+            // flowing during the writes (the pinned frames stay protected by the
+            // atomic pin bump above; their identity/page-table entry is untouched).
+            self.mutex.unlock(io);
 
             // Parallel I/O via submitBatch + WaitGroup for this wave.
             const n_chunks = @min(wave_len, MAX_CHUNKS);
@@ -537,12 +845,13 @@ pub const BufferPool = struct {
 
             wg.wait();
 
-            // Re-acquire mutex to unpin this wave's frames and reconcile errors.
-            self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+            // Re-acquire the mutex to unpin this wave's frames and reconcile
+            // errors.
+            self.mutex.lockUncancelable(io);
             for (wave) |*item| {
-                self.frames[item.frame_idx].pin_count -= 1;
+                _ = @atomicRmw(u32, &self.frames[item.frame_idx].pin_count, .Sub, 1, .acq_rel);
                 if (item.err) |e| {
-                    self.frames[item.frame_idx].dirty = true;
+                    @atomicStore(bool, &self.frames[item.frame_idx].dirty, true, .monotonic);
                     if (first_err == null) first_err = e;
                 } else {
                     // PERF-0057: the page reached the OS page cache; flag its file
@@ -567,7 +876,7 @@ pub const BufferPool = struct {
         }
 
         if (self.metrics) |m| m.page_writes += write_count;
-        self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        self.mutex.unlock(io);
 
         self.allocator.free(items);
 
@@ -587,8 +896,9 @@ pub const BufferPool = struct {
     /// Returns the number of pages actually flushed. This is intended to be called
     /// proactively (e.g. during maintenance) to reduce eviction stalls.
     pub fn flushDirtyPages(self: *BufferPool, max_count: u32) !u32 {
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
-        defer self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         var flushed: u32 = 0;
         var current = self.lru_tail;
         while (current) |idx| {
@@ -596,7 +906,7 @@ pub const BufferPool = struct {
             const frame = &self.frames[idx];
             // Walk via lru_prev before we potentially modify the frame
             const prev = frame.lru_prev;
-            if (frame.dirty and frame.valid and frame.pin_count == 0) {
+            if (frame.dirty and frame.valid and @atomicLoad(u32, &frame.pin_count, .acquire) == 0) {
                 try self.flushFrame(frame);
                 flushed += 1;
             }
@@ -616,30 +926,63 @@ pub const BufferPool = struct {
     // Internal helpers
     // ========================================================================
 
-    /// Flush a single dirty frame to disk via its pager.
+    /// Flush a single dirty frame to disk via its pager — for callers that do NOT
+    /// already hold an exclusive claim on the frame (the bulk flush paths). It
+    /// temporarily bumps `pin_count` (atomically) so the frame cannot be evicted
+    /// across the mutex-dropping I/O window, then restores it.
+    ///
+    /// CONTRACT: called WITH `mutex` held; the blocking disk write DROPS the mutex
+    /// (the v0.2.6 reason — never serialise I/O behind the pool lock) and
+    /// re-acquires it before returning. It does NOT touch the page table or the
+    /// frame's identity, so the PERF-0058 lock-free fast path may pin this frame
+    /// during the write — safe (the page stays resident; only its bytes are
+    /// written). The pin bump is atomic because a concurrent fast-path unpin of a
+    /// still-pinned frame can run while the mutex is dropped.
     fn flushFrame(self: *BufferPool, frame: *PageFrame) !void {
-        // Called WITH mutex held.
+        // Prevent eviction during I/O: eviction claims via CAS(0 -> sentinel),
+        // which fails while pin_count is bumped. Atomic because the mutex is
+        // dropped during the write.
+        _ = @atomicRmw(u32, &frame.pin_count, .Add, 1, .acq_rel);
+        self.writeFrameBytes(frame) catch |err| {
+            _ = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
+            return err;
+        };
+        _ = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
+    }
+
+    /// Flush a single dirty frame to disk for an EVICTION that already holds the
+    /// frame's exclusive claim (`pin_count == PIN_EVICTING`). It must NOT touch
+    /// `pin_count` — the sentinel is the protection; bumping it would overflow.
+    /// Same mutex-drop-across-I/O contract as `flushFrame`.
+    fn flushFrameClaimed(self: *BufferPool, frame: *PageFrame) !void {
+        std.debug.assert(@atomicLoad(u32, &frame.pin_count, .acquire) == PIN_EVICTING);
+        try self.writeFrameBytes(frame);
+    }
+
+    /// Shared body of the flush paths: copy the frame's bytes under the mutex,
+    /// DROP the mutex for the blocking write, re-acquire, and (on success) flag
+    /// the file for fsync + propagate the encryption write_count. Caller manages
+    /// any pin_count/claim protection. Caller holds `mutex` on entry and exit.
+    fn writeFrameBytes(self: *BufferPool, frame: *PageFrame) !void {
+        const io = bpio();
         const fid = frame.file_id;
         const pid = frame.page_id;
         const p = self.pagers[@intFromEnum(fid)] orelse return error.NoPagerRegistered;
 
-        // Prevent eviction during I/O
-        frame.pin_count += 1;
-        frame.dirty = false;
+        @atomicStore(bool, &frame.dirty, false, .monotonic);
 
         var buf: [16384]u8 = undefined;
         std.debug.assert(self.page_size <= buf.len);
         @memcpy(buf[0..self.page_size], frame.dataSlice());
 
-        self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        self.mutex.unlock(io);
         p.writePage(pid, buf[0..self.page_size]) catch |err| {
-            self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
-            frame.pin_count -= 1;
-            // Restore dirty state if write failed so we can retry later
-            frame.dirty = true;
+            self.mutex.lockUncancelable(io);
+            // Restore dirty state if write failed so we can retry later.
+            @atomicStore(bool, &frame.dirty, true, .monotonic);
             return err;
         };
-        self.mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+        self.mutex.lockUncancelable(io);
 
         // PERF-0057: the write reached the OS page cache; this file now needs an
         // fsync before its data is durable. Flag it so the next checkpoint syncs
@@ -655,9 +998,6 @@ pub const BufferPool = struct {
             page_mod.writeWriteCount(frame.dataSlice(), page_mod.readWriteCount(buf[0..self.page_size]));
         }
 
-        // Allowed to be evicted again
-        frame.pin_count -= 1;
-
         if (self.metrics) |m| m.page_writes += 1;
     }
 
@@ -672,51 +1012,75 @@ pub const BufferPool = struct {
         return try self.evict();
     }
 
-    /// Evict the least recently used unpinned frame.
+    /// Evict an unpinned frame, choosing the victim by an approximate-LRU
+    /// CLOCK / second-chance rule. Caller holds `mutex` (NOT a gen bracket —
+    /// evictFrame opens its own fine-grained brackets so the dirty flush runs
+    /// with gen even).
     ///
-    /// PERF-0051: Two-pass walk from the LRU tail towards the head:
-    ///   1. Prefer the least-recently-used evictable frame whose eviction does
-    ///      NOT drop its FileId below its reserved floor. This keeps hot
-    ///      reserved classes (e.g. node pages) resident under a flood of cold
-    ///      scans from other classes.
-    ///   2. If pass 1 finds nothing (every evictable frame belongs to a class
-    ///      at/under its floor), fall back to evicting the least-recently-used
-    ///      evictable frame regardless of reservation. This guarantees the
-    ///      floor can never cause a deadlock or a spurious BufferPoolFull: if
-    ///      ANY unpinned frame exists, eviction succeeds.
+    /// PERF-0058: the cache-HIT pin path no longer moves frames to the LRU head
+    /// (that pool-wide list write is exactly what serialised readers). Instead a
+    /// hit sets the frame's `referenced` clock bit. Eviction walks the LRU list
+    /// from the tail and gives any frame whose bit is set a SECOND CHANCE: it
+    /// clears the bit and moves the frame to the head (so it is reconsidered last)
+    /// rather than evicting it. A frame with a clear bit (not touched since the
+    /// last sweep) is the victim. This keeps genuinely-hot pages resident without
+    /// any per-hit list mutation.
+    ///
+    /// PERF-0051: the reservation floor is still honoured in pass 1 (don't drop a
+    /// reserved class below its floor) with a pass-2 fallback so the floor can
+    /// never deadlock or spuriously raise BufferPoolFull.
+    ///
+    /// evictFrame ABORTS (returns false) if it cannot CLAIM the victim (the frame
+    /// got pinned between the isEvictable scan and the claim CAS); it also drops
+    /// the mutex to flush a dirty victim. On abort, and after every second-chance
+    /// list move, we restart the tail scan because the LRU list and frame states
+    /// may have changed; captured `lru_prev` pointers can be stale. A claimed or
+    /// pinned frame has pin_count != 0 so isEvictable skips it on the retry, and
+    /// every iteration makes progress (clears a reference bit or evicts/skips), so
+    /// this cannot livelock while any evictable frame exists.
     fn evict(self: *BufferPool) !u32 {
-        // evictFrame may DROP the mutex to flush a dirty victim and then ABORT
-        // (return false) if the victim was claimed during that window. On abort
-        // we must restart the tail scan because the LRU list and frame states
-        // may have changed while the mutex was released; captured `lru_prev`
-        // pointers can be stale. The `evicting` guard guarantees a given victim
-        // can be chosen by at most one eviction at a time, and a successful
-        // eviction always makes progress, so this retry cannot livelock as long
-        // as any evictable frame exists.
         restart: while (true) {
-            // Pass 1: honour reservation floors.
+            // Pass 1: honour reservation floors; second-chance via clock bit.
             var current = self.lru_tail;
-            while (current) |idx| {
-                const frame = &self.frames[idx];
-                const prev = frame.lru_prev;
-                if (frame.isEvictable() and !self.wouldUnderflowReserve(frame.file_id)) {
-                    if (try self.evictFrame(idx)) return idx;
-                    continue :restart;
-                }
-                current = prev;
-            }
-
-            // Pass 2: reservation floor is the only thing left standing; evicting
-            // a reserved frame is required to make progress, so allow it.
-            current = self.lru_tail;
+            var saw_reserved_evictable = false;
             while (current) |idx| {
                 const frame = &self.frames[idx];
                 const prev = frame.lru_prev;
                 if (frame.isEvictable()) {
-                    if (try self.evictFrame(idx)) return idx;
-                    continue :restart;
+                    if (self.wouldUnderflowReserve(frame.file_id)) {
+                        saw_reserved_evictable = true;
+                    } else if (@atomicLoad(u8, &frame.referenced, .acquire) != 0) {
+                        // Second chance: clear the bit, promote to head, restart.
+                        @atomicStore(u8, &frame.referenced, 0, .monotonic);
+                        self.moveToHead(idx);
+                        continue :restart;
+                    } else {
+                        if (try self.evictFrame(idx)) return idx;
+                        continue :restart;
+                    }
                 }
                 current = prev;
+            }
+
+            // Pass 2: only reserved-class frames remain evictable. Evicting one is
+            // required to make progress, so allow it (still respect the clock bit
+            // for second-chance ordering among them).
+            if (saw_reserved_evictable) {
+                current = self.lru_tail;
+                while (current) |idx| {
+                    const frame = &self.frames[idx];
+                    const prev = frame.lru_prev;
+                    if (frame.isEvictable()) {
+                        if (@atomicLoad(u8, &frame.referenced, .acquire) != 0) {
+                            @atomicStore(u8, &frame.referenced, 0, .monotonic);
+                            self.moveToHead(idx);
+                            continue :restart;
+                        }
+                        if (try self.evictFrame(idx)) return idx;
+                        continue :restart;
+                    }
+                    current = prev;
+                }
             }
 
             return error.BufferPoolFull;
@@ -724,83 +1088,87 @@ pub const BufferPool = struct {
     }
 
     /// Flush (if dirty), drop from the page table / LRU list, and reset a frame
-    /// so it can be reused. Caller holds the mutex and has confirmed the frame
-    /// is evictable. Keeps `resident_counts` in lockstep with the page table.
+    /// so it can be reused. Caller holds the mutex. Keeps `resident_counts` in
+    /// lockstep with the page table.
     ///
     /// Returns `true` when the frame was evicted (the index is now free for the
-    /// caller to repurpose) and `false` when the eviction was ABORTED because
-    /// the victim was claimed during the dirty-flush window (the frame is still
-    /// resident/valid; the caller must pick a different victim). `false` is a
-    /// safety net: with the `evicting` flag set across the flush, `pin`/`pinNew`
-    /// cannot bump pin_count, so the re-check below normally holds — but if a
-    /// future code path ever claims the frame we abort instead of corrupting it.
+    /// caller to repurpose) and `false` when the eviction was ABORTED because the
+    /// victim could not be CLAIMED (it is pinned) — the caller picks a different
+    /// victim.
     ///
-    /// CONCURRENCY (the eviction race fix): flushing a dirty victim DROPS the
-    /// pool mutex across the blocking disk write (so I/O is never serialised by
-    /// the mutex). Before dropping it we mark the frame `evicting`; while that
-    /// flag is set a concurrent `pin` of the SAME page parks on the cond var
-    /// instead of aliasing the frame, and a concurrent eviction skips it
-    /// (`isEvictable` excludes `evicting`). The flag is cleared on every exit
-    /// path (success, abort, flush error) and a broadcast wakes any parked
-    /// pinners so they can re-load the now-gone page (or re-pin it if aborted).
+    /// CONCURRENCY (PERF-0058 + the v0.2.6 dirty-eviction fix):
+    ///
+    ///  1. CLAIM the frame atomically: CAS `pin_count` 0 -> PIN_EVICTING. This is
+    ///     the single point that excludes the lock-free fast path: a pin is a CAS
+    ///     on the same word, so either our claim wins (and every subsequent pin
+    ///     CAS fails against the sentinel) or a pin already holds the frame (our
+    ///     CAS fails -> abort). No Dekker fence needed — same-word CAS is totally
+    ///     ordered. If the claim fails, the frame is pinned: abort.
+    ///
+    ///  2. Once claimed, the frame is OURS exclusively; pin_count stays at the
+    ///     sentinel across the (possibly mutex-dropping) dirty flush, so unlike
+    ///     v0.2.6 no pin can alias it and no post-flush pin_count re-check is
+    ///     needed. We still set `evicting` (bracketed) so the fast path's cheap
+    ///     pre-CAS identity check also defers, and so a concurrent eviction's
+    ///     `isEvictable` skips it. The flush drops the mutex with gen EVEN so
+    ///     reads of OTHER pages keep flowing.
+    ///
+    ///  3. On flush error, RELEASE the claim (pin_count sentinel -> 0), restore
+    ///     dirty, clear `evicting`, broadcast, and return the error.
+    ///
+    ///  4. On success, TEARDOWN under a gen bracket (remove from table, reset the
+    ///     frame including pin_count -> 0) and broadcast parked pinners.
     fn evictFrame(self: *BufferPool, idx: u32) !bool {
         const frame = &self.frames[idx];
 
-        // Flush if dirty. This is the only branch that releases the mutex, so it
-        // is the only one that needs the `evicting` guard + post-flush re-check.
-        if (frame.dirty) {
-            const want_file = frame.file_id;
-            const want_page = frame.page_id;
-
-            // Publish the in-flight teardown BEFORE flushFrame drops the mutex.
-            frame.evicting = true;
-
-            self.flushFrame(frame) catch |err| {
-                // Flush failed: flushFrame already restored dirty=true and the
-                // pin_count it took. Undo the eviction attempt cleanly so the
-                // page stays resident and pinnable, and wake any parked pinners.
-                frame.evicting = false;
-                self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
-                return err;
-            };
-
-            // Mutex re-acquired by flushFrame. Re-validate the victim: with the
-            // `evicting` guard nobody should have pinned it or changed its
-            // identity, but verify before repurposing rather than trust it.
-            if (frame.pin_count != 0 or
-                frame.file_id != want_file or
-                frame.page_id != want_page or
-                !frame.valid)
-            {
-                // Someone claimed the frame during the flush window. Abort the
-                // eviction: the frame is still resident (and now clean). Clear
-                // the guard, wake parked pinners, and tell the caller to pick a
-                // different victim.
-                frame.evicting = false;
-                self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
-                return false;
-            }
+        // (1) Atomically claim the frame. Fails if it is pinned (incl. by a
+        // lock-free fast-path pin that just won the CAS race) -> abort.
+        if (@cmpxchgStrong(u32, &frame.pin_count, 0, PIN_EVICTING, .acq_rel, .acquire) != null) {
+            return false;
         }
 
-        // Remove from page table
+        // From here the frame is exclusively ours (pin_count == PIN_EVICTING).
+        if (frame.dirty) {
+            // (2) Publish `evicting` to the fast path's pre-CAS check. Bracketed
+            // so the flag is observed coherently; gen returns to even so the
+            // flush does not stall reads of other pages.
+            self.beginTableWrite();
+            frame.evicting = true;
+            self.endTableWrite();
+
+            self.flushFrameClaimed(frame) catch |err| {
+                // (3) Flush failed: release the claim and restore the frame so it
+                // stays resident and pinnable; wake any parked pinners.
+                self.beginTableWrite();
+                frame.evicting = false;
+                @atomicStore(bool, &frame.dirty, true, .monotonic);
+                @atomicStore(u32, &frame.pin_count, 0, .release);
+                self.endTableWrite();
+                self.cond.broadcast(bpio());
+                return err;
+            };
+        }
+
+        // (4) Teardown under a gen bracket so the lock-free fast path never
+        // observes a half-removed frame. No pin_count re-check is needed: the
+        // sentinel has held the frame exclusively since the claim.
+        self.beginTableWrite();
         const key = PageKey{ .file_id = frame.file_id, .page_id = frame.page_id };
         _ = self.page_table.remove(key);
         self.decrResident(frame.file_id);
-
-        // Remove from LRU list
         self.removeFromLru(idx);
-
-        // Reset frame
         frame.valid = false;
-        frame.pin_count = 0;
+        frame.pin_count = 0; // release the claim; frame is now free
+        frame.referenced = 0;
         frame.dirty = false;
         frame.loading = false;
         frame.evicting = false;
         frame.lsn = 0;
+        self.endTableWrite();
 
         // Wake any pinner that parked while this frame was `evicting`: the page
         // is gone from the table now, so it will miss and re-load it fresh.
-        self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
+        self.cond.broadcast(bpio());
         return true;
     }
 
