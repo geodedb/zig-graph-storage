@@ -17,6 +17,14 @@ pub const PageFrame = struct {
     pin_count: u32 = 0,
     dirty: bool = false,
     loading: bool = false,
+    // True while this frame is being torn down for reuse by eviction: its
+    // dirty bytes are being flushed to disk with the pool mutex dropped, after
+    // which the frame is repurposed for a different page. A frame in this state
+    // must NOT be pinned or aliased by a concurrent `pin` of the SAME page (the
+    // page is about to disappear) and must NOT be chosen as a victim by another
+    // eviction. See BufferPool.evictFrame / pin / isEvictable. Always mutated
+    // under the pool mutex.
+    evicting: bool = false,
     valid: bool = false, // true if frame contains actual page data (not empty slot)
     lsn: Lsn = 0,
     // LRU doubly-linked list pointers (index-based, not pointer-based)
@@ -29,8 +37,12 @@ pub const PageFrame = struct {
     }
 
     /// Check if this frame can be evicted (unpinned).
+    ///
+    /// A frame already being torn down by another eviction (`evicting`) is not
+    /// a valid victim: a second concurrent eviction must skip it so it never
+    /// flushes/repurposes a frame whose teardown is already in flight.
     pub fn isEvictable(self: *const PageFrame) bool {
-        return self.pin_count == 0 and self.valid and !self.loading;
+        return self.pin_count == 0 and self.valid and !self.loading and !self.evicting;
     }
 };
 

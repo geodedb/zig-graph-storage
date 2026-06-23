@@ -257,6 +257,18 @@ fn addIntegrationTests(
     });
     const run_integration_sharded = b.addRunArtifact(integration_sharded_tests);
     integration_sharded_step.dependOn(&run_integration_sharded.step);
+
+    // Concurrency regression for the buffer-pool dirty-eviction race. Its own
+    // step so it can be run in isolation under -Doptimize=ReleaseSafe/Debug and
+    // looped (--count) to shake the timing window.
+    const evict_race_step = b.step("test-evict-race", "Run buffer-pool dirty-eviction race regression");
+    const evict_race_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_evict_race.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_evict_race = b.addRunArtifact(evict_race_tests);
+    evict_race_step.dependOn(&run_evict_race.step);
 }
 
 fn addExample(

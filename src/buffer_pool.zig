@@ -234,7 +234,15 @@ pub const BufferPool = struct {
         while (true) {
             if (self.page_table.get(key)) |frame_idx| {
                 const frame = &self.frames[frame_idx];
-                if (frame.loading) {
+                // A frame still loading, or one being torn down by a concurrent
+                // eviction, is unsafe to alias: wait on the cond var and
+                // re-evaluate. For `loading` the same frame becomes valid and we
+                // pin it. For `evicting` the page-table entry is removed once
+                // teardown completes, so the re-loop misses and reloads the page
+                // fresh (or, if the eviction is aborted, finds it cached again).
+                // Either way we never hand back a frame that is about to be — or
+                // has just been — repurposed for a different page.
+                if (frame.loading or frame.evicting) {
                     self.cond.waitUncancelable(std.Io.Threaded.global_single_threaded.io(), &self.mutex);
                     continue;
                 }
@@ -246,7 +254,16 @@ pub const BufferPool = struct {
             }
 
             if (self.metrics) |m| m.buffer_misses += 1;
-            const frame_idx = try self.getFrame();
+            // getFrame can fail (e.g. BufferPoolFull when every frame is pinned
+            // or mid-eviction). The mutex is held here, so release it before
+            // propagating the error -- otherwise the caller's natural retry
+            // (`pin` again) would re-lock a mutex this thread still holds and
+            // self-deadlock. (Pre-existing latent bug; surfaced by tiny-pool
+            // concurrent eviction where BufferPoolFull is common.)
+            const frame_idx = self.getFrame() catch |err| {
+                self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+                return err;
+            };
             const frame = &self.frames[frame_idx];
             const pager = self.pagers[@intFromEnum(file_id)] orelse {
                 self.free_list.appendAssumeCapacity(frame_idx);
@@ -259,6 +276,7 @@ pub const BufferPool = struct {
             frame.pin_count = 1;
             frame.dirty = false;
             frame.loading = true;
+            frame.evicting = false;
             frame.valid = false;
             frame.lsn = 0;
 
@@ -279,6 +297,7 @@ pub const BufferPool = struct {
                 frame.pin_count = 0;
                 frame.dirty = false;
                 frame.loading = false;
+                frame.evicting = false;
                 frame.valid = false;
                 frame.lsn = 0;
                 self.removeFromLru(frame_idx);
@@ -307,9 +326,16 @@ pub const BufferPool = struct {
 
         const key = PageKey{ .file_id = file_id, .page_id = page_id };
 
-        // If already in cache, just pin it
-        if (self.page_table.get(key)) |frame_idx| {
+        // If already in cache, just pin it. As in `pin`, a frame still loading
+        // or being torn down by a concurrent eviction is unsafe to alias: wait
+        // on the cond var and re-check rather than handing back a frame that is
+        // about to be (or has just been) repurposed for a different page.
+        while (self.page_table.get(key)) |frame_idx| {
             const frame = &self.frames[frame_idx];
+            if (frame.loading or frame.evicting) {
+                self.cond.waitUncancelable(std.Io.Threaded.global_single_threaded.io(), &self.mutex);
+                continue;
+            }
             frame.pin_count += 1;
             self.moveToHead(frame_idx);
             return frame;
@@ -326,6 +352,7 @@ pub const BufferPool = struct {
         frame.pin_count = 1;
         frame.dirty = false;
         frame.loading = false;
+        frame.evicting = false;
         frame.valid = true;
         frame.lsn = 0;
 
@@ -658,43 +685,101 @@ pub const BufferPool = struct {
     ///      floor can never cause a deadlock or a spurious BufferPoolFull: if
     ///      ANY unpinned frame exists, eviction succeeds.
     fn evict(self: *BufferPool) !u32 {
-        // Pass 1: honour reservation floors.
-        var current = self.lru_tail;
-        while (current) |idx| {
-            const frame = &self.frames[idx];
-            const prev = frame.lru_prev;
-            if (frame.isEvictable() and !self.wouldUnderflowReserve(frame.file_id)) {
-                try self.evictFrame(idx);
-                return idx;
+        // evictFrame may DROP the mutex to flush a dirty victim and then ABORT
+        // (return false) if the victim was claimed during that window. On abort
+        // we must restart the tail scan because the LRU list and frame states
+        // may have changed while the mutex was released; captured `lru_prev`
+        // pointers can be stale. The `evicting` guard guarantees a given victim
+        // can be chosen by at most one eviction at a time, and a successful
+        // eviction always makes progress, so this retry cannot livelock as long
+        // as any evictable frame exists.
+        restart: while (true) {
+            // Pass 1: honour reservation floors.
+            var current = self.lru_tail;
+            while (current) |idx| {
+                const frame = &self.frames[idx];
+                const prev = frame.lru_prev;
+                if (frame.isEvictable() and !self.wouldUnderflowReserve(frame.file_id)) {
+                    if (try self.evictFrame(idx)) return idx;
+                    continue :restart;
+                }
+                current = prev;
             }
-            current = prev;
-        }
 
-        // Pass 2: reservation floor is the only thing left standing; evicting a
-        // reserved frame is required to make progress, so allow it.
-        current = self.lru_tail;
-        while (current) |idx| {
-            const frame = &self.frames[idx];
-            const prev = frame.lru_prev;
-            if (frame.isEvictable()) {
-                try self.evictFrame(idx);
-                return idx;
+            // Pass 2: reservation floor is the only thing left standing; evicting
+            // a reserved frame is required to make progress, so allow it.
+            current = self.lru_tail;
+            while (current) |idx| {
+                const frame = &self.frames[idx];
+                const prev = frame.lru_prev;
+                if (frame.isEvictable()) {
+                    if (try self.evictFrame(idx)) return idx;
+                    continue :restart;
+                }
+                current = prev;
             }
-            current = prev;
-        }
 
-        return error.BufferPoolFull;
+            return error.BufferPoolFull;
+        }
     }
 
     /// Flush (if dirty), drop from the page table / LRU list, and reset a frame
     /// so it can be reused. Caller holds the mutex and has confirmed the frame
     /// is evictable. Keeps `resident_counts` in lockstep with the page table.
-    fn evictFrame(self: *BufferPool, idx: u32) !void {
+    ///
+    /// Returns `true` when the frame was evicted (the index is now free for the
+    /// caller to repurpose) and `false` when the eviction was ABORTED because
+    /// the victim was claimed during the dirty-flush window (the frame is still
+    /// resident/valid; the caller must pick a different victim). `false` is a
+    /// safety net: with the `evicting` flag set across the flush, `pin`/`pinNew`
+    /// cannot bump pin_count, so the re-check below normally holds — but if a
+    /// future code path ever claims the frame we abort instead of corrupting it.
+    ///
+    /// CONCURRENCY (the eviction race fix): flushing a dirty victim DROPS the
+    /// pool mutex across the blocking disk write (so I/O is never serialised by
+    /// the mutex). Before dropping it we mark the frame `evicting`; while that
+    /// flag is set a concurrent `pin` of the SAME page parks on the cond var
+    /// instead of aliasing the frame, and a concurrent eviction skips it
+    /// (`isEvictable` excludes `evicting`). The flag is cleared on every exit
+    /// path (success, abort, flush error) and a broadcast wakes any parked
+    /// pinners so they can re-load the now-gone page (or re-pin it if aborted).
+    fn evictFrame(self: *BufferPool, idx: u32) !bool {
         const frame = &self.frames[idx];
 
-        // Flush if dirty
+        // Flush if dirty. This is the only branch that releases the mutex, so it
+        // is the only one that needs the `evicting` guard + post-flush re-check.
         if (frame.dirty) {
-            try self.flushFrame(frame);
+            const want_file = frame.file_id;
+            const want_page = frame.page_id;
+
+            // Publish the in-flight teardown BEFORE flushFrame drops the mutex.
+            frame.evicting = true;
+
+            self.flushFrame(frame) catch |err| {
+                // Flush failed: flushFrame already restored dirty=true and the
+                // pin_count it took. Undo the eviction attempt cleanly so the
+                // page stays resident and pinnable, and wake any parked pinners.
+                frame.evicting = false;
+                self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
+                return err;
+            };
+
+            // Mutex re-acquired by flushFrame. Re-validate the victim: with the
+            // `evicting` guard nobody should have pinned it or changed its
+            // identity, but verify before repurposing rather than trust it.
+            if (frame.pin_count != 0 or
+                frame.file_id != want_file or
+                frame.page_id != want_page or
+                !frame.valid)
+            {
+                // Someone claimed the frame during the flush window. Abort the
+                // eviction: the frame is still resident (and now clean). Clear
+                // the guard, wake parked pinners, and tell the caller to pick a
+                // different victim.
+                frame.evicting = false;
+                self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
+                return false;
+            }
         }
 
         // Remove from page table
@@ -710,7 +795,13 @@ pub const BufferPool = struct {
         frame.pin_count = 0;
         frame.dirty = false;
         frame.loading = false;
+        frame.evicting = false;
         frame.lsn = 0;
+
+        // Wake any pinner that parked while this frame was `evicting`: the page
+        // is gone from the table now, so it will miss and re-load it fresh.
+        self.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
+        return true;
     }
 
     /// Move a frame to the head of the LRU list (most recently used).
