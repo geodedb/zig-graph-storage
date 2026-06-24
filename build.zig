@@ -270,6 +270,18 @@ fn addIntegrationTests(
     const run_integration_sharded = b.addRunArtifact(integration_sharded_tests);
     integration_sharded_step.dependOn(&run_integration_sharded.step);
 
+    // Edge co-location (Phase A): single-shard edge write + scatter expandIn +
+    // page-image-redo recovery of the per-shard in-index. Own step so the
+    // reverse-traversal correctness + recovery proofs run in isolation.
+    const edge_colocation_step = b.step("test-edge-colocation", "Run edge co-location tests (single-shard write, scatter expandIn, recovery of the per-shard in-index)");
+    const edge_colocation_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_colocation.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_colocation = b.addRunArtifact(edge_colocation_tests);
+    edge_colocation_step.dependOn(&run_edge_colocation.step);
+
     // Concurrency regression for the buffer-pool dirty-eviction race. Its own
     // step so it can be run in isolation under -Doptimize=ReleaseSafe/Debug and
     // looped (--count) to shake the timing window.

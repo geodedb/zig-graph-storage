@@ -144,6 +144,13 @@ pub const Recovery = struct {
         _ = try file_manager.openFile(.props, .open_existing);
         _ = try file_manager.openFile(.var_store, .open_existing);
         _ = try file_manager.openFile(.free, .open_existing);
+        // Edge co-location (Phase A): the incoming-adjacency chain bodies +
+        // directory ride page-image redo, so their pagers must be registered
+        // BEFORE replay can pinNew their pages. ADDITIVE: a pre-co-location
+        // graph has no such files, so create-if-missing (an old graph simply has
+        // no committed in_idx/in_dir pages to replay).
+        _ = try file_manager.openFile(.in_idx, .create_if_missing);
+        _ = try file_manager.openFile(.in_dir, .create_if_missing);
 
         // Register pagers with buffer pool
         if (file_manager.getPager(.nodes)) |p| buffer_pool.registerPager(.nodes, p);
@@ -152,6 +159,8 @@ pub const Recovery = struct {
         if (file_manager.getPager(.props)) |p| buffer_pool.registerPager(.props, p);
         if (file_manager.getPager(.var_store)) |p| buffer_pool.registerPager(.var_store, p);
         if (file_manager.getPager(.free)) |p| buffer_pool.registerPager(.free, p);
+        if (file_manager.getPager(.in_idx)) |p| buffer_pool.registerPager(.in_idx, p);
+        if (file_manager.getPager(.in_dir)) |p| buffer_pool.registerPager(.in_dir, p);
 
         // 3. Open WAL and read from last_checkpoint_lsn
         const wal_dir_path = try std.fmt.allocPrint(self.allocator, "{s}/wal", .{graph_dir.path});

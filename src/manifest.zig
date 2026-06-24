@@ -37,7 +37,11 @@ pub const MANIFEST_VERSION_V1: u32 = 1;
 
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields (see below) + CRC32(4)
-const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 148
+/// Edge co-location (Phase A) appends in_idx_pages + in_dir_pages (two u64) to
+/// the field block; the format is otherwise unchanged. (Migrating a legacy,
+/// shorter manifest is Phase B; fresh graphs created by this build are
+/// self-consistent.)
+const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 164
 /// Size of the CRC-only (plaintext) serialized manifest: magic + fields + crc = 160.
 pub const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4;
 /// Authenticated (TDE) size: CRC-only body + HMAC-SHA256 trailer = 192.
@@ -63,6 +67,11 @@ pub const Manifest = struct {
     free_pages: u64 = 0,
     node_count: u64 = 0,
     edge_count: u64 = 0,
+    /// Edge co-location (Phase A): allocated page counts for the per-shard
+    /// incoming-adjacency chain bodies (`in_idx`) and the dst->head directory
+    /// (`in_dir`). Serialized at the END of the field block (additive).
+    in_idx_pages: u64 = 0,
+    in_dir_pages: u64 = 0,
 
     /// Serialize to bytes: magic(8) + all fields in little-endian + CRC32(4).
     /// Plaintext (no-key) form. Identical to `serializeWithKey(allocator, null)`.
@@ -108,6 +117,8 @@ pub const Manifest = struct {
         writeU64(buf, &pos, self.free_pages);
         writeU64(buf, &pos, self.node_count);
         writeU64(buf, &pos, self.edge_count);
+        writeU64(buf, &pos, self.in_idx_pages);
+        writeU64(buf, &pos, self.in_dir_pages);
 
         // CRC32 over everything before the checksum
         const crc = Crc32.hash(buf[0..pos]);
@@ -202,6 +213,10 @@ pub const Manifest = struct {
         m.node_count = readU64(data, pos);
         pos += 8;
         m.edge_count = readU64(data, pos);
+        pos += 8;
+        m.in_idx_pages = readU64(data, pos);
+        pos += 8;
+        m.in_dir_pages = readU64(data, pos);
 
         return m;
     }

@@ -14,6 +14,7 @@ const wal_mod = @import("wal.zig");
 const txn_mod = @import("txn.zig");
 const node_store_mod = @import("node_store.zig");
 const adj_store_mod = @import("adj_store.zig");
+const in_head_dir_mod = @import("in_head_dir.zig");
 const prop_store_mod = @import("prop_store.zig");
 const var_store_mod = @import("var_store.zig");
 const free_space_mod = @import("free_space.zig");
@@ -32,6 +33,7 @@ const WalManager = wal_mod.WalManager;
 const TxnManager = txn_mod.TxnManager;
 const NodeStore = node_store_mod.NodeStore;
 const AdjStore = adj_store_mod.AdjStore;
+const InHeadDir = in_head_dir_mod.InHeadDir;
 const PropStore = prop_store_mod.PropStore;
 const VarStore = var_store_mod.VarStore;
 const FreeSpaceManager = free_space_mod.FreeSpaceManager;
@@ -50,12 +52,17 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
     const path = try std.fmt.allocPrint(engine.allocator, "{s}/free.store", .{engine.graph_dir.path});
     defer engine.allocator.free(path);
 
-    // Compute total size needed for all 5 bitmaps.
+    // Compute total size needed for all bitmaps. Edge co-location (Phase A)
+    // appends in_idx + in_dir at the END so the format stays additive (a legacy
+    // 5-bitmap free.store is still readable; the new trailing bitmaps default to
+    // empty when absent — see loadFreeStore).
     const total_size = engine.free_space_nodes.serializedSize() +
         engine.free_space_adj_out.serializedSize() +
         engine.free_space_adj_in.serializedSize() +
         engine.free_space_props.serializedSize() +
-        engine.free_space_var.serializedSize();
+        engine.free_space_var.serializedSize() +
+        engine.free_space_in_idx.serializedSize() +
+        engine.free_space_in_dir.serializedSize();
 
     const buf = try engine.allocator.alloc(u8, total_size);
     defer engine.allocator.free(buf);
@@ -67,6 +74,8 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
         &engine.free_space_adj_in,
         &engine.free_space_props,
         &engine.free_space_var,
+        &engine.free_space_in_idx,
+        &engine.free_space_in_dir,
     };
     for (managers) |fsm| {
         const written = fsm.serialize(buf[offset..]) catch return error.BufferTooSmall;
@@ -120,6 +129,24 @@ pub fn loadFreeStore(engine: *GraphEngine) !bool {
         offset += consumed;
     }
 
+    // Edge co-location (Phase A): the in_idx + in_dir bitmaps are appended at the
+    // end. They are ADDITIVE — a legacy free.store written before co-location has
+    // no trailing bytes here, in which case we leave both at their (empty) init
+    // state. A fresh free.store always carries them.
+    var trailing = [_]*FreeSpaceManager{
+        &engine.free_space_in_idx,
+        &engine.free_space_in_dir,
+    };
+    const trailing_max = [_]u64{
+        try maxPersistedPagesForStore(engine, .in_idx),
+        try maxPersistedPagesForStore(engine, .in_dir),
+    };
+    for (&trailing, trailing_max) |fsm, max_total_pages| {
+        if (offset >= buf.len) break; // legacy free.store: no trailing bitmaps.
+        const consumed = try fsm.deserializeBounded(buf[offset..], max_total_pages);
+        offset += consumed;
+    }
+
     return true;
 }
 
@@ -131,6 +158,8 @@ pub fn rebuildFreeSpaceFromDisk(engine: *GraphEngine) !void {
         .{ .fsm = &engine.free_space_nodes, .fid = .nodes },
         .{ .fsm = &engine.free_space_adj_out, .fid = .adj_out },
         .{ .fsm = &engine.free_space_adj_in, .fid = .adj_in },
+        .{ .fsm = &engine.free_space_in_idx, .fid = .in_idx },
+        .{ .fsm = &engine.free_space_in_dir, .fid = .in_dir },
         .{ .fsm = &engine.free_space_props, .fid = .props },
         .{ .fsm = &engine.free_space_var, .fid = .var_store },
     };
@@ -174,6 +203,13 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     errdefer self.free_space_adj_out.deinit();
     self.free_space_adj_in = try FreeSpaceManager.init(allocator, &self.buffer_pool, .adj_in);
     errdefer self.free_space_adj_in.deinit();
+    // Edge co-location (Phase A): own free space for the incoming-adjacency
+    // chain bodies + directory, each store managing its own file's page space
+    // exactly like adj_in / nodes.
+    self.free_space_in_idx = try FreeSpaceManager.init(allocator, &self.buffer_pool, .in_idx);
+    errdefer self.free_space_in_idx.deinit();
+    self.free_space_in_dir = try FreeSpaceManager.init(allocator, &self.buffer_pool, .in_dir);
+    errdefer self.free_space_in_dir.deinit();
     self.free_space_props = try FreeSpaceManager.init(allocator, &self.buffer_pool, .props);
     errdefer self.free_space_props.deinit();
     self.free_space_var = try FreeSpaceManager.init(allocator, &self.buffer_pool, .var_store);
@@ -209,6 +245,9 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);
     self.adj_out = AdjStore.init(&self.buffer_pool, &self.free_space_adj_out, .adj_out, cfg.page_size);
     self.adj_in = AdjStore.init(&self.buffer_pool, &self.free_space_adj_in, .adj_in, cfg.page_size);
+    // Edge co-location (Phase A): incoming-adjacency chain bodies + directory.
+    self.adj_in_remote = AdjStore.init(&self.buffer_pool, &self.free_space_in_idx, .in_idx, cfg.page_size);
+    self.in_head_dir = InHeadDir.init(&self.buffer_pool, &self.free_space_in_dir, .in_dir, cfg.page_size);
     self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
     self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
     // SEC: when at-rest encryption is enabled the pager writes the per-page
@@ -303,6 +342,8 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     engine.manifest.nodes_pages = engine.free_space_nodes.allocatedCount();
     engine.manifest.adj_out_pages = engine.free_space_adj_out.allocatedCount();
     engine.manifest.adj_in_pages = engine.free_space_adj_in.allocatedCount();
+    engine.manifest.in_idx_pages = engine.free_space_in_idx.allocatedCount();
+    engine.manifest.in_dir_pages = engine.free_space_in_dir.allocatedCount();
     engine.manifest.props_pages = engine.free_space_props.allocatedCount();
     engine.manifest.var_pages = engine.free_space_var.allocatedCount();
 
