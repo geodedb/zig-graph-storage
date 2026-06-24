@@ -24,6 +24,7 @@ pub const FILE_NAMES = [FILE_COUNT][]const u8{
     "labels.idx", // label_idx
     "props.idx", // prop_idx
     "edges.idx", // edge_idx
+    "edges_exist.idx", // edge_exist_idx (Phase 3 edge-existence index snapshot)
 };
 
 pub const OpenMode = enum {
@@ -348,7 +349,7 @@ test "openFile is idempotent — returns same pager on second call" {
 }
 
 test "FILE_NAMES has correct count and entries" {
-    try testing.expectEqual(@as(usize, 9), FILE_NAMES.len);
+    try testing.expectEqual(@as(usize, 10), FILE_NAMES.len);
     try testing.expectEqualStrings("nodes.store", FILE_NAMES[@intFromEnum(FileId.nodes)]);
     try testing.expectEqualStrings("adj_out.store", FILE_NAMES[@intFromEnum(FileId.adj_out)]);
     try testing.expectEqualStrings("adj_in.store", FILE_NAMES[@intFromEnum(FileId.adj_in)]);
@@ -358,6 +359,7 @@ test "FILE_NAMES has correct count and entries" {
     try testing.expectEqualStrings("labels.idx", FILE_NAMES[@intFromEnum(FileId.label_idx)]);
     try testing.expectEqualStrings("props.idx", FILE_NAMES[@intFromEnum(FileId.prop_idx)]);
     try testing.expectEqualStrings("edges.idx", FILE_NAMES[@intFromEnum(FileId.edge_idx)]);
+    try testing.expectEqualStrings("edges_exist.idx", FILE_NAMES[@intFromEnum(FileId.edge_exist_idx)]);
 }
 
 test "SEC-0045: deinit zeroes all per-pager encryption key copies" {

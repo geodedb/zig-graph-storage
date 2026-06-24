@@ -438,6 +438,11 @@ pub const ShardedGraphEngine = struct {
             .rel_type = rel_type,
             .prop_head = 0,
         });
+        // PHASE 3: the edge-existence index lives on the SOURCE shard (same shard
+        // that owns this edge's out-adjacency + edge_index), so a probe routed to
+        // shardOfNode(from) finds cross-shard edges too.
+        try src.edge_exist_index.put(from, rel_type, to, edge_id);
+        src.edge_exist_index_dirty = true;
 
         // 4. Write target incoming adjacency.
         const in_entry = edge_mod.EdgeEntry{
@@ -742,6 +747,9 @@ pub const ShardedGraphEngine = struct {
             .rel_type = rel_type,
             .prop_head = 0,
         });
+        // PHASE 3: keep the existence index in lock-step with edge_index here too.
+        try src.edge_exist_index.put(from, rel_type, to, edge_id);
+        src.edge_exist_index_dirty = true;
         src.manifest.edge_count += 1;
 
         _ = try two_pc.appendDecision(src, .cross_shard_commit, global_txn_id, src_local_txn);

@@ -250,6 +250,18 @@ fn addIntegrationTests(
     const run_cross_shard = b.addRunArtifact(cross_shard_tests);
     cross_shard_step.dependOn(&run_cross_shard.step);
 
+    // PHASE 3: engine edge-EXISTENCE index (durable O(1) MERGE-dedup probe).
+    // Own step so the crash-recovery + idempotency + O(1)-not-O(degree) proofs
+    // can be run in isolation under ReleaseSafe/Debug and looped.
+    const edge_exist_step = b.step("test-edge-existence-index", "Run edge-existence-index tests (durable O(1) dedup probe; crash-recovery; idempotency)");
+    const edge_exist_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/test_edge_existence_index.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_exist = b.addRunArtifact(edge_exist_tests);
+    edge_exist_step.dependOn(&run_edge_exist.step);
+
     const integration_sharded_step = b.step("test-integration-sharded", "Run sharded-engine integration tests");
     const integration_sharded_tests = b.addTest(.{
         .root_module = createModule(b, "tests/integration_sharded.zig", target, optimize, &.{

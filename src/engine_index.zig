@@ -22,6 +22,12 @@ const EDGE_SNAPSHOT_MAGIC = "GSEIDX2\x00";
 // (edge_id u64 + from u64 + neighbor u64 + rel_type u32 + prop_head u32).
 const EDGE_RECORD_MIN_SIZE: usize = 8 + 8 + 8 + 4 + 4;
 
+// PHASE 3: edge-EXISTENCE index snapshot. Distinct magic so a wrong/legacy file
+// is rejected rather than misparsed; one record is (from u64 + to u64 + rel_type
+// u32 + edge_id u64).
+const EDGE_EXIST_SNAPSHOT_MAGIC = "GSXIDX1\x00";
+const EDGE_EXIST_RECORD_MIN_SIZE: usize = 8 + 8 + 4 + 8;
+
 /// Rebuild the in-memory label index by reading each live node's labels
 /// from the LabelStore (var.store-backed).
 /// PERF-0030: Uses scanNodes batch API instead of per-ID getNode.
@@ -109,11 +115,17 @@ pub fn rebuildDerivedIndexes(engine: *GraphEngine) !void {
 /// PERF-0030: Uses scanNodes batch API instead of per-ID getNode.
 pub fn rebuildEdgeIndex(engine: *GraphEngine) !void {
     engine.edge_index.clearAndFree();
+    // PHASE 3: the edge-existence index is DERIVED from the same out-adjacency,
+    // so rebuild it in the SAME scan. This is the recovery-correctness backbone:
+    // whatever out-adjacency the WAL restored determines the existence index
+    // EXACTLY, so a crash can never leave it disagreeing with adjacency.
+    engine.edge_exist_index.clear();
 
     // PERF-0032: Pre-allocate edge_index based on manifest edge count.
     const estimated_edges: u32 = @intCast(@min(engine.manifest.next_edge_id, std.math.maxInt(u32)));
     if (estimated_edges > 1) {
         try engine.edge_index.ensureTotalCapacity(estimated_edges);
+        try engine.edge_exist_index.ensureTotalCapacity(estimated_edges);
     }
 
     const Ctx = struct {
@@ -139,6 +151,13 @@ pub fn rebuildEdgeIndex(engine: *GraphEngine) !void {
                     self.err = e;
                     return;
                 };
+                // (from = node_id, rel_type, to = neighbor) -> edge_id. `put` is
+                // idempotent per edge_id, so re-applied/duplicated adjacency
+                // entries never create a phantom record.
+                self.engine.edge_exist_index.put(node_id, entry.rel_type, entry.neighbor, entry.edge_id) catch |e| {
+                    self.err = e;
+                    return;
+                };
             }
         }
     };
@@ -154,23 +173,37 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !bool {
     const label_file = engine.file_manager.getFile(.label_idx) orelse return false;
     const prop_file = engine.file_manager.getFile(.prop_idx) orelse return false;
     const edge_file = engine.file_manager.getFile(.edge_idx) orelse return false;
+    // PHASE 3: the existence-index file is ADDITIVE. If it is missing entirely
+    // (pre-Phase-3 graph), return false so the caller rebuilds ALL derived
+    // indexes from durable adjacency — the existence index included.
+    const edge_exist_file = engine.file_manager.getFile(.edge_exist_idx) orelse return false;
 
     engine.label_index.clear();
     engine.property_index.clear();
     engine.edge_index.clearAndFree();
+    engine.edge_exist_index.clear();
     errdefer {
         engine.label_index.clear();
         engine.property_index.clear();
         engine.edge_index.clearAndFree();
+        engine.edge_exist_index.clear();
     }
 
     const label_counter = try engine.label_index.loadFromFile(label_file) orelse return false;
     const prop_counter = try engine.property_index.loadFromFile(prop_file) orelse return false;
     const edge_counter = try loadEdgeIndex(engine, edge_file) orelse return false;
-    if (label_counter != engine.manifest.counter or prop_counter != engine.manifest.counter or edge_counter != engine.manifest.counter) {
+    // A pre-Phase-3 graph has an empty/absent existence snapshot → load returns
+    // null → rebuild. A present-but-stale snapshot fails the counter check below.
+    const edge_exist_counter = try loadEdgeExistIndex(engine, edge_exist_file) orelse return false;
+    if (label_counter != engine.manifest.counter or
+        prop_counter != engine.manifest.counter or
+        edge_counter != engine.manifest.counter or
+        edge_exist_counter != engine.manifest.counter)
+    {
         engine.label_index.clear();
         engine.property_index.clear();
         engine.edge_index.clearAndFree();
+        engine.edge_exist_index.clear();
         return false;
     }
 
@@ -182,9 +215,11 @@ pub fn saveDerivedIndexes(engine: *GraphEngine) !void {
     const label_file = engine.file_manager.getFile(.label_idx) orelse return error.LabelIndexFileNotOpen;
     const prop_file = engine.file_manager.getFile(.prop_idx) orelse return error.PropertyIndexFileNotOpen;
     const edge_file = engine.file_manager.getFile(.edge_idx) orelse return error.EdgeIndexFileNotOpen;
+    const edge_exist_file = engine.file_manager.getFile(.edge_exist_idx) orelse return error.EdgeExistIndexFileNotOpen;
     try engine.label_index.saveToFile(label_file, engine.manifest.counter);
     try engine.property_index.saveToFile(prop_file, engine.manifest.counter);
     try saveEdgeIndex(engine, edge_file);
+    try saveEdgeExistIndex(engine, edge_exist_file);
 }
 
 /// Save only the derived index snapshots whose dirty flag is set.
@@ -193,6 +228,7 @@ pub fn saveDerivedIndexesConditional(
     label_dirty: bool,
     property_dirty: bool,
     edge_dirty: bool,
+    edge_exist_dirty: bool,
 ) !void {
     if (label_dirty) {
         const label_file = engine.file_manager.getFile(.label_idx) orelse return error.LabelIndexFileNotOpen;
@@ -205,6 +241,12 @@ pub fn saveDerivedIndexesConditional(
     if (edge_dirty) {
         const edge_file = engine.file_manager.getFile(.edge_idx) orelse return error.EdgeIndexFileNotOpen;
         try saveEdgeIndex(engine, edge_file);
+    }
+    // PHASE 3: persist the existence-index snapshot when dirty (skipped by the
+    // light checkpoint, exactly like edge_index — recovery rebuilds from pages).
+    if (edge_exist_dirty) {
+        const edge_exist_file = engine.file_manager.getFile(.edge_exist_idx) orelse return error.EdgeExistIndexFileNotOpen;
+        try saveEdgeExistIndex(engine, edge_exist_file);
     }
 }
 
@@ -261,6 +303,56 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
             .rel_type = rel_type,
             .prop_head = prop_head,
         });
+    }
+
+    if (r.remaining() != 0) return error.InvalidFormat;
+    return snapshot.checkpoint_counter;
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 3: edge-existence index snapshot (mirrors saveEdgeIndex/loadEdgeIndex).
+// ---------------------------------------------------------------------------
+
+const SnapshotWriterT = index_snapshot_mod.SnapshotWriter;
+
+fn saveEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !void {
+    var w = SnapshotWriterT.init(engine.allocator);
+    defer w.deinit();
+
+    try w.writeHeader(EDGE_EXIST_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_exist_index.recordCount());
+
+    // Write one record per (key, edge_id). forEachRecord visits every record
+    // exactly once across both the primary and overflow maps.
+    const Ctx = struct { w: *SnapshotWriterT };
+    var ctx = Ctx{ .w = &w };
+    try engine.edge_exist_index.forEachRecord(&ctx, struct {
+        fn f(c: *Ctx, from: u64, rel_type: u32, to: u64, edge_id: u64) anyerror!void {
+            try c.w.writeU64(from);
+            try c.w.writeU64(to);
+            try c.w.writeU32(rel_type);
+            try c.w.writeU64(edge_id);
+        }
+    }.f);
+
+    try w.finalize(file.*);
+}
+
+fn loadEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
+    var snapshot = (try index_snapshot_mod.loadPayload(engine.allocator, file, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_MIN_SIZE)) orelse return null;
+    defer snapshot.deinit();
+
+    var r = index_snapshot_mod.SnapshotReader.init(snapshot.payload());
+
+    if (snapshot.item_count > std.math.maxInt(u32)) return error.InvalidFormat;
+    try engine.edge_exist_index.ensureTotalCapacity(@intCast(snapshot.item_count));
+
+    var i: u64 = 0;
+    while (i < snapshot.item_count) : (i += 1) {
+        const from = try r.readU64();
+        const to = try r.readU64();
+        const rel_type = try r.readU32();
+        const edge_id = try r.readU64();
+        try engine.edge_exist_index.put(from, rel_type, to, edge_id);
     }
 
     if (r.remaining() != 0) return error.InvalidFormat;
