@@ -193,6 +193,13 @@ fn replayAdjacencyIfNeeded(
                 .rel_type = payload.rel_type,
                 .prop_head = 0,
             });
+            // PHASE 3: the existence index was already rebuilt from adjacency in
+            // GraphEngine.open; if this committed prepare's source adjacency was
+            // NOT durably written before the crash we are re-applying it now, so
+            // mirror the existence-index put. `put` is idempotent per edge_id, so
+            // the common (already-rebuilt) case is a harmless no-op.
+            try eng.edge_exist_index.put(payload.from, payload.rel_type, payload.to, payload.edge_id);
+            eng.edge_exist_index_dirty = true;
             eng.manifest.edge_count += 1;
         },
         .target => {

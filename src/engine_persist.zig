@@ -232,6 +232,10 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     errdefer self.property_index.deinit();
     self.edge_index = std.AutoHashMap(EdgeId, EdgeIndexEntry).init(allocator);
     errdefer self.edge_index.deinit();
+    // PHASE 3: edge-existence index. Starts empty; open() loads its snapshot or
+    // rebuilds from adjacency, create() leaves it empty.
+    self.edge_exist_index = @import("edge_exist_index.zig").EdgeExistenceIndex.init(allocator);
+    errdefer self.edge_exist_index.deinit();
 
     // GAP-0027 / FR-016 / FR-017: opt-in B+tree property indexes + catalog.
     // Starts empty; create() leaves it empty (no catalog file), open() loads it.
@@ -320,10 +324,12 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
             engine.label_index_dirty,
             engine.property_index_dirty,
             engine.edge_index_dirty,
+            engine.edge_exist_index_dirty,
         );
         engine.label_index_dirty = false;
         engine.property_index_dirty = false;
         engine.edge_index_dirty = false;
+        engine.edge_exist_index_dirty = false;
         engine.metrics.derived_index_saves += 1;
     }
     // Label dictionary is O(labels) and is NOT rebuildable from pages (it maps

@@ -35,6 +35,7 @@ const engine_integrity = @import("engine_integrity.zig");
 const engine_index = @import("engine_index.zig");
 const engine_persist = @import("engine_persist.zig");
 const engine_property_index = @import("engine_property_index.zig");
+const edge_exist_index_mod = @import("edge_exist_index.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -111,6 +112,11 @@ pub const GraphEngine = struct {
     label_index: LabelIndex,
     property_index: PropertyChainIndex,
     edge_index: std.AutoHashMap(EdgeId, EdgeIndexEntry),
+    /// PHASE 3 (edge-engine-direct): durable, derived edge-EXISTENCE index
+    /// mapping (from, rel_type, to) -> edge_id(s) for O(1) MERGE dedup. Same
+    /// crash-safety lifecycle as `edge_index` (snapshot at checkpoint; rebuilt
+    /// from durable out-adjacency on recovery when stale/absent).
+    edge_exist_index: edge_exist_index_mod.EdgeExistenceIndex,
     /// GAP-0027 / FR-016 / FR-017: opt-in B+tree property indexes plus the
     /// per-graph index catalog. Empty unless an index is declared via
     /// `createPropertyIndex`; a graph with no declared index writes no catalog
@@ -139,6 +145,10 @@ pub const GraphEngine = struct {
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     edge_index_dirty: bool = true,
+    /// PHASE 3: set when the edge-existence index changed since the last persist,
+    /// so the next checkpoint/close writes its snapshot. Tracked in lock-step
+    /// with `edge_index_dirty` (both move on every edge add/remove).
+    edge_exist_index_dirty: bool = true,
     /// GAP-0027: set when the index catalog or a declared B+tree property index
     /// has changed since the last persist, so the next checkpoint/close writes
     /// the catalog + tree snapshots.
@@ -157,6 +167,7 @@ pub const GraphEngine = struct {
         self.label_index_dirty = true;
         self.property_index_dirty = true;
         self.edge_index_dirty = true;
+        self.edge_exist_index_dirty = true;
         self.property_catalog_dirty = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
@@ -206,6 +217,7 @@ pub const GraphEngine = struct {
         _ = try self.file_manager.openFile(.label_idx, .create_if_missing);
         _ = try self.file_manager.openFile(.prop_idx, .create_if_missing);
         _ = try self.file_manager.openFile(.edge_idx, .create_if_missing);
+        _ = try self.file_manager.openFile(.edge_exist_idx, .create_if_missing);
 
         // 5. Create buffer pool, register pagers
         // PERF-0051: size the pool with the same auto-size logic open() uses
@@ -255,6 +267,7 @@ pub const GraphEngine = struct {
         self.label_index_dirty = false;
         self.property_index_dirty = false;
         self.edge_index_dirty = false;
+        self.edge_exist_index_dirty = false;
         self.property_catalog_dirty = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
@@ -281,6 +294,10 @@ pub const GraphEngine = struct {
         _ = try self.file_manager.openFile(.label_idx, .open_existing);
         _ = try self.file_manager.openFile(.prop_idx, .open_existing);
         _ = try self.file_manager.openFile(.edge_idx, .open_existing);
+        // PHASE 3: the edge-existence snapshot is ADDITIVE. A pre-Phase-3 graph
+        // has no `edges_exist.idx`; create it if missing so the load path sees an
+        // empty file (→ rebuild from adjacency) instead of failing to open.
+        _ = try self.file_manager.openFile(.edge_exist_idx, .create_if_missing);
 
         // SEC-0010: Validate page_size matches manifest after recovery
         if (cfg.page_size != self.manifest.page_size) {
@@ -340,6 +357,7 @@ pub const GraphEngine = struct {
             self.label_index_dirty = true;
             self.property_index_dirty = true;
             self.edge_index_dirty = true;
+            self.edge_exist_index_dirty = true;
         }
 
         // 7b. GAP-0027: load the opt-in index catalog and rehydrate declared
@@ -564,6 +582,7 @@ pub const GraphEngine = struct {
         self.label_index.deinit();
         self.property_index.deinit();
         self.edge_index.deinit();
+        self.edge_exist_index.deinit();
         self.property_index_set.deinit();
     }
 
@@ -658,6 +677,7 @@ pub const GraphEngine = struct {
         self.label_index.deinit();
         self.property_index.deinit();
         self.edge_index.deinit();
+        self.edge_exist_index.deinit();
         self.property_index_set.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
@@ -811,6 +831,36 @@ pub const GraphEngine = struct {
         };
     }
 
+    /// PHASE 3: O(1) edge-existence probe. Returns the COMPLETE set of edge ids
+    /// whose tuple is exactly `(from, rel_type, to)`, copied into caller-owned
+    /// `out`. Empty slice when none. The common one-edge tuple is a single
+    /// hashmap lookup; a parallel-edge tuple returns all candidates so a higher
+    /// layer (e.g. geode tenant disambiguation) preserves exact MERGE semantics.
+    /// Cost is independent of the source node's out-degree — that is the
+    /// throughput unlock that replaces the O(out-degree) adjacency dedup scan.
+    pub fn probeEdge(self: *GraphEngine, from: NodeId, rel_type: u32, to: NodeId, out: []EdgeId) anyerror![]const EdgeId {
+        return self.edge_exist_index.probe(from, rel_type, to, out);
+    }
+
+    /// Behavioral O(1) proof: candidate edge ids walked on the most recent
+    /// `probeEdge` (== bucket size for the matched key, NOT the parent degree).
+    pub fn lastProbeEntriesExamined(self: *const GraphEngine) usize {
+        return self.edge_exist_index.last_probe_entries_examined;
+    }
+
+    /// Total (key, edge_id) records in the edge-existence index. Equals the
+    /// number of edges it represents — used by tests to cross-check that the
+    /// existence index agrees record-for-record with the edge_index (both are
+    /// derived from the same adjacency scan, so they must match exactly).
+    pub fn edgeExistRecordCount(self: *const GraphEngine) usize {
+        return self.edge_exist_index.recordCount();
+    }
+
+    /// Number of edges in the edge_index (the O(1) getEdge lookup map).
+    pub fn edgeIndexCount(self: *const GraphEngine) usize {
+        return self.edge_index.count();
+    }
+
     /// Zero-copy outgoing-edge iterator (no result-sized allocation). The
     /// returned `AdjEdgeIterator` borrows the source node's adjacency pages and
     /// pins the current page; the caller MUST call `deinit()` to unpin it.
@@ -925,6 +975,12 @@ pub const GraphEngine = struct {
         });
         self.edge_index_dirty = true;
 
+        // PHASE 3: maintain the edge-EXISTENCE index in the SAME logical step as
+        // the edge so a probe is crash-consistent with adjacency. Keyed on
+        // (from, rel_type, to). Co-located with edge_index.put above.
+        try self.edge_exist_index.put(from, rel_type, to, edge_id);
+        self.edge_exist_index_dirty = true;
+
         self.manifest.edge_count += 1;
         self.metrics.edges_created += 1;
         self.markDirty();
@@ -963,6 +1019,13 @@ pub const GraphEngine = struct {
         // Log dirty adjacency pages
         if (from_rec.out_head != 0) try self.logPage(txn, .adj_out, from_rec.out_head);
         if (to_rec.in_head != 0) try self.logPage(txn, .adj_in, to_rec.in_head);
+
+        // PHASE 3: drop the edge-existence entry BEFORE removing the edge_index
+        // record (we need its rel_type to form the key). No-op if absent.
+        if (self.edge_index.get(edge_id)) |idx_entry| {
+            self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
+            self.edge_exist_index_dirty = true;
+        }
 
         // Remove from in-memory edge index
         _ = self.edge_index.remove(edge_id);
