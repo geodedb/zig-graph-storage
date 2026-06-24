@@ -59,16 +59,17 @@ test "full CRUD + cross-shard edges + reopen" {
     try testing.expectEqual(@as(usize, 100), label_nodes.len);
 }
 
-test "PERF-0058: many cross-shard edges via parallel 2PC stay correct and recover" {
-    // Drives the parallelized cross-shard 2PC path (crossShardAddEdge) hard:
-    // every edge here is guaranteed cross-shard, so the parallel prepare and
-    // parallel commit phases both run for each edge. We assert that the
-    // parallelism does NOT change observable outcomes:
+test "co-location: many cross-endpoint edges stay correct (single-shard write) and recover" {
+    // Edge co-location (Phase A) UPDATE: cross-endpoint edge writes are no longer
+    // 2PC — every edge is a SINGLE-shard write on shard(from), so there are NO
+    // cross_shard_commit records (the old `shardHasCommit` assertion is removed;
+    // crossShardAddEdge is present-but-unreachable). We assert the parallelism /
+    // single-shard path does NOT change observable outcomes:
     //   * each edge id is unique and routed to its source shard
     //   * both the source out-adjacency and target in-adjacency are present
-    //   * each participating shard logged a cross_shard_commit (2PC outcome)
-    //   * after close + reopen (which runs cross-shard recovery), every edge
-    //     is still present and the counts are unchanged.
+    //     (the latter via the FanInEdgeIterator scatter over adj_in_remote)
+    //   * after close + reopen, every edge is still present and counts are
+    //     unchanged — the in-index restored by physical page-image redo.
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xC3} ** 16;
@@ -129,16 +130,17 @@ test "PERF-0058: many cross-shard edges via parallel 2PC stay correct and recove
         try testing.expectEqual(@as(u64, N), try eng.nodeCount());
         try testing.expectEqual(@as(u64, edges.len), try eng.edgeCount());
 
-        // Every edge must be readable via BOTH adjacency directions.
+        // Every edge must be readable via BOTH adjacency directions (the
+        // incoming side now via the scatter-gather over adj_in_remote).
         for (edges) |er| {
             try expectOutEdge(eng, er.from, er.id, er.to);
             try expectInEdge(eng, er.to, er.id, er.from);
         }
 
-        // Every shard participated as both source and target, so each shard's
-        // WAL must contain at least one cross_shard_commit decision record.
+        // Co-location: edge writes are single-shard, so NO shard logs a
+        // cross_shard_commit decision record (the 2PC path is unreachable).
         for (0..N) |s| {
-            try testing.expect(try shardHasCommit(eng, s));
+            try testing.expect(!try shardHasCommit(eng, s));
         }
 
         try eng.checkpoint();

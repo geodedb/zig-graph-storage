@@ -17,6 +17,7 @@ const wal_mod = @import("wal.zig");
 const txn_mod = @import("txn.zig");
 const node_store_mod = @import("node_store.zig");
 const adj_store_mod = @import("adj_store.zig");
+const in_head_dir_mod = @import("in_head_dir.zig");
 const prop_store_mod = @import("prop_store.zig");
 const property_mod = @import("property.zig");
 const var_store_mod = @import("var_store.zig");
@@ -53,6 +54,7 @@ const WalManager = wal_mod.WalManager;
 const TxnManager = txn_mod.TxnManager;
 const NodeStore = node_store_mod.NodeStore;
 const AdjStore = adj_store_mod.AdjStore;
+const InHeadDir = in_head_dir_mod.InHeadDir;
 const PropStore = prop_store_mod.PropStore;
 const VarStore = var_store_mod.VarStore;
 const FreeSpaceManager = free_space_mod.FreeSpaceManager;
@@ -100,11 +102,23 @@ pub const GraphEngine = struct {
     node_store: NodeStore,
     adj_out: AdjStore,
     adj_in: AdjStore,
+    /// Edge co-location (Phase A): incoming-adjacency chain bodies for edges
+    /// whose SOURCE hashes to this shard, keyed (via `in_head_dir`) by dst node
+    /// id. Mirrors `adj_in`'s AdjStore shape; page-backed (FileId `in_idx`) so
+    /// durability rides logPage/flushAll/syncDirty exactly like adj_in.
+    adj_in_remote: AdjStore,
+    /// Edge co-location (Phase A): page-backed dst-node-id -> chain-head
+    /// directory for `adj_in_remote` (FileId `in_dir`). Rides page-image redo
+    /// (no snapshot/rebuild) so a crash restores it crash-consistently with the
+    /// chain bodies it indexes.
+    in_head_dir: InHeadDir,
     prop_store: PropStore,
     var_store: VarStore,
     free_space_nodes: FreeSpaceManager,
     free_space_adj_out: FreeSpaceManager,
     free_space_adj_in: FreeSpaceManager,
+    free_space_in_idx: FreeSpaceManager,
+    free_space_in_dir: FreeSpaceManager,
     free_space_props: FreeSpaceManager,
     free_space_var: FreeSpaceManager,
     label_dict: LabelDictionary,
@@ -218,6 +232,9 @@ pub const GraphEngine = struct {
         _ = try self.file_manager.openFile(.prop_idx, .create_if_missing);
         _ = try self.file_manager.openFile(.edge_idx, .create_if_missing);
         _ = try self.file_manager.openFile(.edge_exist_idx, .create_if_missing);
+        // Edge co-location (Phase A): incoming-adjacency chain bodies + directory.
+        _ = try self.file_manager.openFile(.in_idx, .create_if_missing);
+        _ = try self.file_manager.openFile(.in_dir, .create_if_missing);
 
         // 5. Create buffer pool, register pagers
         // PERF-0051: size the pool with the same auto-size logic open() uses
@@ -298,6 +315,13 @@ pub const GraphEngine = struct {
         // has no `edges_exist.idx`; create it if missing so the load path sees an
         // empty file (→ rebuild from adjacency) instead of failing to open.
         _ = try self.file_manager.openFile(.edge_exist_idx, .create_if_missing);
+        // Edge co-location (Phase A): ADDITIVE like the existence index. A
+        // pre-co-location graph has no adj_in_remote/adj_in_dir files; create
+        // them if missing so open() succeeds (empty → no co-located in-edges
+        // until Phase B migration). The pages are restored by WAL page-image
+        // redo (registered below), so recovery needs no special handling.
+        _ = try self.file_manager.openFile(.in_idx, .create_if_missing);
+        _ = try self.file_manager.openFile(.in_dir, .create_if_missing);
 
         // SEC-0010: Validate page_size matches manifest after recovery
         if (cfg.page_size != self.manifest.page_size) {
@@ -308,6 +332,8 @@ pub const GraphEngine = struct {
         const total_pages = self.manifest.nodes_pages +
             self.manifest.adj_out_pages +
             self.manifest.adj_in_pages +
+            self.manifest.in_idx_pages +
+            self.manifest.in_dir_pages +
             self.manifest.props_pages +
             self.manifest.var_pages +
             self.manifest.free_pages;
@@ -402,6 +428,11 @@ pub const GraphEngine = struct {
         if (self.file_manager.getPager(.props)) |p| self.buffer_pool.registerPager(.props, p);
         if (self.file_manager.getPager(.var_store)) |p| self.buffer_pool.registerPager(.var_store, p);
         if (self.file_manager.getPager(.free)) |p| self.buffer_pool.registerPager(.free, p);
+        // Edge co-location (Phase A): the incoming-adjacency chain bodies + the
+        // dst->head directory are page-backed data stores, registered like the
+        // other data pagers so logPage/flush/pin/recovery treat them uniformly.
+        if (self.file_manager.getPager(.in_idx)) |p| self.buffer_pool.registerPager(.in_idx, p);
+        if (self.file_manager.getPager(.in_dir)) |p| self.buffer_pool.registerPager(.in_dir, p);
     }
 
     fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]u8, cfg: GraphConfig, wal_start_lsn: u64) !void {
@@ -418,12 +449,16 @@ pub const GraphEngine = struct {
         const total = self.free_space_nodes.total_pages +
             self.free_space_adj_out.total_pages +
             self.free_space_adj_in.total_pages +
+            self.free_space_in_idx.total_pages +
+            self.free_space_in_dir.total_pages +
             self.free_space_props.total_pages +
             self.free_space_var.total_pages;
         if (total > 0) {
             const free = self.free_space_nodes.freeCount() +
                 self.free_space_adj_out.freeCount() +
                 self.free_space_adj_in.freeCount() +
+                self.free_space_in_idx.freeCount() +
+                self.free_space_in_dir.freeCount() +
                 self.free_space_props.freeCount() +
                 self.free_space_var.freeCount();
             self.metrics.fragmentation_ratio = (free * 10000) / total;
@@ -576,6 +611,8 @@ pub const GraphEngine = struct {
         self.free_space_nodes.deinit();
         self.free_space_adj_out.deinit();
         self.free_space_adj_in.deinit();
+        self.free_space_in_idx.deinit();
+        self.free_space_in_dir.deinit();
         self.free_space_props.deinit();
         self.free_space_var.deinit();
         self.label_dict.deinit();
@@ -671,6 +708,8 @@ pub const GraphEngine = struct {
         self.free_space_nodes.deinit();
         self.free_space_adj_out.deinit();
         self.free_space_adj_in.deinit();
+        self.free_space_in_idx.deinit();
+        self.free_space_in_dir.deinit();
         self.free_space_props.deinit();
         self.free_space_var.deinit();
         self.label_dict.deinit();
@@ -1003,6 +1042,106 @@ pub const GraphEngine = struct {
         observability.endOperationSpan(__obs_span, true, "");
 
         return edge_id;
+    }
+
+    /// Edge co-location (Phase A): add an edge whose SOURCE is on THIS shard,
+    /// recording EVERYTHING on this shard so the write is a single-engine,
+    /// single-txn (crash-consistent) operation — even when `to` lives on another
+    /// shard. Unlike `addEdgeTxn`, this does NOT touch `to`'s node record (it is
+    /// not resident here); the edge's incoming adjacency goes into THIS shard's
+    /// `adj_in_remote` chain, whose head is held in `in_head_dir[to]` rather than
+    /// in `to.in_head`. `ShardedGraphEngine.expandIn(to)` finds it by scattering
+    /// the directory probe across all shards.
+    ///
+    /// One in-edge code path: even a same-shard edge (shard(from)==shard(to))
+    /// routes its in-entry through `adj_in_remote`, not `to.in_head`, so reverse
+    /// traversal has a single uniform source of truth (the legacy `NodeRec.in_head`
+    /// field is left write-dead for new edges).
+    pub fn addEdgeColocatedTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
+        try self.ensureWritable();
+        const edge_id = self.manifest.next_edge_id;
+        const stride: u64 = if (self.config.base_shard_index != null)
+            @intCast(@import("sharded_store.zig").SHARD_COUNT)
+        else
+            1;
+        self.manifest.next_edge_id += stride;
+
+        // 1. Source out-adjacency + source node record (from IS resident here).
+        const out_entry = EdgeEntry{
+            .neighbor = to,
+            .edge_id = edge_id,
+            .rel_type = rel_type,
+            .prop_head = 0,
+        };
+        var from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
+        const new_out_head = try self.adj_out.addEdge(from_rec.out_head, out_entry);
+        from_rec.out_head = new_out_head;
+        try self.node_store.putNode(from, from_rec);
+
+        // 2. Incoming adjacency into THIS shard's adj_in_remote, keyed by `to`
+        //    via the page-backed directory. We do NOT read/write `to`'s NodeRec.
+        const in_entry = EdgeEntry{
+            .neighbor = from,
+            .edge_id = edge_id,
+            .rel_type = rel_type,
+            .prop_head = 0,
+        };
+        const old_in_head = try self.in_head_dir.getHead(to);
+        const new_in_head = try self.adj_in_remote.addEdge(old_in_head, in_entry);
+        const dir_page = try self.in_head_dir.setHead(to, new_in_head);
+
+        // 3. Log every dirty page under the ONE txn: out-adj, from-node, in-adj
+        //    body, in-dir page. No remote pages, no `to`-node page — strictly
+        //    fewer pages than addEdgeTxn's two-node write.
+        try self.logPage(txn, .adj_out, new_out_head);
+        try self.logPage(txn, .nodes, self.nodePageId(from));
+        try self.logPage(txn, .in_idx, new_in_head);
+        try self.logPage(txn, .in_dir, dir_page);
+
+        // 4. Derived in-memory indexes (same as addEdgeTxn — already source-shard).
+        try self.edge_index.put(edge_id, .{
+            .from = from,
+            .neighbor = to,
+            .rel_type = rel_type,
+            .prop_head = 0,
+        });
+        self.edge_index_dirty = true;
+        try self.edge_exist_index.put(from, rel_type, to, edge_id);
+        self.edge_exist_index_dirty = true;
+
+        self.manifest.edge_count += 1;
+        self.metrics.edges_created += 1;
+        self.markDirty();
+
+        return edge_id;
+    }
+
+    /// Edge co-location (Phase A): auto-commit single-shard edge add. The
+    /// ShardedGraphEngine routes BOTH same-shard and cross-endpoint edges here
+    /// (on shard(from)); `crossShardAddEdge`'s 2PC is no longer reached.
+    pub fn addEdgeColocated(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
+        var __obs_span = observability.startOperationSpan("add_edge");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+
+        const edge_id = try self.addEdgeColocatedTxn(from, to, rel_type, txn);
+
+        try self.txn_manager.commit(txn);
+        observability.endOperationSpan(__obs_span, true, "");
+
+        return edge_id;
+    }
+
+    /// Edge co-location (Phase A): zero-copy incoming-edge iterator over THIS
+    /// shard's `adj_in_remote` for `dst` (entries whose source is on this shard).
+    /// The cross-shard union is built by `ShardedGraphEngine.FanInEdgeIterator`,
+    /// which fans this over all shards. Ownership/lifetime match `expandInIter`.
+    pub fn expandInRemoteIter(self: *GraphEngine, dst: NodeId, rel_type: ?u32) anyerror!AdjStore.AdjEdgeIterator {
+        const head = try self.in_head_dir.getHead(dst);
+        return self.adj_in_remote.expand(head, rel_type);
     }
 
     /// Remove an edge within an existing transaction (no auto-commit).

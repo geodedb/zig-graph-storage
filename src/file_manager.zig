@@ -25,6 +25,8 @@ pub const FILE_NAMES = [FILE_COUNT][]const u8{
     "props.idx", // prop_idx
     "edges.idx", // edge_idx
     "edges_exist.idx", // edge_exist_idx (Phase 3 edge-existence index snapshot)
+    "adj_in_remote.store", // in_idx (edge co-location: incoming-adj chain bodies)
+    "adj_in_dir.store", // in_dir (edge co-location: dst-node -> chain-head directory)
 };
 
 pub const OpenMode = enum {
@@ -349,7 +351,7 @@ test "openFile is idempotent — returns same pager on second call" {
 }
 
 test "FILE_NAMES has correct count and entries" {
-    try testing.expectEqual(@as(usize, 10), FILE_NAMES.len);
+    try testing.expectEqual(@as(usize, 12), FILE_NAMES.len);
     try testing.expectEqualStrings("nodes.store", FILE_NAMES[@intFromEnum(FileId.nodes)]);
     try testing.expectEqualStrings("adj_out.store", FILE_NAMES[@intFromEnum(FileId.adj_out)]);
     try testing.expectEqualStrings("adj_in.store", FILE_NAMES[@intFromEnum(FileId.adj_in)]);
@@ -360,6 +362,8 @@ test "FILE_NAMES has correct count and entries" {
     try testing.expectEqualStrings("props.idx", FILE_NAMES[@intFromEnum(FileId.prop_idx)]);
     try testing.expectEqualStrings("edges.idx", FILE_NAMES[@intFromEnum(FileId.edge_idx)]);
     try testing.expectEqualStrings("edges_exist.idx", FILE_NAMES[@intFromEnum(FileId.edge_exist_idx)]);
+    try testing.expectEqualStrings("adj_in_remote.store", FILE_NAMES[@intFromEnum(FileId.in_idx)]);
+    try testing.expectEqualStrings("adj_in_dir.store", FILE_NAMES[@intFromEnum(FileId.in_dir)]);
 }
 
 test "SEC-0045: deinit zeroes all per-pager encryption key copies" {
@@ -383,7 +387,7 @@ test "SEC-0045: deinit zeroes all per-pager encryption key copies" {
 
     // Open all files so each pager gets its own PageEncryption copy
     const file_ids = [_]@import("types.zig").FileId{
-        .nodes, .adj_out, .adj_in, .props, .var_store, .free, .label_idx, .prop_idx, .edge_idx,
+        .nodes, .adj_out, .adj_in, .props, .var_store, .free, .label_idx, .prop_idx, .edge_idx, .in_idx, .in_dir,
     };
     for (file_ids) |fid| {
         _ = try fm.openFile(fid, .open_existing);

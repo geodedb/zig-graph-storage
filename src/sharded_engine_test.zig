@@ -136,7 +136,10 @@ test "ShardedGraphEngine.addEdge succeeds when source and target are co-located"
     try testing.expectEqual(n2, got.?.neighbor);
 }
 
-test "addEdge across shards commits via 2PC and both adjacencies are readable" {
+test "addEdge across shards is single-shard and both adjacencies are readable" {
+    // Edge co-location (Phase A): a cross-endpoint edge is a single-shard write
+    // on shard(src); the incoming side is served by the FanInEdgeIterator
+    // scatter over adj_in_remote. Both directions must still read back.
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0x70} ** 16;
@@ -306,7 +309,14 @@ test "FanOutNodeIterator touches every shard that has matching nodes" {
     for (shard_nodes) |n| try testing.expect(seen.contains(n));
 }
 
-test "cross-shard commit blocks until both shards' WAL commit records are durable" {
+test "co-location: cross-endpoint edge write is single-shard (no cross_shard_commit)" {
+    // Edge co-location (Phase A) UPDATE of the former "2PC commit durability"
+    // test: a cross-endpoint edge `(src on shard 0)->(dst on shard 7)` is now a
+    // SINGLE-shard write on shard(src)=0. So NEITHER shard logs a
+    // cross_shard_commit (the 2PC path is unreachable from addEdge), and shard 7
+    // — which previously took the dst-side in-adjacency write — does no edge
+    // write at all. The edge is still correct in both directions (incoming via
+    // the FanInEdgeIterator scatter).
     const wal_record_mod = @import("wal_record.zig");
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
@@ -324,23 +334,43 @@ test "cross-shard commit blocks until both shards' WAL commit records are durabl
     try eng.putNode(n_src, test_support.emptyNode(1));
     try eng.putNode(n_dst, test_support.emptyNode(1));
 
-    _ = try eng.addEdge(n_src, n_dst, 1);
+    const edge_id = try eng.addEdge(n_src, n_dst, 1);
 
+    // No shard logs a cross_shard_commit decision.
     for ([_]usize{ 0, 7 }) |s| {
         const records = try eng.shards[s].wal.readFrom(0, testing.allocator);
         defer {
             for (records) |*r| r.deinit(testing.allocator);
             testing.allocator.free(records);
         }
-        var found = false;
         for (records) |r| {
-            if (r.record_type == wal_record_mod.WalRecordType.cross_shard_commit) {
-                found = true;
-                break;
-            }
+            try testing.expect(r.record_type != wal_record_mod.WalRecordType.cross_shard_commit);
+            try testing.expect(r.record_type != wal_record_mod.WalRecordType.cross_shard_prepare);
         }
-        try testing.expect(found);
     }
+
+    // The edge resolves both ways: out from src, in to dst (via scatter).
+    var out_it = try eng.expandOutIter(n_src, null);
+    defer out_it.deinit();
+    var out_found = false;
+    while (try out_it.next()) |e| {
+        if (e.edge_id == edge_id) {
+            try testing.expectEqual(n_dst, e.neighbor);
+            out_found = true;
+        }
+    }
+    try testing.expect(out_found);
+
+    var in_it = try eng.expandInIter(n_dst, null);
+    defer in_it.deinit();
+    var in_found = false;
+    while (try in_it.next()) |e| {
+        if (e.edge_id == edge_id) {
+            try testing.expectEqual(n_src, e.neighbor);
+            in_found = true;
+        }
+    }
+    try testing.expect(in_found);
 }
 
 test "ShardedGraphEngine creates one shared pool across all shards" {

@@ -37,11 +37,18 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     const new_head_u64 = try engine.putProperty(@as(u64, found_prop_head), key, value);
     const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
 
-    // 4. If prop_head changed, update BOTH adjacency copies and edge index
+    // 4. If prop_head changed, update BOTH adjacency copies and edge index.
+    //    Edge co-location (Phase A): the incoming copy now lives in THIS shard's
+    //    `adj_in_remote`, keyed by `to` via `in_head_dir` — NOT in `to.in_head`
+    //    on the dst shard (which may not even be this engine). Both the out-chain
+    //    and the in-chain are therefore on the source shard, so this single-engine
+    //    update is correct (it was BROKEN for cross-shard edges before co-location,
+    //    which only ever touched one engine). `to` is not resident here, so we do
+    //    NOT read its NodeRec.
     if (new_head != found_prop_head) {
         _ = try engine.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head);
-        const to_rec = (try engine.node_store.getNode(to)) orelse return error.NodeNotFound;
-        _ = try engine.adj_in.updateEdgePropHead(to_rec.in_head, edge_id, new_head);
+        const in_head = try engine.in_head_dir.getHead(to);
+        _ = try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head);
 
         // Keep edge index prop_head in sync
         if (engine.edge_index.getPtr(edge_id)) |idx_entry| {

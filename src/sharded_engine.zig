@@ -280,10 +280,20 @@ pub const ShardedGraphEngine = struct {
         return self.shards[shard_count_mod.shardOfNode(id)].expandOutIter(id, rel_type);
     }
 
-    pub fn expandInIter(self: *ShardedGraphEngine, id: NodeId, rel_type: ?u32) anyerror!adj_store_mod.AdjStore.AdjEdgeIterator {
-        // expandIn is intra-shard by construction — incoming adjacency
-        // for node v lives in v's shard (§Cross-shard operations.2).
-        return self.shards[shard_count_mod.shardOfNode(id)].expandInIter(id, rel_type);
+    pub fn expandInIter(self: *ShardedGraphEngine, id: NodeId, rel_type: ?u32) anyerror!FanInEdgeIterator {
+        // Edge co-location (Phase A): incoming adjacency for node v is now
+        // FRAGMENTED across the shards of v's various sources (each source shard
+        // recorded its own in-entry into its adj_in_remote keyed by v). Reverse
+        // traversal therefore becomes a bounded SHARD_COUNT-way scatter-gather
+        // over every shard's adj_in_remote + in_head_dir, instead of routing to
+        // shardOfNode(v). Forward traversal (expandOutIter) stays single-shard.
+        return .{
+            .owner = self,
+            .dst = id,
+            .rel_type = rel_type,
+            .shard_idx = 0,
+            .current = null,
+        };
     }
 
     pub fn getProperty(self: *ShardedGraphEngine, prop_head: u64, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
@@ -523,10 +533,15 @@ pub const ShardedGraphEngine = struct {
     }
 
     pub fn addEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
+        // Edge co-location (Phase A): EVERY edge — same-shard or cross-endpoint —
+        // is now a SINGLE-shard write on shard(from). Out-adjacency, edge body,
+        // edge_index, the existence index AND the incoming adjacency (into
+        // shard(from)'s adj_in_remote keyed by `to`) all live on one engine, so
+        // the write is one WAL txn with no cross-shard 2PC. `crossShardAddEdge`
+        // is left present-but-unreachable so Phase A is reversible (deleted in
+        // Phase C); reverse traversal is served by the FanInEdgeIterator scatter.
         const s_from = shard_count_mod.shardOfNode(from);
-        const s_to = shard_count_mod.shardOfNode(to);
-        if (s_from == s_to) return self.shards[s_from].addEdge(from, to, rel_type);
-        return self.crossShardAddEdge(from, to, rel_type, s_from, s_to);
+        return self.shards[s_from].addEdgeColocated(from, to, rel_type);
     }
 
     pub fn removeEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
@@ -819,6 +834,46 @@ pub const FanOutNodeIterator = struct {
     pub fn deinit(self: *FanOutNodeIterator) void {
         // Release the active shard's owned posting-list slice if iteration
         // was abandoned before the iterator was exhausted (PERF-0054).
+        if (self.current) |*inner| inner.deinit();
+        self.current = null;
+    }
+};
+
+/// Edge co-location (Phase A): streaming reverse-adjacency iterator that fans a
+/// single dst's incoming-edge read over EVERY shard's `adj_in_remote` (keyed by
+/// `in_head_dir[dst]`), unioning the results. Modeled on `FanOutNodeIterator`:
+/// it advances one shard at a time, draining that shard's `AdjEdgeIterator`
+/// before opening the next shard's. Yielded `EdgeEntry` values are copies and
+/// stay valid after `deinit()`. The per-page pin/unpin discipline is inherited
+/// from `AdjStore.AdjEdgeIterator` (the same as the legacy single-shard path),
+/// so concurrent readers stay SEGV-safe. Value-typed so `GraphStorage.init`'s
+/// `wrapEdgeIterator` heap-boxes it for the vtable with no signature change.
+pub const FanInEdgeIterator = struct {
+    owner: *ShardedGraphEngine,
+    dst: NodeId,
+    rel_type: ?u32,
+    shard_idx: usize,
+    current: ?adj_store_mod.AdjStore.AdjEdgeIterator,
+
+    pub fn next(self: *FanInEdgeIterator) anyerror!?EdgeEntry {
+        while (true) {
+            if (self.current) |*inner| {
+                if (try inner.next()) |entry| return entry;
+                // Exhausted this shard's chain — unpin its active page.
+                inner.deinit();
+                self.current = null;
+            }
+            if (self.shard_idx >= SHARD_COUNT) return null;
+            // Open the next shard's adj_in_remote chain for dst (may be empty —
+            // head 0 yields an iterator that returns null immediately).
+            self.current = try self.owner.shards[self.shard_idx].expandInRemoteIter(self.dst, self.rel_type);
+            self.shard_idx += 1;
+        }
+    }
+
+    pub fn deinit(self: *FanInEdgeIterator) void {
+        // Release the active shard's pinned page if iteration was abandoned
+        // before exhaustion (mirrors AdjEdgeIterator/FanOutNodeIterator).
         if (self.current) |*inner| inner.deinit();
         self.current = null;
     }
