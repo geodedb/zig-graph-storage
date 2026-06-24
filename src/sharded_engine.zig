@@ -390,27 +390,51 @@ pub const ShardedGraphEngine = struct {
         var dst_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
         two_pc.encodePreparePayload(&dst_prepare, global_txn_id, .target, @intCast(s_from), edge_id, from, to, rel_type);
 
-        var dst_ctx = PrepareCtx{ .eng = dst, .payload = dst_prepare };
-        var wg = self.shared_thread_pool.waitGroup();
-        const submitted = self.shared_thread_pool.submit(
-            prepareTaskFn,
-            &dst_ctx,
-            .{ .wait_group = &wg },
-        ) catch null;
+        // PHASE 4 (edge-engine-direct, low-contention apply): in `deferred` WAL
+        // mode the per-commit fsync is SKIPPED (durability deferred to
+        // checkpoint/clean close), so there is NO fsync latency to overlap — the
+        // sole reason the dst prepare/commit were dispatched to the shared thread
+        // pool (`max(2 fsync)` instead of `sum`). Under deferred the thread-pool
+        // submit+WaitGroup.wait round-trip is then PURE per-edge overhead, and it
+        // dominates cross-shard bulk edge throughput (the popular-parent case
+        // where a hot source's children are spread across all 16 shards → ~15/16
+        // of its edges are cross-shard). Run both prepares (and both commits)
+        // INLINE on the calling thread in that mode. This is correctness-neutral:
+        // identical WAL records in the identical order (src prepare, dst prepare,
+        // … src commit, dst commit), identical recovery — only the dispatch
+        // changes (serial vs overlapped), and there is nothing to overlap.
+        const inline_2pc = (src.config.sync_mode == .deferred);
 
-        // Source prepare runs inline regardless of whether the dst task was
-        // enqueued (it may run inline below as a fallback). Capture rather than
-        // `try` so a src failure does not skip joining the in-flight dst task.
         var src_ctx = PrepareCtx{ .eng = src, .payload = src_prepare };
-        prepareTaskFn(&src_ctx, undefined);
+        var dst_ctx = PrepareCtx{ .eng = dst, .payload = dst_prepare };
 
-        // If submit failed (e.g. queue full / pool draining), run the target
-        // prepare inline on this thread BEFORE waiting so we never block on a
-        // WaitGroup that was never armed.
-        if (submitted == null) {
+        if (inline_2pc) {
+            // Both prepares inline; src first (its WAL record precedes dst's,
+            // matching the overlapped path's intended ordering).
+            prepareTaskFn(&src_ctx, undefined);
             prepareTaskFn(&dst_ctx, undefined);
         } else {
-            wg.wait();
+            var wg = self.shared_thread_pool.waitGroup();
+            const submitted = self.shared_thread_pool.submit(
+                prepareTaskFn,
+                &dst_ctx,
+                .{ .wait_group = &wg },
+            ) catch null;
+
+            // Source prepare runs inline regardless of whether the dst task was
+            // enqueued (it may run inline below as a fallback). Capture rather
+            // than `try` so a src failure does not skip joining the in-flight dst
+            // task.
+            prepareTaskFn(&src_ctx, undefined);
+
+            // If submit failed (e.g. queue full / pool draining), run the target
+            // prepare inline on this thread BEFORE waiting so we never block on a
+            // WaitGroup that was never armed.
+            if (submitted == null) {
+                prepareTaskFn(&dst_ctx, undefined);
+            } else {
+                wg.wait();
+            }
         }
 
         // Surface either prepare's error only after the join, so a failure on
@@ -470,19 +494,25 @@ pub const ShardedGraphEngine = struct {
         var src_commit = CommitCtx{ .eng = src, .global_txn_id = global_txn_id, .local_txn = src_local_txn };
         var dst_commit = CommitCtx{ .eng = dst, .global_txn_id = global_txn_id, .local_txn = dst_local_txn };
 
-        var commit_wg = self.shared_thread_pool.waitGroup();
-        const commit_submitted = self.shared_thread_pool.submit(
-            commitTaskFn,
-            &dst_commit,
-            .{ .wait_group = &commit_wg },
-        ) catch null;
-
-        commitTaskFn(&src_commit, undefined);
-
-        if (commit_submitted == null) {
+        if (inline_2pc) {
+            // Deferred mode: no fsync to overlap → run both commits inline.
+            commitTaskFn(&src_commit, undefined);
             commitTaskFn(&dst_commit, undefined);
         } else {
-            commit_wg.wait();
+            var commit_wg = self.shared_thread_pool.waitGroup();
+            const commit_submitted = self.shared_thread_pool.submit(
+                commitTaskFn,
+                &dst_commit,
+                .{ .wait_group = &commit_wg },
+            ) catch null;
+
+            commitTaskFn(&src_commit, undefined);
+
+            if (commit_submitted == null) {
+                commitTaskFn(&dst_commit, undefined);
+            } else {
+                commit_wg.wait();
+            }
         }
 
         if (src_commit.err) |e| return e;
