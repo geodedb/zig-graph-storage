@@ -60,11 +60,11 @@ test "full CRUD + cross-shard edges + reopen" {
 }
 
 test "co-location: many cross-endpoint edges stay correct (single-shard write) and recover" {
-    // Edge co-location (Phase A) UPDATE: cross-endpoint edge writes are no longer
-    // 2PC — every edge is a SINGLE-shard write on shard(from), so there are NO
-    // cross_shard_commit records (the old `shardHasCommit` assertion is removed;
-    // crossShardAddEdge is present-but-unreachable). We assert the parallelism /
-    // single-shard path does NOT change observable outcomes:
+    // Edge co-location: cross-endpoint edge writes are no longer 2PC — every edge
+    // is a SINGLE-shard write on shard(from), so there are NO cross_shard_commit
+    // records (the old `shardHasCommit` assertion is removed; the cross-shard 2PC
+    // `crossShardAddEdge` path was deleted in Phase C). We assert the parallelism
+    // / single-shard path does NOT change observable outcomes:
     //   * each edge id is unique and routed to its source shard
     //   * both the source out-adjacency and target in-adjacency are present
     //     (the latter via the FanInEdgeIterator scatter over adj_in_remote)
