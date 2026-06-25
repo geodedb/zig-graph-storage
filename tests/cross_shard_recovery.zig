@@ -41,72 +41,17 @@ fn injectCorruptedRecord(
     try eng.wal.sync();
 }
 
-test "recovery: crash after both prepares with no commit → edge not visible after reopen" {
-    var td = try test_support.TestDataDir.init(testing.allocator);
-    defer td.deinit();
-    const uuid = [_]u8{0x80} ** 16;
-
-    {
-        var eng = try graph_storage.ShardedGraphEngine.create(
-            testing.allocator,
-            td.path,
-            uuid,
-            test_support.testConfig(),
-        );
-        const n_src = try eng.shards[0].allocNode();
-        const n_dst = try eng.shards[5].allocNode();
-        try eng.putNode(n_src, test_support.emptyNode(1));
-        try eng.putNode(n_dst, test_support.emptyNode(1));
-        try eng.addEdgeCrashAfterPrepares(n_src, n_dst, 1);
-        eng.deinit();
-    }
-
-    var eng = try graph_storage.ShardedGraphEngine.open(
-        testing.allocator,
-        td.path,
-        uuid,
-        test_support.testConfig(),
-    );
-    defer eng.close() catch {};
-
-    try testing.expectEqual(@as(u64, 0), try eng.edgeCount());
-}
-
-test "recovery: crash after source commit, before target commit → edge visible after reopen" {
-    var td = try test_support.TestDataDir.init(testing.allocator);
-    defer td.deinit();
-    const uuid = [_]u8{0x81} ** 16;
-
-    var n_src_saved: u64 = 0;
-    var n_dst_saved: u64 = 0;
-    var edge_saved: u64 = 0;
-    {
-        var eng = try graph_storage.ShardedGraphEngine.create(
-            testing.allocator,
-            td.path,
-            uuid,
-            test_support.testConfig(),
-        );
-        n_src_saved = try eng.shards[0].allocNode();
-        n_dst_saved = try eng.shards[5].allocNode();
-        try eng.putNode(n_src_saved, test_support.emptyNode(1));
-        try eng.putNode(n_dst_saved, test_support.emptyNode(1));
-        edge_saved = try eng.addEdgeCrashAfterSourceCommit(n_src_saved, n_dst_saved, 1);
-        eng.deinit();
-    }
-
-    var eng = try graph_storage.ShardedGraphEngine.open(
-        testing.allocator,
-        td.path,
-        uuid,
-        test_support.testConfig(),
-    );
-    defer eng.close() catch {};
-
-    const got = try eng.getEdge(edge_saved);
-    try testing.expect(got != null);
-    try testing.expectEqual(n_dst_saved, got.?.neighbor);
-}
+// Edge co-location (Phase C): the two edge-specific 2PC crash-recovery tests
+// that lived here ("crash after both prepares → edge not visible" and "crash
+// after source commit → edge visible after reopen") encoded the OLD cross-shard
+// edge 2PC behavior. Edges are now SINGLE-shard writes (no cross_shard_prepare/
+// commit records are emitted for an edge), so those scenarios — and the
+// `addEdgeCrashAfter{Prepares,SourceCommit}` test hooks that produced them — no
+// longer exist. Single-shard edge crash recovery is covered by
+// tests/edge_colocation.zig ("crash + reopen rebuilds in-index via page-image
+// redo"). The SEC-0041 tests below are retained: they exercise the cross-shard
+// reconciler's FAIL-CLOSED behavior against forged/corrupted WAL records (kept
+// for any future genuinely cross-shard op), independently of edge writes.
 
 test "SEC-0041: reconciler fails closed on a corrupted-checksum record in a shard WAL" {
     // Exercise the cross-shard 2PC reconciler in isolation from the per-shard
@@ -217,48 +162,9 @@ test "SEC-0041: full open fails closed on a corrupted cross-shard record" {
     try testing.expectError(error.ChecksumMismatch, open_result);
 }
 
-test "SEC-0041: larger valid WAL still reconciles a committed cross-shard edge" {
-    var td = try test_support.TestDataDir.init(testing.allocator);
-    defer td.deinit();
-    const uuid = [_]u8{0x84} ** 16;
-
-    var n_src_saved: u64 = 0;
-    var n_dst_saved: u64 = 0;
-    var edge_saved: u64 = 0;
-    {
-        var eng = try graph_storage.ShardedGraphEngine.create(
-            testing.allocator,
-            td.path,
-            uuid,
-            test_support.testConfig(),
-        );
-        n_src_saved = try eng.shards[0].allocNode();
-        n_dst_saved = try eng.shards[5].allocNode();
-        try eng.putNode(n_src_saved, test_support.emptyNode(1));
-        try eng.putNode(n_dst_saved, test_support.emptyNode(1));
-
-        // Generate a larger volume of legitimate WAL traffic so the streaming
-        // reconciler is exercised against a non-trivial log (PERF-0053:
-        // streaming must not materialize the whole WAL).
-        var i: u64 = 0;
-        while (i < 256) : (i += 1) {
-            const node = try eng.shards[0].allocNode();
-            try eng.putNode(node, test_support.emptyNode(1));
-        }
-
-        edge_saved = try eng.addEdgeCrashAfterSourceCommit(n_src_saved, n_dst_saved, 1);
-        eng.deinit();
-    }
-
-    var eng = try graph_storage.ShardedGraphEngine.open(
-        testing.allocator,
-        td.path,
-        uuid,
-        test_support.testConfig(),
-    );
-    defer eng.close() catch {};
-
-    const got = try eng.getEdge(edge_saved);
-    try testing.expect(got != null);
-    try testing.expectEqual(n_dst_saved, got.?.neighbor);
-}
+// Edge co-location (Phase C): the "larger valid WAL still reconciles a committed
+// cross-shard edge" test was removed with the `addEdgeCrashAfterSourceCommit`
+// hook — it was the only way to produce a committed dangling cross-shard EDGE
+// prepare, and edges are now single-shard (no such record is ever emitted). The
+// reconciler's streaming fail-closed behavior on forged records remains covered
+// by the SEC-0041 tests above.

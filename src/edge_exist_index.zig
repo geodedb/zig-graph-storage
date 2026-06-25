@@ -7,7 +7,7 @@
 //! tuple, so a MERGE-edge dedup probe is O(1) instead of O(out-degree). It is a
 //! DERIVED index with the SAME crash-safety lifecycle as the engine's `edge_index`
 //! (edge_id -> entry): mutated in lock-step with the edge in
-//! `addEdgeTxn`/`crossShardAddEdge`/recovery-reapply, snapshotted at checkpoint,
+//! `addEdgeTxn`/`addEdgeColocatedTxn`/recovery-reapply, snapshotted at checkpoint,
 //! and REBUILT from the durable out-adjacency on recovery whenever the snapshot
 //! is stale or absent. Because it is a pure function of the WAL-logged adjacency
 //! (the source of truth), a crash mid-batch can never leave the index disagreeing

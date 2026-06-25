@@ -6,7 +6,6 @@
 //! docs/superpowers/specs/2026-04-24-sharded-graph-engine-design.md.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const tp = @import("thread_pool");
 const Allocator = std.mem.Allocator;
 
@@ -22,7 +21,6 @@ const edge_mod = @import("edge.zig");
 const metrics_mod = @import("metrics.zig");
 const adj_store_mod = @import("adj_store.zig");
 const label_index_mod = @import("label_index.zig");
-const two_pc = @import("sharded_engine_2pc.zig");
 const sharded_recovery = @import("sharded_recovery.zig");
 const prop_store_mod = @import("prop_store.zig");
 
@@ -336,240 +334,25 @@ pub const ShardedGraphEngine = struct {
         return total;
     }
 
-    // PERF-0058: one side of a cross-shard prepare. Begins a local txn on its
-    // (single, disjoint) shard engine and appends+fsyncs the prepare record.
-    // The result (`local_txn`) and any `err` are read by the coordinator only
-    // after the WaitGroup join, which provides the necessary happens-before.
-    const PrepareCtx = struct {
-        eng: *GraphEngine,
-        payload: [two_pc.PREPARE_PAYLOAD_SIZE]u8,
-        local_txn: TxnId = 0,
-        err: ?anyerror = null,
-    };
-
-    fn prepareTaskFn(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
-        const ctx: *PrepareCtx = @ptrCast(@alignCast(ctx_ptr));
-        const local_txn = ctx.eng.beginTxn() catch |e| {
-            ctx.err = e;
-            return;
-        };
-        ctx.local_txn = local_txn;
-        _ = two_pc.appendPrepare(ctx.eng, ctx.payload, local_txn) catch |e| {
-            ctx.err = e;
-        };
-    }
-
-    // PERF-0058: one side of a cross-shard commit. Appends+fsyncs the commit
-    // decision and commits the local txn on its (single, disjoint) shard
-    // engine. Any `err` is read by the coordinator only after the join.
-    const CommitCtx = struct {
-        eng: *GraphEngine,
-        global_txn_id: u64,
-        local_txn: TxnId,
-        err: ?anyerror = null,
-    };
-
-    fn commitTaskFn(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
-        const ctx: *CommitCtx = @ptrCast(@alignCast(ctx_ptr));
-        _ = two_pc.appendDecision(ctx.eng, .cross_shard_commit, ctx.global_txn_id, ctx.local_txn) catch |e| {
-            ctx.err = e;
-            return;
-        };
-        ctx.eng.commitTxn(ctx.local_txn) catch |e| {
-            ctx.err = e;
-        };
-    }
-
-    fn crossShardAddEdge(
-        self: *ShardedGraphEngine,
-        from: NodeId,
-        to: NodeId,
-        rel_type: u32,
-        s_from: usize,
-        s_to: usize,
-    ) !EdgeId {
-        const src = self.shards[s_from];
-        const dst = self.shards[s_to];
-
-        // 1. Allocate edge id on source shard using its striped stride.
-        //    Each per-shard engine already maintains next_edge_id so that
-        //    allocated ids satisfy shardOfNode(id) == s_from (Task 4, with
-        //    Task 8's shard-0 sentinel offset applied at init).
-        const edge_id = src.manifest.next_edge_id;
-        src.manifest.next_edge_id += @as(u64, @intCast(SHARD_COUNT));
-
-        const global_txn_id = self.coordinator_txn_counter.fetchAdd(1, .monotonic) + 1;
-
-        // 2. Prepare on both shards (durable before any data mutation).
-        //
-        // PERF-0058: the two prepares write to disjoint per-shard state — `src`
-        // and `dst` are distinct GraphEngine instances (s_from != s_to is
-        // guaranteed by the caller `addEdge`), each with its OWN WAL, txn
-        // manager, buffer pool and mutex. `beginTxn` mutates only
-        // `eng.txn_manager`; `appendPrepare` mutates only `eng.wal` and fsyncs
-        // it. Nothing crosses between the two engines, and `edge_id` /
-        // `global_txn_id` are computed serially BEFORE this point, so no shared
-        // mutable coordinator state is touched inside the parallel region. We
-        // therefore run the source prepare inline on the calling thread while
-        // the target prepare runs on the shared thread pool, joining via a
-        // WaitGroup. This turns the cross-shard prepare cost from
-        // sum(2 fsync) into max(2 fsync). The WaitGroup's done()/wait()
-        // acquire-release pair publishes the worker's writes (the assigned
-        // local txn id and any error) to the calling thread after the join.
-        var src_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
-        two_pc.encodePreparePayload(&src_prepare, global_txn_id, .source, @intCast(s_to), edge_id, from, to, rel_type);
-
-        var dst_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
-        two_pc.encodePreparePayload(&dst_prepare, global_txn_id, .target, @intCast(s_from), edge_id, from, to, rel_type);
-
-        // PHASE 4 (edge-engine-direct, low-contention apply): in `deferred` WAL
-        // mode the per-commit fsync is SKIPPED (durability deferred to
-        // checkpoint/clean close), so there is NO fsync latency to overlap — the
-        // sole reason the dst prepare/commit were dispatched to the shared thread
-        // pool (`max(2 fsync)` instead of `sum`). Under deferred the thread-pool
-        // submit+WaitGroup.wait round-trip is then PURE per-edge overhead, and it
-        // dominates cross-shard bulk edge throughput (the popular-parent case
-        // where a hot source's children are spread across all 16 shards → ~15/16
-        // of its edges are cross-shard). Run both prepares (and both commits)
-        // INLINE on the calling thread in that mode. This is correctness-neutral:
-        // identical WAL records in the identical order (src prepare, dst prepare,
-        // … src commit, dst commit), identical recovery — only the dispatch
-        // changes (serial vs overlapped), and there is nothing to overlap.
-        const inline_2pc = (src.config.sync_mode == .deferred);
-
-        var src_ctx = PrepareCtx{ .eng = src, .payload = src_prepare };
-        var dst_ctx = PrepareCtx{ .eng = dst, .payload = dst_prepare };
-
-        if (inline_2pc) {
-            // Both prepares inline; src first (its WAL record precedes dst's,
-            // matching the overlapped path's intended ordering).
-            prepareTaskFn(&src_ctx, undefined);
-            prepareTaskFn(&dst_ctx, undefined);
-        } else {
-            var wg = self.shared_thread_pool.waitGroup();
-            const submitted = self.shared_thread_pool.submit(
-                prepareTaskFn,
-                &dst_ctx,
-                .{ .wait_group = &wg },
-            ) catch null;
-
-            // Source prepare runs inline regardless of whether the dst task was
-            // enqueued (it may run inline below as a fallback). Capture rather
-            // than `try` so a src failure does not skip joining the in-flight dst
-            // task.
-            prepareTaskFn(&src_ctx, undefined);
-
-            // If submit failed (e.g. queue full / pool draining), run the target
-            // prepare inline on this thread BEFORE waiting so we never block on a
-            // WaitGroup that was never armed.
-            if (submitted == null) {
-                prepareTaskFn(&dst_ctx, undefined);
-            } else {
-                wg.wait();
-            }
-        }
-
-        // Surface either prepare's error only after the join, so a failure on
-        // one side cannot leave the other prepare task running with a freed
-        // stack context.
-        if (src_ctx.err) |e| return e;
-        if (dst_ctx.err) |e| return e;
-        const src_local_txn = src_ctx.local_txn;
-        const dst_local_txn = dst_ctx.local_txn;
-
-        // 3. Write source outgoing adjacency.
-        var from_rec = try src.getNode(from) orelse return error.NodeNotFound;
-        const out_entry = edge_mod.EdgeEntry{
-            .neighbor = to,
-            .edge_id = edge_id,
-            .rel_type = rel_type,
-            .prop_head = 0,
-        };
-        const new_out_head = try src.adj_out.addEdge(from_rec.out_head, out_entry);
-        from_rec.out_head = new_out_head;
-        try src.node_store.putNode(from, from_rec);
-        try src.edge_index.put(edge_id, .{
-            .from = from,
-            .neighbor = to,
-            .rel_type = rel_type,
-            .prop_head = 0,
-        });
-        // PHASE 3: the edge-existence index lives on the SOURCE shard (same shard
-        // that owns this edge's out-adjacency + edge_index), so a probe routed to
-        // shardOfNode(from) finds cross-shard edges too.
-        try src.edge_exist_index.put(from, rel_type, to, edge_id);
-        src.edge_exist_index_dirty = true;
-
-        // 4. Write target incoming adjacency.
-        const in_entry = edge_mod.EdgeEntry{
-            .neighbor = from,
-            .edge_id = edge_id,
-            .rel_type = rel_type,
-            .prop_head = 0,
-        };
-        var to_rec = try dst.getNode(to) orelse return error.NodeNotFound;
-        const new_in_head = try dst.adj_in.addEdge(to_rec.in_head, in_entry);
-        to_rec.in_head = new_in_head;
-        try dst.node_store.putNode(to, to_rec);
-
-        // 5. Commit on both shards — WAL-durable before acknowledging.
-        //
-        // PERF-0058: symmetric to the prepare phase, the two commits write to
-        // disjoint per-shard state. `appendDecision` mutates only `eng.wal`
-        // (plus its fsync) and `commitTxn` mutates only `eng.txn_manager` /
-        // `eng.metrics`. `global_txn_id`, `src_local_txn` and `dst_local_txn`
-        // are read-only inputs here. We run the source commit inline and the
-        // target commit on the shared pool, joining via a WaitGroup so the two
-        // fsyncs overlap (max instead of sum). `src.manifest.edge_count` is
-        // bumped on the calling thread after the join — it is coordinator-side
-        // single-writer state, never touched by the worker task.
-        var src_commit = CommitCtx{ .eng = src, .global_txn_id = global_txn_id, .local_txn = src_local_txn };
-        var dst_commit = CommitCtx{ .eng = dst, .global_txn_id = global_txn_id, .local_txn = dst_local_txn };
-
-        if (inline_2pc) {
-            // Deferred mode: no fsync to overlap → run both commits inline.
-            commitTaskFn(&src_commit, undefined);
-            commitTaskFn(&dst_commit, undefined);
-        } else {
-            var commit_wg = self.shared_thread_pool.waitGroup();
-            const commit_submitted = self.shared_thread_pool.submit(
-                commitTaskFn,
-                &dst_commit,
-                .{ .wait_group = &commit_wg },
-            ) catch null;
-
-            commitTaskFn(&src_commit, undefined);
-
-            if (commit_submitted == null) {
-                commitTaskFn(&dst_commit, undefined);
-            } else {
-                commit_wg.wait();
-            }
-        }
-
-        if (src_commit.err) |e| return e;
-        if (dst_commit.err) |e| return e;
-
-        src.manifest.edge_count += 1;
-        return edge_id;
-    }
-
     pub fn addEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
-        // Edge co-location (Phase A): EVERY edge — same-shard or cross-endpoint —
-        // is now a SINGLE-shard write on shard(from). Out-adjacency, edge body,
+        // Edge co-location: EVERY edge — same-shard or cross-endpoint — is a
+        // SINGLE-shard write on shard(from). Out-adjacency, edge body,
         // edge_index, the existence index AND the incoming adjacency (into
         // shard(from)'s adj_in_remote keyed by `to`) all live on one engine, so
-        // the write is one WAL txn with no cross-shard 2PC. `crossShardAddEdge`
-        // is left present-but-unreachable so Phase A is reversible (deleted in
-        // Phase C); reverse traversal is served by the FanInEdgeIterator scatter.
+        // the write is one WAL txn with no cross-shard 2PC (the old
+        // `crossShardAddEdge` 2PC path was removed in Phase C). Reverse traversal
+        // is served by the FanInEdgeIterator scatter.
         const s_from = shard_count_mod.shardOfNode(from);
         return self.shards[s_from].addEdgeColocated(from, to, rel_type);
     }
 
     pub fn removeEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
+        // Edge co-location (Phase C): a co-located edge lives ENTIRELY on
+        // shard(from) — out-adjacency, edge_index, existence index AND incoming
+        // adjacency (shard(from).adj_in_remote keyed by `to`). So even a
+        // cross-ENDPOINT remove is a single-shard delete; no 2PC, no
+        // CrossShardEdgeUnsupported.
         const s_from = shard_count_mod.shardOfNode(from);
-        const s_to = shard_count_mod.shardOfNode(to);
-        if (s_from != s_to) return error.CrossShardEdgeUnsupported;
         return self.shards[s_from].removeEdge(from, to, edge_id);
     }
 
@@ -729,102 +512,6 @@ pub const ShardedGraphEngine = struct {
         errdefer list.deinit(allocator);
         while (try iter.next()) |entry| try list.append(allocator, entry);
         return list.toOwnedSlice(allocator);
-    }
-
-    /// TEST-ONLY: issue both prepares for a cross-shard edge but never
-    /// write the commit or abort record. Simulates a crash between 2PC
-    /// steps 2 and 5 of `crossShardAddEdge`. Recovery reconciliation must
-    /// abort the dangling prepares on reopen.
-    pub fn addEdgeCrashAfterPrepares(
-        self: *ShardedGraphEngine,
-        from: NodeId,
-        to: NodeId,
-        rel_type: u32,
-    ) !void {
-        if (!builtin.is_test) return error.TestOnly;
-        const s_from = shard_count_mod.shardOfNode(from);
-        const s_to = shard_count_mod.shardOfNode(to);
-        if (s_from == s_to) return error.NotCrossShard;
-
-        const src = self.shards[s_from];
-        const dst = self.shards[s_to];
-
-        const edge_id = src.manifest.next_edge_id;
-        src.manifest.next_edge_id += @as(u64, @intCast(SHARD_COUNT));
-
-        const global_txn_id = self.coordinator_txn_counter.fetchAdd(1, .monotonic) + 1;
-
-        var src_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
-        two_pc.encodePreparePayload(&src_prepare, global_txn_id, .source, @intCast(s_to), edge_id, from, to, rel_type);
-        const src_local_txn = try src.beginTxn();
-        _ = try two_pc.appendPrepare(src, src_prepare, src_local_txn);
-
-        var dst_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
-        two_pc.encodePreparePayload(&dst_prepare, global_txn_id, .target, @intCast(s_from), edge_id, from, to, rel_type);
-        const dst_local_txn = try dst.beginTxn();
-        _ = try two_pc.appendPrepare(dst, dst_prepare, dst_local_txn);
-        // Intentional crash simulation: txns are open but never committed.
-    }
-
-    /// TEST-ONLY: run through source-side adjacency + commit but crash
-    /// before target adjacency or target commit. Recovery must replay
-    /// the target-side write.
-    pub fn addEdgeCrashAfterSourceCommit(
-        self: *ShardedGraphEngine,
-        from: NodeId,
-        to: NodeId,
-        rel_type: u32,
-    ) !EdgeId {
-        if (!builtin.is_test) return error.TestOnly;
-        const s_from = shard_count_mod.shardOfNode(from);
-        const s_to = shard_count_mod.shardOfNode(to);
-        if (s_from == s_to) return error.NotCrossShard;
-        const src = self.shards[s_from];
-        const dst = self.shards[s_to];
-
-        const edge_id = src.manifest.next_edge_id;
-        src.manifest.next_edge_id += @as(u64, @intCast(SHARD_COUNT));
-
-        const global_txn_id = self.coordinator_txn_counter.fetchAdd(1, .monotonic) + 1;
-
-        var src_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
-        two_pc.encodePreparePayload(&src_prepare, global_txn_id, .source, @intCast(s_to), edge_id, from, to, rel_type);
-        const src_local_txn = try src.beginTxn();
-        _ = try two_pc.appendPrepare(src, src_prepare, src_local_txn);
-
-        var dst_prepare: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
-        two_pc.encodePreparePayload(&dst_prepare, global_txn_id, .target, @intCast(s_from), edge_id, from, to, rel_type);
-        const dst_local_txn = try dst.beginTxn();
-        _ = try two_pc.appendPrepare(dst, dst_prepare, dst_local_txn);
-
-        // Source-side adjacency + commit, skip target-side adjacency + commit.
-        var from_rec = try src.getNode(from) orelse return error.NodeNotFound;
-        const out_entry = edge_mod.EdgeEntry{
-            .neighbor = to,
-            .edge_id = edge_id,
-            .rel_type = rel_type,
-            .prop_head = 0,
-        };
-        const new_out_head = try src.adj_out.addEdge(from_rec.out_head, out_entry);
-        from_rec.out_head = new_out_head;
-        try src.node_store.putNode(from, from_rec);
-        try src.edge_index.put(edge_id, .{
-            .from = from,
-            .neighbor = to,
-            .rel_type = rel_type,
-            .prop_head = 0,
-        });
-        // PHASE 3: keep the existence index in lock-step with edge_index here too.
-        try src.edge_exist_index.put(from, rel_type, to, edge_id);
-        src.edge_exist_index_dirty = true;
-        src.manifest.edge_count += 1;
-
-        _ = try two_pc.appendDecision(src, .cross_shard_commit, global_txn_id, src_local_txn);
-        try src.commitTxn(src_local_txn);
-
-        // Intentional crash simulation: dst_local_txn is open but never committed.
-        // dst_local_txn was passed to appendPrepare above so is already used.
-        return edge_id;
     }
 };
 

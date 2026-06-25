@@ -9,6 +9,17 @@
 //! by global_txn_id with any cross_shard_commit/cross_shard_abort
 //! record on any shard. Dangling prepares are resolved per the spec:
 //!
+//! Edge co-location (Phase C): the engine no longer EMITS any cross-shard 2PC
+//! record — every edge write is single-shard (`crossShardAddEdge` was removed).
+//! This reconciler is retained for two reasons: (1) its CHECKSUM-VERIFYING walk
+//! fails closed on a forged/corrupted cross-shard record (SEC-0041), and (2) a
+//! LEGACY graph opened by this build may still carry dangling cross-shard EDGE
+//! prepares in its WAL from an interrupted PRE-co-location 2PC write. For (2)
+//! the source-side reapply restores the edge's OUT-adjacency, which the Phase B
+//! migration then co-locates (rebuilds adj_in_remote from adj_out); the
+//! target-side adj_in reapply is harmless legacy scaffolding (migration ignores
+//! the legacy adj_in store).
+//!
 //!   - If ANY shard logged a commit for the global_txn_id: replay
 //!     the adjacency write on any shard whose prepare is dangling,
 //!     then log a commit decision locally.
@@ -203,6 +214,15 @@ fn replayAdjacencyIfNeeded(
             eng.manifest.edge_count += 1;
         },
         .target => {
+            // Edge co-location (Phase C): this writes the LEGACY dst-shard
+            // in-adjacency (`adj_in` / dst.in_head). It is dead for any edge
+            // created by a co-located binary (which emits no cross-shard
+            // prepare) and harmless for a legacy graph's dangling prepare: the
+            // co-located reverse-traversal source of truth is `adj_in_remote`,
+            // which the Phase B migration rebuilds from adj_out, so this legacy
+            // write is ignored thereafter. Kept only so a pre-co-location
+            // dangling 2PC prepare still reconciles into a self-consistent
+            // legacy state before migration runs.
             var to_rec = try eng.getNode(payload.to) orelse return error.NodeNotFound;
             const in_entry = edge_mod.EdgeEntry{
                 .neighbor = payload.from,

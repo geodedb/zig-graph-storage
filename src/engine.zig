@@ -1146,9 +1146,9 @@ pub const GraphEngine = struct {
         return edge_id;
     }
 
-    /// Edge co-location (Phase A): auto-commit single-shard edge add. The
+    /// Edge co-location: auto-commit single-shard edge add. The
     /// ShardedGraphEngine routes BOTH same-shard and cross-endpoint edges here
-    /// (on shard(from)); `crossShardAddEdge`'s 2PC is no longer reached.
+    /// (on shard(from)); the cross-shard 2PC add path was removed in Phase C.
     pub fn addEdgeColocated(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
         var __obs_span = observability.startOperationSpan("add_edge");
         defer __obs_span.end(null);
@@ -1175,22 +1175,33 @@ pub const GraphEngine = struct {
     }
 
     /// Remove an edge within an existing transaction (no auto-commit).
+    ///
+    /// Edge co-location (Phase C): a co-located edge `(from)-[r]->(to)` lives
+    /// ENTIRELY on shard(from) — out-adjacency, edge_index, the existence index
+    /// AND the incoming adjacency (in THIS shard's `adj_in_remote`, keyed by `to`
+    /// via `in_head_dir`). So removal is a single-shard delete and never touches
+    /// `to`'s node record (which is not resident here for a cross-endpoint edge).
+    /// Idempotent: removing an absent edge_id is a no-op on every store.
     pub fn removeEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, txn: TxnId) anyerror!void {
         try self.ensureWritable();
-        // Remove from source node's out adjacency list
+        // Remove from source node's out adjacency list (from IS resident here).
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         try self.adj_out.removeEdge(from_rec.out_head, edge_id);
 
-        // Remove from target node's in adjacency list
-        const to_rec = try self.node_store.getNode(to) orelse return error.NodeNotFound;
-        try self.adj_in.removeEdge(to_rec.in_head, edge_id);
+        // Remove from THIS shard's co-located incoming adjacency, keyed by `to`
+        // via the page-backed directory. We do NOT read `to`'s NodeRec.
+        const in_head = try self.in_head_dir.getHead(to);
+        try self.adj_in_remote.removeEdge(in_head, edge_id);
 
-        // Log dirty adjacency pages
+        // Log dirty adjacency pages (out-adj head + in-index head).
         if (from_rec.out_head != 0) try self.logPage(txn, .adj_out, from_rec.out_head);
-        if (to_rec.in_head != 0) try self.logPage(txn, .adj_in, to_rec.in_head);
+        if (in_head != 0) try self.logPage(txn, .in_idx, in_head);
 
         // PHASE 3: drop the edge-existence entry BEFORE removing the edge_index
         // record (we need its rel_type to form the key). No-op if absent.
+        // `edge_present` gates the edge_count decrement so a no-op re-remove of
+        // an already-deleted edge does NOT corrupt the count (idempotency).
+        const edge_present = self.edge_index.get(edge_id) != null;
         if (self.edge_index.get(edge_id)) |idx_entry| {
             self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
             self.edge_exist_index_dirty = true;
@@ -1200,7 +1211,7 @@ pub const GraphEngine = struct {
         _ = self.edge_index.remove(edge_id);
         self.edge_index_dirty = true;
 
-        if (self.manifest.edge_count > 0) {
+        if (edge_present and self.manifest.edge_count > 0) {
             self.manifest.edge_count -= 1;
         }
         self.metrics.edges_removed += 1;

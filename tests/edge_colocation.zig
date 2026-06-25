@@ -261,6 +261,85 @@ test "co-location recovery: crash + reopen rebuilds in-index via page-image redo
     try testing.expectEqual(expected_in_dst0, dst0_in.len);
 }
 
+// Phase C: co-location makes a cross-ENDPOINT edge live entirely on shard(from)
+// (out-adj + edge_index + existence-index + adj_in_remote), so removeEdge no
+// longer needs cross-shard 2PC — it is a single-shard delete.
+test "co-location: cross-endpoint removeEdge deletes the edge in one shard (out + in + existence)" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xD5} ** 16;
+
+    var eng = try ShardedGraphEngine.create(testing.allocator, td.path, uuid, test_support.testConfig());
+    defer eng.close() catch {};
+
+    // from on shard 0, to on shard 5 → a genuine cross-endpoint edge.
+    const from = try eng.shards[0].allocNode();
+    const to = try eng.shards[5].allocNode();
+    try eng.putNode(from, test_support.emptyNode(1));
+    try eng.putNode(to, test_support.emptyNode(1));
+    try testing.expect(shard_count.shardOfNode(from) != shard_count.shardOfNode(to));
+
+    const id = try eng.addEdge(from, to, REL_A);
+
+    // Present in both directions and in the existence index before removal.
+    try testing.expect(try hasOutEdge(eng, from, id, to));
+    try testing.expect(try hasInEdge(eng, to, id, from));
+    {
+        var buf: [8]u64 = undefined;
+        const hits = try eng.shards[shard_count.shardOfNode(from)].probeEdge(from, REL_A, to, &buf);
+        try testing.expectEqual(@as(usize, 1), hits.len);
+    }
+
+    // Single-shard cross-endpoint remove — must NOT return CrossShardEdgeUnsupported.
+    try eng.removeEdge(from, to, id);
+
+    // Gone from out-adjacency, in-adjacency (scatter), and existence index.
+    try testing.expect(!try hasOutEdge(eng, from, id, to));
+    try testing.expect(!try hasInEdge(eng, to, id, from));
+    {
+        const out = try eng.expandOut(from, null, testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqual(@as(usize, 0), out.len);
+        const in_edges = try collectIn(eng, to, null, testing.allocator);
+        defer testing.allocator.free(in_edges);
+        try testing.expectEqual(@as(usize, 0), in_edges.len);
+    }
+    {
+        var buf: [8]u64 = undefined;
+        const hits = try eng.shards[shard_count.shardOfNode(from)].probeEdge(from, REL_A, to, &buf);
+        try testing.expectEqual(@as(usize, 0), hits.len);
+    }
+}
+
+test "co-location: cross-endpoint removeEdge is idempotent (re-remove is a no-op)" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xD6} ** 16;
+
+    var eng = try ShardedGraphEngine.create(testing.allocator, td.path, uuid, test_support.testConfig());
+    defer eng.close() catch {};
+
+    const from = try eng.shards[1].allocNode();
+    const to = try eng.shards[7].allocNode();
+    try eng.putNode(from, test_support.emptyNode(1));
+    try eng.putNode(to, test_support.emptyNode(1));
+
+    // Two parallel cross-endpoint edges; removing one must leave the other.
+    const e1 = try eng.addEdge(from, to, REL_A);
+    const e2 = try eng.addEdge(from, to, REL_A);
+
+    try eng.removeEdge(from, to, e1);
+    // Re-remove e1: no-op, must not error and must not disturb e2.
+    try eng.removeEdge(from, to, e1);
+
+    try testing.expect(!try hasInEdge(eng, to, e1, from));
+    try testing.expect(try hasInEdge(eng, to, e2, from));
+    const in_edges = try collectIn(eng, to, null, testing.allocator);
+    defer testing.allocator.free(in_edges);
+    try testing.expectEqual(@as(usize, 1), in_edges.len);
+    try testing.expectEqual(e2, in_edges[0].edge_id);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
