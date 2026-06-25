@@ -103,6 +103,9 @@ pub const ShardedGraphEngine = struct {
             .shard_count = @intCast(SHARD_COUNT),
             .algorithm_hash = shard_manifest_mod.SHARD_ALGORITHM_HASH,
             .per_shard_uuids = per_shard,
+            // Edge co-location (Phase B): a freshly created graph is co-located
+            // from birth, so stamp the current layout version — no migration.
+            .layout_version = shard_manifest_mod.CURRENT_LAYOUT_VERSION,
         };
 
         try shard_manifest_mod.writeToDir(allocator, self.graph_root, self.shard_manifest);
@@ -215,6 +218,25 @@ pub const ShardedGraphEngine = struct {
         }
 
         _ = try sharded_recovery.reconcilePendingPrepares(self);
+
+        // Edge co-location (Phase B): MIGRATE a pre-co-location (legacy) graph.
+        // A graph whose shard-manifest `layout_version` is < CURRENT has its
+        // cross-shard in-edges in the OLD location (dst shard's adj_in) and an
+        // EMPTY adj_in_remote, so the scatter `expandIn` would silently miss
+        // them. Rebuild each shard's adj_in_remote from its (authoritative,
+        // layout-independent) adj_out, then stamp the version LAST. Idempotent +
+        // crash-safe: a crash before the stamp re-runs cleanly; a crash after it
+        // skips (the rebuilt pages are durable). adj_out is never mutated.
+        if (self.shard_manifest.layout_version < shard_manifest_mod.CURRENT_LAYOUT_VERSION and !self.shards[0].read_only) {
+            for (self.shards) |eng| {
+                try eng.migrateColocateInEdges();
+                // Durable per shard before we stamp: flush rebuilt pages +
+                // truncate WAL so a crash after the stamp finds them on disk.
+                try eng.checkpoint();
+            }
+            self.shard_manifest.layout_version = shard_manifest_mod.CURRENT_LAYOUT_VERSION;
+            try shard_manifest_mod.writeToDir(self.allocator, self.graph_root, self.shard_manifest);
+        }
 
         return self;
     }

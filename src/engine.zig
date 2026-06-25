@@ -762,6 +762,36 @@ pub const GraphEngine = struct {
         _ = try self.txn_manager.logPageUpdate(txn_id, @intFromEnum(file_id), page_id, frame.dataSlice());
     }
 
+    /// Edge co-location (Phase B): public `logPage` for the migration rebuild
+    /// (`engine_index.migrateColocateInEdges`), which lives in a sibling module
+    /// but must log dirty in-index pages under the migration txn exactly like the
+    /// hot write path.
+    pub fn logPagePublic(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
+        return self.logPage(txn_id, file_id, page_id);
+    }
+
+    /// Edge co-location (Phase B): zero a page (pin-or-create), mark it dirty and
+    /// log it under `txn_id`. Used by the migration to wipe stale `in_dir`
+    /// directory pages so a crashed prior migration cannot leave a stale
+    /// dst->head mapping. Crash-durable because the zeroed image is WAL-logged.
+    pub fn zeroPageLogged(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
+        const frame = try self.buffer_pool.pin(file_id, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        @memset(frame.dataSlice(), 0);
+        _ = try self.txn_manager.logPageUpdate(txn_id, @intFromEnum(file_id), page_id, frame.dataSlice());
+        self.buffer_pool.unpin(frame_idx, true);
+    }
+
+    /// Edge co-location (Phase B): rebuild this shard's `adj_in_remote` from its
+    /// out-adjacency (the authoritative, layout-independent edge set), making the
+    /// shard's reverse-traversal source-of-truth co-located. Idempotent +
+    /// crash-safe; see `engine_index.migrateColocateInEdges`. The CALLER stamps
+    /// the manifest `layout_version` after a successful checkpoint.
+    pub fn migrateColocateInEdges(self: *GraphEngine) anyerror!void {
+        try self.ensureWritable();
+        return engine_index.migrateColocateInEdges(self);
+    }
+
     /// Compute the page ID for a given node ID.
     fn nodePageId(self: *const GraphEngine, node_id: NodeId) u64 {
         return node_id / self.node_store.nodes_per_page;
