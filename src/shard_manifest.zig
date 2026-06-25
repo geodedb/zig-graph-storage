@@ -15,11 +15,28 @@ pub const SHARD_MANIFEST_VERSION: u32 = 1;
 /// whenever the routing function semantics change.
 pub const SHARD_ALGORITHM_HASH: u64 = 0x5350_4C49_544D_3601;
 
+/// Edge co-location (Phase B): the on-disk EDGE-ADJACENCY layout version,
+/// distinct from `SHARD_MANIFEST_VERSION` (the manifest FORMAT version).
+///
+///   0 (or absent) = LEGACY: cross-shard in-edges live on the dst shard
+///                   (`dst.adj_in` / `dst.in_head`); `adj_in_remote` is empty.
+///   1             = CO-LOCATED: every edge's in-adjacency lives on shard(src)
+///                   in `adj_in_remote`, keyed by `to` via `in_head_dir`.
+///
+/// A pre-co-location manifest has NO `layout_version` field; `readFromDir`
+/// parses that as 0. A graph whose `layout_version` is < CURRENT migrates its
+/// `adj_in_remote` from `adj_out` on open, then stamps CURRENT (see
+/// `sharded_engine`/`sharded_migration`).
+pub const CURRENT_LAYOUT_VERSION: u32 = 1;
+
 pub const ShardManifest = struct {
     version: u32,
     shard_count: u32,
     algorithm_hash: u64,
     per_shard_uuids: [shard_count_mod.SHARD_COUNT][16]u8,
+    /// Edge-adjacency layout version. Absent in a legacy manifest → 0. Fresh
+    /// graphs are created at `CURRENT_LAYOUT_VERSION`.
+    layout_version: u32 = 0,
 };
 
 const FILE_NAME = "shard_manifest.json";
@@ -48,6 +65,13 @@ pub fn writeToDir(allocator: Allocator, dir_path: []const u8, manifest: ShardMan
     const algorithm_hash_str = try std.fmt.allocPrint(allocator, "{d}", .{manifest.algorithm_hash});
     defer allocator.free(algorithm_hash_str);
     try buf.appendSlice(allocator, algorithm_hash_str);
+
+    // Edge co-location (Phase B): the edge-adjacency layout version. Always
+    // written by this build; a legacy manifest omits it (read back as 0).
+    try buf.appendSlice(allocator, ",\"layout_version\":");
+    const layout_version_str = try std.fmt.allocPrint(allocator, "{d}", .{manifest.layout_version});
+    defer allocator.free(layout_version_str);
+    try buf.appendSlice(allocator, layout_version_str);
 
     try buf.appendSlice(allocator, ",\"per_shard_uuids\":[");
 
@@ -112,6 +136,16 @@ pub fn readFromDir(allocator: Allocator, dir_path: []const u8) !ShardManifest {
     else
         return error.InvalidShardManifest;
 
+    // Edge co-location (Phase B): the layout_version field is OPTIONAL for
+    // backward compatibility. A pre-co-location manifest has no such key →
+    // legacy layout 0 (migrate on open). A present value must be a non-negative
+    // integer within u32.
+    const layout_version: u32 = if (root.get("layout_version")) |lv| blk: {
+        if (lv != .integer) return error.InvalidShardManifest;
+        if (lv.integer < 0 or lv.integer > std.math.maxInt(u32)) return error.InvalidShardManifest;
+        break :blk @as(u32, @intCast(lv.integer));
+    } else 0;
+
     if (version != SHARD_MANIFEST_VERSION) return error.ShardManifestVersionMismatch;
     if (shard_count != shard_count_mod.SHARD_COUNT) return error.ShardCountMismatch;
     if (algorithm_hash != SHARD_ALGORITHM_HASH) return error.ShardAlgorithmMismatch;
@@ -136,6 +170,7 @@ pub fn readFromDir(allocator: Allocator, dir_path: []const u8) !ShardManifest {
         .shard_count = shard_count,
         .algorithm_hash = algorithm_hash,
         .per_shard_uuids = per_shard,
+        .layout_version = layout_version,
     };
 }
 

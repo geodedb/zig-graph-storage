@@ -282,6 +282,19 @@ fn addIntegrationTests(
     const run_edge_colocation = b.addRunArtifact(edge_colocation_tests);
     edge_colocation_step.dependOn(&run_edge_colocation.step);
 
+    // Edge co-location (Phase B): migration of a pre-co-location (legacy) graph.
+    // Rebuilds adj_in_remote from adj_out on open when layout_version < 1, then
+    // stamps the version. Own step so the migration + idempotency + crash-safety
+    // proofs run in isolation.
+    const edge_colocation_migration_step = b.step("test-edge-colocation-migration", "Run edge co-location MIGRATION tests (legacy-graph rebuild on open; idempotent; crash-safe)");
+    const edge_colocation_migration_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_colocation_migration.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_colocation_migration = b.addRunArtifact(edge_colocation_migration_tests);
+    edge_colocation_migration_step.dependOn(&run_edge_colocation_migration.step);
+
     // Concurrency regression for the buffer-pool dirty-eviction race. Its own
     // step so it can be run in isolation under -Doptimize=ReleaseSafe/Debug and
     // looped (--count) to shake the timing window.
