@@ -319,6 +319,18 @@ fn addIntegrationTests(
     });
     const run_pin_scaling = b.addRunArtifact(pin_scaling_tests);
     pin_scaling_step.dependOn(&run_pin_scaling.step);
+
+    // FIX #2 (edge-ingest wedge): the pin slow path must NEVER deadlock under
+    // high concurrency when the working set vastly exceeds the pool. Own step so
+    // it can be looped (20x) under ReleaseSafe (invariants armed) / ReleaseFast.
+    const pin_nodeadlock_step = b.step("test-pin-nodeadlock", "Run buffer-pool pin no-deadlock stress (working set >> pool, threads >> frames)");
+    const pin_nodeadlock_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_pin_nodeadlock.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_pin_nodeadlock = b.addRunArtifact(pin_nodeadlock_tests);
+    pin_nodeadlock_step.dependOn(&run_pin_nodeadlock.step);
 }
 
 fn addExample(

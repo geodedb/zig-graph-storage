@@ -42,6 +42,18 @@ inline fn bpio() std.Io {
 /// pool has at most `capacity` frames, far below 2^32 pins).
 pub const PIN_EVICTING: u32 = std.math.maxInt(u32);
 
+/// FIX #2 (edge-ingest wedge robustness): upper bound on how long a slow-path
+/// pinner parks in the loading/evicting wait before it wakes ITSELF, re-takes
+/// the mutex, and re-evaluates. The wait is woken PROMPTLY by `wakeFrameWaiters`
+/// on every load/evict/unpin transition (the common, event-driven path); this
+/// bound is a pure SAFETY NET that makes "park forever" structurally impossible:
+/// even if a wakeup were ever dropped (today or by a future change), the pinner
+/// re-checks within this interval and makes progress. A loading/evicting frame
+/// is a transient state (microseconds), so the bound never gates steady-state
+/// throughput — it only ever fires on a genuinely-lost wakeup. Kept short so
+/// recovery from a (theoretical) lost wakeup is sub-perceptible.
+pub const FRAME_WAIT_TIMEOUT_NS: u64 = 2 * std.time.ns_per_ms;
+
 /// PERF-0056: upper bound (in pages) on the reusable parallel-flush scratch
 /// buffer. With a 16 KiB page this caps the transient flush allocation at
 /// 16 MiB regardless of how many pages are dirty in a single checkpoint;
@@ -99,13 +111,34 @@ pub const BufferPool = struct {
     max_scratch_pages: usize = PARALLEL_FLUSH_SCRATCH_PAGES,
     // Concurrency protection for multi-threaded access.
     //
-    // `mutex` + `cond` guard ALL structural mutation (the page table, LRU list,
-    // free list, eviction/load coordination, dirty-file flags, reserved-frame
-    // accounting) and the loading/evicting wait protocol — UNCHANGED from the
-    // v0.2.6 dirty-eviction-race fix. Every structural mutator still holds
-    // `mutex` exactly as before.
+    // `mutex` guards ALL structural mutation (the page table, LRU list, free
+    // list, eviction/load coordination, dirty-file flags, reserved-frame
+    // accounting) — UNCHANGED from the v0.2.6 dirty-eviction-race fix. Every
+    // structural mutator still holds `mutex` exactly as before.
     mutex: std.Io.Mutex = std.Io.Mutex.init,
-    cond: std.Io.Condition = std.Io.Condition.init,
+    // FIX #2 (edge-ingest wedge robustness): the loading/evicting wait protocol.
+    //
+    // A slow-path pinner that finds its target frame mid load/evict must park
+    // until that transition completes. v0.2.6..v0.2.11 used `Io.Condition.
+    // waitUncancelable`, which sleeps FOREVER if its wakeup is ever lost — and
+    // `Io.Condition` exposes no timed wait. Under the 14.27M edge ingest, with
+    // 16 handler threads resolving endpoints through property-page chains on a
+    // working set vastly exceeding the 512MB engine pool, a parked pinner that
+    // missed its wake could wedge the pod ("restart to recover").
+    //
+    // Replaced with a generation-counter futex wait that is BOTH event-driven
+    // (woken promptly by `wakeFrameWaiters` on every load/evict/unpin
+    // transition) AND bounded (`FRAME_WAIT_TIMEOUT_NS`): a waiter snapshots
+    // `wait_gen` UNDER the mutex, releases the mutex, and `futexWaitTimeout`s on
+    // `wait_gen` until it changes OR the bound elapses, then re-takes the mutex
+    // and re-evaluates the loop. Because the snapshot is taken under the mutex
+    // and every waker bumps `wait_gen` (release) before/at its wake, a wake that
+    // races the park is NEVER lost (the futex returns immediately when the
+    // observed value already differs from the snapshot). The bound then
+    // guarantees progress even against a (theoretical) dropped wake: pin can
+    // NEVER sleep forever. This is the v0.2.6 wait protocol made deadlock-proof,
+    // not a new coordination model — the mutex discipline is identical.
+    wait_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // PERF-0058 (pin-contention): a SEQLOCK generation counter that lets the
     // COMMON cache-HIT pin/unpin path run lock-free, so concurrent readers no
     // longer serialize on the pool-wide `mutex` (which collapsed aggregate
@@ -137,15 +170,15 @@ pub const BufferPool = struct {
     // to `capacity` at init and never holds more than `capacity` entries, so it
     // never rehashes — its bucket storage never moves under a lock-free reader.
     table_gen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    // PERF-0058: number of threads currently PARKED on `cond` in the slow-path
-    // loading/evicting wait. Incremented (under `mutex`) right before a
-    // `cond.wait`, decremented right after. `unpin` consults it to decide whether
-    // its pin_count->0 transition needs to wake anyone: in the overwhelmingly
-    // common case (no parked waiter) unpin stays FULLY LOCK-FREE and never
-    // touches the pool mutex — which is what lets pin+unpin scale. Without this,
-    // every unpin that drops a frame to zero (i.e. almost every unpin in a
-    // pin/immediately-unpin read workload) would take the mutex and re-serialise
-    // all readers.
+    // PERF-0058: number of threads currently PARKED in the slow-path
+    // loading/evicting wait. Incremented (under `mutex`) right before the wait
+    // (FIX #2: a bounded `wait_gen` futex wait — see `waitFrameChange`),
+    // decremented right after. `unpin` consults it to decide whether to wake
+    // anyone: in the overwhelmingly common case (no parked waiter) unpin stays
+    // FULLY LOCK-FREE. The acquire load here pairs with the release increment;
+    // a waiter that parked before our decrement is observed. Without this,
+    // every unpin would have to issue a (now lock-free) wake — still cheap, but
+    // the gate keeps the hot read path free of even the futex syscall.
     pin_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // Optional thread pool for parallel page flushes
     thread_pool: ?*tp.ThreadPool = null,
@@ -195,7 +228,7 @@ pub const BufferPool = struct {
             .free_list = free_list,
             .pagers = [_]?*Pager{null} ** FILE_COUNT,
             .mutex = std.Io.Mutex.init,
-            .cond = std.Io.Condition.init,
+            .wait_gen = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -249,6 +282,44 @@ pub const BufferPool = struct {
         const g = self.table_gen.load(.monotonic);
         std.debug.assert(g & 1 == 1); // must be odd (inside a writer)
         self.table_gen.store(g + 1, .seq_cst);
+    }
+
+    /// FIX #2: wake every slow-path pinner parked in the loading/evicting wait.
+    /// Bumps `wait_gen` (release) so any waiter that snapshotted the old value —
+    /// even one still between its snapshot and its `futexWaitTimeout` — observes
+    /// the change and does not park (or returns immediately), then wakes all
+    /// parked futex waiters. Replaces `cond.broadcast`. Safe to call with or
+    /// without the mutex held: it touches only the atomic `wait_gen`. Callers
+    /// that mutate frame state (load/evict completion, error rollback) bump it
+    /// while holding the mutex so the state change is published before the wake.
+    /// EVERY caller holds the mutex (the load/evict completion + error-rollback
+    /// paths, and `unpin`'s waiter-present branch): that serialises the wake
+    /// against the loader/eviction's plain-store `pin_count`/identity mutations on
+    /// a published frame, preserving the v0.2.6 invariant that every `pin_count`
+    /// mutation on a table-reachable frame is atomic or mutex-serialised.
+    fn wakeFrameWaiters(self: *BufferPool) void {
+        _ = self.wait_gen.fetchAdd(1, .release);
+        bpio().futexWake(u32, &self.wait_gen.raw, std.math.maxInt(u32));
+    }
+
+    /// FIX #2: park the calling slow-path pinner until a frame load/evict/unpin
+    /// transition (a `wakeFrameWaiters` bump) OR a bounded timeout, whichever
+    /// comes first, then return so the caller re-takes the mutex and re-evaluates
+    /// its loop. `expected_gen` MUST be the value of `wait_gen` read while the
+    /// caller still held the mutex (so a wake that races the park is never lost:
+    /// `futexWaitTimeout` returns immediately when the live value already differs
+    /// from `expected_gen`). The caller holds `mutex` on entry; this drops it for
+    /// the wait and re-acquires it before returning — same contract as the old
+    /// `cond.waitUncancelable(io, &self.mutex)`. The timeout makes "wait forever"
+    /// structurally impossible (deadlock-proof against any lost wake).
+    fn waitFrameChange(self: *BufferPool, io: std.Io, expected_gen: u32) void {
+        self.mutex.unlock(io);
+        defer self.mutex.lockUncancelable(io);
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = std.Io.Duration.fromNanoseconds(FRAME_WAIT_TIMEOUT_NS),
+            .clock = .awake,
+        } };
+        io.futexWaitTimeout(u32, &self.wait_gen.raw, expected_gen, timeout) catch {};
     }
 
     /// Increment the resident-page counter for `file_id`. Caller holds the mutex.
@@ -398,14 +469,15 @@ pub const BufferPool = struct {
 
         // ---- SLOW PATH: structural, under `mutex`. Page-table / frame-identity
         // mutations are bracketed by begin/endTableWrite so the fast path defers
-        // while they are in flight. The loading/evicting cond-var protocol is
-        // exactly the v0.2.6 logic. ----------------------------------------
+        // while they are in flight. The loading/evicting wait protocol is the
+        // v0.2.6 logic, made bounded/lost-wakeup-free by FIX #2 (waitFrameChange).
+        // -------------------------------------------------------------------
         self.mutex.lockUncancelable(io);
         while (true) {
             if (self.page_table.get(key)) |frame_idx| {
                 const frame = &self.frames[frame_idx];
                 // A frame still loading, or one being torn down by a concurrent
-                // eviction, is unsafe to alias: wait on the cond var and
+                // eviction, is unsafe to alias: wait for the transition and
                 // re-evaluate. For `loading` the same frame becomes valid and we
                 // pin it. For `evicting` the page-table entry is removed once
                 // teardown completes, so the re-loop misses and reloads the page
@@ -413,11 +485,16 @@ pub const BufferPool = struct {
                 // Either way we never hand back a frame that is about to be — or
                 // has just been — repurposed for a different page.
                 if (frame.loading or frame.evicting) {
+                    // FIX #2: snapshot `wait_gen` UNDER the mutex, then bounded-
+                    // wait on it. Snapshotting here (before waitFrameChange drops
+                    // the mutex) is what makes the wake lost-wakeup-free: any
+                    // `wakeFrameWaiters` that runs after this load and before our
+                    // futex park bumped wait_gen, so the park returns at once.
                     // Publish that a waiter is parking (so a lock-free unpin knows
-                    // to wake us). Incremented under the mutex; cond.wait releases
-                    // the mutex while parked.
+                    // to wake us). Incremented under the mutex.
+                    const gen = self.wait_gen.load(.acquire);
                     _ = self.pin_waiters.fetchAdd(1, .acq_rel);
-                    self.cond.waitUncancelable(io, &self.mutex);
+                    self.waitFrameChange(io, gen);
                     _ = self.pin_waiters.fetchSub(1, .acq_rel);
                     continue;
                 }
@@ -530,7 +607,7 @@ pub const BufferPool = struct {
                 self.decrResident(file_id);
                 self.free_list.appendAssumeCapacity(frame_idx);
                 self.endTableWrite();
-                self.cond.broadcast(io);
+                self.wakeFrameWaiters();
                 self.mutex.unlock(io);
                 return err;
             }
@@ -543,7 +620,7 @@ pub const BufferPool = struct {
             frame.valid = true;
             self.endTableWrite();
             if (self.metrics) |m| m.page_reads += 1;
-            self.cond.broadcast(io);
+            self.wakeFrameWaiters();
             self.mutex.unlock(io);
             return frame;
         }
@@ -568,13 +645,15 @@ pub const BufferPool = struct {
         while (true) {
             // If already in cache, just pin it. As in `pin`, a frame still loading
             // or being torn down by a concurrent eviction is unsafe to alias: wait
-            // on the cond var and re-check rather than handing back a frame that is
-            // about to be (or has just been) repurposed for a different page.
+            // for the transition and re-check rather than handing back a frame that
+            // is about to be (or has just been) repurposed for a different page.
             while (self.page_table.get(key)) |frame_idx| {
                 const frame = &self.frames[frame_idx];
                 if (frame.loading or frame.evicting) {
+                    // FIX #2: bounded, lost-wakeup-free wait (see `pin`).
+                    const gen = self.wait_gen.load(.acquire);
                     _ = self.pin_waiters.fetchAdd(1, .acq_rel);
-                    self.cond.waitUncancelable(io, &self.mutex);
+                    self.waitFrameChange(io, gen);
                     _ = self.pin_waiters.fetchSub(1, .acq_rel);
                     continue;
                 }
@@ -637,10 +716,9 @@ pub const BufferPool = struct {
     /// alongside cache-hit pins. `dirty` is only ever CLEARED by a flush/eviction
     /// holding the `mutex` (and the v0.2.6 eviction re-reads it under the mutex),
     /// and an unpin only ever SETS it, so the relaxed atomic store cannot lose a
-    /// dirty mark. Only when the count reaches zero do we briefly take the `mutex`
-    /// to wake any waiter parked in the structural cond-var protocol (a flush or
-    /// eviction waiting for this frame to become unpinned) — exactly the v0.2.6
-    /// wake, just gated on the zero transition.
+    /// dirty mark. Only when a waiter actually exists do we wake it — and that
+    /// wake takes the mutex (exactly as the v0.2.6/v0.2.7 wake did), which is what
+    /// serialises it against the loader/eviction's mutex-held frame mutations.
     pub fn unpin(self: *BufferPool, frame_idx: u32, dirty: bool) void {
         const io = bpio();
         const frame = &self.frames[frame_idx];
@@ -658,18 +736,30 @@ pub const BufferPool = struct {
         // Wake a parked slow-path waiter ONLY when one actually exists. A waiter
         // parks while a frame is loading/evicting and (if pool-full) re-attempts
         // eviction on wake; an unpin freeing a frame may be exactly what lets it
-        // make progress, so we must wake it. But in the common case there are NO
-        // waiters (`pin_waiters == 0`) and unpin stays fully lock-free — never
-        // touching the mutex — which is what makes pin/unpin scale. The
-        // `pin_waiters` load is acquire and the increment side is published under
-        // the mutex before the wait, so a waiter that parked before our decrement
-        // is always observed here. (We broadcast on ANY unpin while waiters
-        // exist, not only the zero transition: a waiter blocked on
-        // BufferPoolFull-style starvation can be unblocked by any frame becoming
-        // less pinned; a spurious wake is harmless — the waiter re-checks.)
+        // make progress, so we must wake it. In the common case there are NO
+        // waiters (`pin_waiters == 0`) and unpin stays FULLY LOCK-FREE — never
+        // touching the mutex — which is what makes pin/unpin scale (PERF-0058,
+        // v0.2.7).
+        //
+        // FIX #2: when a waiter exists we take the mutex and wake under it. The
+        // mutex is ESSENTIAL here, not just for the wake: it serialises this wake
+        // path against the slow-path loader/eviction, which mutate a published
+        // frame's `pin_count`/identity with PLAIN (non-atomic) stores WHILE
+        // HOLDING THE MUTEX (e.g. the loader's `frame.pin_count = 1` publish).
+        // The v0.2.7 lock-free unpin was safe only because those plain stores
+        // happen on a frame NOT yet pin-reachable; but a *waiting* unpin can race
+        // a concurrent repurpose of the same slot. Taking the mutex restores the
+        // v0.2.6 invariant that every pin_count mutation on a table-reachable
+        // frame is either atomic or mutex-serialised — closing a use-after-evict
+        // data race. The `pin_waiters` acquire load pairs with the waiter's
+        // release increment (published under the mutex before the wait); the
+        // double-check under the mutex avoids a spurious wake. The wake itself is
+        // `wakeFrameWaiters` (wait_gen bump + futexWake), replacing the removed
+        // `Io.Condition`. (We wake on ANY unpin while waiters exist, not only the
+        // zero transition: a spurious wake is harmless — the waiter re-checks.)
         if (self.pin_waiters.load(.acquire) != 0) {
             self.mutex.lockUncancelable(io);
-            if (self.pin_waiters.load(.acquire) != 0) self.cond.broadcast(io);
+            if (self.pin_waiters.load(.acquire) != 0) self.wakeFrameWaiters();
             self.mutex.unlock(io);
         }
     }
@@ -1144,7 +1234,7 @@ pub const BufferPool = struct {
                 @atomicStore(bool, &frame.dirty, true, .monotonic);
                 @atomicStore(u32, &frame.pin_count, 0, .release);
                 self.endTableWrite();
-                self.cond.broadcast(bpio());
+                self.wakeFrameWaiters();
                 return err;
             };
         }
@@ -1168,7 +1258,7 @@ pub const BufferPool = struct {
 
         // Wake any pinner that parked while this frame was `evicting`: the page
         // is gone from the table now, so it will miss and re-load it fresh.
-        self.cond.broadcast(bpio());
+        self.wakeFrameWaiters();
         return true;
     }
 
@@ -1647,7 +1737,7 @@ test "GAP-0089: pin waits for an in-flight page load" {
             defer p.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
             p.frames[0].loading = false;
             p.frames[0].valid = true;
-            p.cond.broadcast(std.Io.Threaded.global_single_threaded.io());
+            p.wakeFrameWaiters();
         }
     };
 
