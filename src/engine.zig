@@ -394,6 +394,16 @@ pub const GraphEngine = struct {
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
         self.wireMetricsCounters();
+        // Lever B observability: record which derived-index restore path step 7
+        // took. Set AFTER the metrics reset above so it survives (the reset wipes
+        // anything set during the load/rebuild decision). index_rebuild_progress
+        // cannot be used here because wireMetricsCounters unconditionally sets it
+        // to 10000 on every open.
+        if (loaded_indexes) {
+            self.metrics.derived_index_loads = 1;
+        } else {
+            self.metrics.derived_index_rebuilds = 1;
+        }
         self.buffer_pool.setMetrics(&self.metrics);
         // Initialize owned-or-borrowed thread pool (see initThreadPool).
         try self.initThreadPool(allocator, cfg);

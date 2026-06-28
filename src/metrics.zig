@@ -40,6 +40,17 @@ pub const Metrics = struct {
     // this stays flat across light checkpoints to prove the bounded path.
     derived_index_saves: u64 = 0,
 
+    // Derived-index restore path taken on the LAST open(), wired in engine.open
+    // AFTER the metrics reset so it survives. Exactly one of these is 1 per open
+    // of an existing graph. derived_index_loads=1 means the persisted snapshots
+    // matched the manifest counter and were loaded in O(snapshot) (Lever B clean
+    // restart); derived_index_rebuilds=1 means they were stale/absent and the
+    // O(graph) rebuildDerivedIndexes ran (crash restart, or first open). These
+    // distinguish load-vs-rebuild, which index_rebuild_progress cannot (it is
+    // unconditionally set to 10000 by wireMetricsCounters on every open).
+    derived_index_loads: u64 = 0,
+    derived_index_rebuilds: u64 = 0,
+
     // Recovery
     recovery_duration_ns: u64 = 0,
 

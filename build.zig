@@ -250,6 +250,18 @@ fn addIntegrationTests(
     const run_cross_shard = b.addRunArtifact(cross_shard_tests);
     cross_shard_step.dependOn(&run_cross_shard.step);
 
+    // Lever B: a CLEAN restart LOADS the persisted derived-index snapshots
+    // (no O(graph) rebuild) while a CRASH restart is STILL forced to rebuild.
+    // Own step so the load-on-clean / rebuild-on-crash proofs run in isolation.
+    const leverb_step = b.step("test-leverb-clean-restart", "Run Lever B clean-restart-loads / crash-restart-rebuilds derived-index tests");
+    const leverb_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/leverb_clean_restart.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_leverb = b.addRunArtifact(leverb_tests);
+    leverb_step.dependOn(&run_leverb.step);
+
     // PHASE 3: engine edge-EXISTENCE index (durable O(1) MERGE-dedup probe).
     // Own step so the crash-recovery + idempotency + O(1)-not-O(degree) proofs
     // can be run in isolation under ReleaseSafe/Debug and looped.
