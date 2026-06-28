@@ -271,6 +271,19 @@ fn addIntegrationTests(
     const run_integration_sharded = b.addRunArtifact(integration_sharded_tests);
     integration_sharded_step.dependOn(&run_integration_sharded.step);
 
+    // Parallel shard-open recovery: correctness (rebuildDerivedIndexes on every
+    // shard must reproduce ground-truth state) + the concurrent-openers gauge
+    // proving the open loop is N-wide. Own step so it can be run in isolation
+    // and looped under -Doptimize=ReleaseSafe/Debug.
+    const parallel_open_step = b.step("test-parallel-shard-open", "Run parallel shard-open recovery correctness + concurrency-gauge test");
+    const parallel_open_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/parallel_shard_open.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_parallel_open = b.addRunArtifact(parallel_open_tests);
+    parallel_open_step.dependOn(&run_parallel_open.step);
+
     // Edge co-location (Phase A): single-shard edge write + scatter expandIn +
     // page-image-redo recovery of the per-shard in-index. Own step so the
     // reverse-traversal correctness + recovery proofs run in isolation.

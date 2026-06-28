@@ -39,6 +39,44 @@ const Metrics = metrics_mod.Metrics;
 
 pub const SHARD_COUNT = shard_count_mod.SHARD_COUNT;
 
+/// Concurrency high-water gauge for the shard-open phase. A worker calls
+/// `enter()` on entry to its `GraphEngine.open` body and `exit()` when it
+/// returns; `enter()` records the running peak. With the SERIAL open loop the
+/// peak is 1; once `open` spawns one worker per shard the peak rises to
+/// `min(SHARD_COUNT, cpu)`. Exposed for the parallel-shard-open test to prove
+/// the loop is actually N-wide. Single-graph-open scoped: `open` resets it on
+/// entry, so a test that opens one graph at a time reads a clean value. Not a
+/// production signal — purely test instrumentation.
+pub const OpenConcurrencyGauge = struct {
+    current: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    max: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn reset(self: *OpenConcurrencyGauge) void {
+        self.current.store(0, .seq_cst);
+        self.max.store(0, .seq_cst);
+    }
+
+    pub fn enter(self: *OpenConcurrencyGauge) void {
+        const now = self.current.fetchAdd(1, .seq_cst) + 1;
+        var prev = self.max.load(.seq_cst);
+        while (now > prev) {
+            prev = self.max.cmpxchgWeak(prev, now, .seq_cst, .seq_cst) orelse break;
+        }
+    }
+
+    pub fn exit(self: *OpenConcurrencyGauge) void {
+        _ = self.current.fetchSub(1, .seq_cst);
+    }
+
+    pub fn maxObserved(self: *const OpenConcurrencyGauge) u32 {
+        return self.max.load(.seq_cst);
+    }
+};
+
+/// Process-global instrumentation for the most recent `ShardedGraphEngine.open`.
+/// Reset at the start of every `open`. See `OpenConcurrencyGauge`.
+pub var open_concurrency_gauge: OpenConcurrencyGauge = .{};
+
 // Encoded TxnId layout for the facade: high 8 bits = shard_index,
 // low 56 bits = per-shard local txn id. Keeps the public TxnId shape
 // a plain u64 so the GraphStorage vtable binding stays untouched.
@@ -201,17 +239,23 @@ pub const ShardedGraphEngine = struct {
         var opened: usize = 0;
         errdefer for (self.shards[0..opened]) |e| e.close() catch {};
 
+        open_concurrency_gauge.reset();
         for (0..SHARD_COUNT) |s| {
             var per_shard_cfg = cfg;
             per_shard_cfg.base_shard_index = s;
             per_shard_cfg.buffer_pool_pages = @max(1, cfg.buffer_pool_pages / @as(u32, @intCast(SHARD_COUNT)));
             per_shard_cfg.external_thread_pool = self.shared_thread_pool;
-            self.shards[s] = try GraphEngine.open(
+            open_concurrency_gauge.enter();
+            self.shards[s] = GraphEngine.open(
                 allocator,
                 self.graph_root,
                 self.shard_manifest.per_shard_uuids[s],
                 per_shard_cfg,
-            );
+            ) catch |err| {
+                open_concurrency_gauge.exit();
+                return err;
+            };
+            open_concurrency_gauge.exit();
             opened += 1;
         }
 
