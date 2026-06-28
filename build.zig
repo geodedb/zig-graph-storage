@@ -284,6 +284,22 @@ fn addIntegrationTests(
     const run_parallel_open = b.addRunArtifact(parallel_open_tests);
     parallel_open_step.dependOn(&run_parallel_open.step);
 
+    // TSan variant of the parallel-shard-open hardening suite. Runs the same
+    // test file under ThreadSanitizer (sanitize_thread = true) compiled at
+    // Debug optimize so races are not elided by the optimiser. Detects data
+    // races in the parallel open loop (worker threads writing ok[]/err_slots[]
+    // into distinct slots, gauge CAS, etc.). EXIT=0 and no race report = clean.
+    const tsan_parallel_open_step = b.step("test-parallel-shard-open-tsan", "Run parallel shard-open hardening suite under ThreadSanitizer (zero races expected)");
+    const tsan_parallel_open_tests = b.addTest(.{
+        // Always Debug so the optimiser does not elide instrumented accesses.
+        .root_module = createModule(b, "tests/parallel_shard_open.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    tsan_parallel_open_tests.root_module.sanitize_thread = true;
+    const run_tsan_parallel_open = b.addRunArtifact(tsan_parallel_open_tests);
+    tsan_parallel_open_step.dependOn(&run_tsan_parallel_open.step);
+
     // Edge co-location (Phase A): single-shard edge write + scatter expandIn +
     // page-image-redo recovery of the per-shard in-index. Own step so the
     // reverse-traversal correctness + recovery proofs run in isolation.
