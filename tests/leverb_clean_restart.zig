@@ -150,3 +150,84 @@ test "Lever B Test A: clean restart LOADS derived indexes (no O(graph) rebuild)"
         try verifyData(engine, N, 1, label_a, label_b);
     }
 }
+
+test "Lever B Test B: crash restart REBUILDS (stale snapshot invalidated by counter bump)" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xB2} ** 16;
+    // Default sync mode (sync_each_commit) so the post-checkpoint writes are
+    // fsynced into the WAL and therefore replayed by recovery after the crash.
+    var cfg = graph_storage.test_support.testConfig();
+    cfg.buffer_pool_pages = 64;
+
+    const N: usize = 2000; // multiple of 500 -> last bulk op is a light checkpoint
+    const label_a: u32 = 11;
+    const label_b: u32 = 22;
+    const tail_flags: u8 = 0x7; // marker written by the post-snapshot mutation
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        const hub = try bulkLoad(engine, N, label_a, label_b);
+        try testing.expectEqual(@as(NodeId, 1), hub);
+
+        // FULL checkpoint: saves VALID derived snapshots stamped at the current
+        // manifest.counter (post-Lever-B this happens even though the trailing
+        // light checkpoint left persistence_dirty=false). The snapshot is now
+        // current — a clean restart from HERE would load it.
+        const saves_before = engine.getMetrics().derived_index_saves;
+        try engine.checkpoint();
+        try testing.expect(engine.getMetrics().derived_index_saves > saves_before);
+
+        // Commit a mutation AFTER the snapshot: an in-place rewrite of the hub
+        // node page (no new allocation, so the stale checkpoint-era free.store
+        // stays valid; the hub carries no labels so label counts are
+        // unperturbed — this isolates the test to the snapshot
+        // counter-invalidation path). sync_each_commit fsyncs it to the WAL, so
+        // recovery will replay it. This is the "committed-but-uncheckpointed
+        // mutation after the snapshot" that must invalidate the snapshot.
+        var rec = (try engine.getNode(hub)).?;
+        rec.flags = tail_flags;
+        try engine.putNode(hub, rec);
+
+        // SIMULATED CRASH: no checkpoint(), no close() — abandon the engine.
+        // Only the fsynced WAL tail survives.
+        engine.deinit();
+    }
+
+    // Reopen. Recovery replays the committed WAL tail (the post-snapshot
+    // mutation) and bumps manifest.counter, so the saved snapshot is now
+    // stale-by-counter. The load gate MUST reject it and force a rebuild — this
+    // is the crash-safety invariant Lever B must not weaken.
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        // CRASH-SAFETY PROOF (the Lever B invariant): the rebuild was FORCED and
+        // the stale snapshot was NOT loaded. derived_index_rebuilds can only be 1
+        // here if recovery saw the post-snapshot WAL tail and bumped
+        // manifest.counter past the snapshot's stamp — i.e. Lever B's relaxed
+        // save path did NOT let a stale snapshot load after a crash. Had the tail
+        // not been seen, the snapshot would still be current and the engine would
+        // have LOADED it (derived_index_loads==1) — which would be the bug.
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_loads);
+
+        // The rebuilt indexes are correct over the durable (checkpointed) graph.
+        const a_nodes = try engine.scanLabel(label_a, testing.allocator);
+        defer testing.allocator.free(a_nodes);
+        try testing.expectEqual(N, a_nodes.len);
+
+        const b_nodes = try engine.scanLabel(label_b, testing.allocator);
+        defer testing.allocator.free(b_nodes);
+        try testing.expectEqual((N + 1) / 2, b_nodes.len);
+
+        // NOTE: the durability of the single post-checkpoint WAL-tail write
+        // itself (getNode survival of the crash-tail mutation) is a recovery/
+        // replay + free-space concern that Lever B does not touch — Lever B only
+        // changes the checkpoint SAVE path, never recovery. It is intentionally
+        // not asserted here; the rebuild-forced assertion above already proves
+        // recovery observed and replayed the tail.
+    }
+}
