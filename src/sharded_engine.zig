@@ -77,6 +77,54 @@ pub const OpenConcurrencyGauge = struct {
 /// Reset at the start of every `open`. See `OpenConcurrencyGauge`.
 pub var open_concurrency_gauge: OpenConcurrencyGauge = .{};
 
+/// Worker context for the PARALLEL shard-open phase. Threads pull shard indices
+/// from a shared atomic counter and run the (fully independent) per-shard
+/// `GraphEngine.open` body — recovery + derived-index rebuild — into distinct
+/// `shards[s]` / `ok[s]` / `err_slots[s]` slots (no overlapping writes).
+///
+/// SAFETY: every cross-engine touch point in `GraphEngine.open` is read-only
+/// (`shard_manifest`, `graph_root`, `shared_thread_pool` are read; per-shard
+/// `labels.dict` is read; the global registry is lookup-only; std.Io positional
+/// I/O is per-fd thread-safe). The shared thread pool is NOT used for the opens
+/// themselves (dedicated `std.Thread` workers), so this cannot re-enter the
+/// nested-submit / buffer-pool-pin surface. Requires a thread-safe injected
+/// allocator (see the precondition at the call site).
+const ShardOpenWorker = struct {
+    self: *ShardedGraphEngine,
+    allocator: Allocator,
+    cfg: GraphConfig,
+    next_index: *std.atomic.Value(usize),
+    ok: *[SHARD_COUNT]bool,
+    err_slots: *[SHARD_COUNT]?anyerror,
+
+    fn run(ctx: *ShardOpenWorker) void {
+        while (true) {
+            const s = ctx.next_index.fetchAdd(1, .monotonic);
+            if (s >= SHARD_COUNT) break;
+
+            var per_shard_cfg = ctx.cfg;
+            per_shard_cfg.base_shard_index = s;
+            per_shard_cfg.buffer_pool_pages = @max(1, ctx.cfg.buffer_pool_pages / @as(u32, @intCast(SHARD_COUNT)));
+            per_shard_cfg.external_thread_pool = ctx.self.shared_thread_pool;
+
+            open_concurrency_gauge.enter();
+            defer open_concurrency_gauge.exit();
+
+            if (GraphEngine.open(
+                ctx.allocator,
+                ctx.self.graph_root,
+                ctx.self.shard_manifest.per_shard_uuids[s],
+                per_shard_cfg,
+            )) |eng| {
+                ctx.self.shards[s] = eng;
+                ctx.ok[s] = true;
+            } else |e| {
+                ctx.err_slots[s] = e;
+            }
+        }
+    }
+};
+
 // Encoded TxnId layout for the facade: high 8 bits = shard_index,
 // low 56 bits = per-shard local txn id. Keeps the public TxnId shape
 // a plain u64 so the GraphStorage vtable binding stays untouched.
@@ -236,28 +284,76 @@ pub const ShardedGraphEngine = struct {
             self.owned_shared_pool = null;
         };
 
-        var opened: usize = 0;
-        errdefer for (self.shards[0..opened]) |e| e.close() catch {};
+        // PARALLEL shard-open. The 16 per-shard `GraphEngine.open` calls
+        // (recovery + derived-index rebuild) are fully independent and are the
+        // dominant restart cost, so we run them on dedicated `std.Thread`
+        // workers and join ALL before serving — turning the ~serial restart
+        // into a min(SHARD_COUNT, cpu)-wide one.
+        //
+        // ALLOCATOR PRECONDITION: `allocator` MUST be thread-safe — the workers
+        // below call into it concurrently for 16 simultaneous opens. geode
+        // injects `std.heap.smp_allocator` and tests use `std.testing.allocator`,
+        // both thread-safe. A non-thread-safe injected allocator is a CALLER bug
+        // (we deliberately do not silently wrap it).
+        //
+        // Workers do NOT use `shared_thread_pool` for the opens (that would
+        // re-enter the nested-submit / buffer-pool-pin surface); the pool is
+        // only passed through into each engine's config for post-open serving.
+        //
+        // PARTIAL-OPEN CLEANUP: parallel completion is not monotonic, so we
+        // track per-shard `ok` / `err_slots` and, on any failure, close exactly
+        // the shards that opened (by the bool array) and return the lowest-index
+        // error. The earlier pool-teardown + `graph_root`/`self` errdefers then
+        // fire in LIFO order. We NEVER return while a worker is live: join all
+        // helpers first.
+        var ok = [_]bool{false} ** SHARD_COUNT;
+        var err_slots = [_]?anyerror{null} ** SHARD_COUNT;
+        var next_index = std.atomic.Value(usize).init(0);
 
         open_concurrency_gauge.reset();
-        for (0..SHARD_COUNT) |s| {
-            var per_shard_cfg = cfg;
-            per_shard_cfg.base_shard_index = s;
-            per_shard_cfg.buffer_pool_pages = @max(1, cfg.buffer_pool_pages / @as(u32, @intCast(SHARD_COUNT)));
-            per_shard_cfg.external_thread_pool = self.shared_thread_pool;
-            open_concurrency_gauge.enter();
-            self.shards[s] = GraphEngine.open(
-                allocator,
-                self.graph_root,
-                self.shard_manifest.per_shard_uuids[s],
-                per_shard_cfg,
-            ) catch |err| {
-                open_concurrency_gauge.exit();
-                return err;
-            };
-            open_concurrency_gauge.exit();
-            opened += 1;
+
+        var worker_ctx = ShardOpenWorker{
+            .self = self,
+            .allocator = allocator,
+            .cfg = cfg,
+            .next_index = &next_index,
+            .ok = &ok,
+            .err_slots = &err_slots,
+        };
+
+        const worker_count = @min(SHARD_COUNT, std.Thread.getCpuCount() catch SHARD_COUNT);
+        var threads: [SHARD_COUNT]std.Thread = undefined;
+        var spawned: usize = 0;
+        // Spawn up to worker_count-1 helpers; the calling thread is itself the
+        // worker_count-th worker. Pulling from the shared atomic counter means a
+        // failed spawn never strands a shard — whatever threads exist (at least
+        // the caller) drain all SHARD_COUNT indices.
+        while (spawned + 1 < worker_count) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, ShardOpenWorker.run, .{&worker_ctx}) catch break;
         }
+        worker_ctx.run();
+        for (threads[0..spawned]) |t| t.join();
+
+        // Aggregate AFTER every worker has joined. Lowest-index error wins.
+        var first_err: ?anyerror = null;
+        for (err_slots) |maybe| {
+            if (maybe) |e| {
+                first_err = e;
+                break;
+            }
+        }
+        if (first_err) |e| {
+            for (ok, 0..) |opened_ok, s| {
+                if (opened_ok) self.shards[s].close() catch {};
+            }
+            return e;
+        }
+
+        // Every shard opened. From here a failure in the serial post-open work
+        // (reconcile / migration) must still close them; register the cleanup
+        // AFTER the pool-teardown errdefer so Zig's LIFO closes shards first,
+        // then tears down the pool — never the reverse.
+        errdefer for (self.shards) |e| e.close() catch {};
 
         _ = try sharded_recovery.reconcilePendingPrepares(self);
 

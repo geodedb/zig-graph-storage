@@ -188,8 +188,13 @@ test "parallel-shard-open: rebuild-on-reopen state matches ground truth + gauge"
         try expectInEdge(eng, er.to, er.id, er.from);
     }
 
-    // Concurrency gauge: SERIAL open peaks at exactly 1 worker.
-    try testing.expectEqual(@as(u32, 1), sharded_engine.open_concurrency_gauge.maxObserved());
+    // Concurrency gauge: the PARALLEL open peaks above 1 (a serial loop peaks
+    // at exactly 1), bounded by min(SHARD_COUNT, cpu). The >= 2 floor is the
+    // hard, scheduling-robust proof that the open loop is genuinely N-wide.
+    const worker_bound: u32 = @intCast(@min(SHARD_COUNT, std.Thread.getCpuCount() catch SHARD_COUNT));
+    const peak = sharded_engine.open_concurrency_gauge.maxObserved();
+    try testing.expect(peak >= 2);
+    try testing.expect(peak <= worker_bound);
 }
 
 fn expectOutEdge(eng: *ShardedGraphEngine, from: u64, edge_id: u64, to: u64) !void {
