@@ -329,7 +329,22 @@ pub fn checkpointLight(engine: *GraphEngine) anyerror!void {
 /// flags are PRESERVED so a later full checkpoint (e.g. clean shutdown) still
 /// persists them.
 pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
-    if (!engine.persistence_dirty) {
+    // Lever B: a FULL checkpoint (save_derived=true) must still run when any
+    // derived-index dirty flag is set, even if pages are clean
+    // (persistence_dirty==false). A trailing checkpointLight clears
+    // persistence_dirty and bumps manifest.counter but leaves the derived dirty
+    // flags set; without this the clean-shutdown full checkpoint would skip the
+    // derived save, leaving the snapshot stale-by-counter so a CLEAN restart
+    // would do the O(graph) rebuildDerivedIndexes instead of an O(snapshot)
+    // load. The LIGHT path passes save_derived=false, so derived_pending is
+    // always false there — the light path stays O(dirty) (no derived save).
+    // Crash-safety is unchanged: the load gate still requires the snapshot
+    // counter == manifest.counter, and recovery bumps manifest.counter on WAL
+    // replay, so a crash after the snapshot still forces a rebuild.
+    const derived_pending = save_derived and
+        (engine.label_index_dirty or engine.property_index_dirty or
+            engine.edge_index_dirty or engine.edge_exist_index_dirty);
+    if (!engine.persistence_dirty and !derived_pending) {
         return;
     }
 
