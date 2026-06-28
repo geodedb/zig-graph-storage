@@ -6,6 +6,7 @@
 //! docs/superpowers/specs/2026-04-24-sharded-graph-engine-design.md.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tp = @import("thread_pool");
 const Allocator = std.mem.Allocator;
 
@@ -52,11 +53,13 @@ pub const OpenConcurrencyGauge = struct {
     max: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn reset(self: *OpenConcurrencyGauge) void {
+        if (!builtin.is_test) return;
         self.current.store(0, .seq_cst);
         self.max.store(0, .seq_cst);
     }
 
     pub fn enter(self: *OpenConcurrencyGauge) void {
+        if (!builtin.is_test) return;
         const now = self.current.fetchAdd(1, .seq_cst) + 1;
         var prev = self.max.load(.seq_cst);
         while (now > prev) {
@@ -65,6 +68,7 @@ pub const OpenConcurrencyGauge = struct {
     }
 
     pub fn exit(self: *OpenConcurrencyGauge) void {
+        if (!builtin.is_test) return;
         _ = self.current.fetchSub(1, .seq_cst);
     }
 

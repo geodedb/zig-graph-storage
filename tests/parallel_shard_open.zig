@@ -191,9 +191,16 @@ test "parallel-shard-open: rebuild-on-reopen state matches ground truth + gauge"
     // Concurrency gauge: the PARALLEL open peaks above 1 (a serial loop peaks
     // at exactly 1), bounded by min(SHARD_COUNT, cpu). The >= 2 floor is the
     // hard, scheduling-robust proof that the open loop is genuinely N-wide.
-    const worker_bound: u32 = @intCast(@min(SHARD_COUNT, std.Thread.getCpuCount() catch SHARD_COUNT));
+    // On a 1-vCPU machine the open degrades to serial (peak == 1); guard that
+    // case so the test does not spuriously fail in constrained CI environments.
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const worker_bound: u32 = @intCast(@min(SHARD_COUNT, cpu_count));
     const peak = sharded_engine.open_concurrency_gauge.maxObserved();
-    try testing.expect(peak >= 2);
+    if (cpu_count >= 2) {
+        try testing.expect(peak >= 2);
+    } else {
+        try testing.expect(peak >= 1);
+    }
     try testing.expect(peak <= worker_bound);
 }
 
