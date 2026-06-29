@@ -288,6 +288,18 @@ fn addIntegrationTests(
     const run_ordered_freshness = b.addRunArtifact(ordered_freshness_tests);
     ordered_freshness_step.dependOn(&run_ordered_freshness.step);
 
+    // H3-P4 Task A2/A3: ordered-index close() durability lifecycle. Own step so
+    // the rebuild-before-save (#1) + persist-on-not-dirty (#2) proofs run in
+    // isolation and can be looped.
+    const ordered_lifecycle_step = b.step("test-ordered-lifecycle", "Run ordered-index close() durability lifecycle tests (rebuild-before-save + persist-on-light-ckpt) (H3-P4)");
+    const ordered_lifecycle_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/ordered_lifecycle_test.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_ordered_lifecycle = b.addRunArtifact(ordered_lifecycle_tests);
+    ordered_lifecycle_step.dependOn(&run_ordered_lifecycle.step);
+
     const cross_shard_step = b.step("test-cross-shard-recovery", "Run cross-shard 2PC crash recovery tests");
     const cross_shard_tests = b.addTest(.{
         .root_module = createModule(b, "tests/cross_shard_recovery.zig", target, optimize, &.{

@@ -730,10 +730,33 @@ pub const GraphEngine = struct {
                     if (close_err == null) close_err = err;
                 };
             }
-            if (close_err == null and self.ordered_property_index.count() > 0) {
-                // H3-P1: persist the value-ordered index snapshot on close,
-                // stamped at the just-checkpointed manifest.counter so the next
-                // clean restart loads it instead of rebuilding.
+        }
+
+        // H3-P4 #1+#2: refresh + persist the value-ordered index on close
+        // whenever a registered ordered index exists — even when
+        // persistence_dirty is false. This block is INTENTIONALLY outside the
+        // `if (self.persistence_dirty)` gate above:
+        //   #2: a trailing checkpointLight clears persistence_dirty (and already
+        //       bumped + persisted manifest.counter) but saves NO ordered
+        //       snapshot; without this block the next open finds no snapshot and
+        //       LOSES the registration (planner heap fallback).
+        // The REBUILD runs BEFORE saveToFile (#1): close() must not persist a
+        // snapshot stamped at manifest.counter that the next clean open LOADS as
+        // fresh while it is empty/stale. The online label/property hooks only
+        // mark the tree stale; in-place value drift is corrected here. After a
+        // successful rebuild `ordered_index_stale` is false and the snapshot
+        // reflects every committed write.
+        //
+        // manifest.counter == the value the next open() reads (the load gate
+        // requires snapshot.counter == manifest.counter): if the dirty block
+        // above ran doCheckpoint it advanced + persisted the counter; if
+        // persistence_dirty was false, the prior (light) checkpoint already
+        // persisted the manifest at this counter. Neither path here re-bumps it.
+        if (close_err == null and self.ordered_property_index.count() > 0) {
+            self.rebuildOrderedIndex() catch |err| {
+                if (close_err == null) close_err = err;
+            };
+            if (close_err == null) {
                 self.ordered_property_index.saveToFile(self.graph_dir.path, self.manifest.counter) catch |err| {
                     if (close_err == null) close_err = err;
                 };
