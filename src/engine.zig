@@ -179,6 +179,11 @@ pub const GraphEngine = struct {
     /// persist, so the next FULL checkpoint re-saves the snapshot stamped at the
     /// current manifest.counter (the light path skips it, staying O(dirty)).
     ordered_index_dirty: bool = false,
+    /// H3-P4: set by every write that can change an indexed value or label
+    /// membership; cleared only by a successful `rebuildOrderedIndex`. While
+    /// set, the value-ordered trees may not reflect committed state, so the
+    /// planner must NOT serve the ORDER BY fast path (see `orderedIndexFresh`).
+    ordered_index_stale: bool = false,
 
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
@@ -196,6 +201,7 @@ pub const GraphEngine = struct {
         self.edge_exist_index_dirty = true;
         self.property_catalog_dirty = false;
         self.ordered_index_dirty = false;
+        self.ordered_index_stale = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -300,6 +306,7 @@ pub const GraphEngine = struct {
         self.edge_exist_index_dirty = false;
         self.property_catalog_dirty = false;
         self.ordered_index_dirty = false;
+        self.ordered_index_stale = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -929,6 +936,9 @@ pub const GraphEngine = struct {
             if (try self.node_store.getNode(id)) |rec| {
                 try self.orderedIndexOnDeleteNode(id, rec);
             }
+            // H3-P4: a delete changes index membership; the trees are stale
+            // until the next rebuild at the durability boundary.
+            self.ordered_index_stale = true;
         }
         try self.node_store.deleteNode(id);
         try self.logPage(txn, .nodes, self.nodePageId(id));
@@ -1380,6 +1390,10 @@ pub const GraphEngine = struct {
         }
 
         self.metrics.properties_written += 1;
+        // H3-P4: an indexed property value may have changed; mark the ordered
+        // trees stale (the write path is keyed by prop_head, not node_id, so it
+        // cannot maintain the value-ordered trees in place).
+        if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
         self.markDirty();
         return new_head;
     }
@@ -1423,6 +1437,9 @@ pub const GraphEngine = struct {
         } else {
             try self.refreshPropertyChainIndex(owner);
         }
+        // H3-P4: removing an indexed property changes index contents; the
+        // ordered trees are stale until the next rebuild.
+        if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
         self.markDirty();
         observability.endOperationSpan(__obs_span, true, "");
     }
@@ -1448,6 +1465,8 @@ pub const GraphEngine = struct {
         // value for each such key. No-op unless an ordered index on `label`
         // exists (the hasLabel gate keeps the common path zero-cost).
         try self.orderedIndexOnAddLabel(node_id, label, rec.prop_head);
+        // H3-P4: adding a label can change index membership; mark stale.
+        if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
         self.markDirty();
     }
 
@@ -1481,6 +1500,8 @@ pub const GraphEngine = struct {
         // value still matches the one used at insert). rec.prop_head is the
         // property chain, untouched by label removal.
         try self.orderedIndexOnRemoveLabel(node_id, label, rec.prop_head);
+        // H3-P4: removing a label can change index membership; mark stale.
+        if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
 
         // Log dirty pages: var_store page (if any) and node page
         if (result.head != 0) try self.logPage(txn, .var_store, result.head);
@@ -1731,6 +1752,16 @@ pub const GraphEngine = struct {
         var ctx = Ctx{ .engine = self };
         try self.node_store.scanNodes(self.manifest.next_node_id, &ctx, Ctx.callback);
         if (ctx.err) |e| return e;
+        // H3-P4: the trees now reflect every committed write; clear the stale
+        // flag only after the scan completed successfully.
+        self.ordered_index_stale = false;
+    }
+
+    /// True iff a registered ordered index exists AND its trees reflect every
+    /// committed write since the last rebuild/refresh. The planner serves the
+    /// value-ordered fast path ONLY when fresh; otherwise it must use the heap.
+    pub fn orderedIndexFresh(self: *GraphEngine) bool {
+        return self.ordered_property_index.count() > 0 and !self.ordered_index_stale;
     }
 
     /// For a single node, insert its indexed property values into every matching
