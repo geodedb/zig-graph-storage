@@ -252,6 +252,19 @@ fn addIntegrationTests(
     const run_ordered_encoding = b.addRunArtifact(ordered_encoding_tests);
     ordered_encoding_step.dependOn(&run_ordered_encoding.step);
 
+    // H3-P1 Task 1: byte-key ordered B+Tree with a lazy ASC/DESC cursor.
+    // Own step so the data-structure correctness proofs (forward == std.sort
+    // ascending, reverse == descending, seek-first->= , remove, serialize
+    // round-trip, no-leak) run in isolation and can be looped.
+    const ordered_btree_step = b.step("test-ordered-btree", "Run byte-key ordered B+Tree + lazy ASC/DESC cursor tests (H3-P1)");
+    const ordered_btree_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/ordered_btree_test.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_ordered_btree = b.addRunArtifact(ordered_btree_tests);
+    ordered_btree_step.dependOn(&run_ordered_btree.step);
+
     const cross_shard_step = b.step("test-cross-shard-recovery", "Run cross-shard 2PC crash recovery tests");
     const cross_shard_tests = b.addTest(.{
         .root_module = createModule(b, "tests/cross_shard_recovery.zig", target, optimize, &.{
