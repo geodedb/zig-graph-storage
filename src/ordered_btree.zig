@@ -396,8 +396,32 @@ pub const OrderedBTree = struct {
             return e;
         }
 
+        /// Mirror of `normalizeForward` for the DESC walk. BEFORE any backward
+        /// access, re-validate the cursor against the (possibly shrunk) leaf: a
+        /// concurrent `remove` during a lock-release window can drop entries
+        /// from the current leaf, leaving `idx >= keys.len` or the whole leaf
+        /// empty. Clamp `idx` back into range (a torn read — a removed entry is
+        /// skipped or a shifted entry may repeat — is acceptable), and skip
+        /// empty leaves to `prev_leaf`, marking exhausted if we walk off the
+        /// front. After this returns, `leaf == null` OR `idx < leaf.keys.len`,
+        /// so `prev()` can never read past the array.
+        fn normalizeBackward(self: *Cursor) void {
+            while (self.leaf) |cur| {
+                if (cur.keys.items.len == 0) {
+                    // Leaf emptied by a concurrent remove: step to the previous
+                    // leaf and position at ITS last entry on the next iteration.
+                    self.leaf = cur.prev_leaf;
+                    self.idx = std.math.maxInt(usize); // force the clamp below
+                    continue;
+                }
+                if (self.idx >= cur.keys.items.len) self.idx = cur.keys.items.len - 1;
+                return;
+            }
+        }
+
         /// Return the current entry, then step backward (via `prev_leaf`).
         pub fn prev(self: *Cursor) ?Entry {
+            self.normalizeBackward();
             const cur = self.leaf orelse return null;
             const e = Entry{ .key = cur.keys.items[self.idx], .node_id = cur.values.?.items[self.idx] };
             if (self.idx > 0) {
