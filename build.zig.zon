@@ -1,6 +1,6 @@
 .{
     .name = .graph_storage,
-    .version = "0.2.16",
+    .version = "0.2.17",
     .fingerprint = 0x713d4f134b894cf5,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
