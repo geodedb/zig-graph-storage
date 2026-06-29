@@ -1684,6 +1684,17 @@ pub const GraphEngine = struct {
         return self.ordered_property_index.isRegistered(label, property_key);
     }
 
+    /// Report whether ORDER BY on `(label, key)` can be SAFELY served from the
+    /// ordered index with full engine parity (no missing / mis-ordered rows).
+    /// The planner consults this before serving ORDER BY from `openOrderedCursor`
+    /// instead of the heap. False when no such ordered index is registered, OR
+    /// when the column has a value that breaks parity (decimal/ext/NaN, bool/null,
+    /// or mixed int+float). The flag reflects the current data: it is recomputed
+    /// on every rebuild/refresh and restored from the snapshot on a clean load.
+    pub fn isOrderedIndexEligible(self: *GraphEngine, label: LabelId, property_key: []const u8) bool {
+        return self.ordered_property_index.isEligible(label, property_key);
+    }
+
     /// Open a direction-aware cursor over the ordered index for `(label, key)`.
     /// Returns null when no such ordered index is registered. The cursor borrows
     /// the live tree; do not mutate the ordered index while iterating.

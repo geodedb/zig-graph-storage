@@ -48,8 +48,11 @@ const OrderedBTree = ordered_btree.OrderedBTree;
 
 /// Snapshot file name under the graph directory.
 pub const SNAPSHOT_FILE_NAME = "ordered_propidx.snap";
-/// 8-byte snapshot magic (index_snapshot requires exactly 8 bytes).
-pub const SNAPSHOT_MAGIC = "GSORDIX1";
+/// 8-byte snapshot magic (index_snapshot requires exactly 8 bytes). Bumped
+/// 1 -> 2 when the per-index framing gained the eligibility flag + value-order
+/// class (an old GSORDIX1 snapshot is then cleanly rejected by the magic check
+/// and rebuilt from a live scan rather than silently misparsed).
+pub const SNAPSHOT_MAGIC = "GSORDIX2";
 const owner_only_file_mode = 0o600;
 
 fn io() std.Io {
@@ -69,11 +72,53 @@ pub const OrderedPropertyIndex = struct {
     /// byte order); DESC walks them descending (the exact reverse).
     pub const Direction = enum { asc, desc };
 
+    /// The encoder's order-class of a value, used to decide ORDER BY index
+    /// eligibility (see `isEligible`). `int` and `float` are SEPARATE classes
+    /// on purpose: the H3-P0 encoder type-separates them (int TYPE_RANK 0x20 <
+    /// float 0x30) whereas the engine ORDER BY coerces BOTH to f64 and unifies
+    /// them, so a column mixing int and float would be MIS-ordered by the index
+    /// relative to the engine. `boolean`/`null_v` are tracked so a column
+    /// containing them can be flagged ineligible: the engine drops bool/null
+    /// from ORDER BY entirely, so an index scan would surface rows the engine
+    /// omits. Persisted as the `u8` tag in the snapshot (0 == "no class yet").
+    pub const ValueOrderClass = enum(u8) {
+        int = 1,
+        float = 2,
+        string = 3,
+        boolean = 4,
+        null_v = 5,
+
+        /// The order-class for `value`, or null for values with no defined
+        /// encoder order (decimal, ext — these are also `!orderable`).
+        fn fromValue(value: PropertyValue) ?ValueOrderClass {
+            return switch (value) {
+                .int => .int,
+                .float => .float,
+                .string => .string,
+                .bool => .boolean,
+                .null => .null_v,
+                .decimal, .ext => null,
+            };
+        }
+    };
+
     pub const Entry = struct {
         label_id: LabelId,
         /// Owned copy of the property key.
         property_key: []u8,
         tree: OrderedBTree,
+
+        /// Whether ORDER BY for this (label,key) can be SAFELY served from the
+        /// ordered index with full engine parity (no missing / mis-ordered
+        /// rows). True until a value is seen that breaks parity (see the rule in
+        /// `applyEligibility`). Once false, stays false until a rebuild/refresh
+        /// (`clearTrees`) recomputes it from the live values. Recomputed, never
+        /// trusted-across-crash beyond what the snapshot records.
+        eligible: bool = true,
+        /// The single order-class established by the first orderable, indexable
+        /// value seen; a later value of a different class flips `eligible` false.
+        /// Null until the first such value (or after a `clearTrees` reset).
+        value_class: ?ValueOrderClass = null,
 
         fn deinit(self: *Entry, allocator: Allocator) void {
             self.tree.deinit();
@@ -152,13 +197,68 @@ pub const OrderedPropertyIndex = struct {
     }
 
     /// Index `value` for `node_id` under `(label_id, key)`. No-op when the pair
-    /// is not registered or `value` is not orderable (decimal/ext/NaN).
+    /// is not registered or `value` is not orderable (decimal/ext/NaN). Updates
+    /// the per-(label,key) ORDER BY eligibility flag for EVERY value seen
+    /// (including the skipped not-orderable ones — those flip it false).
     pub fn insert(self: *Self, label_id: LabelId, key: []const u8, value: PropertyValue, node_id: NodeId) !void {
         const e = self.find(label_id, key) orelse return;
+        applyEligibility(e, value);
         if (!ordered_encoding.orderable(value)) return;
         const encoded = try ordered_encoding.encodeOrdered(self.allocator, value, node_id);
         defer self.allocator.free(encoded);
         try e.tree.insert(encoded, node_id);
+    }
+
+    /// Fold one observed `value` into the entry's ORDER BY eligibility.
+    ///
+    /// The rule matches the H3-P0 encoder's correctness contract against the
+    /// engine's `entryLess` ORDER BY order. A (label,key) is `eligible` iff
+    /// EVERY value seen is index-servable with engine parity, i.e.:
+    ///   * NO not-orderable value (decimal / ext / NaN float) — `orderable()`
+    ///     rejects these, so they would be SKIPPED (missing rows). Ineligible.
+    ///   * NO bool / null value — the engine drops bool & null from ORDER BY
+    ///     entirely, so an index scan would surface rows the engine omits.
+    ///     Ineligible.
+    ///   * a SINGLE order-class across all values (homogeneous int, OR
+    ///     homogeneous float, OR homogeneous string). int+float mixing is the
+    ///     known-unsafe case (encoder type-separates; engine f64-unifies). We
+    ///     require one class outright: numeric-vs-string mixing is in fact
+    ///     engine-consistent (numeric TYPE_RANK < string), but requiring a
+    ///     single class is strictly conservative — a false negative only costs
+    ///     a heap fallback, never correctness — and it is what the `?ValueOrder
+    ///     Class` single discriminant can represent precisely.
+    ///
+    /// Once `eligible` is false it stays false until a `clearTrees` reset
+    /// (rebuild/refresh), which recomputes it from the live values.
+    fn applyEligibility(e: *Entry, value: PropertyValue) void {
+        const cls = ValueOrderClass.fromValue(value) orelse {
+            // decimal / ext: no defined encoder order -> skipped -> ineligible.
+            e.eligible = false;
+            return;
+        };
+        switch (value) {
+            // NaN float is `!orderable`: the engine has no stable NaN position,
+            // so any NaN in the column makes the index unable to match it.
+            .float => |f| if (std.math.isNan(f)) {
+                e.eligible = false;
+                return;
+            },
+            else => {},
+        }
+        // bool / null: engine ORDER BY drops them -> index would over-return.
+        if (cls == .boolean or cls == .null_v) e.eligible = false;
+        if (e.value_class) |established| {
+            if (established != cls) e.eligible = false;
+        } else {
+            e.value_class = cls;
+        }
+    }
+
+    /// Whether ORDER BY for `(label_id, key)` can be safely served from the
+    /// ordered index with engine parity. False when the pair is not registered.
+    pub fn isEligible(self: *Self, label_id: LabelId, key: []const u8) bool {
+        const e = self.find(label_id, key) orelse return false;
+        return e.eligible;
     }
 
     /// Remove the `value`/`node_id` entry from `(label_id, key)`. No-op when the
@@ -190,6 +290,10 @@ pub const OrderedPropertyIndex = struct {
         for (self.entries.items) |*e| {
             e.tree.deinit();
             e.tree = OrderedBTree.init(self.allocator);
+            // Recompute eligibility from scratch over the re-scanned values
+            // (rebuild/refresh re-`insert`s every live value afterwards).
+            e.eligible = true;
+            e.value_class = null;
         }
     }
 
@@ -223,6 +327,9 @@ pub const OrderedPropertyIndex = struct {
             try w.writeU32(e.label_id);
             try w.writeU32(@intCast(e.property_key.len));
             try w.writeBytes(e.property_key);
+            // Eligibility flag + value-order class tag (0 == no class yet).
+            const class_tag: u8 = if (e.value_class) |c| @intFromEnum(c) else 0;
+            try w.writeBytes(&[_]u8{ @intFromBool(e.eligible), class_tag });
             const blob = try e.tree.serialize(self.allocator);
             defer self.allocator.free(blob);
             try w.writeU64(@intCast(blob.len));
@@ -266,6 +373,17 @@ pub const OrderedPropertyIndex = struct {
             const label_id = try r.readU32();
             const key_len = try r.readU32();
             const key = try r.readBytes(key_len);
+            const flags = try r.readBytes(2);
+            const eligible = flags[0] != 0;
+            const value_class: ?ValueOrderClass = switch (flags[1]) {
+                0 => null,
+                @intFromEnum(ValueOrderClass.int) => .int,
+                @intFromEnum(ValueOrderClass.float) => .float,
+                @intFromEnum(ValueOrderClass.string) => .string,
+                @intFromEnum(ValueOrderClass.boolean) => .boolean,
+                @intFromEnum(ValueOrderClass.null_v) => .null_v,
+                else => return error.InvalidFormat,
+            };
             const blob_len = try r.readU64();
             const blob = try r.readBytes(std.math.cast(usize, blob_len) orelse return error.InvalidFormat);
 
@@ -277,6 +395,8 @@ pub const OrderedPropertyIndex = struct {
                 .label_id = label_id,
                 .property_key = key_copy,
                 .tree = tree,
+                .eligible = eligible,
+                .value_class = value_class,
             });
         }
 
