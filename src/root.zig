@@ -115,6 +115,7 @@ pub const migration = @import("migration.zig");
 pub const backup = @import("backup.zig");
 pub const maintenance = @import("maintenance.zig");
 pub const operation_result = @import("operation_result.zig");
+pub const ordered_encoding = @import("ordered_encoding.zig");
 pub const test_support = @import("testing_support.zig");
 
 // In-memory concurrency primitives (reusable utilities for consumers
