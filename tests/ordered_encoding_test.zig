@@ -303,6 +303,60 @@ test "fuzz: encode order == logical order across many deterministic seeds" {
     }
 }
 
+// Independent total-order check: sorting the encoded keys must produce the same
+// sequence as sorting the items by the reference fullCmp. This catches any
+// non-transitivity / total-order violation a purely pairwise check could miss.
+test "fuzz: sorting encoded keys matches sorting by reference order" {
+    const seeds = [_]u64{ 7, 99, 0xABCDEF, 0xBADC0FFEE0DDF00D, 271828, 161803 };
+    for (seeds) |seed| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+
+        const n: usize = 200;
+        const items = try arena.alloc(Item, n);
+        const encs = try arena.alloc([]u8, n);
+        for (items, 0..) |*it, i| {
+            it.* = try randomItem(rng, arena);
+            encs[i] = try oe.encodeOrdered(arena, it.v, it.id);
+        }
+
+        // Sort items by reference order.
+        const Ctx = struct {
+            fn lessItem(_: void, a: Item, b: Item) bool {
+                return fullCmp(a, b) == .lt;
+            }
+            fn lessEnc(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        };
+        std.mem.sort(Item, items, {}, Ctx.lessItem);
+        std.mem.sort([]u8, encs, {}, Ctx.lessEnc);
+
+        // Re-encode the reference-sorted items; must equal the byte-sorted keys.
+        for (items, 0..) |it, i| {
+            const re = try oe.encodeOrdered(arena, it.v, it.id);
+            try std.testing.expect(std.mem.eql(u8, re, encs[i]));
+        }
+    }
+}
+
+test "not-eligible: mixed int/float column is type-separated (NOT engine f64-unified)" {
+    const alloc = std.testing.allocator;
+    // int 100 vs float 3.0: numerically 100 > 3.0, but the encoder separates by
+    // TYPE_RANK (int 0x20 < float 0x30), so the encoded int sorts BEFORE the
+    // float. This documents why mixed-numeric columns are NOT index-eligible and
+    // the planner must use the heap fallback for them.
+    const ei = try oe.encodeOrdered(alloc, .{ .int = 100 }, 0);
+    defer alloc.free(ei);
+    const ef = try oe.encodeOrdered(alloc, .{ .float = 3.0 }, 0);
+    defer alloc.free(ef);
+    try std.testing.expect(std.mem.order(u8, ei, ef) == .lt); // type-separated, not numeric
+}
+
 test "round-trip: decode recovers value + node_id for eligible types" {
     const alloc = std.testing.allocator;
     const cases = [_]Item{
