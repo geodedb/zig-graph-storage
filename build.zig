@@ -298,6 +298,18 @@ fn addIntegrationTests(
     const run_leverb = b.addRunArtifact(leverb_tests);
     leverb_step.dependOn(&run_leverb.step);
 
+    // H3-P1 Task 3: crash-safe engine integration of the value-ordered index.
+    // Own step so the load-on-clean / rebuild-on-crash proofs (mirroring Lever B)
+    // run in isolation and can be looped.
+    const ordered_recovery_step = b.step("test-ordered-index-recovery", "Run ordered-index crash-safety (clean restart LOADS / crash restart REBUILDS) tests (H3-P1 Task 3)");
+    const ordered_recovery_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/ordered_index_recovery_test.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_ordered_recovery = b.addRunArtifact(ordered_recovery_tests);
+    ordered_recovery_step.dependOn(&run_ordered_recovery.step);
+
     // PHASE 3: engine edge-EXISTENCE index (durable O(1) MERGE-dedup probe).
     // Own step so the crash-recovery + idempotency + O(1)-not-O(degree) proofs
     // can be run in isolation under ReleaseSafe/Debug and looped.

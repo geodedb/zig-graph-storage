@@ -282,6 +282,12 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     errdefer self.property_index_set.deinit();
     self.property_catalog_dirty = false;
 
+    // H3-P1: per-(label,key) value-ordered index. Starts empty; create() leaves
+    // it empty (no snapshot file), open() loads-or-rebuilds it counter-gated.
+    self.ordered_property_index = @import("ordered_property_index.zig").OrderedPropertyIndex.init(allocator);
+    errdefer self.ordered_property_index.deinit();
+    self.ordered_index_dirty = false;
+
     // Checkpointer
     self.checkpointer = Checkpointer.init(
         allocator,
@@ -343,7 +349,8 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     // replay, so a crash after the snapshot still forces a rebuild.
     const derived_pending = save_derived and
         (engine.label_index_dirty or engine.property_index_dirty or
-            engine.edge_index_dirty or engine.edge_exist_index_dirty);
+            engine.edge_index_dirty or engine.edge_exist_index_dirty or
+            engine.ordered_index_dirty);
     if (!engine.persistence_dirty and !derived_pending) {
         return;
     }
@@ -394,6 +401,17 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     // GAP-0027: persist the index catalog + declared B+tree property indexes.
     // No-op when no index is declared (opt-in / backward compat).
     try engine_property_index.save(engine);
+
+    // H3-P1: persist the value-ordered index on the FULL path only, gated on its
+    // dirty flag (reuse the Lever-B derived gating). The light path passes
+    // save_derived=false so it stays O(dirty); a stale snapshot after a crash is
+    // rejected by the counter gate on open and rebuilt from a scan. The snapshot
+    // is stamped at the NOW-advanced manifest.counter so a CLEAN restart loads it.
+    if (save_derived and engine.ordered_index_dirty) {
+        try engine.ordered_property_index.saveToFile(engine.graph_dir.path, engine.manifest.counter);
+        engine.ordered_index_dirty = false;
+        engine.metrics.ordered_index_saves += 1;
+    }
 
     const end_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
     const elapsed = start_ts.durationTo(end_ts);

@@ -37,6 +37,7 @@ const engine_index = @import("engine_index.zig");
 const engine_persist = @import("engine_persist.zig");
 const engine_property_index = @import("engine_property_index.zig");
 const edge_exist_index_mod = @import("edge_exist_index.zig");
+const ordered_property_index_mod = @import("ordered_property_index.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -68,6 +69,7 @@ const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
 const EdgeEntry = edge_mod.EdgeEntry;
 const PropertyIndexSet = engine_property_index.PropertyIndexSet;
+const OrderedPropertyIndex = ordered_property_index_mod.OrderedPropertyIndex;
 
 /// In-memory index entry for O(1) edge lookup by EdgeId.
 pub const EdgeIndexEntry = struct {
@@ -136,6 +138,12 @@ pub const GraphEngine = struct {
     /// `createPropertyIndex`; a graph with no declared index writes no catalog
     /// file and behaves exactly as before.
     property_index_set: PropertyIndexSet,
+    /// H3-P1: per-(label,key) value-ordered secondary index. Empty unless an
+    /// ordered index is declared via `createOrderedIndex`; a graph with none
+    /// writes no snapshot file and behaves exactly as before. Crash-safety
+    /// mirrors the derived indexes (Lever B): counter-gated load on open, save
+    /// on full checkpoint, rebuild from scan when the snapshot is stale.
+    ordered_property_index: OrderedPropertyIndex,
     checkpointer: Checkpointer,
     manifest: Manifest,
     wal_dir_handle: std.Io.Dir,
@@ -167,6 +175,10 @@ pub const GraphEngine = struct {
     /// has changed since the last persist, so the next checkpoint/close writes
     /// the catalog + tree snapshots.
     property_catalog_dirty: bool = false,
+    /// H3-P1: set when a registered ordered-index tree changed since the last
+    /// persist, so the next FULL checkpoint re-saves the snapshot stamped at the
+    /// current manifest.counter (the light path skips it, staying O(dirty)).
+    ordered_index_dirty: bool = false,
 
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
@@ -183,6 +195,7 @@ pub const GraphEngine = struct {
         self.edge_index_dirty = true;
         self.edge_exist_index_dirty = true;
         self.property_catalog_dirty = false;
+        self.ordered_index_dirty = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -286,6 +299,7 @@ pub const GraphEngine = struct {
         self.edge_index_dirty = false;
         self.edge_exist_index_dirty = false;
         self.property_catalog_dirty = false;
+        self.ordered_index_dirty = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -391,6 +405,29 @@ pub const GraphEngine = struct {
         // (backward compat). Snapshots that fail verification are rebuilt.
         try engine_property_index.load(self);
 
+        // 7c. H3-P1: load the per-(label,key) ordered index COUNTER-GATED,
+        // mirroring tryLoadDerivedIndexes (Lever B). The snapshot records the
+        // registered (label,key) pairs AND the trees, stamped with the
+        // manifest.counter at save time:
+        //   * snapshot.counter == manifest.counter  -> LOAD (clean restart).
+        //   * snapshot.counter != manifest.counter  -> the registration is kept
+        //     but the trees are REBUILT from a live scan (crash restart: a WAL
+        //     replay bumped manifest.counter past the snapshot stamp, so the
+        //     persisted trees may be stale and must NOT be trusted).
+        //   * no snapshot file (or unreadable)      -> no ordered index (no-op).
+        // The CRC-only validity check is intentionally NOT the gate (that is the
+        // pre-existing staleness gap); the counter is.
+        var ordered_loaded = false;
+        const ordered_snapshot_counter = self.ordered_property_index.loadFromFile(self.graph_dir.path) catch null;
+        if (ordered_snapshot_counter) |snap_counter| {
+            if (snap_counter == self.manifest.counter) {
+                ordered_loaded = true;
+            } else {
+                try self.rebuildOrderedIndex();
+                self.ordered_index_dirty = true;
+            }
+        }
+
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
         self.wireMetricsCounters();
@@ -403,6 +440,15 @@ pub const GraphEngine = struct {
             self.metrics.derived_index_loads = 1;
         } else {
             self.metrics.derived_index_rebuilds = 1;
+        }
+        // H3-P1: same observability for the ordered index — record load vs
+        // rebuild for THIS open (only meaningful when an ordered index exists).
+        if (self.ordered_property_index.count() > 0) {
+            if (ordered_loaded) {
+                self.metrics.ordered_index_loads = 1;
+            } else {
+                self.metrics.ordered_index_rebuilds = 1;
+            }
         }
         self.buffer_pool.setMetrics(&self.metrics);
         // Initialize owned-or-borrowed thread pool (see initThreadPool).
@@ -631,6 +677,7 @@ pub const GraphEngine = struct {
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
+        self.ordered_property_index.deinit();
     }
 
     /// Close the engine (flush, checkpoint, close files).
@@ -675,6 +722,15 @@ pub const GraphEngine = struct {
                 engine_property_index.save(self) catch |err| {
                     if (close_err == null) close_err = err;
                 };
+            }
+            if (close_err == null and self.ordered_property_index.count() > 0) {
+                // H3-P1: persist the value-ordered index snapshot on close,
+                // stamped at the just-checkpointed manifest.counter so the next
+                // clean restart loads it instead of rebuilding.
+                self.ordered_property_index.saveToFile(self.graph_dir.path, self.manifest.counter) catch |err| {
+                    if (close_err == null) close_err = err;
+                };
+                self.ordered_index_dirty = false;
             }
         }
 
@@ -728,6 +784,7 @@ pub const GraphEngine = struct {
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
+        self.ordered_property_index.deinit();
         self.buffer_pool.deinit();
         self.file_manager.deinit();
         self.graph_dir.deinit();
@@ -865,6 +922,14 @@ pub const GraphEngine = struct {
     /// Delete a node within an existing transaction (no auto-commit).
     pub fn deleteNodeTxn(self: *GraphEngine, id: NodeId, txn: TxnId) anyerror!void {
         try self.ensureWritable();
+        // H3-P1: before the record is gone, remove the node's entries from any
+        // ordered index whose label it carries. Gated on a registered ordered
+        // index existing, so the common path adds no extra read.
+        if (self.ordered_property_index.count() > 0) {
+            if (try self.node_store.getNode(id)) |rec| {
+                try self.orderedIndexOnDeleteNode(id, rec);
+            }
+        }
         try self.node_store.deleteNode(id);
         try self.logPage(txn, .nodes, self.nodePageId(id));
 
@@ -1378,6 +1443,11 @@ pub const GraphEngine = struct {
         }
         try self.label_index.addNode(label, node_id);
         self.label_index_dirty = true;
+        // H3-P1: keep the value-ordered index current. Adding `label` makes this
+        // node visible to any ordered index on (label, key); index its current
+        // value for each such key. No-op unless an ordered index on `label`
+        // exists (the hasLabel gate keeps the common path zero-cost).
+        try self.orderedIndexOnAddLabel(node_id, label, rec.prop_head);
         self.markDirty();
     }
 
@@ -1406,6 +1476,11 @@ pub const GraphEngine = struct {
         try self.node_store.putNode(node_id, rec);
         self.label_index.removeNode(label, node_id);
         self.label_index_dirty = true;
+        // H3-P1: removing `label` drops this node from any ordered index on
+        // (label, key); remove its entry (read before the chain changes so the
+        // value still matches the one used at insert). rec.prop_head is the
+        // property chain, untouched by label removal.
+        try self.orderedIndexOnRemoveLabel(node_id, label, rec.prop_head);
 
         // Log dirty pages: var_store page (if any) and node page
         if (result.head != 0) try self.logPage(txn, .var_store, result.head);
@@ -1578,6 +1653,151 @@ pub const GraphEngine = struct {
     /// `engine_property_index.rangePropertyIndex` for hash-space ordering caveat.
     pub fn rangePropertyIndex(self: *GraphEngine, label: LabelId, property_key: []const u8, lo: u64, hi: u64, allocator: Allocator) anyerror![]NodeId {
         return engine_property_index.rangePropertyIndex(self, label, property_key, lo, hi, allocator);
+    }
+
+    // ── H3-P1: per-(label,key) value-ordered secondary index ───────────
+
+    /// Declare and build a value-ordered index on `(label, property_key)`.
+    /// Registers the (label,key) pair, builds the tree from a live scan of the
+    /// current graph, and marks the ordered index dirty so the next FULL
+    /// checkpoint/close persists it (stamped at manifest.counter for the Lever-B
+    /// load gate). Idempotent registration; a rebuild always reflects current
+    /// state. After this, incremental maintenance keeps the tree current via the
+    /// label-mutation hooks (a property indexed on a node carrying `label` is
+    /// inserted when the label is added and removed when the label is removed or
+    /// the node is deleted).
+    pub fn createOrderedIndex(self: *GraphEngine, label: LabelId, property_key: []const u8) anyerror!void {
+        var __obs_span = observability.startOperationSpan("create_ordered_index");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        try self.ensureWritable();
+        try self.ordered_property_index.registerIndex(label, property_key);
+        try self.rebuildOrderedIndex();
+        self.ordered_index_dirty = true;
+        self.markPersistenceDirty();
+        observability.endOperationSpan(__obs_span, true, "");
+    }
+
+    /// Report whether a value-ordered index is registered for `(label, key)`.
+    pub fn hasOrderedIndex(self: *GraphEngine, label: LabelId, property_key: []const u8) bool {
+        return self.ordered_property_index.isRegistered(label, property_key);
+    }
+
+    /// Open a direction-aware cursor over the ordered index for `(label, key)`.
+    /// Returns null when no such ordered index is registered. The cursor borrows
+    /// the live tree; do not mutate the ordered index while iterating.
+    pub fn openOrderedCursor(
+        self: *GraphEngine,
+        label: LabelId,
+        property_key: []const u8,
+        dir: OrderedPropertyIndex.Direction,
+    ) ?OrderedPropertyIndex.Cursor {
+        return self.ordered_property_index.openCursor(label, property_key, dir);
+    }
+
+    /// Rebuild EVERY registered ordered-index tree from a single live-node scan.
+    /// Used by `createOrderedIndex` and by `open` when the persisted snapshot is
+    /// stale-by-counter (crash restart). Clears the existing trees first but
+    /// keeps the registered (label,key) set.
+    fn rebuildOrderedIndex(self: *GraphEngine) !void {
+        if (self.ordered_property_index.count() == 0) return;
+        self.ordered_property_index.clearTrees();
+
+        const Ctx = struct {
+            engine: *GraphEngine,
+            err: ?anyerror = null,
+
+            fn callback(ctx: *@This(), node_id: NodeId, rec: NodeRec) void {
+                if (ctx.err != null) return;
+                if (rec.prop_head == 0 or rec.label_head == 0) return;
+                ctx.engine.orderedIndexInsertForNode(node_id, rec) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+
+        var ctx = Ctx{ .engine = self };
+        try self.node_store.scanNodes(self.manifest.next_node_id, &ctx, Ctx.callback);
+        if (ctx.err) |e| return e;
+    }
+
+    /// For a single node, insert its indexed property values into every matching
+    /// registered ordered tree (the node must carry the index's label and the
+    /// indexed property). Used by the rebuild scan.
+    fn orderedIndexInsertForNode(self: *GraphEngine, node_id: NodeId, rec: NodeRec) !void {
+        const oidx = &self.ordered_property_index;
+        if (rec.label_head == 0 or rec.prop_head == 0) return;
+        const labels = try self.label_store.getLabels(rec.label_head, self.allocator);
+        defer self.allocator.free(labels);
+        for (oidx.entries.items) |*entry| {
+            var has_label = false;
+            for (labels) |l| {
+                if (l == entry.label_id) {
+                    has_label = true;
+                    break;
+                }
+            }
+            if (!has_label) continue;
+            const val = (try self.prop_store.getProperty(rec.prop_head, entry.property_key, self.allocator)) orelse continue;
+            defer property_mod.freeDecoded(self.allocator, val);
+            try oidx.insert(entry.label_id, entry.property_key, val, node_id);
+        }
+    }
+
+    /// Incremental maintenance: when `label` is added to `node_id`, insert the
+    /// node's value for every property with a registered ordered index on
+    /// `label`. Gated on `hasLabel` so the no-ordered-index path is zero-cost.
+    /// `prop_head` is the node's property chain head.
+    fn orderedIndexOnAddLabel(self: *GraphEngine, node_id: NodeId, label: LabelId, prop_head: u64) !void {
+        const oidx = &self.ordered_property_index;
+        if (prop_head == 0 or !oidx.hasLabel(label)) return;
+        for (oidx.entries.items) |*entry| {
+            if (entry.label_id != label) continue;
+            const val = (try self.prop_store.getProperty(prop_head, entry.property_key, self.allocator)) orelse continue;
+            defer property_mod.freeDecoded(self.allocator, val);
+            try oidx.insert(label, entry.property_key, val, node_id);
+            self.ordered_index_dirty = true;
+        }
+    }
+
+    /// Incremental maintenance: when `label` is removed from `node_id`, remove
+    /// the node's entry from every ordered tree registered on `label`. Reads the
+    /// node's current property value (must match the value used at insert time).
+    fn orderedIndexOnRemoveLabel(self: *GraphEngine, node_id: NodeId, label: LabelId, prop_head: u64) !void {
+        const oidx = &self.ordered_property_index;
+        if (prop_head == 0 or !oidx.hasLabel(label)) return;
+        for (oidx.entries.items) |*entry| {
+            if (entry.label_id != label) continue;
+            const val = (try self.prop_store.getProperty(prop_head, entry.property_key, self.allocator)) orelse continue;
+            defer property_mod.freeDecoded(self.allocator, val);
+            try oidx.remove(label, entry.property_key, val, node_id);
+            self.ordered_index_dirty = true;
+        }
+    }
+
+    /// Incremental maintenance: when `node_id` is deleted, remove its entries
+    /// from every ordered tree whose label the node carries. Gated on there
+    /// being any registered ordered index.
+    fn orderedIndexOnDeleteNode(self: *GraphEngine, node_id: NodeId, rec: NodeRec) !void {
+        const oidx = &self.ordered_property_index;
+        if (oidx.count() == 0 or rec.label_head == 0 or rec.prop_head == 0) return;
+        const labels = try self.label_store.getLabels(rec.label_head, self.allocator);
+        defer self.allocator.free(labels);
+        for (oidx.entries.items) |*entry| {
+            var has_label = false;
+            for (labels) |l| {
+                if (l == entry.label_id) {
+                    has_label = true;
+                    break;
+                }
+            }
+            if (!has_label) continue;
+            const val = (try self.prop_store.getProperty(rec.prop_head, entry.property_key, self.allocator)) orelse continue;
+            defer property_mod.freeDecoded(self.allocator, val);
+            try oidx.remove(entry.label_id, entry.property_key, val, node_id);
+            self.ordered_index_dirty = true;
+        }
     }
 
     // ── Edge property helpers (delegated to engine_edge_props.zig) ─────

@@ -51,6 +51,18 @@ pub const Metrics = struct {
     derived_index_loads: u64 = 0,
     derived_index_rebuilds: u64 = 0,
 
+    // H3-P1: per-(label,key) ordered-index restore path taken on the LAST open(),
+    // wired in engine.open AFTER the metrics reset (same discipline as the
+    // derived counters). At most one is 1 per open of a graph that HAS a
+    // registered ordered index: ordered_index_loads=1 means the snapshot counter
+    // matched manifest.counter and the trees were loaded (clean restart);
+    // ordered_index_rebuilds=1 means the snapshot was stale/absent and the trees
+    // were rebuilt from a live scan (crash restart). ordered_index_saves counts
+    // full-checkpoint snapshot saves (light checkpoints skip it).
+    ordered_index_loads: u64 = 0,
+    ordered_index_rebuilds: u64 = 0,
+    ordered_index_saves: u64 = 0,
+
     // Recovery
     recovery_duration_ns: u64 = 0,
 
