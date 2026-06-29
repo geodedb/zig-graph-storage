@@ -310,6 +310,18 @@ fn addIntegrationTests(
     const run_ordered_recovery = b.addRunArtifact(ordered_recovery_tests);
     ordered_recovery_step.dependOn(&run_ordered_recovery.step);
 
+    // H3-P1: CHECKPOINT-REFRESH of the value-ordered index. Own step so the
+    // stale-before / correct-after-full / clean-reload / light-no-refresh proofs
+    // (mirroring engine_property_index.refreshLive) run in isolation.
+    const ordered_refresh_step = b.step("test-ordered-index-refresh", "Run ordered-index checkpoint-refresh tests (in-place value drift corrected at FULL checkpoint)");
+    const ordered_refresh_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/ordered_index_refresh_test.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_ordered_refresh = b.addRunArtifact(ordered_refresh_tests);
+    ordered_refresh_step.dependOn(&run_ordered_refresh.step);
+
     // PHASE 3: engine edge-EXISTENCE index (durable O(1) MERGE-dedup probe).
     // Own step so the crash-recovery + idempotency + O(1)-not-O(degree) proofs
     // can be run in isolation under ReleaseSafe/Debug and looped.

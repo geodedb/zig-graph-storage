@@ -62,6 +62,12 @@ pub const Metrics = struct {
     ordered_index_loads: u64 = 0,
     ordered_index_rebuilds: u64 = 0,
     ordered_index_saves: u64 = 0,
+    // H3-P1 checkpoint-refresh: counts FULL-checkpoint ordered-index rebuilds
+    // from a live scan that correct in-place property-value drift (the engine
+    // has no node-aware property-write hook). Mirrors engine_property_index's
+    // refreshLive cadence. A LIGHT checkpoint NEVER bumps this (it stays
+    // O(dirty)); tests assert it flat across light checkpoints.
+    ordered_index_refreshes: u64 = 0,
 
     // Recovery
     recovery_duration_ns: u64 = 0,
