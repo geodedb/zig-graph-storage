@@ -402,6 +402,25 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     // No-op when no index is declared (opt-in / backward compat).
     try engine_property_index.save(engine);
 
+    // H3-P1 CHECKPOINT-REFRESH: on the FULL path, REBUILD the ordered trees from
+    // a live-node scan BEFORE saving so in-place property-value drift is
+    // corrected. The engine has no node-aware property-write hook, so an in-place
+    // value change on a still-labelled node never updates the ordered tree (or
+    // its dirty flag); mirror engine_property_index.refreshLive and self-heal at
+    // the durability boundary. NOT gated on ordered_index_dirty — that flag is
+    // only set by label-mutation hooks and would miss pure in-place drift. Gated
+    // instead on a registered index existing, and only on the FULL path: the
+    // LIGHT path (save_derived=false) skips this entirely so it stays O(dirty)
+    // (the OOM-avoidance contract). The rebuild is serial (single scanNodes pass
+    // in rebuildOrderedIndex); acceptable since full checkpoints are infrequent.
+    // It marks the index dirty so the save block below persists the corrected
+    // snapshot, stamped at the now-advanced manifest.counter for a clean reload.
+    if (save_derived and engine.ordered_property_index.count() > 0) {
+        try engine.rebuildOrderedIndex();
+        engine.ordered_index_dirty = true;
+        engine.metrics.ordered_index_refreshes += 1;
+    }
+
     // H3-P1: persist the value-ordered index on the FULL path only, gated on its
     // dirty flag (reuse the Lever-B derived gating). The light path passes
     // save_derived=false so it stays O(dirty); a stale snapshot after a crash is

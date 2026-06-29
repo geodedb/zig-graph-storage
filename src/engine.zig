@@ -1700,7 +1700,7 @@ pub const GraphEngine = struct {
     /// Used by `createOrderedIndex` and by `open` when the persisted snapshot is
     /// stale-by-counter (crash restart). Clears the existing trees first but
     /// keeps the registered (label,key) set.
-    fn rebuildOrderedIndex(self: *GraphEngine) !void {
+    pub fn rebuildOrderedIndex(self: *GraphEngine) !void {
         if (self.ordered_property_index.count() == 0) return;
         self.ordered_property_index.clearTrees();
 
