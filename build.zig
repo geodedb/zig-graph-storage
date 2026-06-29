@@ -241,6 +241,17 @@ fn addIntegrationTests(
     const run_fuzz_regression = b.addRunArtifact(fuzz_regression_tests);
     fuzz_regression_step.dependOn(&run_fuzz_regression.step);
 
+    // H3-P0: order-preserving value encoder — exhaustive all-pairs + fuzz
+    // proving encode order == the engine's ORDER BY (entryLess) order.
+    const ordered_encoding_step = b.step("test-ordered-encoding", "Run order-preserving value encoder ordering + fuzz tests (H3-P0)");
+    const ordered_encoding_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/ordered_encoding_test.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_ordered_encoding = b.addRunArtifact(ordered_encoding_tests);
+    ordered_encoding_step.dependOn(&run_ordered_encoding.step);
+
     const cross_shard_step = b.step("test-cross-shard-recovery", "Run cross-shard 2PC crash recovery tests");
     const cross_shard_tests = b.addTest(.{
         .root_module = createModule(b, "tests/cross_shard_recovery.zig", target, optimize, &.{
