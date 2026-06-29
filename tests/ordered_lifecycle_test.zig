@@ -217,3 +217,46 @@ test "STAGE H: trailing LIGHT checkpoint then close() -> reopen keeps registrati
         try testing.expectEqual(@as(u64, 0), m.ordered_index_rebuilds);
     }
 }
+
+test "NO-DRIFT CLOSE: clean close skips rebuild but unconditional save stays durable" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x9D} ** 16;
+    var cfg = graph_storage.test_support.testConfig();
+    cfg.sync_mode = .deferred;
+
+    // Populate + persist a fresh ordered snapshot (STAGE E equivalent).
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.createOrderedIndex(LABEL, KEY);
+        var i: i64 = 0;
+        while (i < N) : (i += 1) _ = try addBenchNode(engine, i);
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // First reopen: clean snapshot LOAD; tree is fresh, NOT stale, no writes follow.
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        try testing.expect(engine.hasOrderedIndex(LABEL, KEY));
+        try testing.expect(engine.orderedIndexFresh());
+        try testing.expect(!engine.ordered_index_stale);
+        try testing.expectEqual(@as(usize, @intCast(N)), cursorCount(engine));
+        // SECOND close WITHOUT any intervening writes: H3-P4 skips the rebuild
+        // (stale == false) but the SAVE must still run unconditionally.
+        try engine.close();
+    }
+
+    // Second reopen: the no-rebuild close's snapshot still LOADS cleanly.
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+        try testing.expect(engine.hasOrderedIndex(LABEL, KEY)); // registration durable
+        try testing.expect(engine.orderedIndexFresh());
+        try testing.expect(!engine.ordered_index_stale);
+        try testing.expectEqual(@as(usize, @intCast(N)), cursorCount(engine)); // tree still N
+        const m = engine.getMetrics();
+        try testing.expectEqual(@as(u64, 1), m.ordered_index_loads); // snapshot loaded, not rebuilt
+        try testing.expectEqual(@as(u64, 0), m.ordered_index_rebuilds);
+    }
+}

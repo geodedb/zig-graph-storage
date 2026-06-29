@@ -753,9 +753,15 @@ pub const GraphEngine = struct {
         // persistence_dirty was false, the prior (light) checkpoint already
         // persisted the manifest at this counter. Neither path here re-bumps it.
         if (close_err == null and self.ordered_property_index.count() > 0) {
-            self.rebuildOrderedIndex() catch |err| {
-                if (close_err == null) close_err = err;
-            };
+            // H3-P4: rebuild only when the tree has drifted since the last refresh
+            // (ordered_index_stale ⇔ a write occurred). A clean/no-op close skips the
+            // full node scan — important at 14.27M nodes — but the SAVE always runs so
+            // registration + the fresh tree persist (durability fix #2).
+            if (self.ordered_index_stale) {
+                self.rebuildOrderedIndex() catch |err| {
+                    if (close_err == null) close_err = err;
+                };
+            }
             if (close_err == null) {
                 self.ordered_property_index.saveToFile(self.graph_dir.path, self.manifest.counter) catch |err| {
                     if (close_err == null) close_err = err;
