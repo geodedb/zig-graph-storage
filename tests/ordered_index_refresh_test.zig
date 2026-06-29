@@ -34,6 +34,7 @@ const graph_storage = @import("graph_storage");
 const GraphEngine = graph_storage.GraphEngine;
 const NodeRec = graph_storage.node.NodeRec;
 const NodeId = graph_storage.NodeId;
+const PropertyValue = graph_storage.PropertyValue;
 const TestDataDir = graph_storage.test_support.TestDataDir;
 const ordered_encoding = graph_storage.ordered_encoding;
 
@@ -210,5 +211,89 @@ test "light-no-refresh: LIGHT checkpoint skips the O(graph) refresh; FULL runs i
         const got = try collectAsc(engine);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(i64, &.{ 300, 400 }, got);
+    }
+}
+
+/// Create a labelled node carrying KEY = `value` (arbitrary type). Property set
+/// BEFORE addLabel so the incremental add-label hook indexes it.
+fn addLabelledNodeVal(engine: *GraphEngine, value: PropertyValue) !NodeId {
+    const nid = try engine.allocNode();
+    var rec = emptyNode();
+    rec.prop_head = try engine.putProperty(rec.prop_head, KEY, value);
+    try engine.putNode(nid, rec);
+    try engine.addLabel(nid, LABEL);
+    return nid;
+}
+
+/// Change KEY to an arbitrary-typed `value` IN PLACE (no label mutation, so the
+/// ordered-index hooks are not invoked — only a FULL checkpoint refresh sees it).
+fn setValInPlace(engine: *GraphEngine, nid: NodeId, value: PropertyValue) !void {
+    var rec = (try engine.getNode(nid)) orelse return error.NodeMissing;
+    rec.prop_head = try engine.putProperty(rec.prop_head, KEY, value);
+    try engine.putNode(nid, rec);
+}
+
+test "eligibility: homogeneous int column is index-eligible; introducing a float makes it ineligible" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xE1} ** 16;
+    var cfg = graph_storage.test_support.testConfig();
+    cfg.sync_mode = .deferred;
+
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    try engine.createOrderedIndex(LABEL, KEY);
+    try testing.expect(engine.isOrderedIndexEligible(LABEL, KEY)); // empty -> eligible
+
+    _ = try addLabelledNodeVal(engine, .{ .int = 100 });
+    _ = try addLabelledNodeVal(engine, .{ .int = 300 });
+    try testing.expect(engine.isOrderedIndexEligible(LABEL, KEY)); // homogeneous int
+
+    // Incremental add-label hook re-runs the eligibility rule: a float value in
+    // the same column flips it ineligible (encoder type-separates int/float).
+    _ = try addLabelledNodeVal(engine, .{ .float = 2.5 });
+    try testing.expect(!engine.isOrderedIndexEligible(LABEL, KEY));
+
+    // An unregistered (label,key) is never eligible.
+    try testing.expect(!engine.isOrderedIndexEligible(999, "nope"));
+}
+
+test "eligibility: a FULL checkpoint refresh recomputes the flag from live values" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xE2} ** 16;
+    var cfg = graph_storage.test_support.testConfig();
+    cfg.sync_mode = .deferred;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+
+        try engine.createOrderedIndex(LABEL, KEY);
+        _ = try addLabelledNodeVal(engine, .{ .int = 100 });
+        // A decimal is not-orderable: the incremental hook flags it ineligible.
+        const dec = try addLabelledNodeVal(engine, .{ .decimal = .{ .coeff = 5, .scale = 1 } });
+        try testing.expect(!engine.isOrderedIndexEligible(LABEL, KEY));
+
+        // Fix the bad value IN PLACE to an int. Bounded-staleness: the hook is
+        // not invoked, so the flag stays false until the FULL checkpoint.
+        try setValInPlace(engine, dec, .{ .int = 200 });
+        try testing.expect(!engine.isOrderedIndexEligible(LABEL, KEY));
+
+        // FULL checkpoint rebuilds the trees from a live scan and RECOMPUTES the
+        // flag over the now-homogeneous-int column -> eligible.
+        try engine.checkpoint();
+        try testing.expect(engine.isOrderedIndexEligible(LABEL, KEY));
+    }
+
+    // The recomputed flag persists and is restored on a clean reload.
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().ordered_index_loads);
+        try testing.expect(engine.isOrderedIndexEligible(LABEL, KEY));
     }
 }

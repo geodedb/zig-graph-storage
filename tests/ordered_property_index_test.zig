@@ -166,6 +166,173 @@ test "save -> load round-trips counter and the cursor walk" {
     }
 }
 
+// ── ORDER BY eligibility flag (safe index-served ORDER BY planning) ──────────
+//
+// `isEligible(label,key)` tells the planner whether ORDER BY can be served from
+// the ordered index with full engine parity (no missing / mis-ordered rows). The
+// rule (see applyEligibility): eligible iff EVERY value is orderable AND shares a
+// single order-class, with bool/null columns excluded (the engine drops them).
+
+/// Walk a (label,key) ASC cursor, decoding each composite key back to its string
+/// value. Returns the values in cursor order (caller owns the list + items).
+fn walkStrings(
+    idx: *OrderedPropertyIndex,
+    label_id: u32,
+    key: []const u8,
+    allocator: std.mem.Allocator,
+) !std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    var cursor = idx.openCursor(label_id, key, .asc) orelse return out;
+    while (cursor.next()) |entry| {
+        const decoded = try ordered_encoding.decode(allocator, entry.key);
+        // Hand ownership of the string to the list (don't deinit decoded here).
+        try out.append(allocator, @constCast(decoded.value.string));
+    }
+    return out;
+}
+
+test "eligibility: homogeneous string column is eligible and cursor returns all in order" {
+    var idx = OrderedPropertyIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    const label: u32 = 1;
+    const key = "name";
+    try idx.registerIndex(label, key);
+
+    try idx.insert(label, key, .{ .string = "delta" }, 1);
+    try idx.insert(label, key, .{ .string = "alpha" }, 2);
+    try idx.insert(label, key, .{ .string = "charlie" }, 3);
+    try idx.insert(label, key, .{ .string = "bravo" }, 4);
+
+    try testing.expect(idx.isEligible(label, key));
+    try testing.expectEqual(@as(?usize, 4), idx.treeLen(label, key));
+
+    var got = try walkStrings(&idx, label, key, testing.allocator);
+    defer {
+        for (got.items) |s| testing.allocator.free(s);
+        got.deinit(testing.allocator);
+    }
+    try testing.expectEqual(@as(usize, 4), got.items.len);
+    try testing.expectEqualStrings("alpha", got.items[0]);
+    try testing.expectEqualStrings("bravo", got.items[1]);
+    try testing.expectEqualStrings("charlie", got.items[2]);
+    try testing.expectEqualStrings("delta", got.items[3]);
+}
+
+test "eligibility: a decimal value mixed in makes the column ineligible" {
+    var idx = OrderedPropertyIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    const label: u32 = 2;
+    const key = "amount";
+    try idx.registerIndex(label, key);
+
+    try idx.insert(label, key, .{ .int = 1 }, 1);
+    try idx.insert(label, key, .{ .int = 2 }, 2);
+    try testing.expect(idx.isEligible(label, key)); // homogeneous int so far
+
+    // A decimal is not-orderable: it is SKIPPED (missing row) -> ineligible.
+    try idx.insert(label, key, .{ .decimal = .{ .coeff = 999, .scale = 2 } }, 3);
+    try testing.expect(!idx.isEligible(label, key));
+    try testing.expectEqual(@as(?usize, 2), idx.treeLen(label, key)); // decimal not stored
+}
+
+test "eligibility: mixed int+float column is ineligible (encoder type-separates; engine f64-unifies)" {
+    var idx = OrderedPropertyIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    const label: u32 = 3;
+    const key = "measure";
+    try idx.registerIndex(label, key);
+
+    try idx.insert(label, key, .{ .int = 10 }, 1);
+    try testing.expect(idx.isEligible(label, key));
+    try idx.insert(label, key, .{ .float = 2.5 }, 2);
+    try testing.expect(!idx.isEligible(label, key));
+
+    // Both are still stored (both orderable), but parity is lost -> ineligible.
+    try testing.expectEqual(@as(?usize, 2), idx.treeLen(label, key));
+}
+
+test "eligibility: bool and null columns are ineligible (engine drops them from ORDER BY)" {
+    var idx = OrderedPropertyIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    try idx.registerIndex(1, "flag");
+    try idx.insert(1, "flag", .{ .bool = true }, 1);
+    try idx.insert(1, "flag", .{ .bool = false }, 2);
+    try testing.expect(!idx.isEligible(1, "flag"));
+
+    try idx.registerIndex(2, "missing");
+    try idx.insert(2, "missing", .null, 10);
+    try idx.insert(2, "missing", .null, 11);
+    try testing.expect(!idx.isEligible(2, "missing"));
+
+    // An int column with a single null mixed in is also ineligible.
+    try idx.registerIndex(3, "score");
+    try idx.insert(3, "score", .{ .int = 5 }, 20);
+    try testing.expect(idx.isEligible(3, "score"));
+    try idx.insert(3, "score", .null, 21);
+    try testing.expect(!idx.isEligible(3, "score"));
+}
+
+test "eligibility: survives save -> load and is recomputed by a clearTrees rebuild" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    const counter: u64 = 88;
+    const L_ok: u32 = 1; // homogeneous int -> eligible
+    const L_bad: u32 = 2; // int+float -> ineligible
+
+    {
+        var idx = OrderedPropertyIndex.init(testing.allocator);
+        defer idx.deinit();
+        try idx.registerIndex(L_ok, "score");
+        try idx.registerIndex(L_bad, "measure");
+        try idx.insert(L_ok, "score", .{ .int = 1 }, 1);
+        try idx.insert(L_ok, "score", .{ .int = 2 }, 2);
+        try idx.insert(L_bad, "measure", .{ .int = 1 }, 3);
+        try idx.insert(L_bad, "measure", .{ .float = 1.5 }, 4);
+
+        try testing.expect(idx.isEligible(L_ok, "score"));
+        try testing.expect(!idx.isEligible(L_bad, "measure"));
+        try idx.saveToFile(dir_path, counter);
+    }
+
+    {
+        var idx = OrderedPropertyIndex.init(testing.allocator);
+        defer idx.deinit();
+        const loaded = try idx.loadFromFile(dir_path);
+        try testing.expectEqual(@as(?u64, counter), loaded);
+
+        // Restored from the snapshot, not recomputed.
+        try testing.expect(idx.isEligible(L_ok, "score"));
+        try testing.expect(!idx.isEligible(L_bad, "measure"));
+
+        // A rebuild (clearTrees) resets eligibility to true; re-inserting only
+        // homogeneous values recomputes it back to eligible for BOTH (proving
+        // the flag reflects the CURRENT data, not the stale snapshot).
+        idx.clearTrees();
+        try testing.expect(idx.isEligible(L_ok, "score")); // reset to true, no values yet
+        try idx.insert(L_ok, "score", .{ .int = 7 }, 1);
+        try idx.insert(L_bad, "measure", .{ .int = 9 }, 3); // now homogeneous int
+        try testing.expect(idx.isEligible(L_ok, "score"));
+        try testing.expect(idx.isEligible(L_bad, "measure")); // recomputed -> eligible
+
+        // And a rebuild that re-scans a not-orderable value flips it false again.
+        idx.clearTrees();
+        try idx.insert(L_ok, "score", .{ .int = 7 }, 1);
+        try idx.insert(L_ok, "score", .{ .float = std.math.nan(f64) }, 2);
+        try testing.expect(!idx.isEligible(L_ok, "score")); // NaN -> ineligible
+    }
+}
+
 test "loadFromFile returns null when no snapshot exists" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
