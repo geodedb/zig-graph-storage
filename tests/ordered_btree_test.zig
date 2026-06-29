@@ -260,6 +260,135 @@ test "serialize → deserialize → walk identical (round-trip)" {
     try testing.expectEqual(tree.len(), count);
 }
 
+// ---------------------------------------------------------------------------
+// MUST-FIX (memory safety): DESC `prev()` must re-validate the cursor before
+// dereferencing the (possibly shrunk) leaf arrays.
+//
+// A geode `orderedScan` consumer holds a DESC cursor across a per-shard
+// SHARED-lock RELEASE window between batches. A concurrent writer (holding the
+// shard EXCLUSIVE lock) may `remove` entries from the cursor's CURRENT leaf in
+// that window, leaving `cursor.idx >= leaf.keys.items.len`. The next `prev()`
+// then reads OUT OF BOUNDS. ASC `next()` is guarded by `normalizeForward`;
+// DESC `prev()` needs the mirror `normalizeBackward`. We reproduce the stale
+// serialized index deterministically (single-thread "remove then prev"): TSan
+// cannot catch this class — it is a stale index, not a data race.
+// ---------------------------------------------------------------------------
+
+test "DESC prev() survives a concurrent remove that pushes idx past the leaf end (no OOB)" {
+    const n = 600; // > ORDER (64) so the tree is a multi-leaf chain
+    var keys = try genDistinctKeys(testing.allocator, n, 0xABCDEF0123456789);
+    defer {
+        for (keys.items) |k| testing.allocator.free(k);
+        keys.deinit(testing.allocator);
+    }
+
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+    for (keys.items, 0..) |k, i| try tree.insert(k, @intCast(i));
+
+    const sorted = try sortedView(testing.allocator, keys.items);
+    defer testing.allocator.free(sorted);
+
+    // Park a DESC cursor at the rightmost (largest) entry.
+    var cur = tree.cursor();
+    cur.seekToLast();
+    const leaf = cur.leaf.?;
+    try testing.expect(leaf.keys.items.len > 0);
+    try testing.expectEqual(leaf.keys.items.len - 1, cur.idx);
+
+    // Simulate the concurrent writer: remove the entry the cursor is parked on
+    // (the leaf's LAST entry). The leaf shrinks by one but is NOT freed, so the
+    // cursor now satisfies `idx == leaf.keys.items.len` — out of range.
+    const victim = try testing.allocator.dupe(u8, leaf.keys.items[cur.idx]);
+    defer testing.allocator.free(victim);
+    try testing.expect(tree.remove(victim));
+    try testing.expect(cur.idx >= cur.leaf.?.keys.items.len); // idx is now OOB
+
+    // RED before the fix: this prev() dereferences keys.items[idx] OOB → panic
+    // (Debug/ReleaseSafe) or heap corruption (ReleaseFast). GREEN after the fix:
+    // `normalizeBackward` clamps idx into range, the removed entry is skipped,
+    // and the remaining reverse walk is exact (strictly descending over the
+    // n-1 survivors, every key still a live member).
+    var remaining: std.StringHashMapUnmanaged(void) = .empty;
+    defer remaining.deinit(testing.allocator);
+    for (sorted) |k| {
+        if (std.mem.eql(u8, k, victim)) continue;
+        try remaining.put(testing.allocator, k, {});
+    }
+
+    var last: ?[]const u8 = null;
+    var count: usize = 0;
+    while (cur.prev()) |e| {
+        try testing.expect(remaining.contains(e.key)); // valid live member
+        if (last) |l| try testing.expect(std.mem.order(u8, e.key, l) == .lt); // strictly descending
+        last = e.key;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, n - 1), count); // all survivors, no crash
+}
+
+test "DESC reverse walk skips a leaf emptied mid-walk by concurrent removes (no OOB, ordered)" {
+    const n = 800; // many leaves so emptying one mid-chain is meaningful
+    var keys = try genDistinctKeys(testing.allocator, n, 0x0F1E2D3C4B5A6978);
+    defer {
+        for (keys.items) |k| testing.allocator.free(k);
+        keys.deinit(testing.allocator);
+    }
+
+    var tree = Tree.init(testing.allocator);
+    defer tree.deinit();
+    for (keys.items, 0..) |k, i| try tree.insert(k, @intCast(i));
+
+    // Membership of everything we will EVER consider valid (full inserted set);
+    // we relax to non-strict descending + membership because torn reads (a
+    // shifted entry repeating, or a removed entry skipped) are acceptable —
+    // only OOB / panic / mis-ordering is not.
+    var members: std.StringHashMapUnmanaged(void) = .empty;
+    defer members.deinit(testing.allocator);
+    for (keys.items) |k| try members.put(testing.allocator, k, {});
+
+    var cur = tree.cursor();
+    cur.seekToLast();
+
+    var last: ?[]u8 = null; // owned copy: removes below may free borrowed keys
+    defer if (last) |l| testing.allocator.free(l);
+
+    var steps: usize = 0;
+    var emptied_once = false;
+    while (cur.prev()) |e| {
+        try testing.expect(members.contains(e.key));
+        if (last) |l| {
+            try testing.expect(std.mem.order(u8, e.key, l) != .gt); // non-strict descending
+            testing.allocator.free(l);
+        }
+        last = try testing.allocator.dupe(u8, e.key);
+
+        steps += 1;
+        // Once, mid-walk, EMPTY the cursor's current leaf entirely (the
+        // concurrent-writer worst case): every key removed, the leaf node kept
+        // but len==0 and idx out of range. normalizeBackward must skip it to
+        // prev_leaf and keep the walk bounded + ordered.
+        if (!emptied_once and steps == 50) {
+            const leaf = cur.leaf.?;
+            const m = leaf.keys.items.len;
+            if (m > 0) {
+                var victims: std.ArrayList([]u8) = .empty;
+                defer {
+                    for (victims.items) |v| testing.allocator.free(v);
+                    victims.deinit(testing.allocator);
+                }
+                for (leaf.keys.items) |k| try victims.append(testing.allocator, try testing.allocator.dupe(u8, k));
+                for (victims.items) |v| _ = tree.remove(v);
+                try testing.expectEqual(@as(usize, 0), cur.leaf.?.keys.items.len);
+                emptied_once = true;
+            }
+        }
+        if (steps > n + 10) break; // guard against any accidental non-termination
+    }
+    try testing.expect(emptied_once); // we actually exercised the empty-leaf path
+    try testing.expect(steps <= n); // bounded: never more than the inserted count
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
