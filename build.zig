@@ -265,6 +265,18 @@ fn addIntegrationTests(
     const run_ordered_btree = b.addRunArtifact(ordered_btree_tests);
     ordered_btree_step.dependOn(&run_ordered_btree.step);
 
+    // H3-P1 Task 2: per-(label,key) ordered property index (register/insert/
+    // remove/openCursor/save/load). Own step so the ASC/DESC ordering, skip-not-
+    // orderable, and save->load round-trip proofs run in isolation.
+    const ordered_property_index_step = b.step("test-ordered-property-index", "Run per-(label,key) ordered property index tests (H3-P1 Task 2)");
+    const ordered_property_index_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/ordered_property_index_test.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_ordered_property_index = b.addRunArtifact(ordered_property_index_tests);
+    ordered_property_index_step.dependOn(&run_ordered_property_index.step);
+
     const cross_shard_step = b.step("test-cross-shard-recovery", "Run cross-shard 2PC crash recovery tests");
     const cross_shard_tests = b.addTest(.{
         .root_module = createModule(b, "tests/cross_shard_recovery.zig", target, optimize, &.{
