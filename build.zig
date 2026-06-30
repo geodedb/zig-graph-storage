@@ -321,6 +321,18 @@ fn addIntegrationTests(
     const run_leverb = b.addRunArtifact(leverb_tests);
     leverb_step.dependOn(&run_leverb.step);
 
+    // Phase A (engine early-ready): open returns query-READY without building the
+    // O(nodes+edges) derived indexes; first-access lazy materialization (load or
+    // rebuild) exactly once, concurrency-safe, crash-safe. Own step.
+    const early_ready_step = b.step("test-engine-early-ready", "Run Phase A engine early-ready + lazy derived-index materialization tests");
+    const early_ready_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/engine_early_ready.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_early_ready = b.addRunArtifact(early_ready_tests);
+    early_ready_step.dependOn(&run_early_ready.step);
+
     // H3-P1 Task 3: crash-safe engine integration of the value-ordered index.
     // Own step so the load-on-clean / rebuild-on-crash proofs (mirroring Lever B)
     // run in isolation and can be looped.

@@ -19,6 +19,11 @@ const PropStore = prop_store_mod.PropStore;
 const GraphEngine = engine_mod.GraphEngine;
 
 fn edgeIndexEntry(engine: *GraphEngine, from: NodeId, edge_id: EdgeId) !engine_mod.EdgeIndexEntry {
+    // Phase A: edge_index is deferred. Every edge-property accessor (get/set/
+    // remove/getAll) flows through this single lookup chokepoint, so guarding
+    // here covers all of them. setEdgeProperty additionally touches the
+    // property_index chain, but materialize hydrates the whole derived set.
+    try engine.ensureDerivedHydrated();
     const entry = engine.edge_index.get(edge_id) orelse return error.EdgeNotFound;
     if (entry.from != from) return error.EdgeNotFound;
     return entry;

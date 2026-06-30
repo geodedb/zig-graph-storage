@@ -185,6 +185,25 @@ pub const GraphEngine = struct {
     /// planner must NOT serve the ORDER BY fast path (see `orderedIndexFresh`).
     ordered_index_stale: bool = false,
 
+    /// Phase A (engine early-ready): lazy derived-index materialization latch.
+    /// `open` returns query-READY WITHOUT building the O(nodes+edges) derived
+    /// indexes (label_index / property_index chain / edge_index /
+    /// edge_exist_index). The FIRST accessor of any of those indexes — read OR
+    /// write — calls `ensureDerivedHydrated`, which runs the SAME counter-gated
+    /// load-or-rebuild exactly once (atomic fast-path + mutex slow-path); all
+    /// other concurrent first-accesses block until it completes. Point lookups
+    /// (getNode, and the node/adjacency stores) need NO derived index and serve
+    /// immediately after open. A fresh `create` starts already hydrated (empty
+    /// derived indexes are the correct state for an empty graph). CRASH-SAFETY
+    /// is UNCHANGED: the counter gate (snapshot.counter == manifest.counter ?
+    /// load : rebuild) just runs at first-access instead of at open; WAL replay
+    /// stays in `open` (recovery).
+    derived_hydrated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    derived_hydrate_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    /// Test/observability: number of times the materialize BODY actually ran.
+    /// MUST be exactly 1 across any number of concurrent first-accesses.
+    derived_materialize_runs: u32 = 0,
+
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
         const self = try allocator.create(GraphEngine);
@@ -202,6 +221,12 @@ pub const GraphEngine = struct {
         self.property_catalog_dirty = false;
         self.ordered_index_dirty = false;
         self.ordered_index_stale = false;
+        // A fresh graph's derived indexes start empty == correct: mark hydrated
+        // so no lazy materialization is ever attempted (there is no snapshot to
+        // load and nothing to rebuild from).
+        self.derived_hydrated = std.atomic.Value(bool).init(true);
+        self.derived_hydrate_mutex = std.Io.Mutex.init;
+        self.derived_materialize_runs = 0;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -337,6 +362,11 @@ pub const GraphEngine = struct {
         self.property_catalog_dirty = false;
         self.ordered_index_dirty = false;
         self.ordered_index_stale = false;
+        // Phase A: open returns READY without building the derived indexes; the
+        // first accessor materializes them via `ensureDerivedHydrated`.
+        self.derived_hydrated = std.atomic.Value(bool).init(false);
+        self.derived_hydrate_mutex = std.Io.Mutex.init;
+        self.derived_materialize_runs = 0;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -438,18 +468,15 @@ pub const GraphEngine = struct {
             else => return err,
         };
 
-        // 7. Load persisted derived indexes when they match the active
-        // checkpoint. Otherwise rebuild from the primary stores.
-        const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
-        if (!loaded_indexes) {
-            try self.rebuildDerivedIndexes();
-            // Rebuilt indexes differ from disk snapshots; mark dirty so the
-            // next checkpoint writes them.
-            self.label_index_dirty = true;
-            self.property_index_dirty = true;
-            self.edge_index_dirty = true;
-            self.edge_exist_index_dirty = true;
-        }
+        // 7. Phase A (engine early-ready): the O(nodes+edges) derived-index
+        // build (label/property-chain/edge/edge-existence) is DEFERRED out of
+        // the open path. It is the dominant open cost at scale, and point
+        // lookups (getNode and the node/adjacency stores) need none of it, so
+        // open returns query-READY here. The FIRST accessor of any derived
+        // index calls `ensureDerivedHydrated`, which runs the SAME counter-gated
+        // `tryLoadDerivedIndexes` (clean restart) or `rebuildDerivedIndexes`
+        // (crash/stale) exactly once. Crash-safety is unchanged: the counter
+        // gate just decides at first-access instead of at open.
 
         // 7b. GAP-0027: load the opt-in index catalog and rehydrate declared
         // B+tree property indexes. A missing catalog means "no indexes"
@@ -482,16 +509,10 @@ pub const GraphEngine = struct {
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
         self.wireMetricsCounters();
-        // Lever B observability: record which derived-index restore path step 7
-        // took. Set AFTER the metrics reset above so it survives (the reset wipes
-        // anything set during the load/rebuild decision). index_rebuild_progress
-        // cannot be used here because wireMetricsCounters unconditionally sets it
-        // to 10000 on every open.
-        if (loaded_indexes) {
-            self.metrics.derived_index_loads = 1;
-        } else {
-            self.metrics.derived_index_rebuilds = 1;
-        }
+        // Phase A: the derived-index load-vs-rebuild observability
+        // (derived_index_loads / derived_index_rebuilds) is now set inside
+        // `materializeDerivedIndexes` at first-access, not here — the build is
+        // deferred out of open.
         // H3-P1: same observability for the ordered index — record load vs
         // rebuild for THIS open (only meaningful when an ordered index exists).
         if (self.ordered_property_index.count() > 0) {
@@ -622,7 +643,61 @@ pub const GraphEngine = struct {
     }
 
     fn rebuildDerivedIndexes(self: *GraphEngine) !void {
-        return engine_index.rebuildDerivedIndexes(self);
+        try engine_index.rebuildDerivedIndexes(self);
+        // A direct rebuild fully populates the derived indexes from the primary
+        // stores, so the engine is hydrated afterward — prevent a later
+        // first-access from clobbering this state with another materialize.
+        self.derived_hydrated.store(true, .release);
+    }
+
+    /// Phase A: ensure the deferred derived indexes (label_index /
+    /// property_index chain / edge_index / edge_exist_index) are materialized
+    /// before the caller touches any of them. Exactly-once under concurrent
+    /// first-access: an atomic fast-path returns immediately once hydrated; the
+    /// first caller takes the mutex and runs `materializeDerivedIndexes` while
+    /// any concurrent callers block on the mutex and then observe the flag set.
+    ///
+    /// MUST be called at the top of EVERY read and write accessor that touches a
+    /// deferred index, BEFORE the index is read or mutated — materializing as
+    /// the first touch keeps the counter gate valid (no write has mutated the
+    /// resident index yet, so a clean snapshot still matches manifest.counter).
+    ///
+    /// Re-entrancy: `materializeDerivedIndexes` calls only the load/rebuild
+    /// helpers (which touch the index structures directly, never a guarded
+    /// accessor of the same index), so this never recurses or deadlocks.
+    pub fn ensureDerivedHydrated(self: *GraphEngine) !void {
+        if (self.derived_hydrated.load(.acquire)) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.derived_hydrate_mutex.lockUncancelable(io);
+        defer self.derived_hydrate_mutex.unlock(io);
+        // Double-check under the lock: a racing caller may have hydrated while
+        // we waited for the mutex.
+        if (self.derived_hydrated.load(.acquire)) return;
+        try self.materializeDerivedIndexes();
+        // Publish only on success; on error the flag stays false so a later
+        // accessor retries (and a crash mid-build leaves the counter-gated
+        // on-disk snapshot to re-decide on the next open).
+        self.derived_hydrated.store(true, .release);
+    }
+
+    /// The body moved out of `open` step 7: run the counter-gated load-or-
+    /// rebuild for the derived index set exactly once. Caller holds
+    /// `derived_hydrate_mutex`.
+    fn materializeDerivedIndexes(self: *GraphEngine) !void {
+        self.derived_materialize_runs += 1;
+        const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
+        if (!loaded_indexes) {
+            try engine_index.rebuildDerivedIndexes(self);
+            // Rebuilt indexes differ from the disk snapshots; mark dirty so the
+            // next checkpoint writes them.
+            self.label_index_dirty = true;
+            self.property_index_dirty = true;
+            self.edge_index_dirty = true;
+            self.edge_exist_index_dirty = true;
+            self.metrics.derived_index_rebuilds = 1;
+        } else {
+            self.metrics.derived_index_loads = 1;
+        }
     }
 
     fn rebuildEdgeIndex(self: *GraphEngine) !void {
@@ -758,7 +833,16 @@ pub const GraphEngine = struct {
                     if (close_err == null) close_err = err;
                 };
             }
-            if (close_err == null) {
+            // Phase A: only persist the derived-index snapshots when they were
+            // materialized this session. If never hydrated, the resident indexes
+            // are EMPTY and saving them would stamp empty snapshots at the
+            // (checkpoint-advanced) manifest.counter — corrupting the next open's
+            // clean-load. Skipping leaves the existing on-disk snapshots; the
+            // counter gate on the next open detects the advance and rebuilds from
+            // pages (correct, just not a fast clean-load). Any write this session
+            // would have hydrated first, so a dirtied derived index is always
+            // hydrated here.
+            if (close_err == null and self.derived_hydrated.load(.acquire)) {
                 self.saveDerivedIndexes() catch |err| {
                     if (close_err == null) close_err = err;
                 };
@@ -1045,6 +1129,7 @@ pub const GraphEngine = struct {
         defer __obs_span.end(null);
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
+        try self.ensureDerivedHydrated(); // Phase A: edge_index is deferred.
         const entry = self.edge_index.get(edge_id) orelse {
             observability.endOperationSpan(__obs_span, true, "");
             return null;
@@ -1066,6 +1151,7 @@ pub const GraphEngine = struct {
     /// Cost is independent of the source node's out-degree — that is the
     /// throughput unlock that replaces the O(out-degree) adjacency dedup scan.
     pub fn probeEdge(self: *GraphEngine, from: NodeId, rel_type: u32, to: NodeId, out: []EdgeId) anyerror![]const EdgeId {
+        try self.ensureDerivedHydrated(); // Phase A: edge_exist_index is deferred.
         return self.edge_exist_index.probe(from, rel_type, to, out);
     }
 
@@ -1080,11 +1166,18 @@ pub const GraphEngine = struct {
     /// existence index agrees record-for-record with the edge_index (both are
     /// derived from the same adjacency scan, so they must match exactly).
     pub fn edgeExistRecordCount(self: *const GraphEngine) usize {
+        // Phase A: edge_exist_index is deferred. This introspection helper has a
+        // non-error const signature, so materialize via a mutable view and
+        // ignore a (rare) materialize error — a failed build leaves the count 0,
+        // and the error surfaces on the real query paths that return errors.
+        @constCast(self).ensureDerivedHydrated() catch {};
         return self.edge_exist_index.recordCount();
     }
 
     /// Number of edges in the edge_index (the O(1) getEdge lookup map).
     pub fn edgeIndexCount(self: *const GraphEngine) usize {
+        // Phase A: edge_index is deferred (see edgeExistRecordCount note).
+        @constCast(self).ensureDerivedHydrated() catch {};
         return self.edge_index.count();
     }
 
@@ -1151,6 +1244,9 @@ pub const GraphEngine = struct {
     /// Add an edge within an existing transaction (no auto-commit).
     pub fn addEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
         try self.ensureWritable();
+        // Phase A: this mutates edge_index + edge_exist_index — materialize them
+        // first so the write lands on the fully-populated resident index.
+        try self.ensureDerivedHydrated();
         const edge_id = self.manifest.next_edge_id;
         const stride: u64 = if (self.config.base_shard_index != null)
             @intCast(@import("sharded_store.zig").SHARD_COUNT)
@@ -1247,6 +1343,8 @@ pub const GraphEngine = struct {
     /// field is left write-dead for new edges).
     pub fn addEdgeColocatedTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
         try self.ensureWritable();
+        // Phase A: mutates edge_index + edge_exist_index — materialize first.
+        try self.ensureDerivedHydrated();
         const edge_id = self.manifest.next_edge_id;
         const stride: u64 = if (self.config.base_shard_index != null)
             @intCast(@import("sharded_store.zig").SHARD_COUNT)
@@ -1342,6 +1440,9 @@ pub const GraphEngine = struct {
     /// Idempotent: removing an absent edge_id is a no-op on every store.
     pub fn removeEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, txn: TxnId) anyerror!void {
         try self.ensureWritable();
+        // Phase A: reads/mutates edge_index + edge_exist_index — materialize
+        // first so the dedup/count logic sees the true edge set.
+        try self.ensureDerivedHydrated();
         // Remove from source node's out adjacency list (from IS resident here).
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         try self.adj_out.removeEdge(from_rec.out_head, edge_id);
@@ -1407,6 +1508,7 @@ pub const GraphEngine = struct {
             observability.endOperationSpan(__obs_span, true, "");
             return null;
         }
+        try self.ensureDerivedHydrated(); // Phase A: property_index chain is deferred.
         if (self.property_index.containsChain(prop_head) and !self.property_index.hasKey(prop_head, key)) {
             observability.endOperationSpan(__obs_span, true, "");
             return null;
@@ -1429,6 +1531,8 @@ pub const GraphEngine = struct {
     /// Put a property within an existing transaction (no auto-commit).
     pub fn putPropertyTxn(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId) anyerror!u64 {
         try self.ensureWritable();
+        // Phase A: reads/mutates the property_index chain — materialize first.
+        try self.ensureDerivedHydrated();
         const new_head = try self.prop_store.putProperty(owner, key, val);
 
         // Log the property page that was written to
@@ -1494,6 +1598,8 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         try self.ensureWritable();
+        // Phase A: reads/mutates the property_index chain — materialize first.
+        try self.ensureDerivedHydrated();
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
@@ -1520,6 +1626,8 @@ pub const GraphEngine = struct {
     /// Add a label within an existing transaction (no auto-commit).
     pub fn addLabelTxn(self: *GraphEngine, node_id: NodeId, label: LabelId, txn: TxnId) anyerror!void {
         try self.ensureWritable();
+        // Phase A: mutates label_index — materialize first.
+        try self.ensureDerivedHydrated();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
         if (result.count != rec.label_count or result.head != rec.label_head) {
@@ -1561,6 +1669,8 @@ pub const GraphEngine = struct {
     /// Remove a label within an existing transaction (no auto-commit).
     pub fn removeLabelTxn(self: *GraphEngine, node_id: NodeId, label: LabelId, txn: TxnId) anyerror!void {
         try self.ensureWritable();
+        // Phase A: mutates label_index — materialize first.
+        try self.ensureDerivedHydrated();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
         const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
         rec.label_head = result.head;
@@ -1606,6 +1716,7 @@ pub const GraphEngine = struct {
         defer __obs_span.end(null);
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
+        try self.ensureDerivedHydrated(); // Phase A: label_index is deferred.
         // Delegate to label index for O(1) lookup instead of O(N) scan
         const result = try self.label_index.scan(label, alloc);
         observability.endOperationSpan(__obs_span, true, "");
@@ -1618,6 +1729,7 @@ pub const GraphEngine = struct {
     /// type-erased iterator state; the posting-list slice itself is allocated
     /// on the engine allocator (PERF-0054).
     pub fn scanLabelIter(self: *GraphEngine, label: LabelId) !LabelIndex.Iterator {
+        try self.ensureDerivedHydrated(); // Phase A: label_index is deferred.
         return self.label_index.iterator(label, self.allocator);
     }
 

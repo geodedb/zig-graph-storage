@@ -187,6 +187,12 @@ fn replayAdjacencyIfNeeded(
     // reapply for target (addEdge on adj_in is idempotent by slot).
     switch (payload.role) {
         .source => {
+            // Phase A: edge_index is deferred. This dangling-2PC reconciliation
+            // (rare crash-recovery path) uses `edge_index.contains` as its
+            // idempotence guard against duplicating durable adjacency, so the
+            // index MUST be materialized before the check. A clean restart has no
+            // dangling prepares, so this never forces hydration on the hot path.
+            try eng.ensureDerivedHydrated();
             if (eng.edge_index.contains(payload.edge_id)) return;
             var from_rec = try eng.getNode(payload.from) orelse return error.NodeNotFound;
             const out_entry = edge_mod.EdgeEntry{
