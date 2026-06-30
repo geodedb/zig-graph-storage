@@ -185,8 +185,26 @@ pub const BufferPool = struct {
 
     /// Initialize a buffer pool with the given capacity (number of frames).
     pub fn init(allocator: Allocator, page_size: u32, capacity: u32) !BufferPool {
-        const page_buf = try allocator.alignedAlloc(u8, .fromByteUnits(4096), @as(usize, capacity) * @as(usize, page_size));
-        @memset(page_buf, 0);
+        // PERF: back the page-frame data with an ANONYMOUS PRIVATE mmap instead
+        // of an allocator alloc followed by an eager `@memset(.., 0)`. The kernel
+        // zero-fills mapped pages LAZILY on first fault, so open no longer pays a
+        // capacity-proportional zeroing pass (~0.5-1s for a multi-hundred-MB
+        // pool; GBs across 16 shards). A freshly-faulted anonymous page reads as
+        // zero — the SAME guarantee the `@memset` provided — so any frame whose
+        // first use reads before a write still observes zeros (and `pinNew`
+        // memsets the frame on reuse regardless). The mapping is page (>=4096)
+        // aligned, preserving the previous 4096-byte alignment contract. Pages
+        // still fault in on first `pin`/`pinNew` exactly as before — only the
+        // eager up-front zero is removed.
+        const map_len = @as(usize, capacity) * @as(usize, page_size);
+        const page_buf: []align(4096) u8 = @alignCast(try std.posix.mmap(
+            null,
+            map_len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        ));
 
         const frames = try allocator.alloc(PageFrame, capacity);
         for (frames, 0..) |*frame, i| {
@@ -237,7 +255,8 @@ pub const BufferPool = struct {
         self.page_table.deinit();
         self.free_list.deinit(self.allocator);
         self.allocator.free(self.frames);
-        self.allocator.free(self.page_buf);
+        // page_buf is an anonymous mmap (see init), not an allocator allocation.
+        std.posix.munmap(@alignCast(self.page_buf));
         if (self.flush_scratch.len != 0) self.allocator.free(self.flush_scratch);
     }
 
@@ -1582,6 +1601,38 @@ test "pinNew: data is zeroed" {
         try testing.expectEqual(@as(u8, 0), byte);
     }
 
+    try testing.expectEqual(@as(u32, 1), frame.pin_count);
+    try testing.expect(frame.valid);
+}
+
+test "PERF: large-capacity pool uses lazy anon-mmap backing — no eager zero, fresh frames read as zero" {
+    // A large pool: 65536 * 4096 = 256 MiB of frame backing. The old code did an
+    // eager `@memset(page_buf, 0)` here, touching all 256 MiB (a
+    // capacity-proportional ~0.5-1s cost at scale, GBs across 16 shards). The
+    // anonymous-mmap backing zero-fills LAZILY on first fault, so init no longer
+    // pays that cost. We can't assert wall-time without flakiness, but we CAN
+    // assert the correctness invariant the memset used to provide: a freshly
+    // mapped frame reads as zero — and that this holds across the whole mapping.
+    const capacity: u32 = 65536;
+    var pool = try BufferPool.init(testing.allocator, 4096, capacity);
+    defer pool.deinit();
+
+    try testing.expectEqual(capacity, pool.capacity);
+    try testing.expectEqual(@as(usize, capacity) * 4096, pool.page_buf.len);
+
+    // Sample frame backing across the whole mapping (first, middle, last) and
+    // confirm the kernel zero-filled it — these reads go straight to the
+    // mmap-backed bytes (no pinNew, which would itself memset the frame).
+    const samples = [_]u32{ 0, capacity / 2, capacity - 1 };
+    for (samples) |i| {
+        const slice = pool.frames[i].dataSlice();
+        try testing.expectEqual(@as(usize, 4096), slice.len);
+        for (slice) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    }
+
+    // And pinNew still returns a zeroed, valid, pinned fresh frame.
+    const frame = try pool.pinNew(.nodes, 0);
+    for (frame.dataSlice()) |byte| try testing.expectEqual(@as(u8, 0), byte);
     try testing.expectEqual(@as(u32, 1), frame.pin_count);
     try testing.expect(frame.valid);
 }

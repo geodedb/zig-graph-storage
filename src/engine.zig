@@ -290,6 +290,36 @@ pub const GraphEngine = struct {
         return self;
     }
 
+    /// PERF: compute the buffer-pool capacity to allocate up front when OPENING
+    /// an existing graph, so the pool is sized ONCE rather than allocated small
+    /// and then re-created larger after recovery. Peeks the persisted manifest's
+    /// page counts and applies the SAME auto-size policy
+    /// (`effectiveBufferPoolPages`) recovery uses. On any manifest-read error it
+    /// returns the configured default and the post-recovery guard re-sizes if the
+    /// authoritative manifest disagrees (safety net).
+    fn openInitialPoolPages(allocator: Allocator, graph_dir: *const GraphDir, cfg: *const GraphConfig) u32 {
+        const total = peekManifestTotalPages(allocator, graph_dir, cfg.encryption_key) orelse
+            return cfg.buffer_pool_pages;
+        return cfg.effectiveBufferPoolPages(total);
+    }
+
+    /// Read the persisted manifest (A/B, the same slot selection recovery uses)
+    /// and return the sum of its store page counts — or null on any read or
+    /// selection error so the caller falls back to the configured default. This
+    /// is a cheap header read; recovery re-reads the manifest authoritatively.
+    fn peekManifestTotalPages(allocator: Allocator, graph_dir: *const GraphDir, key: ?[32]u8) ?u64 {
+        const path_a = graph_dir.manifestPath(allocator, .a) catch return null;
+        defer allocator.free(path_a);
+        const path_b = graph_dir.manifestPath(allocator, .b) catch return null;
+        defer allocator.free(path_b);
+        const ma = Manifest.readFromFileWithKey(allocator, path_a, key) catch null;
+        const mb = Manifest.readFromFileWithKey(allocator, path_b, key) catch null;
+        const m = Manifest.selectManifest(ma, mb) catch return null;
+        return m.nodes_pages + m.adj_out_pages + m.adj_in_pages +
+            m.in_idx_pages + m.in_dir_pages + m.props_pages +
+            m.var_pages + m.free_pages;
+    }
+
     /// Open an existing graph (with recovery).
     pub fn open(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
         const self = try allocator.create(GraphEngine);
@@ -318,8 +348,16 @@ pub const GraphEngine = struct {
         self.file_manager = FileManager.init(allocator, self.graph_dir.path, cfg.page_size);
         self.file_manager.encryption_key = cfg.encryption_key;
 
-        // 3. Create buffer pool
-        self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, cfg.buffer_pool_pages);
+        // 3. Create buffer pool.
+        // PERF: size the pool ONCE up front from the persisted manifest's page
+        // counts (applying the SAME auto-size policy recovery applies below) so
+        // we don't allocate a small pool and then re-create a larger one after
+        // recovery (a second allocation). On any manifest-peek error this falls
+        // back to the configured default; the post-recovery guard below remains
+        // as a safety net should the peek and the authoritative manifest ever
+        // disagree.
+        const initial_pool_pages = openInitialPoolPages(allocator, &self.graph_dir, &cfg);
+        self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, initial_pool_pages);
         errdefer self.buffer_pool.deinit();
 
         // 4. Run recovery (loads manifest, replays WAL)
@@ -360,7 +398,13 @@ pub const GraphEngine = struct {
             self.manifest.free_pages;
         const effective = cfg.effectiveBufferPoolPages(total_pages);
         if (effective > self.buffer_pool.capacity) {
-            // Re-create buffer pool with larger capacity, re-register pagers
+            // SAFETY NET: the pool was already sized to this `effective` value up
+            // front (see `openInitialPoolPages` at step 3), so in the normal path
+            // this branch does not run. It only fires if the up-front manifest
+            // peek failed (fell back to the default) or disagreed with the
+            // authoritative manifest — re-create with the correct capacity,
+            // re-register pagers. With the anon-mmap backing this re-create no
+            // longer pays an eager zero-fill either.
             self.buffer_pool.deinit();
             self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, effective);
             self.registerDataPagers();
