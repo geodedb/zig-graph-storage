@@ -1518,6 +1518,25 @@ pub const GraphEngine = struct {
         return result;
     }
 
+    /// H1-engine (cold-open): a sibling of `getProperty` that skips
+    /// `ensureDerivedHydrated` and the `property_index` negative-lookup
+    /// entirely. Intended for callers (e.g. loop1's per-node chain read at
+    /// cold-open) that only ever look up keys known to be present on the
+    /// chain — for those callers the derived property-chain index gives no
+    /// benefit, and `ensureDerivedHydrated` is a full O(graph) index build
+    /// that should not be paid just to serve a property read. Walking the
+    /// chain via `prop_store.getProperty` directly is correct and sufficient;
+    /// it returns byte-identical results to `getProperty` for any key that
+    /// IS present on the chain. For a key that is ABSENT, `getProperty`'s
+    /// negative-lookup may short-circuit via the (now possibly stale or
+    /// unhydrated) derived index — callers needing that optimization, or a
+    /// hydrated-index guarantee, should use `getProperty` instead.
+    pub fn getPropertyNoDerived(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
+        self.metrics.properties_read += 1;
+        if (prop_head == 0) return null;
+        return try self.prop_store.getProperty(prop_head, key, alloc);
+    }
+
     pub fn getAllProperties(self: *GraphEngine, prop_head: u64) anyerror!PropStore.PropIterator {
         var __obs_span = observability.startOperationSpan("get_all_properties");
         defer __obs_span.end(null);

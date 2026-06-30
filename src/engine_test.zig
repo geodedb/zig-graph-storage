@@ -322,6 +322,104 @@ test "open rebuilds derived indexes when snapshot files are stale" {
     try testing.expectEqualStrings("alice@example.com", email.?.string);
 }
 
+test "getPropertyNoDerived matches getProperty for present keys without hydrating the derived index" {
+    // H1-engine: loop1's per-node chain read must not trigger
+    // ensureDerivedHydrated (the full derived property-chain index build).
+    // getPropertyNoDerived walks prop_store directly; verify it returns the
+    // same value as getProperty for a chain that spans multiple property
+    // pages, and that calling ONLY getPropertyNoDerived never materializes
+    // the derived indexes (derived_hydrated stays false, derived_materialize_runs
+    // stays 0).
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x20} ** 16;
+    const cfg = testConfig();
+
+    // Build a property chain that spans more than one page (page_size=4096
+    // in testConfig; ~36 bytes/entry incl. directory overhead means well
+    // under 200 entries overflows a single page).
+    const entry_count: usize = 200;
+    var head: u64 = 0;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        var buf: [32]u8 = undefined;
+        var i: usize = 0;
+        while (i < entry_count) : (i += 1) {
+            const key = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+            var vbuf: [32]u8 = undefined;
+            const val = try std.fmt.bufPrint(&vbuf, "v{d}", .{i});
+            head = try engine.putProperty(head, key, .{ .string = val });
+        }
+
+        try testing.expect(head != 0);
+
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Re-open: Phase A means the derived indexes are NOT yet hydrated.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    try testing.expect(!engine.derived_hydrated.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), engine.derived_materialize_runs);
+
+    // prop_head == 0 returns null without touching prop_store.
+    try testing.expectEqual(@as(?PropertyValue, null), try engine.getPropertyNoDerived(0, "k0", testing.allocator));
+
+    // Present key, no-derived path: must succeed and match the expected value.
+    const nd_first = try engine.getPropertyNoDerived(head, "k0", testing.allocator);
+    defer if (nd_first) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(nd_first != null);
+    try testing.expectEqualStrings("v0", nd_first.?.string);
+
+    // A key near the tail of the chain (forces a multi-page walk).
+    const nd_last = try engine.getPropertyNoDerived(head, "k199", testing.allocator);
+    defer if (nd_last) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(nd_last != null);
+    try testing.expectEqualStrings("v199", nd_last.?.string);
+
+    // The derived index must STILL be unhydrated: getPropertyNoDerived never
+    // calls ensureDerivedHydrated.
+    try testing.expect(!engine.derived_hydrated.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), engine.derived_materialize_runs);
+
+    // Now compare against getProperty (which DOES hydrate) for byte-identical
+    // results on present keys.
+    const d_first = try engine.getProperty(head, "k0", testing.allocator);
+    defer if (d_first) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(d_first != null);
+    try testing.expectEqualStrings(nd_first.?.string, d_first.?.string);
+
+    const d_last = try engine.getProperty(head, "k199", testing.allocator);
+    defer if (d_last) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(d_last != null);
+    try testing.expectEqualStrings(nd_last.?.string, d_last.?.string);
+
+    // getProperty hydrated the derived index exactly once, as expected.
+    try testing.expect(engine.derived_hydrated.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), engine.derived_materialize_runs);
+}
+
 test "GraphStorage vtable interface works" {
     var td = try testDataDir();
     defer td.deinit();
