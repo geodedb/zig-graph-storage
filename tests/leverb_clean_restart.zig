@@ -141,13 +141,19 @@ test "Lever B Test A: clean restart LOADS derived indexes (no O(graph) rebuild)"
         const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
         defer engine.close() catch {};
 
-        // Lever B core assertion: the clean restart LOADED the persisted
-        // snapshots (O(snapshot)) and did NOT run the O(graph) rebuild. On
-        // current code this FAILS (the stale snapshot forces a rebuild).
-        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_loads);
+        // Phase A: the derived-index build is DEFERRED out of open, so the
+        // load/rebuild counters are 0 until the first accessor materializes them.
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_loads);
         try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
 
+        // First derived access materializes via the clean-snapshot LOAD path.
         try verifyData(engine, N, 1, label_a, label_b);
+
+        // Lever B core assertion (now at first-access): the clean restart LOADED
+        // the persisted snapshots (O(snapshot)) and did NOT run the O(graph)
+        // rebuild.
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
     }
 }
 
@@ -204,17 +210,12 @@ test "Lever B Test B: crash restart REBUILDS (stale snapshot invalidated by coun
         const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
         defer engine.close() catch {};
 
-        // CRASH-SAFETY PROOF (the Lever B invariant): the rebuild was FORCED and
-        // the stale snapshot was NOT loaded. derived_index_rebuilds can only be 1
-        // here if recovery saw the post-snapshot WAL tail and bumped
-        // manifest.counter past the snapshot's stamp — i.e. Lever B's relaxed
-        // save path did NOT let a stale snapshot load after a crash. Had the tail
-        // not been seen, the snapshot would still be current and the engine would
-        // have LOADED it (derived_index_loads==1) — which would be the bug.
-        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_rebuilds);
+        // Phase A: the build is DEFERRED, so no rebuild has run at open yet.
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
         try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_loads);
 
         // The rebuilt indexes are correct over the durable (checkpointed) graph.
+        // The first scanLabel materializes via the REBUILD path (stale snapshot).
         const a_nodes = try engine.scanLabel(label_a, testing.allocator);
         defer testing.allocator.free(a_nodes);
         try testing.expectEqual(N, a_nodes.len);
@@ -222,6 +223,15 @@ test "Lever B Test B: crash restart REBUILDS (stale snapshot invalidated by coun
         const b_nodes = try engine.scanLabel(label_b, testing.allocator);
         defer testing.allocator.free(b_nodes);
         try testing.expectEqual((N + 1) / 2, b_nodes.len);
+
+        // CRASH-SAFETY PROOF (the Lever B invariant), now asserted at first-
+        // access: the rebuild was FORCED and the stale snapshot was NOT loaded.
+        // derived_index_rebuilds can only be 1 here if recovery saw the
+        // post-snapshot WAL tail and bumped manifest.counter past the snapshot's
+        // stamp. Had the tail not been seen, the snapshot would still be current
+        // and the first access would have LOADED it (loads==1) — the bug.
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_loads);
 
         // NOTE: the durability of the single post-checkpoint WAL-tail write
         // itself (getNode survival of the crash-tail mutation) is a recovery/

@@ -333,6 +333,19 @@ fn addIntegrationTests(
     const run_early_ready = b.addRunArtifact(early_ready_tests);
     early_ready_step.dependOn(&run_early_ready.step);
 
+    // TSan variant: validates the build-once latch (atomic done flag + Io.Mutex)
+    // serialises concurrent first-accesses with zero data races. Debug optimize
+    // so the optimiser does not elide instrumented accesses.
+    const early_ready_tsan_step = b.step("test-engine-early-ready-tsan", "Run Phase A early-ready lazy-materialization suite under ThreadSanitizer (zero races expected)");
+    const early_ready_tsan_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/engine_early_ready.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    early_ready_tsan_tests.root_module.sanitize_thread = true;
+    const run_early_ready_tsan = b.addRunArtifact(early_ready_tsan_tests);
+    early_ready_tsan_step.dependOn(&run_early_ready_tsan.step);
+
     // H3-P1 Task 3: crash-safe engine integration of the value-ordered index.
     // Own step so the load-on-clean / rebuild-on-crash proofs (mirroring Lever B)
     // run in isolation and can be looped.

@@ -1569,7 +1569,7 @@ fn indexBuildTestLogFn(_: config_mod.LogLevel, msg: []const u8) void {
     }
 }
 
-test "NFR-OBS-002: GraphEngine.open emits index_build_start and index_build_end events" {
+test "NFR-OBS-002: lazy derived-index build emits index_build_start and index_build_end events" {
     var td = try testDataDir();
     defer td.deinit();
 
@@ -1587,6 +1587,14 @@ test "NFR-OBS-002: GraphEngine.open emits index_build_start and index_build_end 
 
     const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     defer engine.close() catch {};
+
+    // Phase A: the derived-index build is DEFERRED out of open, so no build
+    // events fire at open. The first derived accessor materializes the indexes
+    // (this fresh graph wrote no clean snapshot, so it takes the REBUILD path,
+    // which emits the build events). A label scan is such an accessor.
+    try testing.expectEqual(@as(usize, 0), index_build_event_count);
+    const empty = try engine.scanLabel(1, testing.allocator);
+    testing.allocator.free(empty);
 
     var found_start = false;
     var found_end = false;
