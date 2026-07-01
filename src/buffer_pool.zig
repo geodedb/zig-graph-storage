@@ -93,15 +93,22 @@ pub const BufferPool = struct {
     resident_counts: [FILE_COUNT]u32 = [_]u32{0} ** FILE_COUNT,
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
-    // PERF (CLOCK eviction): count of LRU-list mutations (`moveToHead` calls)
-    // performed BY the eviction victim-selection loop. The textbook CLOCK
-    // hand-advance must NOT move frames while sweeping, so this stays at 0 in the
-    // current implementation; the prior second-chance code moved every referenced
-    // frame to the head per sweep (O(N) list writes per victim, O(K*N) for K
-    // victims under a hot scan — the 62%-self-time hotspot). A regression test
-    // asserts this counter stays O(1)-amortized. Mutated only under `mutex`
-    // (eviction holds it), so a plain field suffices.
+    // PERF (CLOCK eviction): count of `moveToHead` calls made WHILE the eviction
+    // victim-selection loop is active (see `in_evict`). The textbook CLOCK
+    // hand-advance must NOT move frames while sweeping, so the current
+    // implementation makes ZERO such calls and this stays exactly 0. The prior
+    // second-chance code moved every referenced frame to the head per sweep (O(N)
+    // list writes per victim, O(K*N) for K victims under a hot scan — the
+    // 62%-self-time hotspot). `moveToHead` self-increments this ONLY when
+    // `in_evict` is set, so a reintroduced in-sweep `moveToHead` (the O(N)
+    // restart regression) is caught automatically by the `== 0` assertion in the
+    // CLOCK-eviction regression test — the ordinary pin/pinNew `moveToHead` runs
+    // with `in_evict` clear and is not counted. Both fields are mutated only
+    // under `mutex`, so plain (non-atomic) fields suffice.
     evict_list_moves: usize = 0,
+    // Set for the duration of `evict()` (victim selection). Read by `moveToHead`
+    // to decide whether to bump `evict_list_moves`. Written only under `mutex`.
+    in_evict: bool = false,
     // PERF-0057: per-FileId "needs fsync" flags. Set whenever a page is
     // successfully written to a file's pager via any flush path (flushFrame,
     // flushAllParallel, eviction). Cleared only by takeDirtyFiles() once the
@@ -1174,6 +1181,13 @@ pub const BufferPool = struct {
     /// no frame is evictable → error.BufferPoolFull. So this cannot livelock while
     /// any genuinely-evictable (unpinned, clear-bit) frame exists.
     fn evict(self: *BufferPool) !u32 {
+        // Mark the eviction victim-selection context so any `moveToHead` reached
+        // from this call (there should be NONE — the CLOCK hand-advance never
+        // moves frames) self-increments `evict_list_moves`, arming the regression
+        // guard against a reintroduced in-sweep list move. Set/cleared only under
+        // the caller's `mutex`; cleared on every exit path via `defer`.
+        self.in_evict = true;
+        defer self.in_evict = false;
         while (true) {
             // Pass 1: honour reservation floors; second-chance via clock bit.
             // Sweep tail → head, advancing the clock hand without moving frames.
@@ -1331,6 +1345,13 @@ pub const BufferPool = struct {
 
     /// Move a frame to the head of the LRU list (most recently used).
     fn moveToHead(self: *BufferPool, idx: u32) void {
+        // Regression guard: a `moveToHead` reached from the eviction
+        // victim-selection loop (`in_evict`) is exactly the O(N)-restart hotspot
+        // the CLOCK hand-advance removed. Count it so the CLOCK-eviction test's
+        // `evict_list_moves == 0` assertion fails if such a call is reintroduced.
+        // Ordinary pin/pinNew moves run with `in_evict` clear and are not counted.
+        if (self.in_evict) self.evict_list_moves += 1;
+
         // If already head, nothing to do
         if (self.lru_head) |head| {
             if (head == idx) return;
@@ -1747,8 +1768,13 @@ test "PERF: CLOCK eviction is O(1)-amortized (no per-victim LRU churn under a ho
     // We simulate the worst case: before EVERY eviction we re-set all resident
     // `referenced` bits (the ongoing scan touched the whole working set since the
     // last sweep). With K == N evictions, the old code performed ~K*N list moves;
-    // the CLOCK loop performs none. We assert the eviction-loop list-move counter
-    // stays O(pool) (a generous 2*N bound) rather than O(K*N).
+    // the CLOCK loop performs EXACTLY ZERO. `evict_list_moves` is incremented by
+    // `moveToHead` ONLY while the eviction victim-selection loop is active
+    // (`in_evict`), so it measures precisely the in-sweep list moves the CLOCK
+    // fix eliminated. We assert it is 0: if anyone reintroduces an in-sweep
+    // `moveToHead` (the O(K*N) restart regression), this counter goes non-zero
+    // and the test fails. (The `<= 2*N` bound this replaced was vacuous — the
+    // counter was never incremented, so 0 <= 2*N always held.)
     const file = try createTempFile(".test_bp_clock_evict");
     defer cleanupTempFile(file, ".test_bp_clock_evict");
 
@@ -1798,9 +1824,10 @@ test "PERF: CLOCK eviction is O(1)-amortized (no per-victim LRU churn under a ho
     try testing.expectEqual(K, evicted); // every eviction succeeded
     try testing.expectEqual(@as(usize, 0), pool.free_list.items.len); // still full + consistent
 
-    // The whole point: victim selection must be O(1)-amortized in list mutations.
-    // Old code: ~K*N == 4096 moves. CLOCK hand-advance: 0. Bound generously at 2*N.
-    try testing.expect(pool.evict_list_moves <= 2 * N);
+    // The whole point: victim selection must perform NO LRU-list moves. Old
+    // code: ~K*N == 4096 in-sweep moves. CLOCK hand-advance: exactly 0. Any
+    // non-zero value means an in-sweep `moveToHead` was reintroduced.
+    try testing.expectEqual(@as(usize, 0), pool.evict_list_moves);
 }
 
 test "flushDirtyPages flushes dirty unpinned frames from LRU tail" {
