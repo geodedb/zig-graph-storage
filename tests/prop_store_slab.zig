@@ -572,3 +572,272 @@ test "GAP-ENT-0020 P1 read-both: slab-packed layout matches legacy" {
         try testing.expect(miss == null);
     }
 }
+
+// ============================================================================
+// Phase P2 — slab WRITE path.
+//
+// RED baseline: the P0 metric test above (slab OFF) locks in 8192 bytes/node
+// (exactly one page per node). GREEN: with `slab_packing = true` the SAME
+// putProperty workload packs many nodes per shared page.
+// ============================================================================
+
+/// Golden oracle text for a putTaxonNode-shaped node (keys sorted).
+fn taxonGolden(allocator: Allocator, id: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, "kingdom=string:Animalia\n" ++
+        "name=string:Genus species\n" ++
+        "phylum=string:Chordata\n" ++
+        "rank=string:species\n" ++
+        "src_id=string:T{d}\n" ++
+        "status=string:accepted\n", .{id});
+}
+
+fn expectOracleText(store: *PropStore, head: u64, expected: []const u8) !void {
+    var oracle = try readOracle(testing.allocator, store, head);
+    defer oracle.deinit();
+    const text = try formatOracle(testing.allocator, &oracle);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(expected, text);
+}
+
+test "GAP-ENT-0020 P2 packing: 1000 small-prop nodes share slab pages (bytes/node collapses)" {
+    const page_size: u32 = 8192; // production default; P0 baseline = 8192 bytes/node
+    const n: usize = 1000;
+
+    var env = try Env.init(page_size, @intCast(n + 32));
+    defer env.deinit();
+    var store = env.store();
+    store.slab_packing = true;
+
+    const heads = try testing.allocator.alloc(u64, n);
+    defer testing.allocator.free(heads);
+
+    var idbuf: [24]u8 = undefined;
+    for (heads, 0..) |*h, i| {
+        h.* = try putTaxonNode(&store, i, &idbuf);
+        // Every small-prop node must be slab-resident, not legacy.
+        try testing.expect(gs.prop_store.isSlabHead(h.*));
+    }
+
+    const allocated = env.fsm().allocatedCount();
+    const bytes_per_node =
+        @as(f64, @floatFromInt(allocated * page_size)) / @as(f64, @floatFromInt(n));
+    std.debug.print(
+        "\n[GAP-ENT-0020 P2 packed] nodes={d} page_size={d} allocated_props_pages={d} " ++
+            "=> {d:.1} props-store bytes/node (baseline was 8192.0)\n",
+        .{ n, page_size, allocated, bytes_per_node },
+    );
+
+    // Headline assertion: bytes/node is a small fraction of the 8192 baseline.
+    try testing.expect(bytes_per_node < 1024.0);
+
+    // Byte-identical round-trip for EVERY node through the P1 slab reader.
+    for (heads, 0..) |h, i| {
+        const golden = try taxonGolden(testing.allocator, i);
+        defer testing.allocator.free(golden);
+        try expectOracleText(&store, h, golden);
+    }
+}
+
+test "GAP-ENT-0020 P2 parity: interleaved slab and legacy(oversized) writes match legacy oracles" {
+    const page_size: u32 = 8192;
+    var env = try Env.init(page_size, 256);
+    defer env.deinit();
+
+    // Two stores over the same pool/fsm: the slab writer under test and a
+    // legacy reference writer (slab off) producing the oracle twin.
+    var slab_store = env.store();
+    slab_store.slab_packing = true;
+    var legacy_store = env.store(); // slab_packing stays false
+
+    const ps = gs.prop_store;
+
+    // Oversized first write: the blob (4-byte count + entry) must exceed the
+    // slab max blob while the entry still fits a legacy page:
+    //   slab max blob = page_size - SLAB_DATA_OFFSET(36) - 4 - 8      = 8144
+    //   blob          = 4 + 2 + key.len(3) + string_enc(5 + vlen)     = 14 + vlen
+    //   legacy max    = dataCapacity(8146) - DIR_ENTRY_SIZE(4)        = 8142
+    //   entry         = 2 + 3 + 5 + vlen                              = 10 + vlen
+    // vlen = 8131 → blob 8145 (> 8144, no slab) and entry 8141 (≤ 8142, legacy ok).
+    const oversize_len: usize = 8131;
+    const big_val = try testing.allocator.alloc(u8, oversize_len);
+    defer testing.allocator.free(big_val);
+    @memset(big_val, 'x');
+
+    var idbuf: [24]u8 = undefined;
+    var i: usize = 0;
+    while (i < 24) : (i += 1) {
+        if (i % 4 == 3) {
+            // Oversized node: slab writer must fall back to the legacy layout.
+            const h = try slab_store.putProperty(0, "big", .{ .string = big_val });
+            try testing.expect(!ps.isSlabHead(h));
+            const h_ref = try legacy_store.putProperty(0, "big", .{ .string = big_val });
+
+            var a = try readOracle(testing.allocator, &slab_store, h);
+            defer a.deinit();
+            var b = try readOracle(testing.allocator, &legacy_store, h_ref);
+            defer b.deinit();
+            try b.expectEqual(&a);
+        } else {
+            // Small node: packs into the shared fill page.
+            const h = try putTaxonNode(&slab_store, i, &idbuf);
+            try testing.expect(ps.isSlabHead(h));
+            const h_ref = try putTaxonNode(&legacy_store, i, &idbuf);
+
+            var a = try readOracle(testing.allocator, &slab_store, h);
+            defer a.deinit();
+            var b = try readOracle(testing.allocator, &legacy_store, h_ref);
+            defer b.deinit();
+            try b.expectEqual(&a);
+        }
+    }
+}
+
+test "GAP-ENT-0020 P2 update/remove: slab-resident nodes stay correct (in-place, relocate+tombstone, legacy migration)" {
+    const page_size: u32 = 8192;
+    var env = try Env.init(page_size, 256);
+    defer env.deinit();
+    var store = env.store();
+    store.slab_packing = true;
+
+    const ps = gs.prop_store;
+
+    // Node A first, node B second — so A's blob is NOT the page tail and a
+    // grow of A must RELOCATE (new slot) rather than grow in place.
+    var head_a: u64 = 0;
+    head_a = try store.putProperty(head_a, "name", .{ .string = "Panthera leo" });
+    head_a = try store.putProperty(head_a, "rank", .{ .string = "species" });
+    head_a = try store.putProperty(head_a, "year", .{ .int = 1758 });
+    const head_b = try store.putProperty(0, "name", .{ .string = "Homo sapiens" });
+    try testing.expect(ps.isSlabHead(head_a));
+    try testing.expect(ps.isSlabHead(head_b));
+
+    // (1) same-size replace → in place, head unchanged.
+    {
+        const h = try store.putProperty(head_a, "year", .{ .int = 1759 });
+        try testing.expectEqual(head_a, h);
+        const v = try store.getProperty(head_a, "year", testing.allocator);
+        try testing.expectEqual(@as(i64, 1759), v.?.int);
+    }
+
+    // (2) growing replace on a non-tail blob → relocated to a new slot; the
+    // old slot is tombstoned (len = 0) and a dangling read fails loudly.
+    var head_a2: u64 = undefined;
+    {
+        const old_page = ps.slabPageId(head_a);
+        const old_slot = ps.slabSlot(head_a);
+        head_a2 = try store.putProperty(head_a, "name", .{ .string = "Panthera leo persica (relocated)" });
+        try testing.expect(head_a2 != head_a);
+        try testing.expect(ps.isSlabHead(head_a2));
+
+        // Old slot tombstoned in the slot directory.
+        const frame = try env.pool().pin(.props, old_page);
+        const frame_idx = env.pool().frameIndex(frame);
+        const s = ps.readSlabSlot(frame.dataSlice(), old_slot);
+        env.pool().unpin(frame_idx, false);
+        try testing.expectEqual(@as(u32, 0), s.len);
+
+        // Dangling old head errors instead of returning stale data.
+        try testing.expectError(error.DataCorruption, store.getProperty(head_a, "name", testing.allocator));
+
+        // New head carries the full updated set.
+        try expectOracleText(&store, head_a2, "name=string:Panthera leo persica (relocated)\n" ++
+            "rank=string:species\n" ++
+            "year=int:1759\n");
+    }
+
+    // (3) grow past slab capacity → migrated to a LEGACY chain, old slot
+    // tombstoned, no data loss.
+    var head_a3: u64 = undefined;
+    {
+        const filler = try testing.allocator.alloc(u8, 4200);
+        defer testing.allocator.free(filler);
+        @memset(filler, 'y');
+        // First big value still fits a slab blob…
+        const h1 = try store.putProperty(head_a2, "blob1", .{ .string = filler });
+        try testing.expect(ps.isSlabHead(h1));
+        // …the second pushes the blob past the slab max → legacy migration.
+        head_a3 = try store.putProperty(h1, "blob2", .{ .string = filler });
+        try testing.expect(!ps.isSlabHead(head_a3));
+
+        const v1 = try store.getProperty(head_a3, "blob1", testing.allocator);
+        try testing.expect(v1 != null);
+        defer property.freeDecoded(testing.allocator, v1.?);
+        try testing.expectEqualStrings(filler, v1.?.string);
+        const v2 = try store.getProperty(head_a3, "name", testing.allocator);
+        try testing.expect(v2 != null);
+        defer property.freeDecoded(testing.allocator, v2.?);
+        try testing.expectEqualStrings("Panthera leo persica (relocated)", v2.?.string);
+
+        var oracle = try readOracle(testing.allocator, &store, head_a3);
+        defer oracle.deinit();
+        try testing.expectEqual(@as(usize, 5), oracle.props.items.len);
+    }
+
+    // (4) remove on a slab-resident node: in-place shrink, head stays valid.
+    {
+        var head_c: u64 = 0;
+        head_c = try store.putProperty(head_c, "x", .{ .int = 1 });
+        head_c = try store.putProperty(head_c, "y", .{ .int = 2 });
+        head_c = try store.putProperty(head_c, "z", .{ .int = 3 });
+        try testing.expect(ps.isSlabHead(head_c));
+
+        try store.removeProperty(head_c, "y");
+        const gone = try store.getProperty(head_c, "y", testing.allocator);
+        try testing.expect(gone == null);
+        try expectOracleText(&store, head_c, "x=int:1\nz=int:3\n");
+
+        // Remove everything: the head still reads back as an empty set.
+        try store.removeProperty(head_c, "x");
+        try store.removeProperty(head_c, "z");
+        var oracle = try readOracle(testing.allocator, &store, head_c);
+        defer oracle.deinit();
+        try testing.expectEqual(@as(usize, 0), oracle.props.items.len);
+
+        // Removing an absent key is a no-op, exactly like legacy.
+        try store.removeProperty(head_c, "never-there");
+    }
+
+    // Sibling B was never disturbed by any of A's/C's rewrites.
+    try expectOracleText(&store, head_b, "name=string:Homo sapiens\n");
+}
+
+test "GAP-ENT-0020 P2 reopen: slab pages survive flush + clean reopen (oracle parity)" {
+    const page_size: u32 = 8192;
+    const n: usize = 50;
+
+    var env = try Env.init(page_size, 128);
+    defer env.deinit();
+    // Env.init registers pager pointers BEFORE the env struct is moved to its
+    // final address, so they dangle; every other test tolerates that because
+    // it never flushes. This test drives the pager (flushAll), so re-register
+    // at the stable address first.
+    env.base.register();
+    var store = env.store();
+    store.slab_packing = true;
+
+    const heads = try testing.allocator.alloc(u64, n);
+    defer testing.allocator.free(heads);
+    var idbuf: [24]u8 = undefined;
+    for (heads, 0..) |*h, i| {
+        h.* = try putTaxonNode(&store, i, &idbuf);
+    }
+
+    // Persist every dirty page through the pager (clean close), then reopen
+    // the SAME props file with a brand-new buffer pool: proves slab pages
+    // round-trip through the on-disk persist path, not just pool frames.
+    try env.pool().flushAll();
+
+    var pool2 = try BufferPool.init(testing.allocator, page_size, 128);
+    defer pool2.deinit();
+    var pager2 = gs.pager.Pager.init(env.base.primary_file, page_size);
+    pool2.registerPager(.props, &pager2);
+
+    var store2 = PropStore.init(&pool2, env.fsm(), &env.vs, page_size);
+    store2.slab_packing = true; // read path is layout-discriminated regardless
+
+    for (heads, 0..) |h, i| {
+        const golden = try taxonGolden(testing.allocator, i);
+        defer testing.allocator.free(golden);
+        try expectOracleText(&store2, h, golden);
+    }
+}

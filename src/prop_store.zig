@@ -238,6 +238,25 @@ pub const PropStore = struct {
     /// Plaintext mode keeps tail_reserve == 0 for backward compatibility.
     tail_reserve: u32 = 0,
 
+    /// GAP prop-store slab packing (P2): when true, a NEW node's first
+    /// property is packed as a slot in a shared slab fill page instead of
+    /// allocating a whole ≥page_size page per node. Rollout toggle for P7.
+    /// Default OFF: the ENGINE still assumes legacy heads in two places that
+    /// P4/P5/P7 must fix before enabling there — (a) WAL logging does
+    /// `logPage(txn, .props, prop_head)`, treating the head as a bare page id
+    /// (a slab head would pin/log a bogus page id), and (b) adjacency entries
+    /// pack edge prop_heads into a u32, which would truncate the slab tag
+    /// bit. Legacy on-disk pages are untouched either way (read-both, P1).
+    slab_packing: bool = false,
+
+    /// The shared "current fill page" that new slab blobs append to.
+    /// In-memory only: after a reopen the first slab write simply starts a
+    /// fresh fill page (a partially-filled predecessor keeps its data and is
+    /// reclaimed by P6 compaction). The append state (slot count, next free
+    /// byte) is always re-derived from the page itself, never cached, so a
+    /// stale or copied PropStore value cannot corrupt a page.
+    current_fill_page: ?PageId = null,
+
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, var_store: *VarStore, page_size: u32) PropStore {
         return .{
             .buffer_pool = buffer_pool,
@@ -245,6 +264,8 @@ pub const PropStore = struct {
             .var_store = var_store,
             .page_size = page_size,
             .tail_reserve = 0,
+            .slab_packing = false,
+            .current_fill_page = null,
         };
     }
 
@@ -487,6 +508,318 @@ pub const PropStore = struct {
         return null;
     }
 
+    // ========================================================================
+    // GAP prop-store slab packing — Phase P2: slab WRITE path.
+    //
+    // First-property writes for NEW nodes allocate a SLOT in the shared
+    // `current_fill_page` (P1's slab page format) instead of a whole page, so
+    // many small-prop nodes share one ≥8 KB page. prop_head = (page, slot)
+    // via encodeSlabHead. All page mutations go through the buffer pool
+    // (pin/pinNew → mutate → unpin(dirty)) exactly like the legacy writers.
+    //
+    // P2 SIMPLIFICATION (P3 does update/grow/relocate properly): a put on a
+    // slab-resident node REBUILDS the node's blob and places it by the first
+    // strategy that fits:
+    //   1. shrink/equal      → rewrite in place, head unchanged;
+    //   2. tail blob + fits  → grow in place, head unchanged;
+    //   3. otherwise         → append as a NEW slot (possibly a new fill
+    //                          page), tombstone the old slot, head changes;
+    //   4. > slab capacity   → MIGRATE to a fresh legacy chain (existing
+    //                          code path), tombstone the old slot.
+    // A remove shrinks the blob in place (head must stay valid). A tombstone
+    // is `len = 0` in the slot directory (offset preserved for P6
+    // compaction); the dead blob bytes remain until compaction.
+    // ========================================================================
+
+    /// Total bytes on a slab page available for blobs + slot-directory
+    /// entries (logical page minus header/meta and the slot_count footer).
+    fn slabCapacity(self: *const PropStore) u32 {
+        return self.page_size - self.tail_reserve - SLAB_DATA_OFFSET - SLAB_SLOT_COUNT_SIZE;
+    }
+
+    /// Largest single blob that can ever be placed on a slab page (fresh
+    /// page, one slot-directory entry). Larger property sets use the legacy
+    /// one-page-per-node chain.
+    fn slabMaxBlobLen(self: *const PropStore) u32 {
+        return self.slabCapacity() - SLAB_SLOT_SIZE;
+    }
+
+    const SlabPageState = struct { slot_count: u32, next_off: u32 };
+
+    /// Derive the append state of a slab page from the page itself: the slot
+    /// count and the first free blob byte (max over slots of offset+len).
+    /// Always re-derived — never cached — so a copied/stale PropStore value
+    /// cannot corrupt a page. O(slot_count), bounded by page_size.
+    fn slabPageState(_: *const PropStore, data: []const u8) error{DataCorruption}!SlabPageState {
+        if (data.len < SLAB_DATA_OFFSET + SLAB_SLOT_COUNT_SIZE) return error.DataCorruption;
+        if (data[SLAB_META_OFFSET] != SLAB_LAYOUT_VERSION) return error.DataCorruption;
+        const slot_count = readSlabSlotCount(data);
+        const dir_bytes: u64 = @as(u64, SLAB_SLOT_COUNT_SIZE) + @as(u64, slot_count) * SLAB_SLOT_SIZE;
+        if (@as(u64, SLAB_DATA_OFFSET) + dir_bytes > data.len) return error.DataCorruption;
+        const dir_start: u64 = @as(u64, data.len) - dir_bytes;
+        var next_off: u32 = SLAB_DATA_OFFSET;
+        var i: u32 = 0;
+        while (i < slot_count) : (i += 1) {
+            const s = readSlabSlot(data, i);
+            const end = @as(u64, s.offset) + @as(u64, s.len);
+            if (s.offset < SLAB_DATA_OFFSET or end > dir_start) return error.DataCorruption;
+            if (end > next_off) next_off = @intCast(end);
+        }
+        return .{ .slot_count = slot_count, .next_off = next_off };
+    }
+
+    /// Append `blob` as a new slot on the current fill page, or on a fresh
+    /// slab page when there is no fill page / it is full. Returns the encoded
+    /// slab prop_head, or null when the blob can never fit a slab page or the
+    /// P1 page-id encoding guard trips — the caller must then fall back to
+    /// the legacy layout. Never partially writes: the slot becomes visible
+    /// only via the slot_count bump after blob + directory entry are written.
+    fn appendSlabBlob(self: *PropStore, blob: []const u8) !?u64 {
+        if (blob.len > self.slabMaxBlobLen()) return null;
+        const blob_len: u32 = @intCast(blob.len);
+
+        // Try the current fill page first.
+        if (self.current_fill_page) |fill_page| {
+            const frame = try self.buffer_pool.pin(.props, fill_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = self.logical(frame.dataSlice());
+            const state = self.slabPageState(data) catch |err| {
+                self.buffer_pool.unpin(frame_idx, false);
+                return err;
+            };
+            if (@as(u64, state.slot_count) <= SLAB_SLOT_MASK) {
+                const slot: u32 = state.slot_count;
+                const dir_needed: u64 = @as(u64, SLAB_SLOT_COUNT_SIZE) + (@as(u64, slot) + 1) * SLAB_SLOT_SIZE;
+                if (@as(u64, state.next_off) + blob_len <= @as(u64, data.len) - dir_needed) {
+                    @memcpy(data[state.next_off..][0..blob.len], blob);
+                    writeSlabSlot(data, slot, state.next_off, blob_len);
+                    writeSlabSlotCount(data, slot + 1);
+                    self.buffer_pool.unpin(frame_idx, true);
+                    return encodeSlabHead(fill_page, slot);
+                }
+            }
+            // Full (or slot indices exhausted): retire it as the fill page.
+            self.buffer_pool.unpin(frame_idx, false);
+            self.current_fill_page = null;
+        }
+
+        // Start a fresh slab fill page.
+        const new_page = try self.free_space.allocPage();
+        // P1 encoding-limit guard: the page id must fit the 39-bit field with
+        // the tag bit clear. Never encode an out-of-range id (that would
+        // corrupt the head) — release the page and use the legacy layout.
+        if (new_page >= SLAB_MAX_PAGE_ID) {
+            self.free_space.freePage(new_page) catch {};
+            return null;
+        }
+        const frame = try self.buffer_pool.pinNew(.props, new_page); // zeroed
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = self.logical(frame.dataSlice());
+        writeSlabLayoutVersion(data); // meta pad bytes are already zero
+        @memcpy(data[SLAB_DATA_OFFSET..][0..blob.len], blob);
+        writeSlabSlot(data, 0, SLAB_DATA_OFFSET, blob_len);
+        writeSlabSlotCount(data, 1);
+        self.buffer_pool.unpin(frame_idx, true);
+        self.current_fill_page = new_page;
+        return encodeSlabHead(new_page, 0);
+    }
+
+    /// P2: first property write for a new node with slab packing on. Builds
+    /// the single-entry blob (the exact legacy entry wire format, P1) and
+    /// packs it. Returns null when the caller must fall back to legacy.
+    fn slabFirstWrite(self: *PropStore, key: []const u8, encoded_val: []const u8) !?u64 {
+        const blob_len = 4 + 2 + key.len + encoded_val.len;
+        if (blob_len > self.slabMaxBlobLen()) return null;
+        const alloc = self.buffer_pool.allocator;
+        const blob = try alloc.alloc(u8, blob_len);
+        defer alloc.free(blob);
+        std.mem.writeInt(u32, blob[0..4], 1, .little);
+        _ = writeBlobEntry(blob, 4, key, encoded_val);
+        return self.appendSlabBlob(blob);
+    }
+
+    /// P2: put (add or replace a key) on a slab-resident node. See the phase
+    /// header above for the placement strategy. Returns the (possibly new)
+    /// prop_head; a legacy page id when the set outgrew the slab layout.
+    fn putSlabProperty(self: *PropStore, prop_head: u64, key: []const u8, encoded_val: []const u8) !u64 {
+        const page_id = slabPageId(prop_head);
+        const slot = slabSlot(prop_head);
+        const alloc = self.buffer_pool.allocator;
+
+        // Snapshot the current blob (copied out so no pin is held while the
+        // rebuilt blob is placed — appendSlabBlob pins pages itself).
+        const old_blob: []u8 = blk: {
+            const frame = try self.buffer_pool.pin(.props, page_id);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            defer self.buffer_pool.unpin(frame_idx, false);
+            const data = self.logical(frame.dataSlice());
+            const span = try self.slabBlobSpan(data, slot);
+            if (span.len < 4) return error.DataCorruption; // tombstoned/dangling head
+            break :blk try alloc.dupe(u8, data[span.offset..][0..span.len]);
+        };
+        defer alloc.free(old_blob);
+
+        // Rebuild: all old entries except `key`, then the new entry last
+        // (matches legacy remove+re-insert ordering semantics).
+        const new_blob_buf = try alloc.alloc(u8, old_blob.len + 2 + key.len + encoded_val.len);
+        defer alloc.free(new_blob_buf);
+        var kept: u32 = 0;
+        var w: usize = 4;
+        {
+            const entry_count = std.mem.readInt(u32, old_blob[0..4], .little);
+            var off: usize = 4;
+            var i: u32 = 0;
+            while (i < entry_count) : (i += 1) {
+                if (off + 2 > old_blob.len) return error.DataCorruption;
+                const key_len = std.mem.bytesToValue(u16, old_blob[off..][0..2]);
+                if (off + 2 + key_len > old_blob.len) return error.DataCorruption;
+                const entry_key = old_blob[off + 2 ..][0..key_len];
+                const val_size = try encodedSizeFromBytes(old_blob[off + 2 + key_len ..]);
+                const entry_len = 2 + @as(usize, key_len) + val_size;
+                if (!std.mem.eql(u8, entry_key, key)) {
+                    @memcpy(new_blob_buf[w..][0..entry_len], old_blob[off..][0..entry_len]);
+                    w += entry_len;
+                    kept += 1;
+                }
+                off += entry_len;
+            }
+        }
+        w = writeBlobEntry(new_blob_buf, w, key, encoded_val);
+        std.mem.writeInt(u32, new_blob_buf[0..4], kept + 1, .little);
+        const rebuilt = new_blob_buf[0..w];
+
+        // (1)/(2): in-place rewrite within the existing slot when it fits.
+        {
+            const frame = try self.buffer_pool.pin(.props, page_id);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = self.logical(frame.dataSlice());
+            const placed = self.tryRewriteSlabSlotInPlace(data, slot, rebuilt) catch |err| {
+                self.buffer_pool.unpin(frame_idx, false);
+                return err;
+            };
+            self.buffer_pool.unpin(frame_idx, placed);
+            if (placed) return prop_head;
+        }
+
+        // (3): relocate to a new slot (possibly a new fill page).
+        if (try self.appendSlabBlob(rebuilt)) |new_head| {
+            try self.tombstoneSlabSlot(page_id, slot);
+            return new_head;
+        }
+
+        // (4): grown past slab capacity — migrate to a legacy chain.
+        const legacy_head = try self.migrateBlobToLegacy(rebuilt);
+        try self.tombstoneSlabSlot(page_id, slot);
+        return legacy_head;
+    }
+
+    /// Try to place `rebuilt` inside slot `slot`'s existing position:
+    /// shrink/equal always fits; a blob that is the LAST one in the data
+    /// region may grow in place up to the slot directory. Returns true when
+    /// placed (caller unpins dirty), false when the caller must relocate.
+    fn tryRewriteSlabSlotInPlace(self: *const PropStore, data: []u8, slot: u32, rebuilt: []const u8) !bool {
+        const span = try self.slabBlobSpan(data, slot);
+        if (rebuilt.len <= span.len) {
+            @memcpy(data[span.offset..][0..rebuilt.len], rebuilt);
+            if (rebuilt.len < span.len)
+                @memset(data[span.offset + rebuilt.len ..][0 .. span.len - rebuilt.len], 0);
+            writeSlabSlot(data, slot, span.offset, @intCast(rebuilt.len));
+            return true;
+        }
+        const state = try self.slabPageState(data);
+        const dir_bytes: u64 = @as(u64, SLAB_SLOT_COUNT_SIZE) + @as(u64, state.slot_count) * SLAB_SLOT_SIZE;
+        const is_tail = @as(u64, span.offset) + span.len == state.next_off;
+        if (is_tail and @as(u64, span.offset) + rebuilt.len <= @as(u64, data.len) - dir_bytes) {
+            @memcpy(data[span.offset..][0..rebuilt.len], rebuilt);
+            writeSlabSlot(data, slot, span.offset, @intCast(rebuilt.len));
+            return true;
+        }
+        return false;
+    }
+
+    /// Mark a slab slot dead: len = 0, offset preserved (P6 compaction uses
+    /// it; a dangling read of a tombstoned slot fails loudly with
+    /// DataCorruption instead of returning stale data).
+    fn tombstoneSlabSlot(self: *PropStore, page_id: PageId, slot: u32) !void {
+        const frame = try self.buffer_pool.pin(.props, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = self.logical(frame.dataSlice());
+        const span = self.slabBlobSpan(data, slot) catch |err| {
+            self.buffer_pool.unpin(frame_idx, false);
+            return err;
+        };
+        writeSlabSlot(data, slot, span.offset, 0);
+        self.buffer_pool.unpin(frame_idx, true);
+    }
+
+    /// P2 fallback: write every entry of `blob` into a fresh LEGACY
+    /// one-page-per-node chain (the pre-slab code path, byte-identical entry
+    /// format). Used when a slab-resident node's set outgrows a slab page.
+    fn migrateBlobToLegacy(self: *PropStore, blob: []const u8) !u64 {
+        if (blob.len < 4) return error.DataCorruption;
+        const entry_count = std.mem.readInt(u32, blob[0..4], .little);
+        var head: u64 = 0;
+        var off: usize = 4;
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            if (off + 2 > blob.len) return error.DataCorruption;
+            const key_len = std.mem.bytesToValue(u16, blob[off..][0..2]);
+            if (off + 2 + key_len > blob.len) return error.DataCorruption;
+            const entry_key = blob[off + 2 ..][0..key_len];
+            const val_start = off + 2 + key_len;
+            const val_size = try encodedSizeFromBytes(blob[val_start..]);
+            const enc = blob[val_start..][0..val_size];
+            const entry_size: u32 = @intCast(2 + @as(usize, key_len) + val_size);
+            head = if (head == 0)
+                try self.legacyNewChain(entry_key, enc)
+            else
+                try self.insertEntry(head, entry_key, enc, entry_size);
+            off = val_start + val_size;
+        }
+        // putSlabProperty always migrates a blob with ≥1 entry.
+        std.debug.assert(head != 0);
+        return head;
+    }
+
+    /// P2: remove on a slab-resident node — in-place blob shrink. The head
+    /// stays valid (removeProperty cannot return a new one); removing the
+    /// last entry leaves a valid empty blob (entry_count = 0, len = 4).
+    fn removeSlabProperty(self: *PropStore, prop_head: u64, key: []const u8) !void {
+        const page_id = slabPageId(prop_head);
+        const slot = slabSlot(prop_head);
+        const frame = try self.buffer_pool.pin(.props, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        var dirty = false;
+        defer self.buffer_pool.unpin(frame_idx, dirty);
+        const data = self.logical(frame.dataSlice());
+        const span = try self.slabBlobSpan(data, slot);
+        if (span.len < 4) return error.DataCorruption; // tombstoned/dangling head
+        const blob = data[span.offset..][0..span.len];
+        const entry_count = std.mem.readInt(u32, blob[0..4], .little);
+        var off: usize = 4;
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            if (off + 2 > blob.len) return error.DataCorruption;
+            const key_len = std.mem.bytesToValue(u16, blob[off..][0..2]);
+            if (off + 2 + key_len > blob.len) return error.DataCorruption;
+            const entry_key = blob[off + 2 ..][0..key_len];
+            const val_size = try encodedSizeFromBytes(blob[off + 2 + key_len ..]);
+            const entry_len = 2 + @as(usize, key_len) + val_size;
+            if (std.mem.eql(u8, entry_key, key)) {
+                const tail_len = span.len - (off + entry_len);
+                std.mem.copyForwards(u8, blob[off..][0..tail_len], blob[off + entry_len ..][0..tail_len]);
+                const new_len: u32 = @intCast(span.len - entry_len);
+                @memset(blob[new_len..span.len], 0);
+                std.mem.writeInt(u32, blob[0..4], entry_count - 1, .little);
+                writeSlabSlot(data, slot, span.offset, new_len);
+                dirty = true;
+                return;
+            }
+            off += entry_len;
+        }
+        // Key absent: no-op (matches legacy removeProperty semantics).
+    }
+
     pub const PropertyEntrySlice = struct {
         key: []const u8,
         encoded_value: []const u8,
@@ -682,23 +1015,19 @@ pub const PropStore = struct {
         // passed, because the key is still too long for the configured page size.
         if (entry_size > self.dataCapacity() -| DIR_ENTRY_SIZE) return error.PropertyKeyTooLong;
 
+        // GAP prop-store slab packing (P2): a slab-resident node's put goes
+        // through the slab write path (in-place / relocate / legacy-migrate).
+        if (isSlabHead(prop_head)) return self.putSlabProperty(prop_head, key, encoded_val);
+
         if (prop_head == 0) {
-            // Allocate new property page
-            const new_page = try self.free_space.allocPage();
-            const frame = try self.buffer_pool.pinNew(.props, new_page);
-            const frame_idx = self.buffer_pool.frameIndex(frame);
-            const data = self.logical(frame.dataSlice());
-
-            writeNextPage(data, 0);
-            writeEntryCount(data, 1);
-            self.writePropertyEntry(data, PROP_DATA_OFFSET, key, encoded_val);
-
-            // PERF-0023: Initialize directory with the first entry.
-            writeDirCount(data, 1);
-            writeDirEntry(data, 0, keyHash(key), PROP_DATA_OFFSET);
-
-            self.buffer_pool.unpin(frame_idx, true);
-            return new_page;
+            // GAP prop-store slab packing (P2): pack the first property into a
+            // shared slab fill page. Falls back to the legacy one-page-per-node
+            // chain when the blob can never fit a slab page or the page-id
+            // encoding guard trips.
+            if (self.slab_packing) {
+                if (try self.slabFirstWrite(key, encoded_val)) |head| return head;
+            }
+            return try self.legacyNewChain(key, encoded_val);
         }
 
         // Pass 1: find and remove existing key. If the key is found and
@@ -711,6 +1040,27 @@ pub const PropStore = struct {
         // Pass 2: insert the new entry into the first page with space,
         // allocating an overflow page if necessary.
         return try self.insertEntry(prop_head, key, encoded_val, entry_size);
+    }
+
+    /// Allocate and initialize a fresh LEGACY property page holding a single
+    /// entry; returns the new page id (the legacy prop_head). Extracted from
+    /// putProperty (P2) so the slab→legacy migration path can reuse it.
+    fn legacyNewChain(self: *PropStore, key: []const u8, encoded_val: []const u8) !u64 {
+        const new_page = try self.free_space.allocPage();
+        const frame = try self.buffer_pool.pinNew(.props, new_page);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = self.logical(frame.dataSlice());
+
+        writeNextPage(data, 0);
+        writeEntryCount(data, 1);
+        self.writePropertyEntry(data, PROP_DATA_OFFSET, key, encoded_val);
+
+        // PERF-0023: Initialize directory with the first entry.
+        writeDirCount(data, 1);
+        writeDirEntry(data, 0, keyHash(key), PROP_DATA_OFFSET);
+
+        self.buffer_pool.unpin(frame_idx, true);
+        return new_page;
     }
 
     /// Pass 1: Scan the chain to find and remove an existing key.
@@ -824,6 +1174,11 @@ pub const PropStore = struct {
     /// Compacts the page by shifting remaining entries forward.
     pub fn removeProperty(self: *PropStore, prop_head: u64, key: []const u8) !void {
         if (prop_head == 0) return;
+
+        // GAP prop-store slab packing (P2): slab-resident nodes shrink their
+        // blob in place (removal never grows, and removeProperty cannot
+        // return a new head, so the head must stay valid).
+        if (isSlabHead(prop_head)) return self.removeSlabProperty(prop_head, key);
 
         var cursor = PageChainCursor.init(self, prop_head);
         defer cursor.deinit();
@@ -942,6 +1297,19 @@ pub const PropStore = struct {
         return cursor.offset - PROP_DATA_OFFSET;
     }
 };
+
+/// GAP prop-store slab packing (P2): serialize one property entry — the exact
+/// legacy wire format (key_len u16 LE + key + encoded value) — into `buf` at
+/// `offset`. Returns the offset one past the entry.
+fn writeBlobEntry(buf: []u8, offset: usize, key: []const u8, encoded_val: []const u8) usize {
+    var off = offset;
+    std.mem.writeInt(u16, buf[off..][0..2], @intCast(key.len), .little);
+    off += 2;
+    @memcpy(buf[off..][0..key.len], key);
+    off += key.len;
+    @memcpy(buf[off..][0..encoded_val.len], encoded_val);
+    return off + encoded_val.len;
+}
 
 /// Determine the encoded size of a property value from its raw bytes.
 /// This avoids needing to fully decode the value.
