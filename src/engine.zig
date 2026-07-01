@@ -1575,8 +1575,16 @@ pub const GraphEngine = struct {
         try self.ensureDerivedHydrated();
         const new_head = try self.prop_store.putProperty(owner, key, val);
 
-        // Log the property page that was written to
-        try self.logPage(txn, .props, new_head);
+        // P4 (GAP prop-store slab packing): WAL-image EVERY props page the
+        // put dirtied. `new_head` is not necessarily a page id — a slab head
+        // encodes tag|page|slot, so logging it raw would image a bogus page —
+        // and one put can dirty several pages (slab relocation: old-page
+        // tombstone + fill-page append; slab→legacy migration: tombstone +
+        // every page of the new chain; legacy chain put: possibly a non-head
+        // page). The store records the exact dirtied set.
+        for (self.prop_store.touchedPages()) |touched_page| {
+            try self.logPage(txn, .props, touched_page);
+        }
 
         if (owner != 0 and owner != new_head) {
             self.property_index.removeChain(owner);
@@ -1645,8 +1653,13 @@ pub const GraphEngine = struct {
 
         try self.prop_store.removeProperty(owner, key);
 
-        // Log the property page if there is one
-        if (owner != 0) try self.logPage(txn, .props, owner);
+        // P4 (GAP prop-store slab packing): WAL-image every props page the
+        // remove dirtied (see putPropertyTxn) — `owner` may be a slab head
+        // (not a page id) and a legacy remove can dirty a non-head chain
+        // page. A no-op remove (absent key / owner == 0) logs nothing.
+        for (self.prop_store.touchedPages()) |touched_page| {
+            try self.logPage(txn, .props, touched_page);
+        }
 
         try self.txn_manager.commit(txn);
 

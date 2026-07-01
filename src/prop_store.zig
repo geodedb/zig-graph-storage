@@ -241,12 +241,13 @@ pub const PropStore = struct {
     /// GAP prop-store slab packing (P2): when true, a NEW node's first
     /// property is packed as a slot in a shared slab fill page instead of
     /// allocating a whole ≥page_size page per node. Rollout toggle for P7.
-    /// Default OFF: the ENGINE still assumes legacy heads in two places that
-    /// P4/P5/P7 must fix before enabling there — (a) WAL logging does
-    /// `logPage(txn, .props, prop_head)`, treating the head as a bare page id
-    /// (a slab head would pin/log a bogus page id), and (b) adjacency entries
-    /// pack edge prop_heads into a u32, which would truncate the slab tag
-    /// bit. Legacy on-disk pages are untouched either way (read-both, P1).
+    /// Default OFF. P4 fixed the WAL gap (engine now logs the DECODED set of
+    /// dirtied pages via `touchedPages`, never the raw head), so slab writes
+    /// are crash-safe; the remaining blockers before P7 can flip the default
+    /// are P5's: (a) adjacency entries pack EDGE prop_heads into a u32, which
+    /// would truncate the slab tag bit, and (b) property_chain_index /
+    /// negative-cache churn on head-changing relocations. Legacy on-disk
+    /// pages are untouched either way (read-both, P1).
     slab_packing: bool = false,
 
     /// The shared "current fill page" that new slab blobs append to.
@@ -256,6 +257,53 @@ pub const PropStore = struct {
     /// byte) is always re-derived from the page itself, never cached, so a
     /// stale or copied PropStore value cannot corrupt a page.
     current_fill_page: ?PageId = null,
+
+    /// P4 (WAL slab-awareness): page ids DIRTIED by the CURRENT top-level
+    /// mutating op (`putProperty` / `removeProperty`), deduplicated, in
+    /// first-touch order. The ENGINE logs a WAL page-image for every entry
+    /// after the op returns (engine.putPropertyTxn / engine.removeProperty).
+    /// Rationale: a prop_head is no longer always a page id (slab heads
+    /// encode tag|page|slot), and one op can dirty SEVERAL pages — a slab
+    /// relocation tombstones the old page and appends to the fill page; a
+    /// slab→legacy migration additionally writes every page of the fresh
+    /// legacy chain; even a legacy put/remove can dirty a non-head chain
+    /// page. Logging just "the head" would either image a bogus page id
+    /// (slab) or silently under-log (multi-page ops) — both crash-consistency
+    /// bugs. Capacity: the worst case (slab→legacy migration of a
+    /// near-page-size blob) dirties ≤ ~6 distinct pages regardless of
+    /// page_size; 16 leaves generous slack and `recordTouched` fails loudly
+    /// rather than ever silently dropping a page.
+    touched_pages: [MAX_TOUCHED_PAGES]PageId = undefined,
+    touched_len: u8 = 0,
+
+    pub const MAX_TOUCHED_PAGES: usize = 16;
+
+    /// P4: forget the previous op's dirtied-page set. Called at the top of
+    /// every public mutating entry point.
+    fn resetTouched(self: *PropStore) void {
+        self.touched_len = 0;
+    }
+
+    /// P4: record a page dirtied by the current mutating op (deduplicated).
+    /// Over-recording is harmless (a redundant page image is still correct);
+    /// UNDER-recording is silent data loss on crash — so overflow fails the
+    /// op loudly instead of dropping a page (unreachable by construction,
+    /// see `touched_pages`).
+    fn recordTouched(self: *PropStore, page_id: PageId) !void {
+        for (self.touched_pages[0..self.touched_len]) |p| {
+            if (p == page_id) return;
+        }
+        if (self.touched_len >= MAX_TOUCHED_PAGES) return error.TooManyDirtyPropPages;
+        self.touched_pages[self.touched_len] = page_id;
+        self.touched_len += 1;
+    }
+
+    /// P4: the pages dirtied by the most recent `putProperty` /
+    /// `removeProperty` call. Valid until the next mutating call on this
+    /// store. The engine WAL-logs a page image for each entry.
+    pub fn touchedPages(self: *const PropStore) []const PageId {
+        return self.touched_pages[0..self.touched_len];
+    }
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, var_store: *VarStore, page_size: u32) PropStore {
         return .{
@@ -595,6 +643,7 @@ pub const PropStore = struct {
                     writeSlabSlot(data, slot, state.next_off, blob_len);
                     writeSlabSlotCount(data, slot + 1);
                     self.buffer_pool.unpin(frame_idx, true);
+                    try self.recordTouched(fill_page); // P4: WAL images the fill page
                     return encodeSlabHead(fill_page, slot);
                 }
             }
@@ -620,6 +669,7 @@ pub const PropStore = struct {
         writeSlabSlot(data, 0, SLAB_DATA_OFFSET, blob_len);
         writeSlabSlotCount(data, 1);
         self.buffer_pool.unpin(frame_idx, true);
+        try self.recordTouched(new_page); // P4: WAL images the fresh slab page
         self.current_fill_page = new_page;
         return encodeSlabHead(new_page, 0);
     }
@@ -698,7 +748,10 @@ pub const PropStore = struct {
                 return err;
             };
             self.buffer_pool.unpin(frame_idx, placed);
-            if (placed) return prop_head;
+            if (placed) {
+                try self.recordTouched(page_id); // P4: in-place rewrite dirtied it
+                return prop_head;
+            }
         }
 
         // (3): relocate to a new slot (possibly a new fill page).
@@ -750,6 +803,10 @@ pub const PropStore = struct {
         };
         writeSlabSlot(data, slot, span.offset, 0);
         self.buffer_pool.unpin(frame_idx, true);
+        // P4: the tombstone is a page mutation in its own right — it MUST be
+        // WAL-imaged together with the relocated/migrated blob's new pages,
+        // or a crash could replay one side without the other.
+        try self.recordTouched(page_id);
     }
 
     /// P2 fallback: write every entry of `blob` into a fresh LEGACY
@@ -813,6 +870,7 @@ pub const PropStore = struct {
                 std.mem.writeInt(u32, blob[0..4], entry_count - 1, .little);
                 writeSlabSlot(data, slot, span.offset, new_len);
                 dirty = true;
+                try self.recordTouched(page_id); // P4: in-place shrink dirtied it
                 return;
             }
             off += entry_len;
@@ -988,6 +1046,7 @@ pub const PropStore = struct {
     /// to at most 2 (find+remove in pass 1, insert in pass 2).
     /// QUAL-0026: Decomposed into findAndRemoveKey + insertEntry helpers.
     pub fn putProperty(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
+        self.resetTouched(); // P4: this op's dirtied pages, for the engine's WAL logging
         if (key.len > std.math.maxInt(u16)) return error.PropertyKeyTooLong;
 
         // PERF-0022: Use a stack buffer for small fixed-size types to avoid
@@ -1060,6 +1119,7 @@ pub const PropStore = struct {
         writeDirEntry(data, 0, keyHash(key), PROP_DATA_OFFSET);
 
         self.buffer_pool.unpin(frame_idx, true);
+        try self.recordTouched(new_page); // P4: WAL must image the new chain head
         return new_page;
     }
 
@@ -1091,12 +1151,15 @@ pub const PropStore = struct {
                     writeEntryCount(data, entry_count + 1);
                     rebuildDirectory(data, entry_count + 1, self.page_size);
                     cursor.unpinCurrent(true);
+                    // P4: the dirtied page may be a NON-HEAD chain page.
+                    try self.recordTouched(page.page_id);
                     return prop_head;
                 }
 
                 writeEntryCount(data, entry_count);
                 rebuildDirectory(data, entry_count, self.page_size);
                 cursor.unpinCurrent(true);
+                try self.recordTouched(page.page_id); // P4: removal dirtied this page
 
                 // Key removed but page too full; caller needs Pass 2.
                 return null;
@@ -1138,6 +1201,8 @@ pub const PropStore = struct {
                 writeDirEntry(data, @intCast(page.entry_count), keyHash(key), @intCast(write_offset));
 
                 cursor.unpinCurrent(true);
+                // P4: the first page with space may be a NON-HEAD chain page.
+                try self.recordTouched(page.page_id);
                 return prop_head;
             }
 
@@ -1161,6 +1226,10 @@ pub const PropStore = struct {
                 // page's tail; the cursor still holds the current frame pinned.
                 writeNextPage(data, new_page);
                 cursor.unpinCurrent(true);
+                // P4: BOTH the new overflow page and the page it was linked
+                // onto were dirtied and must be WAL-imaged.
+                try self.recordTouched(new_page);
+                try self.recordTouched(page.page_id);
                 return prop_head;
             }
 
@@ -1173,6 +1242,7 @@ pub const PropStore = struct {
     /// Remove a property by key. Scans all pages in the chain.
     /// Compacts the page by shifting remaining entries forward.
     pub fn removeProperty(self: *PropStore, prop_head: u64, key: []const u8) !void {
+        self.resetTouched(); // P4: this op's dirtied pages, for the engine's WAL logging
         if (prop_head == 0) return;
 
         // GAP prop-store slab packing (P2): slab-resident nodes shrink their
@@ -1190,6 +1260,8 @@ pub const PropStore = struct {
                 writeEntryCount(data, removal.entry_count);
                 rebuildDirectory(data, removal.entry_count, self.page_size);
                 cursor.unpinCurrent(true);
+                // P4: the dirtied page may be a NON-HEAD chain page.
+                try self.recordTouched(page.page_id);
                 return;
             }
 

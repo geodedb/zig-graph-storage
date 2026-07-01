@@ -801,6 +801,324 @@ test "GAP-ENT-0020 P2 update/remove: slab-resident nodes stay correct (in-place,
     try expectOracleText(&store, head_b, "name=string:Homo sapiens\n");
 }
 
+// ============================================================================
+// Phase P4 — WAL slab-awareness + crash safety.
+//
+// WAL model (confirmed): durability is EXPLICIT physical page-image redo.
+// The engine calls logPage(txn, file, page_id) AFTER a store mutation; logPage
+// pins the page and copies its full current image into a `page_update` WAL
+// record. Recovery replays committed txns' images byte-for-byte (recovery.zig
+// step 5) and discards uncommitted ones. The buffer pool does NOT log
+// anything by itself — so the ONLY prop-store gap was at the engine call
+// sites, which passed `prop_head` to logPage as if it were a bare page id:
+//   * a slab head (tag|page|slot) is NOT a page id → bogus image;
+//   * one slab put can dirty SEVERAL pages (relocation = old-page tombstone
+//     + fill-page append; slab→legacy migration = tombstone + every page of
+//     the fresh legacy chain) → silent under-logging → crash data loss.
+// These tests are the RED/GREEN proof of the fix (PropStore.touchedPages()).
+// ============================================================================
+
+const GraphEngine = gs.GraphEngine;
+const TestDataDir = gs.test_support.TestDataDir;
+
+/// All .props page_update page-ids currently in the engine's WAL, LSN order.
+/// Caller frees the returned slice.
+fn propsPageUpdateIds(eng: *GraphEngine, alloc: Allocator) ![]u64 {
+    const records = try eng.wal.readFrom(1, alloc);
+    defer {
+        for (records) |*r| r.deinit(alloc);
+        alloc.free(records);
+    }
+    var ids: std.ArrayList(u64) = .empty;
+    errdefer ids.deinit(alloc);
+    for (records) |r| {
+        if (r.record_type != .page_update) continue;
+        if (r.file_id != @intFromEnum(gs.types.FileId.props)) continue;
+        try ids.append(alloc, r.page_id);
+    }
+    return ids.toOwnedSlice(alloc);
+}
+
+fn containsId(ids: []const u64, id: u64) bool {
+    for (ids) |x| {
+        if (x == id) return true;
+    }
+    return false;
+}
+
+fn countDistinct(ids: []const u64) usize {
+    var n: usize = 0;
+    for (ids, 0..) |x, i| {
+        var dup = false;
+        for (ids[0..i]) |y| {
+            if (y == x) dup = true;
+        }
+        if (!dup) n += 1;
+    }
+    return n;
+}
+
+test "GAP-ENT-0020 P4 WAL: slab writes log DECODED page ids — every touched page, no slab-head ids" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xD4} ** 16;
+    var cfg = gs.test_support.testConfig(); // page_size 4096
+    cfg.buffer_pool_pages = 512;
+
+    const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    eng.prop_store.slab_packing = true;
+
+    const ps = gs.prop_store;
+    const alloc = testing.allocator;
+    var mark: usize = 0;
+
+    // --- op 1: first slab write (node A). The WAL must reference the slab
+    // page by its REAL page id — never by the slab-encoded head. ---
+    const head_a1 = try eng.putProperty(0, "name", .{ .string = "Panthera leo" });
+    try testing.expect(ps.isSlabHead(head_a1));
+    const page_a = ps.slabPageId(head_a1);
+    {
+        const ids = try propsPageUpdateIds(eng, alloc);
+        defer alloc.free(ids);
+        try testing.expect(containsId(ids[mark..], page_a));
+        for (ids) |id| try testing.expect(!ps.isSlabHead(id));
+        mark = ids.len;
+    }
+
+    // --- op 2: node B shares the same fill page. ---
+    const head_b = try eng.putProperty(0, "name", .{ .string = "Homo sapiens" });
+    try testing.expectEqual(page_a, ps.slabPageId(head_b));
+    {
+        const ids = try propsPageUpdateIds(eng, alloc);
+        defer alloc.free(ids);
+        try testing.expect(containsId(ids[mark..], page_a));
+        mark = ids.len;
+    }
+
+    // --- advance the fill page so A's page is retired (forces the coming
+    // relocation to land on a DIFFERENT page than the tombstone). ---
+    var filler: [1000]u8 = undefined;
+    @memset(&filler, 'f');
+    var hops: usize = 0;
+    while (hops < 20) : (hops += 1) {
+        const h = try eng.putProperty(0, "pad", .{ .string = &filler });
+        try testing.expect(ps.isSlabHead(h));
+        if (ps.slabPageId(h) != page_a) break;
+    }
+    try testing.expect(hops < 20);
+    {
+        const ids = try propsPageUpdateIds(eng, alloc);
+        defer alloc.free(ids);
+        mark = ids.len;
+    }
+
+    // --- op 3: RELOCATION across pages. One committed txn dirties TWO pages
+    // (tombstone on page_a + new slot on the current fill page); BOTH must be
+    // WAL-logged or a crash loses the relocated blob / resurrects the old. ---
+    var grown: [200]u8 = undefined;
+    @memset(&grown, 'g');
+    const head_a2 = try eng.putProperty(head_a1, "name", .{ .string = &grown });
+    try testing.expect(head_a2 != head_a1);
+    try testing.expect(ps.isSlabHead(head_a2));
+    const page_a2 = ps.slabPageId(head_a2);
+    try testing.expect(page_a2 != page_a);
+    {
+        const ids = try propsPageUpdateIds(eng, alloc);
+        defer alloc.free(ids);
+        const tail = ids[mark..];
+        try testing.expect(containsId(tail, page_a)); // tombstoned old page
+        try testing.expect(containsId(tail, page_a2)); // new slot's page
+        for (ids) |id| try testing.expect(!ps.isSlabHead(id));
+        mark = ids.len;
+    }
+
+    // --- op 4: slab→legacy MIGRATION. Touches the old slab page (tombstone)
+    // + BOTH pages of the fresh 2-page legacy chain (4 KB page cannot hold
+    // 2000+2600 byte entries on one page). All three must be logged. ---
+    var big1: [2000]u8 = undefined;
+    @memset(&big1, '1');
+    var big2: [2600]u8 = undefined;
+    @memset(&big2, '2');
+    const head_c1 = try eng.putProperty(0, "big1", .{ .string = &big1 });
+    try testing.expect(ps.isSlabHead(head_c1));
+    const page_c = ps.slabPageId(head_c1);
+    {
+        const ids = try propsPageUpdateIds(eng, alloc);
+        defer alloc.free(ids);
+        mark = ids.len;
+    }
+    const head_c2 = try eng.putProperty(head_c1, "big2", .{ .string = &big2 });
+    try testing.expect(!ps.isSlabHead(head_c2)); // migrated to a legacy chain
+    {
+        const ids = try propsPageUpdateIds(eng, alloc);
+        defer alloc.free(ids);
+        const tail = ids[mark..];
+        try testing.expect(containsId(tail, page_c)); // tombstoned slab page
+        try testing.expect(containsId(tail, head_c2)); // legacy chain head
+        try testing.expect(countDistinct(tail) >= 3); // + the overflow page
+        for (ids) |id| try testing.expect(!ps.isSlabHead(id));
+        mark = ids.len;
+    }
+
+    // --- op 5: slab remove logs the blob's REAL page (owner head is slab). ---
+    try eng.removeProperty(head_b, "name");
+    {
+        const ids = try propsPageUpdateIds(eng, alloc);
+        defer alloc.free(ids);
+        try testing.expect(containsId(ids[mark..], page_a));
+        for (ids) |id| try testing.expect(!ps.isSlabHead(id));
+    }
+
+    // Data stayed intact through the new logging path.
+    {
+        const v = try eng.prop_store.getProperty(head_a2, "name", alloc);
+        try testing.expect(v != null);
+        defer property.freeDecoded(alloc, v.?);
+        try testing.expectEqualStrings(&grown, v.?.string);
+    }
+}
+
+/// Engine-level twin of putTaxonNode (auto-commit engine puts).
+fn putTaxonNodeEngine(eng: *GraphEngine, id: usize, buf: []u8) !u64 {
+    var head: u64 = 0;
+    head = try eng.putProperty(head, "name", .{ .string = "Genus species" });
+    head = try eng.putProperty(head, "rank", .{ .string = "species" });
+    head = try eng.putProperty(head, "kingdom", .{ .string = "Animalia" });
+    head = try eng.putProperty(head, "phylum", .{ .string = "Chordata" });
+    head = try eng.putProperty(head, "status", .{ .string = "accepted" });
+    const idstr = try std.fmt.bufPrint(buf, "T{d}", .{id});
+    head = try eng.putProperty(head, "src_id", .{ .string = idstr });
+    return head;
+}
+
+test "GAP-ENT-0020 P4 crash: committed slab writes recover byte-identical; uncommitted slab txn is atomically invisible" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xD5} ** 16;
+    var cfg = gs.test_support.testConfig(); // sync_each_commit: commits are WAL-durable
+    // Big pool: no dirty page is stolen (flushed) before the crash, so the
+    // ONLY durability channel across it is the fsynced WAL — exactly the
+    // path under test.
+    cfg.buffer_pool_pages = 512;
+
+    const alloc = testing.allocator;
+    const ps = gs.prop_store;
+
+    const N: usize = 20;
+    var heads: [N]u64 = undefined;
+    var nids: [N]gs.NodeId = undefined;
+    var goldens: [N][]u8 = undefined;
+    var goldens_set: usize = 0;
+    defer for (goldens[0..goldens_set]) |g| alloc.free(g);
+
+    var head_u: u64 = 0;
+
+    // ---- session 1: committed workload, then a SIMULATED CRASH ----
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        eng.prop_store.slab_packing = true;
+
+        var idbuf: [24]u8 = undefined;
+        for (0..N) |i| {
+            const nid = try eng.allocNode();
+            try eng.putNode(nid, gs.test_support.emptyNode(1));
+            const head = try putTaxonNodeEngine(eng, i, &idbuf);
+            try testing.expect(ps.isSlabHead(head));
+            var rec = (try eng.getNode(nid)).?;
+            rec.prop_head = head;
+            try eng.putNode(nid, rec);
+            nids[i] = nid;
+            heads[i] = head;
+        }
+
+        // Committed RELOCATION (node 0): siblings sit after its blob, so the
+        // grow moves it to a new slot and tombstones the old — one txn.
+        {
+            var big: [600]u8 = undefined;
+            @memset(&big, 'r');
+            const nh = try eng.putProperty(heads[0], "name", .{ .string = &big });
+            try testing.expect(nh != heads[0]);
+            var rec = (try eng.getNode(nids[0])).?;
+            rec.prop_head = nh;
+            try eng.putNode(nids[0], rec);
+            heads[0] = nh;
+        }
+
+        // Committed slab→legacy MIGRATION (node 1): grow past the slab max.
+        {
+            var big1: [2000]u8 = undefined;
+            @memset(&big1, 'm');
+            var big2: [2600]u8 = undefined;
+            @memset(&big2, 'M');
+            var h = try eng.putProperty(heads[1], "blob1", .{ .string = &big1 });
+            h = try eng.putProperty(h, "blob2", .{ .string = &big2 });
+            try testing.expect(!ps.isSlabHead(h));
+            var rec = (try eng.getNode(nids[1])).?;
+            rec.prop_head = h;
+            try eng.putNode(nids[1], rec);
+            heads[1] = h;
+        }
+
+        // Committed slab REMOVE (node 2): in-place shrink on the shared page.
+        try eng.removeProperty(heads[2], "rank");
+
+        // Golden snapshot of every node AFTER all committed mutations.
+        for (0..N) |i| {
+            var oracle = try readOracle(alloc, &eng.prop_store, heads[i]);
+            defer oracle.deinit();
+            goldens[i] = try formatOracle(alloc, &oracle);
+            goldens_set += 1;
+        }
+
+        // ---- uncommitted tail txn (must be ATOMICALLY invisible): ----
+        //  (a) a fresh slab append on the LIVE fill page (crash mid-append:
+        //      committed siblings sharing that page must be unaffected);
+        //  (b) a relocation of committed node 3 (tombstone+rewrite must be
+        //      atomic: after recovery the OLD slot must still be live).
+        const txn = try eng.beginTxn();
+        head_u = try eng.putPropertyTxn(0, "ghost", .{ .string = "must-not-survive" }, txn);
+        try testing.expect(ps.isSlabHead(head_u));
+        var ubig: [700]u8 = undefined;
+        @memset(&ubig, 'u');
+        const reloc_head = try eng.putPropertyTxn(heads[3], "name", .{ .string = &ubig }, txn);
+        try testing.expect(reloc_head != heads[3]);
+
+        // NO commit. CRASH: no checkpoint, no close, no flush — only the
+        // fsynced WAL survives (deinit frees memory without writeback).
+        eng.deinit();
+    }
+
+    // ---- session 2: recovery (WAL page-image redo of committed txns) ----
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Every committed node — including the relocated (0), migrated (1),
+        // shrunk (2), and would-be-uncommitted-relocated (3) — recovers
+        // byte-identical: redo reproduced slab slot dirs + blobs exactly.
+        for (0..N) |i| {
+            const rec = (try eng.getNode(nids[i])).?;
+            try testing.expectEqual(heads[i], rec.prop_head);
+            try expectOracleText(&eng.prop_store, rec.prop_head, goldens[i]);
+        }
+
+        // (b) proven by the loop: node 3's OLD head read its committed value,
+        // so the uncommitted tombstone never reached the durable page.
+
+        // (a) the uncommitted ghost append is invisible: its slot must not
+        // exist in the recovered slot directory. A read error (DataCorruption
+        // — slot beyond slot_count / unstamped page) is the expected outcome;
+        // surfacing the value would be an atomicity bug.
+        if (eng.prop_store.getProperty(head_u, "ghost", alloc)) |maybe| {
+            if (maybe) |v| {
+                property.freeDecoded(alloc, v);
+                try testing.expect(false); // uncommitted write surfaced
+            }
+        } else |_| {}
+    }
+}
+
 test "GAP-ENT-0020 P2 reopen: slab pages survive flush + clean reopen (oracle parity)" {
     const page_size: u32 = 8192;
     const n: usize = 50;
