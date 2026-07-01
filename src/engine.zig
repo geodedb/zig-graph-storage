@@ -1570,10 +1570,37 @@ pub const GraphEngine = struct {
 
     /// Put a property within an existing transaction (no auto-commit).
     pub fn putPropertyTxn(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId) anyerror!u64 {
+        return self.putPropertyTxnImpl(owner, key, val, txn, true);
+    }
+
+    /// GAP prop-store slab packing (P5): the LEGACY-ONLY put for edge
+    /// property chains. Identical to `putPropertyTxn` except a new chain is
+    /// never slab-packed (see PropStore.putPropertyLegacyOnly): edge
+    /// prop_heads are packed as u32 in adjacency entries and the edge index,
+    /// which cannot represent a slab head. Every edge-property write path
+    /// (engine_edge_props.setEdgeProperty here; geode's adapter edge sites
+    /// once slab packing rolls out) must use this instead of putPropertyTxn.
+    pub fn putPropertyLegacyTxn(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId) anyerror!u64 {
+        return self.putPropertyTxnImpl(owner, key, val, txn, false);
+    }
+
+    /// Auto-commit wrapper for `putPropertyLegacyTxn` (edge-prop chains).
+    pub fn putPropertyLegacy(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+        const new_head = try self.putPropertyLegacyTxn(owner, key, val, txn);
+        try self.txn_manager.commit(txn);
+        return new_head;
+    }
+
+    fn putPropertyTxnImpl(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId, allow_slab: bool) anyerror!u64 {
         try self.ensureWritable();
         // Phase A: reads/mutates the property_index chain — materialize first.
         try self.ensureDerivedHydrated();
-        const new_head = try self.prop_store.putProperty(owner, key, val);
+        const new_head = if (allow_slab)
+            try self.prop_store.putProperty(owner, key, val)
+        else
+            try self.prop_store.putPropertyLegacyOnly(owner, key, val);
 
         // P4 (GAP prop-store slab packing): WAL-image EVERY props page the
         // put dirtied. `new_head` is not necessarily a page id — a slab head

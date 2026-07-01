@@ -1046,6 +1046,26 @@ pub const PropStore = struct {
     /// to at most 2 (find+remove in pass 1, insert in pass 2).
     /// QUAL-0026: Decomposed into findAndRemoveKey + insertEntry helpers.
     pub fn putProperty(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
+        return self.putPropertyImpl(prop_head, key, val, true);
+    }
+
+    /// GAP prop-store slab packing (P5): the NODE-ONLY slab gate. Identical
+    /// to `putProperty` except a NEW chain (prop_head == 0) is always
+    /// allocated in the LEGACY one-page-per-node layout, even when
+    /// `slab_packing` is enabled. EDGE property chains MUST use this entry
+    /// point: adjacency entries and the edge index pack edge prop_heads as
+    /// u32, which cannot represent a slab head (tag bit 63 | 39-bit page id
+    /// | 24-bit slot), and the sharded head-routed compatibility API cannot
+    /// route slab heads at all. A slab head passed as `prop_head` here is a
+    /// caller bug — a slab chain leaked into a legacy-only owner — and fails
+    /// loudly instead of silently relocating/migrating it (which could mint
+    /// a fresh slab head for a u32 consumer).
+    pub fn putPropertyLegacyOnly(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue) !u64 {
+        if (isSlabHead(prop_head)) return error.UnexpectedSlabHead;
+        return self.putPropertyImpl(prop_head, key, val, false);
+    }
+
+    fn putPropertyImpl(self: *PropStore, prop_head: u64, key: []const u8, val: PropertyValue, allow_slab: bool) !u64 {
         self.resetTouched(); // P4: this op's dirtied pages, for the engine's WAL logging
         if (key.len > std.math.maxInt(u16)) return error.PropertyKeyTooLong;
 
@@ -1082,8 +1102,10 @@ pub const PropStore = struct {
             // GAP prop-store slab packing (P2): pack the first property into a
             // shared slab fill page. Falls back to the legacy one-page-per-node
             // chain when the blob can never fit a slab page or the page-id
-            // encoding guard trips.
-            if (self.slab_packing) {
+            // encoding guard trips. P5: `allow_slab` gates slab allocation to
+            // node-property owners (edge chains are legacy-only — see
+            // putPropertyLegacyOnly).
+            if (allow_slab and self.slab_packing) {
                 if (try self.slabFirstWrite(key, encoded_val)) |head| return head;
             }
             return try self.legacyNewChain(key, encoded_val);

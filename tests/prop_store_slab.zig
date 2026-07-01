@@ -1159,3 +1159,334 @@ test "GAP-ENT-0020 P2 reopen: slab pages survive flush + clean reopen (oracle pa
         try expectOracleText(&store2, h, golden);
     }
 }
+
+// ============================================================================
+// GAP prop-store slab packing — Phase P5: slab-safe routing for every
+// remaining prop_head consumer (sharded router, edge-prop u32 gating,
+// index consistency across relocation). See the P5 tests below.
+// ============================================================================
+
+const ShardedGraphEngine = gs.ShardedGraphEngine;
+
+test "GAP-ENT-0020 P5 routing: head-routed sharded API never mints slab heads" {
+    // The ShardedGraphEngine's head-routed property API (the GraphStorage
+    // vtable surface) routes by shardOfNode(prop_head). A slab head encodes
+    // tag|page|slot — page ids are PER-SHARD-sequential, not shard-striped —
+    // so a slab head carries no shard information and head-value routing
+    // pins an arbitrary shard's page.
+    //
+    // RED (pre-P5): with slab_packing ON, putProperty(0, ...) minted a slab
+    // head through the round-robin create path; every subsequent head-routed
+    // op on it misroutes. GREEN (P5): the head-routed create is forced
+    // LEGACY, so the head-routed world never contains a slab head.
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE0} ** 16;
+    const eng = try ShardedGraphEngine.create(
+        testing.allocator,
+        td.path,
+        uuid,
+        gs.test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+    for (eng.shards) |sh| sh.prop_store.slab_packing = true;
+
+    const head = try eng.putProperty(0, "name", .{ .string = "alice" });
+    try testing.expect(!gs.prop_store.isSlabHead(head));
+
+    // The chain exists, intact, on exactly one shard (legacy layout). NOTE:
+    // head-routed reads on a multi-shard graph carry a PRE-EXISTING caveat —
+    // legacy page ids are also per-shard-sequential, so shardOfNode(head)
+    // only finds the chain when the round-robin shard and head%SHARD_COUNT
+    // coincide; owner-routed getNodeProperty is the reliable path. Probe all
+    // shards here to stay deterministic.
+    var found = false;
+    for (eng.shards) |sh| {
+        const maybe = sh.getProperty(head, "name", testing.allocator) catch null;
+        if (maybe) |v| {
+            defer property.freeDecoded(testing.allocator, v);
+            if (v == .string and std.mem.eql(u8, v.string, "alice")) found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "GAP-ENT-0020 P5 routing: owner-routed slab ops reach the owning shard (get/put/remove/getAll)" {
+    // Slab heads carry no shard information: prop page ids are per-shard-
+    // sequential, so the FIRST slab fill page of every shard gets the SAME
+    // (page, slot) encoding. This test proves the ambiguity is real (two
+    // nodes on different shards share an identical head value), that the
+    // owner-routed API disambiguates by node id, and that the head-routed
+    // compatibility API rejects slab heads loudly instead of misrouting.
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE1} ** 16;
+    const eng = try ShardedGraphEngine.create(
+        testing.allocator,
+        td.path,
+        uuid,
+        gs.test_support.testConfig(),
+    );
+    defer eng.close() catch {};
+    for (eng.shards) |sh| sh.prop_store.slab_packing = true;
+
+    const ps = gs.prop_store;
+    const alloc = testing.allocator;
+    const N: usize = 32; // two nodes per shard (16 shards, round-robin alloc)
+
+    var nids: [N]gs.NodeId = undefined;
+    var heads: [N]u64 = undefined;
+    var namebuf: [N][16]u8 = undefined;
+    var names: [N][]const u8 = undefined;
+
+    for (0..N) |i| {
+        nids[i] = try eng.allocNode();
+        try eng.putNode(nids[i], gs.test_support.emptyNode(1));
+        names[i] = try std.fmt.bufPrint(&namebuf[i], "species-{d}", .{i});
+
+        var head = try eng.putNodeProperty(nids[i], 0, "name", .{ .string = names[i] });
+        head = try eng.putNodeProperty(nids[i], head, "rank", .{ .string = "species" });
+        try testing.expect(ps.isSlabHead(head));
+
+        var rec = (try eng.getNode(nids[i])).?;
+        rec.prop_head = head;
+        try eng.putNode(nids[i], rec);
+        heads[i] = head;
+    }
+
+    // The ambiguity the old shardOfNode(prop_head) router could not survive:
+    // nodes 0 and 1 live on DIFFERENT shards yet their slab heads are the
+    // IDENTICAL u64 (same first fill page id, same slot, different shard).
+    try testing.expect(gs.shard_count.shardOfNode(nids[0]) != gs.shard_count.shardOfNode(nids[1]));
+    try testing.expectEqual(heads[0], heads[1]);
+
+    // Relocation on every shard: grow the FIRST node per shard past its slot
+    // (a sibling blob sits after it, so it cannot grow in place). The head
+    // CHANGES mid-life — routing state keyed on the head value would go stale.
+    var big: [600]u8 = undefined;
+    for (0..16) |i| {
+        @memset(&big, @as(u8, @intCast('A' + (i % 26))));
+        const nh = try eng.putNodeProperty(nids[i], heads[i], "name", .{ .string = &big });
+        try testing.expect(nh != heads[i]);
+        try testing.expect(ps.isSlabHead(nh));
+        var rec = (try eng.getNode(nids[i])).?;
+        rec.prop_head = nh;
+        try eng.putNode(nids[i], rec);
+        heads[i] = nh;
+    }
+
+    // Every read reaches the right shard and the right blob.
+    for (0..N) |i| {
+        const got = (try eng.getNodeProperty(nids[i], heads[i], "name", alloc)).?;
+        defer property.freeDecoded(alloc, got);
+        if (i < 16) {
+            @memset(&big, @as(u8, @intCast('A' + (i % 26))));
+            try testing.expectEqualStrings(&big, got.string);
+        } else {
+            try testing.expectEqualStrings(names[i], got.string);
+        }
+
+        const rank = (try eng.getNodeProperty(nids[i], heads[i], "rank", alloc)).?;
+        defer property.freeDecoded(alloc, rank);
+        try testing.expectEqualStrings("species", rank.string);
+
+        var it = try eng.getAllNodeProperties(nids[i], heads[i]);
+        defer it.deinit();
+        var count: usize = 0;
+        while (try it.next()) |_| count += 1;
+        try testing.expectEqual(@as(usize, 2), count);
+    }
+
+    // Owner-routed remove: in-place shrink, head stays valid, sibling intact.
+    try eng.removeNodeProperty(nids[0], heads[0], "rank");
+    try testing.expectEqual(
+        @as(?gs.PropertyValue, null),
+        try eng.getNodeProperty(nids[0], heads[0], "rank", alloc),
+    );
+    {
+        const still = (try eng.getNodeProperty(nids[0], heads[0], "name", alloc)).?;
+        defer property.freeDecoded(alloc, still);
+        @memset(&big, 'A');
+        try testing.expectEqualStrings(&big, still.string);
+    }
+
+    // The head-routed compatibility API refuses slab heads LOUDLY (the old
+    // router would silently pin an arbitrary shard's page instead).
+    try testing.expectError(error.SlabHeadRequiresOwnerRouting, eng.getProperty(heads[2], "name", alloc));
+    try testing.expectError(error.SlabHeadRequiresOwnerRouting, eng.getAllProperties(heads[2]));
+    try testing.expectError(error.SlabHeadRequiresOwnerRouting, eng.putProperty(heads[2], "x", .{ .int = 1 }));
+    try testing.expectError(error.SlabHeadRequiresOwnerRouting, eng.removeProperty(heads[2], "name"));
+}
+
+test "GAP-ENT-0020 P5 edge gate: edge properties never slab-encode (node-only slab)" {
+    // Edge prop_heads are packed as u32 in adjacency entries and the edge
+    // index; a slab head (tag bit 63) cannot survive that. Slab packing is
+    // therefore NODE-ONLY: the edge write path allocates legacy chains even
+    // with slab_packing enabled, while node puts on the same engine slab-pack.
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE2} ** 16;
+    const eng = try GraphEngine.create(testing.allocator, td.path, uuid, gs.test_support.testConfig());
+    defer eng.close() catch {};
+    eng.prop_store.slab_packing = true;
+
+    const ps = gs.prop_store;
+    const alloc = testing.allocator;
+
+    const n1 = try eng.allocNode();
+    try eng.putNode(n1, gs.test_support.emptyNode(1));
+    const n2 = try eng.allocNode();
+    try eng.putNode(n2, gs.test_support.emptyNode(1));
+    const edge = try eng.addEdge(n1, n2, 5);
+
+    // First edge property with slab ON: must allocate a LEGACY chain.
+    try eng.setEdgeProperty(n1, n2, edge, "weight", .{ .int = 42 });
+    const entry = (try eng.getEdge(edge)).?;
+    try testing.expect(entry.prop_head != 0);
+    try testing.expect(!ps.isSlabHead(@as(u64, entry.prop_head)));
+
+    // Round-trips + update + second key through the legacy edge chain.
+    try eng.setEdgeProperty(n1, n2, edge, "label", .{ .string = "knows" });
+    try eng.setEdgeProperty(n1, n2, edge, "weight", .{ .int = 43 });
+    {
+        const w = (try eng.getEdgeProperty(n1, edge, "weight", alloc)).?;
+        try testing.expectEqual(@as(i64, 43), w.int);
+        const l = (try eng.getEdgeProperty(n1, edge, "label", alloc)).?;
+        defer property.freeDecoded(alloc, l);
+        try testing.expectEqualStrings("knows", l.string);
+    }
+    {
+        var it = (try eng.getAllEdgeProperties(n1, edge)).?;
+        defer it.deinit();
+        var count: usize = 0;
+        while (try it.next()) |_| count += 1;
+        try testing.expectEqual(@as(usize, 2), count);
+    }
+    try eng.removeEdgeProperty(n1, edge, "label");
+    try testing.expectEqual(@as(?gs.PropertyValue, null), try eng.getEdgeProperty(n1, edge, "label", alloc));
+
+    // Adjacency copy agrees with the edge index (u32 head round-trip).
+    {
+        const after = (try eng.getEdge(edge)).?;
+        var it = try eng.expandOutIter(n1, null);
+        defer it.deinit();
+        const adj_entry = (try it.next()).?;
+        try testing.expectEqual(after.prop_head, adj_entry.prop_head);
+        try testing.expect(!ps.isSlabHead(@as(u64, adj_entry.prop_head)));
+    }
+
+    // The gate is edge-scoped, not global: a NODE put on the same engine
+    // still slab-packs.
+    const node_head = try eng.putProperty(0, "name", .{ .string = "still-slab" });
+    try testing.expect(ps.isSlabHead(node_head));
+
+    // Sharded facade: setEdgeProperty routes by shard(from) and stays legacy.
+    var td2 = try TestDataDir.init(testing.allocator);
+    defer td2.deinit();
+    const uuid2 = [_]u8{0xE4} ** 16;
+    const seng = try ShardedGraphEngine.create(testing.allocator, td2.path, uuid2, gs.test_support.testConfig());
+    defer seng.close() catch {};
+    for (seng.shards) |sh| sh.prop_store.slab_packing = true;
+
+    const a = try seng.allocNode();
+    try seng.putNode(a, gs.test_support.emptyNode(1));
+    const b = try seng.allocNode();
+    try seng.putNode(b, gs.test_support.emptyNode(1));
+    const e2 = try seng.addEdge(a, b, 7);
+    try seng.setEdgeProperty(a, b, e2, "since", .{ .int = 2026 });
+    const sv = (try seng.getEdgeProperty(a, e2, "since", alloc)).?;
+    try testing.expectEqual(@as(i64, 2026), sv.int);
+    const sentry = (try seng.getEdge(e2)).?;
+    try testing.expect(!ps.isSlabHead(@as(u64, sentry.prop_head)));
+}
+
+test "GAP-ENT-0020 P5 index: exact index + chain cache stay correct across slab relocations" {
+    // Relocation changes a node's prop_head mid-life. The chain digest
+    // (property_chain_index, the negative cache) is keyed BY head, so a
+    // relocation must evict the stale key and re-register the new head; the
+    // exact B+tree property index rebuilds by scanning rec.prop_head via the
+    // slab-aware reader at the durability boundary. Update-heavy workload →
+    // both must keep answering correctly.
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE3} ** 16;
+    var cfg = gs.test_support.testConfig();
+    cfg.buffer_pool_pages = 256;
+    const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    eng.prop_store.slab_packing = true;
+
+    const ps = gs.prop_store;
+    const alloc = testing.allocator;
+    const LABEL: gs.LabelId = 7;
+    const N: usize = 6;
+
+    var nids: [N]gs.NodeId = undefined;
+    var heads: [N]u64 = undefined;
+    var namebuf: [N][16]u8 = undefined;
+
+    for (0..N) |i| {
+        nids[i] = try eng.allocNode();
+        try eng.putNode(nids[i], gs.test_support.emptyNode(1));
+        try eng.addLabel(nids[i], LABEL);
+        const name = try std.fmt.bufPrint(&namebuf[i], "species-{d}", .{i});
+        var head = try eng.putProperty(0, "name", .{ .string = name });
+        head = try eng.putProperty(head, "rank", .{ .string = "species" });
+        try testing.expect(ps.isSlabHead(head));
+        var rec = (try eng.getNode(nids[i])).?;
+        rec.prop_head = head;
+        try eng.putNode(nids[i], rec);
+        heads[i] = head;
+    }
+
+    // Index build scans SLAB heads (P1 reader) — every value resolvable.
+    try eng.createPropertyIndex(LABEL, "name");
+    for (0..N) |i| {
+        const found = try eng.lookupPropertyIndex(LABEL, "name", .{ .string = namebuf[i][0..9] });
+        try testing.expectEqual(@as(?gs.NodeId, nids[i]), found);
+    }
+
+    // Update-heavy rounds: growing values force relocations (heads change).
+    const lens = [_]usize{ 100, 300, 700 };
+    var valbuf: [700]u8 = undefined;
+    var reloc_seen = false;
+    for (lens) |len| {
+        for (0..N) |i| {
+            @memset(valbuf[0..len], @as(u8, @intCast('A' + i)));
+            const nh = try eng.putProperty(heads[i], "name", .{ .string = valbuf[0..len] });
+            if (nh != heads[i]) {
+                reloc_seen = true;
+                // Stale chain-cache key evicted with the old head.
+                try testing.expect(!eng.property_index.containsChain(heads[i]));
+            }
+            var rec = (try eng.getNode(nids[i])).?;
+            rec.prop_head = nh;
+            try eng.putNode(nids[i], rec);
+            heads[i] = nh;
+
+            // Negative cache correct under the (possibly new) head...
+            try testing.expectEqual(
+                @as(?gs.PropertyValue, null),
+                try eng.getProperty(heads[i], "absent-key", alloc),
+            );
+            // ...and the positive read returns the freshly written value.
+            const got = (try eng.getProperty(heads[i], "name", alloc)).?;
+            defer property.freeDecoded(alloc, got);
+            try testing.expectEqualStrings(valbuf[0..len], got.string);
+        }
+    }
+    try testing.expect(reloc_seen); // the workload actually exercised relocation
+
+    // Durability boundary: the exact index rebuilds from the slab store.
+    try eng.checkpoint();
+    for (0..N) |i| {
+        @memset(valbuf[0..700], @as(u8, @intCast('A' + i)));
+        const found = try eng.lookupPropertyIndex(LABEL, "name", .{ .string = valbuf[0..700] });
+        try testing.expectEqual(@as(?gs.NodeId, nids[i]), found);
+    }
+    // The pre-update values are gone from the rebuilt index.
+    try testing.expectEqual(
+        @as(?gs.NodeId, null),
+        try eng.lookupPropertyIndex(LABEL, "name", .{ .string = "species-0" }),
+    );
+}

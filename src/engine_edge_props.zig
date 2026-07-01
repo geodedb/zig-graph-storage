@@ -38,8 +38,16 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
     const found_prop_head = edge_entry.prop_head;
 
-    // 3. Write property, get new prop_head
-    const new_head_u64 = try engine.putProperty(@as(u64, found_prop_head), key, value);
+    // 3. Write property, get new prop_head.
+    //    GAP prop-store slab packing (P5): edge property chains are
+    //    LEGACY-ONLY. The head is packed as u32 below (adjacency entries +
+    //    edge index), which cannot represent a slab head (tag bit 63), so
+    //    slab allocation is gated off for this owner class.
+    const new_head_u64 = try engine.putPropertyLegacy(@as(u64, found_prop_head), key, value);
+    // Loud invariant guard: a slab-encoded head must never reach the u32
+    // packing. Unreachable via the legacy-only put above; fails hard (never
+    // truncates) if the gate is ever bypassed.
+    if (prop_store_mod.isSlabHead(new_head_u64)) return error.UnexpectedSlabHead;
     const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
 
     // 4. If prop_head changed, update BOTH adjacency copies and edge index.
