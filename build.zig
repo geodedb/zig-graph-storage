@@ -493,6 +493,20 @@ fn addIntegrationTests(
     });
     const run_recreate_uaf = b.addRunArtifact(recreate_uaf_tests);
     recreate_uaf_step.dependOn(&run_recreate_uaf.step);
+
+    // GAP-ENT-0020 Phase P0: prop-store slab-packing FOUNDATION — props-store
+    // efficiency metric (one-page-per-node baseline), property-set parity oracle,
+    // and the read-both parity skeleton (legacy half passing; slab half TODO for
+    // P1). Own step so the baseline metric is easy to re-run and diff against as
+    // the slab write path lands. No production format change in P0.
+    const prop_store_slab_step = b.step("test-prop-store-slab", "Run prop-store slab-packing P0: efficiency metric + parity oracle + read-both skeleton");
+    const prop_store_slab_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/prop_store_slab.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_prop_store_slab = b.addRunArtifact(prop_store_slab_tests);
+    prop_store_slab_step.dependOn(&run_prop_store_slab.step);
 }
 
 fn addExample(
