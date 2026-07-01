@@ -123,6 +123,9 @@ fn measurePropsEfficiency(page_size: u32, n: usize) !EfficiencyResult {
     defer env.deinit();
 
     var store = env.store();
+    // This helper measures the LEGACY (one-page-per-node) baseline that the
+    // slab writer must beat — force legacy explicitly (default is ON since P7).
+    store.slab_packing = false;
 
     var idbuf: [24]u8 = undefined;
     var i: usize = 0;
@@ -407,6 +410,8 @@ test "GAP-ENT-0020 P0 read-both: legacy one-page-per-node layout (implemented)" 
     var env = try Env.init(8192, 32);
     defer env.deinit();
     var store = env.store();
+    // Legacy-layout coverage: force the legacy writer (default ON since P7).
+    store.slab_packing = false;
 
     // Two independently-built legacy nodes carrying the same logical props must
     // yield identical oracles. This proves the oracle + parity harness that P1's
@@ -647,7 +652,8 @@ test "GAP-ENT-0020 P2 parity: interleaved slab and legacy(oversized) writes matc
     // legacy reference writer (slab off) producing the oracle twin.
     var slab_store = env.store();
     slab_store.slab_packing = true;
-    var legacy_store = env.store(); // slab_packing stays false
+    var legacy_store = env.store();
+    legacy_store.slab_packing = false; // explicit legacy oracle (default is ON since P7)
 
     const ps = gs.prop_store;
 

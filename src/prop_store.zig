@@ -240,15 +240,17 @@ pub const PropStore = struct {
 
     /// GAP prop-store slab packing (P2): when true, a NEW node's first
     /// property is packed as a slot in a shared slab fill page instead of
-    /// allocating a whole ≥page_size page per node. Rollout toggle for P7.
-    /// Default OFF. P4 fixed the WAL gap (engine now logs the DECODED set of
-    /// dirtied pages via `touchedPages`, never the raw head), so slab writes
-    /// are crash-safe; the remaining blockers before P7 can flip the default
-    /// are P5's: (a) adjacency entries pack EDGE prop_heads into a u32, which
-    /// would truncate the slab tag bit, and (b) property_chain_index /
-    /// negative-cache churn on head-changing relocations. Legacy on-disk
-    /// pages are untouched either way (read-both, P1).
-    slab_packing: bool = false,
+    /// allocating a whole ≥page_size page per node. P4 fixed the WAL gap
+    /// (engine logs the DECODED set of dirtied pages via `touchedPages`,
+    /// never the raw head) so slab writes are crash-safe; P5 made every
+    /// prop_head consumer slab-safe and gated EDGE chains legacy-only
+    /// (adjacency entries pack edge prop_heads into a u32, which cannot
+    /// represent a slab head — see putPropertyLegacyOnly). Default ON since
+    /// P7: new NODE chains slab-pack; existing legacy chains keep reading
+    /// via the layout-discriminated read-both path (P1) — no migration.
+    /// Toggle retained for rollback/diagnostics (set false → pure legacy
+    /// writer).
+    slab_packing: bool = true,
 
     /// The shared "current fill page" that new slab blobs append to.
     /// In-memory only: after a reopen the first slab write simply starts a
@@ -312,7 +314,7 @@ pub const PropStore = struct {
             .var_store = var_store,
             .page_size = page_size,
             .tail_reserve = 0,
-            .slab_packing = false,
+            .slab_packing = true,
             .current_fill_page = null,
         };
     }
@@ -1795,6 +1797,7 @@ test "PERF-0023: directory is created on put and used for lookup" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     // Insert 10 properties and verify each is found via directory.
     var head: u64 = 0;
@@ -1864,6 +1867,7 @@ test "PERF-0023: legacy page without directory uses linear scan" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     // Create a page with entries but manually zero out the directory.
     var head = try store.putProperty(0, "key1", .{ .int = 10 });
@@ -1891,6 +1895,7 @@ test "PERF-0023: directory survives put-replace cycle" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     var head = try store.putProperty(0, "x", .{ .int = 1 });
     head = try store.putProperty(head, "y", .{ .int = 2 });
@@ -1923,6 +1928,7 @@ test "PERF-0023: directory rebuilt after removeProperty" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     var head = try store.putProperty(0, "a", .{ .int = 1 });
     head = try store.putProperty(head, "b", .{ .int = 2 });
@@ -1987,6 +1993,7 @@ test "SEC-0039: getProperty returns DataCorruption when dir_count is 0xFFFF" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     // Create a real property page.
     const head = try store.putProperty(0, "k", .{ .int = 1 });
@@ -2010,6 +2017,7 @@ test "SEC-0039: getProperty returns DataCorruption when dir_count just exceeds c
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     const head = try store.putProperty(0, "k", .{ .int = 1 });
 
@@ -2229,6 +2237,7 @@ test "QUAL-0040: PageChainCursor detects circular chain in getProperty" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     const head = try store.putProperty(0, "key", .{ .int = 42 });
 
@@ -2252,6 +2261,7 @@ test "QUAL-0040: PageChainCursor detects circular chain in removeProperty" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     const head = try store.putProperty(0, "key", .{ .int = 42 });
 
@@ -2277,6 +2287,7 @@ test "SEC-0042: PropIterator.next detects circular page chain" {
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     // Create a real property page with one entry.
     const head = try store.putProperty(0, "key", .{ .int = 42 });
@@ -2395,6 +2406,7 @@ test "QUAL-0044 T2: rebuildDirectory disables directory when data region overlap
     defer env.deinit();
 
     var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = false; // legacy slotted-page layout under test (slab default ON since P7)
 
     // Insert the sentinel entry that will be removed later.
     const sentinel_key = "sentinel";

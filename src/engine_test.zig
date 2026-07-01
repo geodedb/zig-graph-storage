@@ -1623,6 +1623,11 @@ test "PERF-0055: putProperty no redundant ArrayList alloc for fixed-size values"
     const engine2 = try GraphEngine.create(count_alloc, td2.path, uuid2, cfg);
     defer engine2.close() catch {};
 
+    // PERF-0055 asserts the LEGACY upsertKey stack-buffer encode path (a slab
+    // in-place update legitimately rebuilds the blob and may allocate) —
+    // force the legacy writer now that slab_packing defaults ON (P7).
+    engine2.prop_store.slab_packing = false;
+
     // First write: creates the property chain and index entry.
     var head2: u64 = 0;
     head2 = try engine2.putProperty(head2, "counter", .{ .int = 0 });
