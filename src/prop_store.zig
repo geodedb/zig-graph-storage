@@ -98,6 +98,122 @@ fn dirOverhead(dir_count: u16) u32 {
     return DIR_COUNT_SIZE + @as(u32, dir_count) * DIR_ENTRY_SIZE;
 }
 
+// ============================================================================
+// GAP prop-store slab packing — Phase P1: slab READ path (read-both).
+//
+// LAYOUT DISCRIMINATION (authoritative scheme): a TAG BIT in prop_head.
+//   - Legacy one-page-per-node: prop_head == page_id (a bare PageId); bit 63 is
+//     CLEAR. The whole page belongs to one node and reads via the existing
+//     page-chain path, unchanged. (Page ids are allocated sequentially and never
+//     approach 2^63, so bit 63 is a safe, otherwise-unused discriminator.)
+//   - Slab-packed: bit 63 is SET. The remaining bits pack (page_id, slot):
+//     bits [24..63) = page_id (39 bits), bits [0..24) = slot index (24 bits).
+//     Many nodes' property blobs share one page; the slot directory (offset,len
+//     per slot) grows backward from the page tail — mirroring the legacy
+//     intra-page entry directory, but the "entries" are now whole per-node blobs.
+//
+// WHY the tag lives in prop_head and not only the page header: to read a page at
+// all you must first know its page id, but legacy interprets the FULL u64 as the
+// page id while slab uses only the high bits — so the discriminator must be in
+// prop_head. A slab page ALSO stamps a layout_version byte right after the page
+// header (defense-in-depth: readers reject a page whose version byte is wrong).
+//
+// SLAB BLOB format (reuses the legacy property-entry format verbatim):
+//   [entry_count: u32 LE] then entry_count × (key_len: u16, key, encoded_value)
+// i.e. identical to a legacy page's entry region, minus the per-page
+// next_page/entry_count meta and per-page key directory. P1 does NOT write slabs
+// (production writers still emit legacy one-page-per-node); it only READS them.
+// ============================================================================
+
+/// Tag bit in prop_head marking a slab-packed pointer (vs a legacy page id).
+pub const SLAB_TAG_BIT: u64 = @as(u64, 1) << 63;
+/// Number of low bits of a slab prop_head used for the slot index.
+const SLAB_SLOT_BITS: u6 = 24;
+const SLAB_SLOT_MASK: u64 = (@as(u64, 1) << SLAB_SLOT_BITS) - 1;
+/// Maximum page id encodable in a slab prop_head (64 - 1 tag - 24 slot = 39).
+const SLAB_MAX_PAGE_ID: u64 = @as(u64, 1) << (64 - 1 - SLAB_SLOT_BITS);
+
+/// True when prop_head is a slab-packed pointer (bit 63 set) rather than a
+/// legacy bare page id.
+pub fn isSlabHead(prop_head: u64) bool {
+    return (prop_head & SLAB_TAG_BIT) != 0;
+}
+
+/// Encode a legacy prop_head: the bare page id (the slot is the whole page).
+/// Provided so callers can drive both layouts through the same accessors.
+pub fn encodeLegacyHead(page_id: PageId) u64 {
+    return page_id;
+}
+
+/// Encode a slab prop_head from (page_id, slot index into the slab directory).
+pub fn encodeSlabHead(page_id: PageId, slot: u32) u64 {
+    std.debug.assert(page_id < SLAB_MAX_PAGE_ID);
+    std.debug.assert(@as(u64, slot) <= SLAB_SLOT_MASK);
+    return SLAB_TAG_BIT | (page_id << SLAB_SLOT_BITS) | (@as(u64, slot) & SLAB_SLOT_MASK);
+}
+
+/// Decode the page id from a slab prop_head.
+pub fn slabPageId(prop_head: u64) PageId {
+    return (prop_head & ~SLAB_TAG_BIT) >> SLAB_SLOT_BITS;
+}
+
+/// Decode the slot index from a slab prop_head.
+pub fn slabSlot(prop_head: u64) u32 {
+    return @intCast(prop_head & SLAB_SLOT_MASK);
+}
+
+// --- Slab page on-disk layout constants + helpers (also used by P1 tests and
+//     the future P2 writer) ---
+
+/// Byte offset (after the 32-byte page header) of the slab layout_version byte.
+pub const SLAB_META_OFFSET: u32 = PAGE_HEADER_SIZE;
+/// Current slab page layout version.
+pub const SLAB_LAYOUT_VERSION: u8 = 1;
+/// Size of the slab meta region (version byte + reserved padding).
+pub const SLAB_META_SIZE: u32 = 4;
+/// First byte at which per-node blobs are stored.
+pub const SLAB_DATA_OFFSET: u32 = PAGE_HEADER_SIZE + SLAB_META_SIZE;
+/// Size of one slot-directory entry: blob offset (u32) + blob len (u32).
+pub const SLAB_SLOT_SIZE: u32 = 8;
+/// Size of the slot_count footer (u32 LE) at the very end of the page.
+pub const SLAB_SLOT_COUNT_SIZE: u32 = 4;
+
+/// Read the slab slot_count from the last 4 bytes of a (logical) slab page.
+pub fn readSlabSlotCount(data: []const u8) u32 {
+    return std.mem.readInt(u32, data[data.len - SLAB_SLOT_COUNT_SIZE ..][0..4], .little);
+}
+
+/// Write the slab slot_count to the last 4 bytes (tests / P2 writer).
+pub fn writeSlabSlotCount(data: []u8, count: u32) void {
+    std.mem.writeInt(u32, data[data.len - SLAB_SLOT_COUNT_SIZE ..][0..4], count, .little);
+}
+
+/// Base byte offset of slot `idx` in the backward-growing slot directory.
+fn slabSlotBase(data_len: usize, idx: u32) usize {
+    return data_len - SLAB_SLOT_COUNT_SIZE - (@as(usize, idx) + 1) * SLAB_SLOT_SIZE;
+}
+
+/// Read slot `idx`'s (offset, len) from the slab directory.
+pub fn readSlabSlot(data: []const u8, idx: u32) struct { offset: u32, len: u32 } {
+    const base = slabSlotBase(data.len, idx);
+    return .{
+        .offset = std.mem.readInt(u32, data[base..][0..4], .little),
+        .len = std.mem.readInt(u32, data[base + 4 ..][0..4], .little),
+    };
+}
+
+/// Write slot `idx`'s (offset, len) into the slab directory (tests / P2 writer).
+pub fn writeSlabSlot(data: []u8, idx: u32, offset: u32, len: u32) void {
+    const base = slabSlotBase(data.len, idx);
+    std.mem.writeInt(u32, data[base..][0..4], offset, .little);
+    std.mem.writeInt(u32, data[base + 4 ..][0..4], len, .little);
+}
+
+/// Stamp the slab layout_version byte (tests / P2 writer).
+pub fn writeSlabLayoutVersion(data: []u8) void {
+    data[SLAB_META_OFFSET] = SLAB_LAYOUT_VERSION;
+}
+
 /// Slotted-page property storage with overflow.
 /// For v1, uses a simple sequential layout within each property page.
 pub const PropStore = struct {
@@ -238,6 +354,10 @@ pub const PropStore = struct {
     pub fn getProperty(self: *PropStore, prop_head: u64, key: []const u8, allocator: Allocator) !?PropertyValue {
         if (prop_head == 0) return null;
 
+        // GAP prop-store slab packing (P1): slab-packed heads read via the slab
+        // path; legacy bare-page-id heads fall through to the chain path below.
+        if (isSlabHead(prop_head)) return self.getSlabProperty(prop_head, key, allocator);
+
         var cursor = PageChainCursor.init(self, prop_head);
         defer cursor.deinit();
         while (try cursor.next()) |page| {
@@ -306,6 +426,67 @@ pub const PropStore = struct {
         return null;
     }
 
+    /// GAP prop-store slab packing (P1): resolve the (offset,len) of the blob
+    /// for `slot` on a slab-format logical page, with full bounds validation.
+    /// Returns error.DataCorruption on any inconsistency (bad version, slot out
+    /// of range, directory/blob overrun) — it never reads out of bounds.
+    fn slabBlobSpan(_: *const PropStore, data: []const u8, slot: u32) error{DataCorruption}!struct { offset: u32, len: u32 } {
+        // Must at least hold the meta region and the slot_count footer.
+        if (data.len < SLAB_DATA_OFFSET + SLAB_SLOT_COUNT_SIZE) return error.DataCorruption;
+        if (data[SLAB_META_OFFSET] != SLAB_LAYOUT_VERSION) return error.DataCorruption;
+
+        const slot_count = readSlabSlotCount(data);
+        // The whole directory (slot_count entries + the count footer) must fit
+        // above SLAB_DATA_OFFSET. Use u64 math so a crafted slot_count cannot wrap.
+        const dir_bytes: u64 = @as(u64, SLAB_SLOT_COUNT_SIZE) + @as(u64, slot_count) * SLAB_SLOT_SIZE;
+        if (@as(u64, SLAB_DATA_OFFSET) + dir_bytes > data.len) return error.DataCorruption;
+        if (slot >= slot_count) return error.DataCorruption;
+
+        const s = readSlabSlot(data, slot);
+        const dir_start: u32 = @intCast(@as(u64, data.len) - dir_bytes);
+        // The blob must live entirely in [SLAB_DATA_OFFSET, dir_start).
+        if (s.offset < SLAB_DATA_OFFSET or s.offset > dir_start) return error.DataCorruption;
+        if (@as(u64, s.offset) + @as(u64, s.len) > dir_start) return error.DataCorruption;
+        return .{ .offset = s.offset, .len = s.len };
+    }
+
+    /// GAP prop-store slab packing (P1): read a single property by key from a
+    /// slab-packed blob addressed by prop_head = (page_id, slot). Parses the
+    /// blob's property entries with the exact legacy entry format.
+    fn getSlabProperty(self: *PropStore, prop_head: u64, key: []const u8, allocator: Allocator) !?PropertyValue {
+        const page_id = slabPageId(prop_head);
+        const slot = slabSlot(prop_head);
+
+        const frame = try self.buffer_pool.pin(.props, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        defer self.buffer_pool.unpin(frame_idx, false);
+
+        const data = self.logical(frame.dataSlice());
+        const span = try self.slabBlobSpan(data, slot);
+        const blob = data[span.offset..][0..span.len];
+
+        if (blob.len < 4) return error.DataCorruption;
+        const entry_count = std.mem.readInt(u32, blob[0..4], .little);
+        var off: u32 = 4;
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            if (off + 2 > blob.len) return error.DataCorruption;
+            const key_len = std.mem.bytesToValue(u16, blob[off..][0..2]);
+            off += 2;
+            if (off + key_len > blob.len) return error.DataCorruption;
+            const entry_key = blob[off..][0..key_len];
+            off += key_len;
+
+            const val_size = try encodedSizeFromBytes(blob[off..]);
+            if (std.mem.eql(u8, entry_key, key)) {
+                const decode_result = try property_mod.decode(allocator, blob[off..]);
+                return decode_result.value;
+            }
+            off += @intCast(val_size);
+        }
+        return null;
+    }
+
     pub const PropertyEntrySlice = struct {
         key: []const u8,
         encoded_value: []const u8,
@@ -327,6 +508,12 @@ pub const PropStore = struct {
         current_offset: u32 = PROP_DATA_OFFSET,
         entry_count_cache: u32 = 0,
         hops: u32 = 0,
+        /// GAP prop-store slab packing (P1): when set, the head is a slab
+        /// pointer; iterate one blob (no page chain) via `slab_slot`.
+        is_slab: bool = false,
+        slab_slot: u32 = 0,
+        /// Absolute end offset (within the logical page) of the slab blob.
+        slab_blob_end: u32 = 0,
 
         pub fn deinit(self: *PropIterator) void {
             if (self.current_frame_idx) |idx| {
@@ -336,6 +523,7 @@ pub const PropStore = struct {
         }
 
         pub fn next(self: *PropIterator) anyerror!?PropertyEntrySlice {
+            if (self.is_slab) return self.nextSlab();
             while (self.current_page != 0) {
                 if (self.current_frame_idx == null) {
                     if (self.hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
@@ -381,10 +569,79 @@ pub const PropStore = struct {
 
             return null;
         }
+
+        /// GAP prop-store slab packing (P1): iterate the entries of a single
+        /// slab blob addressed by (current_page, slab_slot). No page chaining —
+        /// a slab node's whole property set lives in one blob in P1.
+        fn nextSlab(self: *PropIterator) anyerror!?PropertyEntrySlice {
+            if (self.current_page == 0) return null;
+
+            if (self.current_frame_idx == null) {
+                const frame = try self.store.buffer_pool.pin(.props, self.current_page);
+                self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
+                const data = self.store.logical(frame.dataSlice());
+                const span = self.store.slabBlobSpan(data, self.slab_slot) catch |err| {
+                    self.store.buffer_pool.unpin(self.current_frame_idx.?, false);
+                    self.current_frame_idx = null;
+                    return err;
+                };
+                if (span.len < 4) {
+                    self.store.buffer_pool.unpin(self.current_frame_idx.?, false);
+                    self.current_frame_idx = null;
+                    return error.DataCorruption;
+                }
+                const blob = data[span.offset..][0..span.len];
+                self.entry_count_cache = std.mem.readInt(u32, blob[0..4], .little);
+                self.current_offset = span.offset + 4;
+                self.slab_blob_end = span.offset + span.len;
+                self.current_index = 0;
+            }
+
+            const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
+            const data = self.store.logical(frame.dataSlice());
+            const end = self.slab_blob_end;
+
+            if (self.current_index < self.entry_count_cache) {
+                if (self.current_offset + 2 > end) return error.DataCorruption;
+                const key_len = std.mem.bytesToValue(u16, data[self.current_offset..][0..2]);
+                self.current_offset += 2;
+                if (self.current_offset + key_len > end) return error.DataCorruption;
+
+                const entry_key = data[self.current_offset..][0..key_len];
+                self.current_offset += key_len;
+
+                const val_size = try encodedSizeFromBytes(data[self.current_offset..end]);
+                const encoded_val = data[self.current_offset..][0..val_size];
+                self.current_offset += @intCast(val_size);
+
+                self.current_index += 1;
+
+                return PropertyEntrySlice{
+                    .key = entry_key,
+                    .encoded_value = encoded_val,
+                };
+            }
+
+            // Blob exhausted: release the frame and stop (no chain in P1).
+            self.store.buffer_pool.unpin(self.current_frame_idx.?, false);
+            self.current_frame_idx = null;
+            self.current_page = 0;
+            return null;
+        }
     };
 
     /// Get an iterator over all properties in a property page chain (zero allocation).
     pub fn getAllProperties(self: *PropStore, prop_head: u64) PropIterator {
+        // GAP prop-store slab packing (P1): a slab head iterates a single blob;
+        // a legacy head walks the page chain as before.
+        if (isSlabHead(prop_head)) {
+            return .{
+                .store = self,
+                .current_page = slabPageId(prop_head),
+                .is_slab = true,
+                .slab_slot = slabSlot(prop_head),
+            };
+        }
         return .{
             .store = self,
             .current_page = prop_head,

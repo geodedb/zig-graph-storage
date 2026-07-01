@@ -423,16 +423,152 @@ test "GAP-ENT-0020 P0 read-both: legacy one-page-per-node layout (implemented)" 
     try testing.expectEqual(@as(usize, 5), oracle_a.props.items.len);
 }
 
-test "GAP-ENT-0020 P0 read-both: slab-packed layout matches legacy (P1 TODO)" {
-    // P1 (slab read path) fills this in:
-    //   1. build a node the legacy way            -> legacy_head, legacy oracle
-    //   2. hand-build the SAME property set into a slab-packed page (many nodes
-    //      per shared page; prop_head = (page_id, intra-page offset))
-    //   3. read it via the P1 slab-aware PropStore -> slab oracle
-    //   4. try legacy_oracle.expectEqual(&slab_oracle)  // byte-for-byte parity
-    //
-    // The slab writer/reader do not exist in P0 (production format unchanged),
-    // so this half is skipped until P1. The oracle + expectEqual harness above
-    // is the exact contract it must satisfy.
-    return error.SkipZigTest;
+// ----------------------------------------------------------------------------
+// P1 slab-page hand-build helpers.
+//
+// A slab BLOB reuses the legacy property-entry format verbatim:
+//   [entry_count: u32 LE] then entry_count × (key_len: u16 LE, key, encoded_value)
+// The page's slot directory (offset,len per slot) grows backward from the tail
+// via the PropStore slab helpers. These helpers let the test hand-build a page
+// exactly as the future P2 writer will, so the P1 reader is exercised over a
+// real slab layout.
+// ----------------------------------------------------------------------------
+
+const KV = struct { key: []const u8, val: PropertyValue };
+
+/// Append one node's property blob (entry_count + entries) into `page` at
+/// `write_off.*`, advancing `write_off`. Returns nothing; caller records the
+/// (offset,len) span for the slot directory.
+fn appendBlob(alloc: Allocator, page: []u8, write_off: *u32, kvs: []const KV) !void {
+    std.mem.writeInt(u32, page[write_off.*..][0..4], @intCast(kvs.len), .little);
+    write_off.* += 4;
+    for (kvs) |kv| {
+        const enc = try property.encode(alloc, kv.val);
+        defer alloc.free(enc);
+        std.mem.writeInt(u16, page[write_off.*..][0..2], @intCast(kv.key.len), .little);
+        write_off.* += 2;
+        @memcpy(page[write_off.*..][0..kv.key.len], kv.key);
+        write_off.* += @intCast(kv.key.len);
+        @memcpy(page[write_off.*..][0..enc.len], enc);
+        write_off.* += @intCast(enc.len);
+    }
+}
+
+/// Build the same property set two ways — legacy (putProperty chain) and slab
+/// (`slab_head`) — and assert their oracles are byte-for-byte identical.
+fn expectSlabMatchesLegacy(store: *PropStore, kvs: []const KV, slab_head: u64) !void {
+    var legacy_head: u64 = 0;
+    for (kvs) |kv| {
+        legacy_head = try store.putProperty(legacy_head, kv.key, kv.val);
+    }
+    var legacy_oracle = try readOracle(testing.allocator, store, legacy_head);
+    defer legacy_oracle.deinit();
+
+    var slab_oracle = try readOracle(testing.allocator, store, slab_head);
+    defer slab_oracle.deinit();
+
+    try legacy_oracle.expectEqual(&slab_oracle);
+    try testing.expectEqual(kvs.len, slab_oracle.props.items.len);
+}
+
+test "GAP-ENT-0020 P1 read-both: slab-packed layout matches legacy" {
+    var env = try Env.init(8192, 32);
+    defer env.deinit();
+    var store = env.store();
+
+    const ps = gs.prop_store;
+
+    // Three nodes' property sets, ALL packed into ONE shared slab page:
+    //   slot 0: a single property
+    //   slot 1: many properties spanning every value type
+    //   slot 2: the shared reference set (byte-for-byte vs a legacy node)
+    const set0 = [_]KV{
+        .{ .key = "only", .val = .{ .int = 7 } },
+    };
+    const set1 = [_]KV{
+        .{ .key = "v_null", .val = PropertyValue.null },
+        .{ .key = "v_bool", .val = .{ .bool = true } },
+        .{ .key = "v_int", .val = .{ .int = -123456789 } },
+        .{ .key = "v_float", .val = .{ .float = 2.5 } },
+        .{ .key = "v_string", .val = .{ .string = "hello world" } },
+        .{ .key = "v_decimal", .val = .{ .decimal = .{ .coeff = 12345, .scale = 2 } } },
+        .{ .key = "v_ext", .val = .{ .ext = .{ .type_tag = 99, .data = "binary" } } },
+        .{ .key = "name", .val = .{ .string = "Genus species" } },
+    };
+    const set2 = [_]KV{
+        .{ .key = "name", .val = .{ .string = "Panthera leo" } },
+        .{ .key = "rank", .val = .{ .string = "species" } },
+        .{ .key = "year", .val = .{ .int = 1758 } },
+        .{ .key = "valid", .val = .{ .bool = true } },
+        .{ .key = "note", .val = PropertyValue.null },
+    };
+
+    // Hand-build a single slab page holding all three blobs + a 3-slot directory.
+    const page_id = try env.fsm().allocPage();
+    const frame = try env.pool().pinNew(.props, page_id);
+    const frame_idx = env.pool().frameIndex(frame);
+    const data = frame.dataSlice();
+
+    var write_off: u32 = ps.SLAB_DATA_OFFSET;
+    const off0 = write_off;
+    try appendBlob(testing.allocator, data, &write_off, &set0);
+    const len0 = write_off - off0;
+    const off1 = write_off;
+    try appendBlob(testing.allocator, data, &write_off, &set1);
+    const len1 = write_off - off1;
+    const off2 = write_off;
+    try appendBlob(testing.allocator, data, &write_off, &set2);
+    const len2 = write_off - off2;
+
+    ps.writeSlabSlot(data, 0, off0, len0);
+    ps.writeSlabSlot(data, 1, off1, len1);
+    ps.writeSlabSlot(data, 2, off2, len2);
+    ps.writeSlabSlotCount(data, 3);
+    ps.writeSlabLayoutVersion(data);
+    env.pool().unpin(frame_idx, true);
+
+    const head0 = ps.encodeSlabHead(page_id, 0);
+    const head1 = ps.encodeSlabHead(page_id, 1);
+    const head2 = ps.encodeSlabHead(page_id, 2);
+
+    // Encode/decode round-trip sanity: the tag bit discriminates and (page,slot)
+    // survives the encoding.
+    try testing.expect(ps.isSlabHead(head1));
+    try testing.expect(!ps.isSlabHead(page_id)); // a legacy bare page id
+    try testing.expectEqual(page_id, ps.slabPageId(head1));
+    try testing.expectEqual(@as(u32, 1), ps.slabSlot(head1));
+
+    // Byte-for-byte oracle parity vs an equivalent legacy-written node, for each
+    // of the three slots — proving multiple nodes' props coexist in one page and
+    // read back correctly (single prop, many/mixed types, shared reference set).
+    try expectSlabMatchesLegacy(&store, &set0, head0);
+    try expectSlabMatchesLegacy(&store, &set1, head1);
+    try expectSlabMatchesLegacy(&store, &set2, head2);
+
+    // Direct getProperty on the slab path resolves the right blob per slot and
+    // does NOT leak keys across sibling nodes sharing the page.
+    {
+        const v = try store.getProperty(head0, "only", testing.allocator);
+        try testing.expect(v != null);
+        try testing.expectEqual(@as(i64, 7), v.?.int);
+    }
+    {
+        const v = try store.getProperty(head1, "v_string", testing.allocator);
+        try testing.expect(v != null);
+        defer property.freeDecoded(testing.allocator, v.?);
+        try testing.expectEqualStrings("hello world", v.?.string);
+    }
+    {
+        // "v_string" lives only in slot 1's blob; slot 0 must not see it.
+        const v = try store.getProperty(head0, "v_string", testing.allocator);
+        try testing.expect(v == null);
+    }
+    {
+        const v = try store.getProperty(head2, "year", testing.allocator);
+        try testing.expect(v != null);
+        try testing.expectEqual(@as(i64, 1758), v.?.int);
+        // slot 0's key must not resolve against slot 2's blob.
+        const miss = try store.getProperty(head2, "only", testing.allocator);
+        try testing.expect(miss == null);
+    }
 }
