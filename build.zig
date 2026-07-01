@@ -480,6 +480,19 @@ fn addIntegrationTests(
     });
     const run_pin_nodeadlock = b.addRunArtifact(pin_nodeadlock_tests);
     pin_nodeadlock_step.dependOn(&run_pin_nodeadlock.step);
+
+    // GAP-ENT-0018: the lock-free pin page-table read must stay safe against a
+    // concurrent structural writer AND must never dereference a freed/moved
+    // page-table backing store. Own step so it can be looped under ReleaseSafe
+    // (invariants armed) / ReleaseFast.
+    const recreate_uaf_step = b.step("test-recreate-uaf", "Run buffer-pool pin-vs-structural-write / page-table-free UAF regression");
+    const recreate_uaf_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_recreate_uaf.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_recreate_uaf = b.addRunArtifact(recreate_uaf_tests);
+    recreate_uaf_step.dependOn(&run_recreate_uaf.step);
 }
 
 fn addExample(

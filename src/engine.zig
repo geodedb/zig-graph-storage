@@ -435,8 +435,29 @@ pub const GraphEngine = struct {
             // authoritative manifest — re-create with the correct capacity,
             // re-register pagers. With the anon-mmap backing this re-create no
             // longer pays an eager zero-fill either.
+            //
+            // LOCK-FREE POOL LIFETIME INVARIANT (GAP-ENT-0018): the buffer pool's
+            // `page_table` metadata base and frame array MUST NOT be freed or
+            // moved while any thread can call `pin` — the PERF-0058 lock-free
+            // fast path reads that backing store WITHOUT the pool mutex, so a
+            // free-under-reader is an immediate use-after-free segfault (the
+            // `page_table.get` dereferences a dangling `metadata` base). This
+            // re-create is safe ONLY because it runs on the open path BEFORE
+            // `open` returns `self` — the engine is not yet published, so no
+            // reader exists. recovery.recover already `flushAll`ed, so the old
+            // (clean) pool can be discarded without data loss. Do NOT introduce a
+            // pool deinit+recreate (or any metadata-moving grow) on a path where
+            // reads may be in flight.
+            //
+            // CORRECTNESS (double-free on OOM): build the replacement BEFORE
+            // tearing down the old pool. If `init` fails (OOM), `self.buffer_pool`
+            // still points at the valid old pool, so the `errdefer` registered at
+            // step 3 frees it EXACTLY ONCE. The prior order (deinit then assign)
+            // left `self.buffer_pool` referencing freed memory on an init failure,
+            // and the errdefer double-freed it.
+            const resized_pool = try BufferPool.init(allocator, cfg.page_size, effective);
             self.buffer_pool.deinit();
-            self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, effective);
+            self.buffer_pool = resized_pool;
             self.registerDataPagers();
         }
         // PERF-0051: reserve a floor of frames for the hot node store so cold
