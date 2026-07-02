@@ -309,7 +309,7 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     errdefer self.label_index.deinit();
     self.property_index = PropertyChainIndex.init(allocator);
     errdefer self.property_index.deinit();
-    self.edge_index = std.AutoHashMap(EdgeId, EdgeIndexEntry).init(allocator);
+    self.edge_index = @import("edge_index_map.zig").EdgeIndexMap.init(allocator);
     errdefer self.edge_index.deinit();
     // PHASE 3: edge-existence index. Starts empty; open() loads its snapshot or
     // rebuilds from adjacency, create() leaves it empty.

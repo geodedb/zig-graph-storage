@@ -1073,19 +1073,35 @@ test "P2 crash: plain v2 appends (multi-block chain) replay with exact public_id
 // In-memory EdgeIndexEntry gains `public_id: u64`; every insert site carries
 // it (add path from the API param, rebuild from the adjacency scan — v1
 // blocks yield 0). The persisted edge-index snapshot record grows 32 B → 40 B
-// under a NEW magic ("GSEIDX3\x00"): the magic IS the format version, so an
-// OLD (GSEIDX2, 32 B-record) snapshot file is version-REJECTED by loadFile's
-// magic check (error.InvalidFormat → tryLoadDerivedIndexes catch-false →
-// clean rebuild from durable adjacency) and can NEVER be misparsed as 40 B
-// records. The edge-EXISTENCE index snapshot (GSXIDX1, 28 B records) is
-// UNTOUCHED.
+// under a NEW magic: the magic IS the format version, so an OLD (GSEIDX2,
+// 32 B-record) snapshot file is version-REJECTED by the loader's magic check
+// (error.InvalidFormat → tryLoadDerivedIndexes catch-false → clean rebuild
+// from durable adjacency) and can NEVER be misparsed as 40 B records.
+// GAP warm-reopen P1 later moved both edge snapshots into the SORTED mmap
+// container (GSEIDX4 / GSXIDX2 — see sorted_index_snapshot.zig); the same
+// version-reject rule carries over, which these tests now assert.
 // ============================================================================
 
 const OLD_EDGE_SNAPSHOT_MAGIC = "GSEIDX2\x00"; // pre-P3 (32 B records)
-const NEW_EDGE_SNAPSHOT_MAGIC = "GSEIDX3\x00"; // P3 (40 B records, +public_id)
+// GAP warm-reopen P1: the edge snapshots moved to the SORTED mmap container
+// (sorted_index_snapshot.zig) under bumped magics — same record FIELDS as
+// GSEIDX3/GSXIDX1, sorted, with a per-block CRC directory.
+const NEW_EDGE_SNAPSHOT_MAGIC = "GSEIDX4\x00"; // P1 (sorted 40 B records)
+const NEW_EXIST_SNAPSHOT_MAGIC = "GSXIDX2\x00"; // P1 (sorted 28 B records)
 const SNAPSHOT_CRC = std.hash.crc.Crc32Iscsi;
-/// magic(8) + checkpoint_counter(8) + item_count(8).
+/// LEGACY container header: magic(8) + checkpoint_counter(8) + item_count(8).
 const SNAPSHOT_HEADER = 24;
+/// Sorted-container header: magic(8) + counter(8) + record_count(8) +
+/// record_size(4) + block_size(4).
+const SORTED_HEADER = gs.sorted_index_snapshot.HEADER_SIZE;
+
+/// Total on-disk size of a sorted-container snapshot with `n` records of
+/// `record_size` bytes: header + payload + per-block CRC dir + meta CRC.
+fn sortedSnapshotSize(n: usize, record_size: usize) usize {
+    const payload = n * record_size;
+    const nblocks = if (payload == 0) 0 else (payload - 1) / gs.sorted_index_snapshot.DEFAULT_BLOCK_SIZE + 1;
+    return SORTED_HEADER + payload + nblocks * 4 + 4;
+}
 
 fn ioT() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -1113,19 +1129,21 @@ fn writeFileBytes(path: []const u8, bytes: []const u8) !void {
     try f.writePositionalAll(io, bytes, 0);
 }
 
-/// Downgrade a NEW-format (GSEIDX3, 40 B records) edges.idx file on disk into
-/// a byte-exact OLD-format (GSEIDX2, 32 B records) snapshot: same counter,
-/// same item_count, public_id column dropped, CRC32 recomputed. This is
-/// exactly what a pre-P3 binary would have written for the same edge set.
+/// Downgrade a NEW-format (GSEIDX4 sorted-container, 40 B records) edges.idx
+/// file on disk into a byte-exact OLD-format (GSEIDX2 legacy container, 32 B
+/// records) snapshot: same counter, same item_count, public_id column
+/// dropped, legacy whole-file CRC32 appended. This is exactly what a pre-P3
+/// binary would have written for the same edge set.
 fn downgradeEdgeSnapshotToV2(allocator: Allocator, path: []const u8) !void {
     const data = try readFileBytes(allocator, path);
     defer allocator.free(data);
 
-    try testing.expect(data.len >= SNAPSHOT_HEADER + 4);
+    try testing.expect(data.len >= SORTED_HEADER + 4);
     try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
     const item_count = std.mem.readInt(u64, data[16..24], .little);
-    const payload = data[SNAPSHOT_HEADER .. data.len - 4];
-    try testing.expectEqual(@as(usize, item_count * 40), payload.len);
+    try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[24..28], .little));
+    try testing.expectEqual(sortedSnapshotSize(@intCast(item_count), 40), data.len);
+    const payload = data[SORTED_HEADER..][0 .. item_count * 40];
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -1252,13 +1270,23 @@ test "P3 snapshot round-trip: clean reopen LOADS the 40 B-record snapshot (no re
     }
     defer testing.allocator.free(idx_path);
 
-    // On-disk snapshot shape: header + P3_N 40 B records + CRC, new magic.
+    // On-disk snapshot shape: sorted container — header + P3_N 40 B records
+    // (sorted by edge_id) + block-CRC dir + meta CRC, new magic.
     {
         const data = try readFileBytes(testing.allocator, idx_path);
         defer testing.allocator.free(data);
         try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
         try testing.expectEqual(@as(u64, P3_N), std.mem.readInt(u64, data[16..24], .little));
-        try testing.expectEqual(@as(usize, SNAPSHOT_HEADER + P3_N * 40 + 4), data.len);
+        try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[24..28], .little));
+        try testing.expectEqual(sortedSnapshotSize(P3_N, 40), data.len);
+        // Records are sorted by edge_id (the binary-search invariant).
+        var prev: u64 = 0;
+        var ri: usize = 0;
+        while (ri < P3_N) : (ri += 1) {
+            const id = std.mem.readInt(u64, data[SORTED_HEADER + ri * 40 ..][0..8], .little);
+            try testing.expect(id > prev);
+            prev = id;
+        }
     }
 
     {
@@ -1449,14 +1477,16 @@ test "P3 existence index untouched: MERGE dedup (probeEdge) works on v2 edges, 2
     }
     defer testing.allocator.free(exist_path);
 
-    // The existence snapshot format is UNCHANGED: GSXIDX1 magic, 28 B records
-    // (from u64 + to u64 + rel u32 + edge_id u64) — no prop_head/public_id.
+    // The existence snapshot record FIELDS are unchanged (28 B: from u64 +
+    // to u64 + rel u32 + edge_id u64 — no prop_head/public_id); P1 moved the
+    // container to the sorted mmap format under the GSXIDX2 magic.
     {
         const data = try readFileBytes(testing.allocator, exist_path);
         defer testing.allocator.free(data);
-        try testing.expectEqualStrings("GSXIDX1\x00", data[0..8]);
+        try testing.expectEqualStrings(NEW_EXIST_SNAPSHOT_MAGIC, data[0..8]);
         try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, data[16..24], .little));
-        try testing.expectEqual(@as(usize, SNAPSHOT_HEADER + 28 + 4), data.len);
+        try testing.expectEqual(@as(u32, 28), std.mem.readInt(u32, data[24..28], .little));
+        try testing.expectEqual(sortedSnapshotSize(1, 28), data.len);
     }
 
     // After a clean reopen (snapshot LOAD path) the probe still dedups.

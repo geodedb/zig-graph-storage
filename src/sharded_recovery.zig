@@ -193,7 +193,7 @@ fn replayAdjacencyIfNeeded(
             // index MUST be materialized before the check. A clean restart has no
             // dangling prepares, so this never forces hydration on the hot path.
             try eng.ensureDerivedHydrated();
-            if (eng.edge_index.contains(payload.edge_id)) return;
+            if (try eng.edge_index.contains(payload.edge_id)) return;
             var from_rec = try eng.getNode(payload.from) orelse return error.NodeNotFound;
             const out_entry = edge_mod.EdgeEntry{
                 .neighbor = payload.to,

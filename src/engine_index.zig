@@ -6,7 +6,6 @@
 const std = @import("std");
 
 const node_mod = @import("node.zig");
-const index_snapshot_mod = @import("index_snapshot.zig");
 const types = @import("types.zig");
 const engine_mod = @import("engine.zig");
 const config_mod = @import("config.zig");
@@ -15,26 +14,27 @@ const NodeId = types.NodeId;
 const NodeRec = node_mod.NodeRec;
 const GraphEngine = engine_mod.GraphEngine;
 const EdgeIndexEntry = engine_mod.EdgeIndexEntry;
-// SEC-0051: snapshot format appends a trailing CRC32 over the payload.
-// GAP-ENT-0024 P3: the magic IS the snapshot format version. "GSEIDX3"
-// records are 40 B (+public_id u64); the previous "GSEIDX2" records were
-// 32 B. Bumping the magic makes loadFile REJECT an old snapshot outright
+const edge_index_map_mod = @import("edge_index_map.zig");
+const edge_exist_index_mod = @import("edge_exist_index.zig");
+const sorted_snapshot = @import("sorted_index_snapshot.zig");
+// GAP-ENT-0024 P3 rule, still in force: the magic IS the snapshot format
+// version — bumping it makes the loader REJECT an old snapshot outright
 // (error.InvalidFormat → materializeDerivedIndexes' `catch false` → clean
-// one-time rebuild from durable adjacency) — an old file can never be
-// misparsed at the 40 B stride, and an old binary rejects a new file the
-// same way. Do NOT reuse "GSEIDX2" for any future layout.
-const EDGE_SNAPSHOT_MAGIC = "GSEIDX3\x00";
+// one-time rebuild from durable adjacency); an old file can never be
+// misparsed, and an old binary rejects a new file the same way. Never reuse
+// a retired magic ("GSEIDX2"/"GSEIDX3"/"GSXIDX1") for a future layout.
+//
+// GAP warm-reopen P1: "GSEIDX4" — same 40 B record fields as GSEIDX3 but in
+// the SORTED mmap container (sorted_index_snapshot.zig): records ordered by
+// edge_id, per-block CRC directory, loaded by mmap-adopt instead of a
+// whole-file read + hashmap build.
+const EDGE_SNAPSHOT_MAGIC = "GSEIDX4\x00";
+const EDGE_RECORD_SIZE: u32 = edge_index_map_mod.RECORD_SIZE; // 40
 
-// SEC-0044/SEC-0048: smallest bytes a single edge-index record consumes on disk
-// (edge_id u64 + from u64 + neighbor u64 + rel_type u32 + prop_head u32 +
-//  public_id u64).
-const EDGE_RECORD_MIN_SIZE: usize = 8 + 8 + 8 + 4 + 4 + 8;
-
-// PHASE 3: edge-EXISTENCE index snapshot. Distinct magic so a wrong/legacy file
-// is rejected rather than misparsed; one record is (from u64 + to u64 + rel_type
-// u32 + edge_id u64).
-const EDGE_EXIST_SNAPSHOT_MAGIC = "GSXIDX1\x00";
-const EDGE_EXIST_RECORD_MIN_SIZE: usize = 8 + 8 + 4 + 8;
+// PHASE 3 existence index, same P1 treatment: "GSXIDX2" — 28 B GSXIDX1 record
+// fields, sorted by (from, to, rel_type, edge_id) in the mmap container.
+const EDGE_EXIST_SNAPSHOT_MAGIC = "GSXIDX2\x00";
+const EDGE_EXIST_RECORD_SIZE: u32 = edge_exist_index_mod.RECORD_SIZE; // 28
 
 /// Rebuild the in-memory label index by reading each live node's labels
 /// from the LabelStore (var.store-backed).
@@ -405,117 +405,77 @@ pub fn saveDerivedIndexesConditional(
     }
 }
 
+// GAP warm-reopen P1: both edge snapshots now use the SORTED mmap container
+// (sorted_index_snapshot.zig). The saver serializes the MERGED live view
+// (overlay ⊕ base ⊖ tombstones — a never-mutated mmap-backed index never gets
+// here because its dirty flag stays false, so the old snapshot file survives
+// untouched), sorts the fixed-width records in place, and writes them with the
+// per-block CRC directory. The loader mmap-adopts the file as the immutable
+// base — NO whole-file read, NO hashmap build.
+
 fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
-    // PERF-0052: serialize the entire snapshot into one in-memory buffer and
-    // flush it with a single positional write instead of ~5 syscalls per edge.
-    // The byte layout (magic | counter | item_count | payload | crc32) is
-    // identical to the previous per-field path; CRC32 (SEC-0051) is appended by
-    // finalize().
-    var w = index_snapshot_mod.SnapshotWriter.init(engine.allocator);
-    defer w.deinit();
+    const n = engine.edge_index.count();
+    const payload = try engine.allocator.alloc(u8, n * EDGE_RECORD_SIZE);
+    defer engine.allocator.free(payload);
 
-    try w.writeHeader(EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_index.count());
+    const Ctx = struct { buf: []u8, i: usize = 0 };
+    var ctx = Ctx{ .buf = payload };
+    try engine.edge_index.forEachLive(&ctx, struct {
+        fn f(c: *Ctx, edge_id: u64, e: EdgeIndexEntry) anyerror!void {
+            // forEachLive visits exactly count() live entries; a disagreement
+            // here would mean the live-count invariant broke — fail loudly
+            // rather than write a short/torn payload.
+            if (c.i * EDGE_RECORD_SIZE >= c.buf.len) return error.InvalidFormat;
+            edge_index_map_mod.encodeRecord(c.buf[c.i * EDGE_RECORD_SIZE ..][0..EDGE_RECORD_SIZE], edge_id, e);
+            c.i += 1;
+        }
+    }.f);
+    if (ctx.i != n) return error.InvalidFormat;
 
-    var it = engine.edge_index.iterator();
-    while (it.next()) |entry| {
-        try w.writeU64(entry.key_ptr.*);
-        try w.writeU64(entry.value_ptr.from);
-        try w.writeU64(entry.value_ptr.neighbor);
-        try w.writeU32(entry.value_ptr.rel_type);
-        try w.writeU32(entry.value_ptr.prop_head);
-        // P3 (GSEIDX3): 40 B record — trailing inline public id.
-        try w.writeU64(entry.value_ptr.public_id);
-    }
-
-    try w.finalize(file.*);
+    sorted_snapshot.sortRecords(payload, EDGE_RECORD_SIZE, edge_index_map_mod.recordLess);
+    try sorted_snapshot.write(engine.allocator, file.*, EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, EDGE_RECORD_SIZE, payload);
 }
 
 fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
-    // PERF-0052: read + validate the whole snapshot once (CRC32 verified per
-    // SEC-0051; item_count bounded vs payload per SEC-0044/0048), then walk the
-    // resident payload instead of issuing ~5 positional reads per edge.
-    var snapshot = (try index_snapshot_mod.loadPayload(engine.allocator, file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_MIN_SIZE)) orelse return null;
-    defer snapshot.deinit();
-
-    var r = index_snapshot_mod.SnapshotReader.init(snapshot.payload());
-
-    // SEC-0044/SEC-0048: item_count was bounded against payload_size in
-    // loadPayload, so this reservation cannot be driven past the available bytes.
-    // Guard the u64-to-u32 cast: a crafted snapshot with item_count > maxInt(u32)
-    // would panic in ReleaseSafe without this check (DoS via integer overflow).
-    if (snapshot.item_count > std.math.maxInt(u32)) return error.InvalidFormat;
-    try engine.edge_index.ensureTotalCapacity(@intCast(snapshot.item_count));
-
-    var i: u64 = 0;
-    while (i < snapshot.item_count) : (i += 1) {
-        const edge_id = try r.readU64();
-        const from = try r.readU64();
-        const neighbor = try r.readU64();
-        const rel_type = try r.readU32();
-        const prop_head = try r.readU32();
-        // P3 (GSEIDX3): 40 B record — trailing inline public id. An OLD 32 B
-        // snapshot never reaches this reader (magic-rejected in loadPayload).
-        const public_id = try r.readU64();
-
-        try engine.edge_index.put(edge_id, .{
-            .from = from,
-            .neighbor = neighbor,
-            .rel_type = rel_type,
-            .prop_head = prop_head,
-            .public_id = public_id,
-        });
-    }
-
-    if (r.remaining() != 0) return error.InvalidFormat;
-    return snapshot.checkpoint_counter;
+    // mmap-adopt: O(header + directory) instead of O(snapshot). Any error
+    // (old GSEIDX3/GSEIDX2 magic, torn write, truncation, header/dir CRC)
+    // propagates to materializeDerivedIndexes' `catch false` → clean rebuild.
+    const loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE)) orelse return null;
+    engine.edge_index.adoptBase(loaded);
+    return loaded.checkpoint_counter;
 }
 
 // ---------------------------------------------------------------------------
 // PHASE 3: edge-existence index snapshot (mirrors saveEdgeIndex/loadEdgeIndex).
 // ---------------------------------------------------------------------------
 
-const SnapshotWriterT = index_snapshot_mod.SnapshotWriter;
-
 fn saveEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !void {
-    var w = SnapshotWriterT.init(engine.allocator);
-    defer w.deinit();
+    const n = engine.edge_exist_index.recordCount();
+    const payload = try engine.allocator.alloc(u8, n * EDGE_EXIST_RECORD_SIZE);
+    defer engine.allocator.free(payload);
 
-    try w.writeHeader(EDGE_EXIST_SNAPSHOT_MAGIC, engine.manifest.counter, engine.edge_exist_index.recordCount());
-
-    // Write one record per (key, edge_id). forEachRecord visits every record
-    // exactly once across both the primary and overflow maps.
-    const Ctx = struct { w: *SnapshotWriterT };
-    var ctx = Ctx{ .w = &w };
+    // One record per LIVE (key, edge_id); forEachRecord visits each exactly
+    // once across primary + overflow + base−tombstones.
+    const Ctx = struct { buf: []u8, i: usize = 0 };
+    var ctx = Ctx{ .buf = payload };
     try engine.edge_exist_index.forEachRecord(&ctx, struct {
         fn f(c: *Ctx, from: u64, rel_type: u32, to: u64, edge_id: u64) anyerror!void {
-            try c.w.writeU64(from);
-            try c.w.writeU64(to);
-            try c.w.writeU32(rel_type);
-            try c.w.writeU64(edge_id);
+            if (c.i * EDGE_EXIST_RECORD_SIZE >= c.buf.len) return error.InvalidFormat;
+            edge_exist_index_mod.encodeRecord(
+                c.buf[c.i * EDGE_EXIST_RECORD_SIZE ..][0..EDGE_EXIST_RECORD_SIZE],
+                .{ .from = from, .to = to, .rel_type = rel_type, .edge_id = edge_id },
+            );
+            c.i += 1;
         }
     }.f);
+    if (ctx.i != n) return error.InvalidFormat;
 
-    try w.finalize(file.*);
+    sorted_snapshot.sortRecords(payload, EDGE_EXIST_RECORD_SIZE, edge_exist_index_mod.recordLess);
+    try sorted_snapshot.write(engine.allocator, file.*, EDGE_EXIST_SNAPSHOT_MAGIC, engine.manifest.counter, EDGE_EXIST_RECORD_SIZE, payload);
 }
 
 fn loadEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
-    var snapshot = (try index_snapshot_mod.loadPayload(engine.allocator, file, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_MIN_SIZE)) orelse return null;
-    defer snapshot.deinit();
-
-    var r = index_snapshot_mod.SnapshotReader.init(snapshot.payload());
-
-    if (snapshot.item_count > std.math.maxInt(u32)) return error.InvalidFormat;
-    try engine.edge_exist_index.ensureTotalCapacity(@intCast(snapshot.item_count));
-
-    var i: u64 = 0;
-    while (i < snapshot.item_count) : (i += 1) {
-        const from = try r.readU64();
-        const to = try r.readU64();
-        const rel_type = try r.readU32();
-        const edge_id = try r.readU64();
-        try engine.edge_exist_index.put(from, rel_type, to, edge_id);
-    }
-
-    if (r.remaining() != 0) return error.InvalidFormat;
-    return snapshot.checkpoint_counter;
+    const loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE)) orelse return null;
+    engine.edge_exist_index.adoptBase(loaded);
+    return loaded.checkpoint_counter;
 }

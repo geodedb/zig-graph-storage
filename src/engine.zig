@@ -37,6 +37,7 @@ const engine_index = @import("engine_index.zig");
 const engine_persist = @import("engine_persist.zig");
 const engine_property_index = @import("engine_property_index.zig");
 const edge_exist_index_mod = @import("edge_exist_index.zig");
+const edge_index_map_mod = @import("edge_index_map.zig");
 const ordered_property_index_mod = @import("ordered_property_index.zig");
 
 const NodeId = types.NodeId;
@@ -72,19 +73,9 @@ const PropertyIndexSet = engine_property_index.PropertyIndexSet;
 const OrderedPropertyIndex = ordered_property_index_mod.OrderedPropertyIndex;
 
 /// In-memory index entry for O(1) edge lookup by EdgeId.
-pub const EdgeIndexEntry = struct {
-    from: NodeId,
-    neighbor: NodeId,
-    rel_type: u32,
-    prop_head: u32,
-    /// GAP-ENT-0024 P3: inline 64-bit public edge id, mirrored from the
-    /// durable adjacency record (edge.zig EdgeEntry.public_id). 0 = unknown/
-    /// absent (legacy edges / v1 blocks) — callers fall back to the legacy
-    /// `__geode_internal_edge_id` property read. Deliberately NO default
-    /// value: every insert site must state the id it carries, so a new
-    /// insert site cannot silently drop ids.
-    public_id: u64,
-};
+/// GAP warm-reopen P1: definition moved to edge_index_map.zig (re-exported
+/// here so every existing `engine_mod.EdgeIndexEntry` reference keeps working).
+pub const EdgeIndexEntry = edge_index_map_mod.EdgeIndexEntry;
 
 /// Default worker count for the owned (no-`external_thread_pool`) path.
 /// Sized for the only consumer — `BufferPool.flushAllParallel`, capped at
@@ -134,7 +125,10 @@ pub const GraphEngine = struct {
     label_store: LabelStore,
     label_index: LabelIndex,
     property_index: PropertyChainIndex,
-    edge_index: std.AutoHashMap(EdgeId, EdgeIndexEntry),
+    /// GAP warm-reopen P1: overlay hashmap + optional immutable mmap base
+    /// (see edge_index_map.zig). Resident mode (no base) behaves exactly like
+    /// the previous `std.AutoHashMap(EdgeId, EdgeIndexEntry)`.
+    edge_index: edge_index_map_mod.EdgeIndexMap,
     /// PHASE 3 (edge-engine-direct): durable, derived edge-EXISTENCE index
     /// mapping (from, rel_type, to) -> edge_id(s) for O(1) MERGE dedup. Same
     /// crash-safety lifecycle as `edge_index` (snapshot at checkpoint; rebuilt
@@ -1198,7 +1192,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         try self.ensureDerivedHydrated(); // Phase A: edge_index is deferred.
-        const entry = self.edge_index.get(edge_id) orelse {
+        const entry = (try self.edge_index.get(edge_id)) orelse {
             observability.endOperationSpan(__obs_span, true, "");
             return null;
         };
@@ -1573,14 +1567,15 @@ pub const GraphEngine = struct {
         // record (we need its rel_type to form the key). No-op if absent.
         // `edge_present` gates the edge_count decrement so a no-op re-remove of
         // an already-deleted edge does NOT corrupt the count (idempotency).
-        const edge_present = self.edge_index.get(edge_id) != null;
-        if (self.edge_index.get(edge_id)) |idx_entry| {
-            self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
+        const idx_entry_opt = try self.edge_index.get(edge_id);
+        const edge_present = idx_entry_opt != null;
+        if (idx_entry_opt) |idx_entry| {
+            try self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
             self.edge_exist_index_dirty = true;
         }
 
         // Remove from in-memory edge index
-        _ = self.edge_index.remove(edge_id);
+        try self.edge_index.remove(edge_id);
         self.edge_index_dirty = true;
 
         if (edge_present and self.manifest.edge_count > 0) {

@@ -24,7 +24,7 @@ fn edgeIndexEntry(engine: *GraphEngine, from: NodeId, edge_id: EdgeId) !engine_m
     // here covers all of them. setEdgeProperty additionally touches the
     // property_index chain, but materialize hydrates the whole derived set.
     try engine.ensureDerivedHydrated();
-    const entry = engine.edge_index.get(edge_id) orelse return error.EdgeNotFound;
+    const entry = (try engine.edge_index.get(edge_id)) orelse return error.EdgeNotFound;
     if (entry.from != from) return error.EdgeNotFound;
     return entry;
 }
@@ -63,10 +63,10 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
         const in_head = try engine.in_head_dir.getHead(to);
         _ = try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head);
 
-        // Keep edge index prop_head in sync
-        if (engine.edge_index.getPtr(edge_id)) |idx_entry| {
-            idx_entry.prop_head = new_head;
-        }
+        // Keep edge index prop_head in sync (no-op if the edge is absent).
+        // GAP warm-reopen P1: a base-resident entry is copied into the overlay
+        // with the new head (the mmap base is immutable).
+        try engine.edge_index.updatePropHead(edge_id, new_head);
     }
 
     if (found_prop_head != 0 and found_prop_head != new_head) {
