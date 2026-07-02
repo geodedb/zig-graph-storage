@@ -507,6 +507,21 @@ fn addIntegrationTests(
     });
     const run_prop_store_slab = b.addRunArtifact(prop_store_slab_tests);
     prop_store_slab_step.dependOn(&run_prop_store_slab.step);
+
+    // GAP edge-inline-public-id P0/P1 — baseline oracle for the per-edge
+    // `__geode_internal_edge_id` LEGACY property cost (one ≥8 KB props page
+    // per edge) + parity oracle over full edge enumeration, and the v1/v2
+    // adjacency-block read-both tests (per-block `entry_format`
+    // discriminator). The baseline scenario stays green through all phases:
+    // legacy stores keep working forever.
+    const edge_inline_pubid_step = b.step("test-edge-inline-public-id", "Run inline-public-edge-id tests: legacy per-edge id-property baseline (bytes/edge lock-in + parity oracle) and v1/v2 adjacency block read-both");
+    const edge_inline_pubid_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_inline_public_id.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_inline_pubid = b.addRunArtifact(edge_inline_pubid_tests);
+    edge_inline_pubid_step.dependOn(&run_edge_inline_pubid.step);
 }
 
 fn addExample(
