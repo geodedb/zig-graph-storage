@@ -67,6 +67,13 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
         // GAP warm-reopen P1: a base-resident entry is copied into the overlay
         // with the new head (the mmap base is immutable).
         try engine.edge_index.updatePropHead(edge_id, new_head);
+        // P2 re-review F1: the in-memory edge index now diverges from the
+        // persisted edges.idx snapshot, so it MUST be marked dirty at the
+        // mutation point — otherwise a full checkpoint RESTAMPS the
+        // clean-looking snapshot to the new counter with the OLD prop_head
+        // content, and the next open silently loses the property linkage
+        // (blessed-stale, the 0018-class silent-loss shape).
+        engine.edge_index_dirty = true;
     }
 
     if (found_prop_head != 0 and found_prop_head != new_head) {

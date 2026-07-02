@@ -229,9 +229,20 @@ pub const GraphEngine = struct {
     ///     branch: all four flags set dirty (holds vacuously; the next full
     ///     checkpoint saves them).
     ///   * full checkpoint that saved ALL FOUR (all were dirty): true.
-    /// Mutations never clear it: any derived mutation sets that index's
-    /// dirty flag first, which removes the index from the invariant's
-    /// scope until the next save.
+    /// Mutations never clear it. Instead, the invariant is an OBLIGATION on
+    /// every derived-index mutation entry point: set that index's dirty flag
+    /// at the mutation point, which removes the index from the invariant's
+    /// scope until the next save. Any mutator that forgets converts the next
+    /// full checkpoint's restamp into a blessing of a stale snapshot =
+    /// silent durable data loss (re-review F1/F2 were exactly this shape:
+    /// engine_edge_props.setEdgeProperty's updatePropHead and
+    /// sharded_recovery's dangling-2PC edge_index.put replay). Audited
+    /// mutation sites that uphold it: label add/remove → label_index_dirty;
+    /// property chain writes (refreshPropertyChainIndex/removeChain) →
+    /// property_index_dirty; edge add/remove and setEdgeProperty's
+    /// prop_head update → edge_index_dirty; existence-index put/remove
+    /// (including 2PC recovery replay) → edge_exist_index_dirty; a full
+    /// rebuild sets all four.
     derived_snapshots_trusted: bool = false,
 
     /// Create a new graph.

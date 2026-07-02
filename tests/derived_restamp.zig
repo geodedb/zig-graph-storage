@@ -305,6 +305,64 @@ test "P2 crash mid-restamp: torn label counter (CRC not updated) → loader reje
     }
 }
 
+test "P2 F1: edge-prop-only session dirties the edge index — edges.idx SAVED (2 restamps, not 3) and the property linkage survives reopen" {
+    // Re-review F1 (Critical): setEdgeProperty mutates edge_index via
+    // updatePropHead (COW into the overlay) but did not set edge_index_dirty.
+    // A full checkpoint then RESTAMPED the clean-looking edges.idx to the new
+    // counter with the OLD prop_head=0 content — blessed stale snapshot →
+    // next open loads it → getEdgeProperty returns null forever (silent,
+    // durable loss of the property linkage). Pre-P2 this exact case was safe
+    // because the clean edges.idx went counter-stale → all-four gate →
+    // rebuild from adjacency (which has the new head); the restamp removed
+    // that self-healing. The fix dirties edge_index at the mutation point, so
+    // the checkpoint SAVES edges.idx (restamps must be 2 — label + exist —
+    // NOT 3).
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xF1} ** 16;
+    const cfg = test_support.testConfig();
+
+    var fx: Fixture = undefined;
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        fx = try populate(eng);
+        try eng.checkpoint(); // all four saved at counter C
+    }
+
+    {
+        // EDGE-PROP-ONLY session: hydrate via load, then the ONLY mutation is
+        // setEdgeProperty on a previously property-less edge (prop_head 0→h).
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        try eng.setEdgeProperty(fx.nodes[0], fx.nodes[1], fx.edges[0], "weight", .{ .int = 42 });
+        // Hydration happened through the counter-gated LOAD, not a rebuild.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
+
+        try eng.checkpoint(); // FULL checkpoint
+        // THE F1 ASSERTION: edge_index was DIRTIED by the prop_head mutation,
+        // so edges.idx was SAVED — only label + exist restamp. 3 restamps
+        // here means a stale edges.idx was blessed with prop_head=0 content.
+        try testing.expectEqual(@as(u64, 2), eng.getMetrics().derived_index_restamps);
+    }
+
+    {
+        // Clean reopen: the snapshots must LOAD (counter-current) AND the
+        // loaded edge index must carry the property linkage.
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        const val = (try eng.getEdgeProperty(fx.nodes[0], fx.edges[0], "weight", testing.allocator)) orelse
+            return error.EdgePropertyLinkageLost;
+        try testing.expectEqual(@as(i64, 42), val.int);
+
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
+    }
+}
+
 test "P2 safety gate: crash restart + never-hydrated page-only session must NOT restamp (no blessing of crash-stale snapshots)" {
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();

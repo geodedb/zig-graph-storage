@@ -228,6 +228,12 @@ fn replayAdjacencyIfNeeded(
             // mirror the existence-index put. `put` is idempotent per edge_id, so
             // the common (already-rebuilt) case is a harmless no-op.
             try eng.edge_exist_index.put(payload.from, payload.rel_type, payload.to, payload.edge_id);
+            // P2 re-review F2: this replay mutated BOTH the edge index (put
+            // above) and the existence index — dirty BOTH. Leaving edge_index
+            // clean would let the next full checkpoint restamp a stale
+            // edges.idx that is missing the reconciled edge (blessed-stale →
+            // edge invisible via getEdge after reopen).
+            eng.edge_index_dirty = true;
             eng.edge_exist_index_dirty = true;
             eng.manifest.edge_count += 1;
         },
