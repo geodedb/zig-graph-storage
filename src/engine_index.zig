@@ -267,6 +267,12 @@ pub fn migrateColocateInEdges(engine: *GraphEngine) !void {
                     .edge_id = entry.edge_id,
                     .rel_type = entry.rel_type,
                     .prop_head = entry.prop_head,
+                    // Review F2: the rebuilt in-entry must carry the source
+                    // entry's inline public id. Dropping it here (the old
+                    // silent-default behavior) wiped every FanIn-route id when
+                    // the colocation migration re-ran over a v2 store (e.g.
+                    // after a lost/stale shard_manifest.json → layout_version 0).
+                    .public_id = entry.public_id,
                 };
                 const old_head = self.engine.in_head_dir.getHead(to) catch |e| {
                     self.err = e;

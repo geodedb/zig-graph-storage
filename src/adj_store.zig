@@ -38,8 +38,10 @@ pub const AdjStore = struct {
     page_size: u32,
     /// Capacity of the blocks the PRODUCTION WRITER creates (v2, 32 B
     /// entries, since P2). Use `capacityFor` when parsing an existing block —
-    /// legacy v1 blocks hold more (24 B) entries.
-    entries_per_block: u32,
+    /// legacy v1 blocks hold more (24 B) entries. Named `writer_...` (review
+    /// F6) so no future caller mistakes it for a universal per-block capacity
+    /// and under-counts v1 blocks (339 vs 254 @ 8 KB).
+    writer_entries_per_block: u32,
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, file_id: FileId, page_size: u32) AdjStore {
         return .{
@@ -47,7 +49,7 @@ pub const AdjStore = struct {
             .free_space = free_space,
             .file_id = file_id,
             .page_size = page_size,
-            .entries_per_block = edge_mod.entriesPerBlock(page_size, edge_mod.ENTRY_FORMAT_V2),
+            .writer_entries_per_block = edge_mod.entriesPerBlock(page_size, edge_mod.ENTRY_FORMAT_V2),
         };
     }
 
@@ -383,6 +385,9 @@ fn makeEdge(neighbor: u64, edge_id: u64, rel_type: u32) EdgeEntry {
         .edge_id = edge_id,
         .rel_type = rel_type,
         .prop_head = 0,
+        // Test helper models a LEGACY (no inline id) edge; v2-entry tests
+        // construct their entries explicitly.
+        .public_id = 0,
     };
 }
 
@@ -455,7 +460,7 @@ test "overflow to second block when first is full" {
 
     var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
 
-    const epb = store.entries_per_block;
+    const epb = store.writer_entries_per_block;
 
     var head: PageId = 0;
     // Fill first block completely

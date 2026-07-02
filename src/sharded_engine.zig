@@ -522,6 +522,15 @@ pub const ShardedGraphEngine = struct {
     /// (adj_out + adj_in_remote) in v2 blocks, so the edge needs NO
     /// `__geode_internal_edge_id` property page. `addEdge` remains the
     /// legacy public_id==0 path.
+    ///
+    /// CONTRACT (review F4): `public_id == 0` is RESERVED — it means "no
+    /// inline id" and silently degrades the edge to the legacy class (readers
+    /// fall back to the `__geode_internal_edge_id` property, which THIS path
+    /// does not write). A caller that stops writing the id property MUST NOT
+    /// pass 0 for a real edge (geode mints nonzero time-based ids; its
+    /// adapter must reject/handle 0 explicitly), otherwise the edge has no
+    /// durable public id anywhere. A debug assert is impossible here — the
+    /// legacy `addEdge`/`addEdgeColocated` delegates pass 0 by design.
     pub fn addEdgeColocatedWithPublicId(self: *ShardedGraphEngine, from: NodeId, to: NodeId, rel_type: u32, public_id: u64) anyerror!EdgeId {
         const s_from = shard_count_mod.shardOfNode(from);
         return self.shards[s_from].addEdgeColocatedWithPublicId(from, to, rel_type, public_id);

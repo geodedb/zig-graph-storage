@@ -30,7 +30,13 @@ pub const EdgeEntry = extern struct {
     /// Inline 64-bit public edge id (GAP-ENT-0024). 0 = unknown/absent:
     /// entries read from v1 blocks always surface 0, and callers fall back to
     /// the legacy `__geode_internal_edge_id` property in that case.
-    public_id: u64 = 0,
+    ///
+    /// Deliberately NO default value (mirrors `EdgeIndexEntry.public_id`):
+    /// every construction site must state the id it carries. A silent `= 0`
+    /// default let `migrateColocateInEdges` drop real ids from rebuilt
+    /// in-entries while compiling cleanly (review F2/F5); the compiler now
+    /// re-audits every literal site.
+    public_id: u64,
 };
 
 comptime {
@@ -84,9 +90,21 @@ test "EdgeEntry is 32 bytes (v2 record); v1 record is its 24-byte prefix" {
     try std.testing.expectEqual(@as(u32, 32), entrySize(ENTRY_FORMAT_V2));
 }
 
-test "EdgeEntry.public_id defaults to 0 (legacy literal sites stay valid)" {
-    const e = EdgeEntry{ .neighbor = 1, .edge_id = 2, .rel_type = 3, .prop_head = 4 };
+test "EdgeEntry.public_id has NO default — every literal site states it (F5)" {
+    // Compile-time contract: if this initializer compiles WITHOUT .public_id,
+    // the field regained a silent default and writer-feeding literals can drop
+    // real ids again (review F2). Keep the explicit field here.
+    const e = EdgeEntry{ .neighbor = 1, .edge_id = 2, .rel_type = 3, .prop_head = 4, .public_id = 0 };
     try std.testing.expectEqual(@as(u64, 0), e.public_id);
+    comptime {
+        // public_id must be a required field: struct must NOT be default-
+        // initializable without it.
+        for (@typeInfo(EdgeEntry).@"struct".fields) |f| {
+            if (std.mem.eql(u8, f.name, "public_id") and f.default_value_ptr != null) {
+                @compileError("EdgeEntry.public_id must not have a default value (review F5)");
+            }
+        }
+    }
 }
 
 test "EdgeBlockHeader is 16 bytes" {

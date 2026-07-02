@@ -200,6 +200,12 @@ fn replayAdjacencyIfNeeded(
                 .edge_id = payload.edge_id,
                 .rel_type = payload.rel_type,
                 .prop_head = 0,
+                // Legacy 2PC prepare payloads predate the inline public id
+                // (the co-located write path emits no cross-shard prepares),
+                // so this reconciliation re-applies the edge as a legacy
+                // record: 0 → readers use the id-property fallback. Matches
+                // the edge_index put below.
+                .public_id = 0,
             };
             const new_out_head = try eng.adj_out.addEdge(from_rec.out_head, out_entry);
             from_rec.out_head = new_out_head;
@@ -241,6 +247,10 @@ fn replayAdjacencyIfNeeded(
                 .edge_id = payload.edge_id,
                 .rel_type = payload.rel_type,
                 .prop_head = 0,
+                // Legacy dst-shard in-adjacency for a pre-co-location dangling
+                // prepare — same legacy-payload reasoning as the source-shard
+                // out-entry above: no inline id exists, 0 is correct.
+                .public_id = 0,
             };
             const new_in_head = try eng.adj_in.addEdge(to_rec.in_head, in_entry);
             to_rec.in_head = new_in_head;

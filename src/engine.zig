@@ -1290,6 +1290,11 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            // Legacy (pre-public-id) API: 0 = no inline id by design. Callers
+            // on this path persist the public id as the
+            // `__geode_internal_edge_id` property; readers fall back to it for
+            // public_id == 0 entries.
+            .public_id = 0,
         };
 
         // Update source node's out adjacency list
@@ -1304,6 +1309,7 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = 0, // legacy path — see out-entry comment above
         };
         var to_rec = try self.node_store.getNode(to) orelse return error.NodeNotFound;
         const new_in_head = try self.adj_in.addEdge(to_rec.in_head, in_entry);
@@ -1461,6 +1467,9 @@ pub const GraphEngine = struct {
     /// GAP-ENT-0024 P2: auto-commit variant of
     /// `addEdgeColocatedTxnWithPublicId` — the geode adapter's target surface
     /// for new edges (inline id, NO `__geode_internal_edge_id` property).
+    /// CONTRACT (review F4): `public_id == 0` is RESERVED = "no inline id"
+    /// (legacy class; readers fall back to the id property, which this path
+    /// does not write). Callers must pass a nonzero id for real edges.
     pub fn addEdgeColocatedWithPublicId(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, public_id: u64) anyerror!EdgeId {
         var __obs_span = observability.startOperationSpan("add_edge");
         defer __obs_span.end(null);
