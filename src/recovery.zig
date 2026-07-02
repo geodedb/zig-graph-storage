@@ -122,6 +122,7 @@ pub const Recovery = struct {
         }
 
         // Validate manifest format version compatibility
+        var upgraded_from_v2 = false;
         if (m.format_version != manifest_mod.MANIFEST_VERSION) {
             if (m.format_version == manifest_mod.MANIFEST_VERSION_V1) {
                 if (self.legacy_policy == .read_only) {
@@ -132,6 +133,17 @@ pub const Recovery = struct {
                     std.log.warn("V1 graph format detected — data directory must be recreated for V2 (40-byte NodeRec is incompatible with 48-byte V2 layout)", .{});
                     return error.IncompatibleVersion;
                 }
+            } else if (m.format_version == manifest_mod.MANIFEST_VERSION_V2) {
+                // GAP-ENT-0024 downgrade gate: a V2 store (v0.2.23 and earlier)
+                // is fully readable by this binary — accept it and upgrade the
+                // manifest to V3 in place. The rewrite of both manifest slots at
+                // the end of `recover` persists the bump, so a pre-v0.2.24
+                // binary pointed at this store afterwards fails loudly here
+                // (IncompatibleVersion) instead of misparsing 32 B v2 adjacency
+                // entries at its 24 B stride and durably corrupting them.
+                std.log.info("V2 store format detected — upgrading manifest to V3 (inline edge public-id era; pre-v0.2.24 binaries will refuse this store)", .{});
+                m.format_version = manifest_mod.MANIFEST_VERSION;
+                upgraded_from_v2 = true;
             } else {
                 return error.IncompatibleVersion;
             }
@@ -216,7 +228,23 @@ pub const Recovery = struct {
         try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &classify_ctx, ClassifyCtx.visit);
 
         if (!saw_records) {
-            // Clean recovery: no WAL records to replay
+            // Clean recovery: no WAL records to replay.
+            // GAP-ENT-0024: a V2 → V3 manifest upgrade must be durable at OPEN,
+            // not merely at the next checkpoint — otherwise the window between
+            // this binary's first committed v2 adjacency write and its first
+            // checkpoint leaves a version-2 manifest on disk that a pre-v0.2.24
+            // binary would happily open (and misparse). Persist the bump to
+            // both slots now; everything else about the clean path (no counter
+            // semantics change beyond the A/B freshness bump) is unchanged.
+            if (upgraded_from_v2) {
+                m.counter += 1;
+                const upath_a = try graph_dir.manifestPath(self.allocator, .a);
+                defer self.allocator.free(upath_a);
+                try m.writeToFileWithKey(self.allocator, upath_a, self.encryption_key);
+                const upath_b = try graph_dir.manifestPath(self.allocator, .b);
+                defer self.allocator.free(upath_b);
+                try m.writeToFileWithKey(self.allocator, upath_b, self.encryption_key);
+            }
             return m;
         }
 
@@ -774,6 +802,71 @@ test "recovery rejects manifest with incompatible format_version" {
     var recovery = Recovery.init(allocator, null);
     const result = recovery.recover(&setup.graph_dir, &pool, &fm);
     try testing.expectError(error.IncompatibleVersion, result);
+}
+
+test "GAP-ENT-0024 F1: version-2 manifest opens fine and is upgraded to version 3 on disk" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // A store exactly as v0.2.23 left it: format_version 2.
+    var v2_manifest = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .next_node_id = 42,
+    };
+    v2_manifest.format_version = manifest_mod.MANIFEST_VERSION_V2;
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try v2_manifest.writeToFile(allocator, path_a);
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    // Opens WITHOUT error (accept-and-upgrade, not reject) and every other
+    // manifest field survives the upgrade untouched.
+    var recovery = Recovery.init(allocator, null);
+    const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectEqual(manifest_mod.MANIFEST_VERSION, recovered.format_version);
+    try testing.expectEqual(@as(u64, 42), recovered.next_node_id);
+    try testing.expect(!recovery.read_only);
+
+    // The upgrade must be durable at OPEN (clean path included): BOTH slots on
+    // disk now carry version 3, so a pre-v0.2.24 binary refuses this store.
+    const on_disk_a = (try Manifest.readFromFile(allocator, path_a)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(manifest_mod.MANIFEST_VERSION, on_disk_a.format_version);
+    const path_b = try setup.graph_dir.manifestPath(allocator, .b);
+    defer allocator.free(path_b);
+    const on_disk_b = (try Manifest.readFromFile(allocator, path_b)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(manifest_mod.MANIFEST_VERSION, on_disk_b.format_version);
+    // And the A/B counter moved forward so the upgraded slots win selection.
+    try testing.expect(on_disk_a.counter > v2_manifest.counter);
+}
+
+test "GAP-ENT-0024 F1: freshly written manifests carry version 3" {
+    const allocator = testing.allocator;
+    // The constant itself is the downgrade gate: v0.2.23 rejects any value
+    // other than 2 (and the V1 legacy path), so 3 fails loudly there.
+    try testing.expectEqual(@as(u32, 3), manifest_mod.MANIFEST_VERSION);
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const dir_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(dir_path);
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/manifest_v3_roundtrip", .{dir_path});
+    defer allocator.free(file_path);
+
+    // A default-constructed manifest (what create() persists) round-trips as 3.
+    const fresh = Manifest{ .graph_uuid = [_]u8{0xCC} ** 16 };
+    try fresh.writeToFile(allocator, file_path);
+    const on_disk = (try Manifest.readFromFile(allocator, file_path)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 3), on_disk.format_version);
 }
 
 test "GAP-0005a: torn/truncated WAL record fails recovery closed" {

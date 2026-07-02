@@ -15,7 +15,15 @@ const timing_safe = std.crypto.timing_safe;
 const owner_only_file_mode = 0o600;
 
 pub const MANIFEST_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'M', 'N', 'F', '0', '1' };
-pub const MANIFEST_VERSION: u32 = 2;
+/// V3 (v0.2.24, GAP-ENT-0024): store-level downgrade gate for inline edge
+/// public ids. The manifest's own byte layout is UNCHANGED from V2 — the bump
+/// exists so a pre-v0.2.24 binary (which loudly rejects any unknown
+/// format_version at open, recovery.zig) fails with IncompatibleVersion on a
+/// store this version has touched, instead of silently misparsing 32 B v2
+/// adjacency entries at the legacy 24 B stride (and durably corrupting them on
+/// its first write). V3 readers ACCEPT V2 stores and silently upgrade them at
+/// open (recovery rewrites both manifest slots at the end of `recover`).
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// SEC-0043: When Transparent Data Encryption is enabled (an encryption key is
 /// configured), the manifest carries a keyed HMAC-SHA256 trailer in addition to
@@ -34,6 +42,12 @@ pub const MANIFEST_HMAC_SIZE: usize = HmacSha256.mac_length;
 /// V2 uses a 48-byte NodeRec with label_head: u64 + label_count: u16.
 /// Migration from V1 to V2 requires recreating the data directory.
 pub const MANIFEST_VERSION_V1: u32 = 1;
+
+/// V2 (v0.2.23 and earlier): 48-byte NodeRec, 24 B adjacency entries only.
+/// Every store byte a V2 binary wrote is readable by a V3 binary (v2 adjacency
+/// blocks are self-describing via `entry_format` in the block header), so V2
+/// stores are accepted and upgraded in place at open.
+pub const MANIFEST_VERSION_V2: u32 = 2;
 
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields (see below) + CRC32(4)
