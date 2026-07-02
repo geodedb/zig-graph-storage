@@ -551,6 +551,20 @@ fn addIntegrationTests(
     const run_edge_remove_crash = b.addRunArtifact(edge_remove_crash_tests);
     edge_remove_crash_step.dependOn(&run_edge_remove_crash.step);
 
+    // GAP warm-reopen P1 — mmap-adopted edge-index snapshots (GSEIDX4/GSXIDX2):
+    // clean-reopen adopt, checkpoint merge (base + overlay - tombstones),
+    // dirty-gate no-op persist, crash-rebuild via counter gate, corrupt/
+    // truncated-snapshot reject, lazy payload-CRC failure model, and the
+    // 1M-edge load bench (legacy read+build vs mmap-adopt).
+    const mmap_index_step = b.step("test-mmap-index-snapshot", "Run mmap-adopted edge-index snapshot tests: adopt-on-clean-reopen, checkpoint merge, dirty-gate, crash/corruption recovery, 1M-edge load bench");
+    const mmap_index_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/mmap_index_snapshot.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_mmap_index = b.addRunArtifact(mmap_index_tests);
+    mmap_index_step.dependOn(&run_mmap_index.step);
+
     // Review F-5 (GAP-ENT-0011): CI runs `zig build test`, `test-integration`
     // and `test-fuzz-regression` only — standalone named steps never run
     // there. Silent-corruption crash-recovery regression guards must be gated,
@@ -558,6 +572,9 @@ fn addIntegrationTests(
     // remain individually invokable via their named steps).
     integration_step.dependOn(&run_free_space_wal_tail.step);
     integration_step.dependOn(&run_edge_remove_crash.step);
+    // P1: the mmap-snapshot crash/corruption guards are the same class — gate
+    // them under the integration umbrella too.
+    integration_step.dependOn(&run_mmap_index.step);
 }
 
 fn addExample(
