@@ -209,6 +209,12 @@ fn replayAdjacencyIfNeeded(
                 .neighbor = payload.to,
                 .rel_type = payload.rel_type,
                 .prop_head = 0,
+                // Legacy 2PC prepare payloads predate the inline public id (the
+                // co-located write path emits no cross-shard prepares), so this
+                // reconciliation re-applies the edge as a legacy record: id 0 →
+                // readers use the id-property fallback, matching the
+                // public_id=0 adjacency entry re-applied above.
+                .public_id = 0,
             });
             // PHASE 3: the existence index was already rebuilt from adjacency in
             // GraphEngine.open; if this committed prepare's source adjacency was

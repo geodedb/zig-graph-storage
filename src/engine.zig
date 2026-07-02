@@ -77,6 +77,13 @@ pub const EdgeIndexEntry = struct {
     neighbor: NodeId,
     rel_type: u32,
     prop_head: u32,
+    /// GAP-ENT-0024 P3: inline 64-bit public edge id, mirrored from the
+    /// durable adjacency record (edge.zig EdgeEntry.public_id). 0 = unknown/
+    /// absent (legacy edges / v1 blocks) — callers fall back to the legacy
+    /// `__geode_internal_edge_id` property read. Deliberately NO default
+    /// value: every insert site must state the id it carries, so a new
+    /// insert site cannot silently drop ids.
+    public_id: u64,
 };
 
 /// Default worker count for the owned (no-`external_thread_pool`) path.
@@ -1161,6 +1168,9 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = entry.rel_type,
             .prop_head = entry.prop_head,
+            // P3: the edge_index-sourced route surfaces the SAME public_id the
+            // adjacency-sourced routes (expand*/FanIn) yield for this edge.
+            .public_id = entry.public_id,
         };
     }
 
@@ -1316,6 +1326,9 @@ pub const GraphEngine = struct {
             .neighbor = to,
             .rel_type = rel_type,
             .prop_head = 0,
+            // Legacy add path: no public id (matches the 0 written into the
+            // adjacency entries above — readers use the property fallback).
+            .public_id = 0,
         });
         self.edge_index_dirty = true;
 
@@ -1418,11 +1431,14 @@ pub const GraphEngine = struct {
         try self.logPage(txn, .in_dir, dir_page);
 
         // 4. Derived in-memory indexes (same as addEdgeTxn — already source-shard).
+        //    P3: the edge_index carries the SAME public_id as the durable
+        //    adjacency entries so getEdge agrees with the adjacency routes.
         try self.edge_index.put(edge_id, .{
             .from = from,
             .neighbor = to,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = public_id,
         });
         self.edge_index_dirty = true;
         try self.edge_exist_index.put(from, rel_type, to, edge_id);

@@ -15,12 +15,20 @@ const NodeId = types.NodeId;
 const NodeRec = node_mod.NodeRec;
 const GraphEngine = engine_mod.GraphEngine;
 const EdgeIndexEntry = engine_mod.EdgeIndexEntry;
-// SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
-const EDGE_SNAPSHOT_MAGIC = "GSEIDX2\x00";
+// SEC-0051: snapshot format appends a trailing CRC32 over the payload.
+// GAP-ENT-0024 P3: the magic IS the snapshot format version. "GSEIDX3"
+// records are 40 B (+public_id u64); the previous "GSEIDX2" records were
+// 32 B. Bumping the magic makes loadFile REJECT an old snapshot outright
+// (error.InvalidFormat → materializeDerivedIndexes' `catch false` → clean
+// one-time rebuild from durable adjacency) — an old file can never be
+// misparsed at the 40 B stride, and an old binary rejects a new file the
+// same way. Do NOT reuse "GSEIDX2" for any future layout.
+const EDGE_SNAPSHOT_MAGIC = "GSEIDX3\x00";
 
 // SEC-0044/SEC-0048: smallest bytes a single edge-index record consumes on disk
-// (edge_id u64 + from u64 + neighbor u64 + rel_type u32 + prop_head u32).
-const EDGE_RECORD_MIN_SIZE: usize = 8 + 8 + 8 + 4 + 4;
+// (edge_id u64 + from u64 + neighbor u64 + rel_type u32 + prop_head u32 +
+//  public_id u64).
+const EDGE_RECORD_MIN_SIZE: usize = 8 + 8 + 8 + 4 + 4 + 8;
 
 // PHASE 3: edge-EXISTENCE index snapshot. Distinct magic so a wrong/legacy file
 // is rejected rather than misparsed; one record is (from u64 + to u64 + rel_type
@@ -147,6 +155,10 @@ pub fn rebuildEdgeIndex(engine: *GraphEngine) !void {
                     .neighbor = entry.neighbor,
                     .rel_type = entry.rel_type,
                     .prop_head = entry.prop_head,
+                    // P3: carried straight from the adjacency scan — v2 blocks
+                    // yield the real inline id, v1 blocks yield 0 (readers fall
+                    // back to the legacy id property for those).
+                    .public_id = entry.public_id,
                 }) catch |e| {
                     self.err = e;
                     return;
@@ -405,6 +417,8 @@ fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
         try w.writeU64(entry.value_ptr.neighbor);
         try w.writeU32(entry.value_ptr.rel_type);
         try w.writeU32(entry.value_ptr.prop_head);
+        // P3 (GSEIDX3): 40 B record — trailing inline public id.
+        try w.writeU64(entry.value_ptr.public_id);
     }
 
     try w.finalize(file.*);
@@ -433,12 +447,16 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
         const neighbor = try r.readU64();
         const rel_type = try r.readU32();
         const prop_head = try r.readU32();
+        // P3 (GSEIDX3): 40 B record — trailing inline public id. An OLD 32 B
+        // snapshot never reaches this reader (magic-rejected in loadPayload).
+        const public_id = try r.readU64();
 
         try engine.edge_index.put(edge_id, .{
             .from = from,
             .neighbor = neighbor,
             .rel_type = rel_type,
             .prop_head = prop_head,
+            .public_id = public_id,
         });
     }
 

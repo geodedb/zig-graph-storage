@@ -1067,6 +1067,410 @@ test "P2 crash: plain v2 appends (multi-block chain) replay with exact public_id
     }
 }
 
+// ============================================================================
+// P3 — EdgeIndexEntry + edge-index snapshot + consumers.
+//
+// In-memory EdgeIndexEntry gains `public_id: u64`; every insert site carries
+// it (add path from the API param, rebuild from the adjacency scan — v1
+// blocks yield 0). The persisted edge-index snapshot record grows 32 B → 40 B
+// under a NEW magic ("GSEIDX3\x00"): the magic IS the format version, so an
+// OLD (GSEIDX2, 32 B-record) snapshot file is version-REJECTED by loadFile's
+// magic check (error.InvalidFormat → tryLoadDerivedIndexes catch-false →
+// clean rebuild from durable adjacency) and can NEVER be misparsed as 40 B
+// records. The edge-EXISTENCE index snapshot (GSXIDX1, 28 B records) is
+// UNTOUCHED.
+// ============================================================================
+
+const OLD_EDGE_SNAPSHOT_MAGIC = "GSEIDX2\x00"; // pre-P3 (32 B records)
+const NEW_EDGE_SNAPSHOT_MAGIC = "GSEIDX3\x00"; // P3 (40 B records, +public_id)
+const SNAPSHOT_CRC = std.hash.crc.Crc32Iscsi;
+/// magic(8) + checkpoint_counter(8) + item_count(8).
+const SNAPSHOT_HEADER = 24;
+
+fn ioT() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Read a whole file into a caller-owned buffer.
+fn readFileBytes(allocator: Allocator, path: []const u8) ![]u8 {
+    const io = ioT();
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+    const buf = try allocator.alloc(u8, @intCast(st.size));
+    errdefer allocator.free(buf);
+    const n = try f.readPositionalAll(io, buf, 0);
+    try testing.expectEqual(buf.len, n);
+    return buf;
+}
+
+/// Overwrite a file with `bytes` (truncate).
+fn writeFileBytes(path: []const u8, bytes: []const u8) !void {
+    const io = ioT();
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer f.close(io);
+    try f.setLength(io, 0);
+    try f.writePositionalAll(io, bytes, 0);
+}
+
+/// Downgrade a NEW-format (GSEIDX3, 40 B records) edges.idx file on disk into
+/// a byte-exact OLD-format (GSEIDX2, 32 B records) snapshot: same counter,
+/// same item_count, public_id column dropped, CRC32 recomputed. This is
+/// exactly what a pre-P3 binary would have written for the same edge set.
+fn downgradeEdgeSnapshotToV2(allocator: Allocator, path: []const u8) !void {
+    const data = try readFileBytes(allocator, path);
+    defer allocator.free(data);
+
+    try testing.expect(data.len >= SNAPSHOT_HEADER + 4);
+    try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
+    const item_count = std.mem.readInt(u64, data[16..24], .little);
+    const payload = data[SNAPSHOT_HEADER .. data.len - 4];
+    try testing.expectEqual(@as(usize, item_count * 40), payload.len);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, OLD_EDGE_SNAPSHOT_MAGIC);
+    try out.appendSlice(allocator, data[8..24]); // counter + item_count verbatim
+    var i: usize = 0;
+    while (i < item_count) : (i += 1) {
+        const rec = payload[i * 40 ..][0..40];
+        try out.appendSlice(allocator, rec[0..32]); // drop trailing public_id u64
+    }
+    const crc = SNAPSHOT_CRC.hash(out.items);
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, crc, .little);
+    try out.appendSlice(allocator, &crc_buf);
+
+    try writeFileBytes(path, out.items);
+}
+
+/// getEdge must surface the exact public_id from the edge_index route.
+fn expectEdgePid(eng: anytype, edge_id: u64, want_pid: u64) !void {
+    const e = (try eng.getEdge(edge_id)) orelse return error.EdgeNotFound;
+    try testing.expectEqual(edge_id, e.edge_id);
+    try testing.expectEqual(want_pid, e.public_id);
+}
+
+test "P3: edge_index route (getEdge) agrees with adjacency routes (expandOut + FanIn) on public_id" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE6} ** 16;
+
+    var eng = try ShardedGraphEngine.create(testing.allocator, td.path, uuid, baselineConfig());
+    defer eng.close() catch {};
+
+    const a = try eng.allocNode();
+    const b = try eng.allocNode();
+    const c = try eng.allocNode();
+    try eng.putNode(a, test_support.emptyNode(1));
+    try eng.putNode(b, test_support.emptyNode(1));
+    try eng.putNode(c, test_support.emptyNode(1));
+
+    const pid: u64 = 0x1D_0000_0000_0042;
+    const new_edge = try eng.addEdgeColocatedWithPublicId(a, b, REL, pid);
+    const legacy_edge = try eng.addEdge(a, c, REL); // public_id 0 delegate
+
+    // Route 1: edge_index (getEdge).
+    try expectEdgePid(eng, new_edge, pid);
+    try expectEdgePid(eng, legacy_edge, 0);
+
+    // Route 2: adjacency out-chain.
+    var out_new: ?u64 = null;
+    var out_legacy: ?u64 = null;
+    {
+        var it = try eng.expandOutIter(a, null);
+        defer it.deinit();
+        while (try it.next()) |e| {
+            if (e.edge_id == new_edge) out_new = e.public_id;
+            if (e.edge_id == legacy_edge) out_legacy = e.public_id;
+        }
+    }
+    try testing.expectEqual(@as(?u64, pid), out_new);
+    try testing.expectEqual(@as(?u64, 0), out_legacy);
+
+    // Route 3: FanInEdgeIterator (adj_in_remote).
+    {
+        var it = try eng.expandInIter(b, null);
+        defer it.deinit();
+        const e = (try it.next()).?;
+        try testing.expectEqual(new_edge, e.edge_id);
+        try testing.expectEqual(pid, e.public_id);
+        try testing.expectEqual(@as(?edge_mod.EdgeEntry, null), try it.next());
+    }
+}
+
+const P3_N = 53; // deliberately odd; 3 legacy + 50 v2 below
+
+fn p3Pid(i: usize) u64 {
+    return 0x9D3_0000_0000_0000 | @as(u64, @intCast(i + 1));
+}
+
+const P3Nodes = struct { a: u64, sinks: [4]u64 };
+
+fn p3Nodes(eng: *GraphEngine) !P3Nodes {
+    var n: P3Nodes = undefined;
+    n.a = try eng.allocNode();
+    try eng.putNode(n.a, test_support.emptyNode(1));
+    for (&n.sinks) |*s| {
+        s.* = try eng.allocNode();
+        try eng.putNode(s.*, test_support.emptyNode(1));
+    }
+    return n;
+}
+
+/// 3 legacy edges + 50 v2-with-pid edges out of `n.a`
+/// (index < 3 → legacy/pid 0, else pid p3Pid(i)).
+fn p3Edges(eng: *GraphEngine, n: P3Nodes, ids: *[P3_N]u64) !void {
+    for (ids, 0..) |*slot, i| {
+        const to = n.sinks[i % n.sinks.len];
+        slot.* = if (i < 3)
+            try eng.addEdgeColocated(n.a, to, REL)
+        else
+            try eng.addEdgeColocatedWithPublicId(n.a, to, REL, p3Pid(i));
+    }
+}
+
+fn p3Populate(eng: *GraphEngine, ids: *[P3_N]u64) !void {
+    const n = try p3Nodes(eng);
+    try p3Edges(eng, n, ids);
+}
+
+test "P3 snapshot round-trip: clean reopen LOADS the 40 B-record snapshot (no rebuild), ids intact" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE7} ** 16;
+    const cfg = test_support.testConfig();
+
+    var ids: [P3_N]u64 = undefined;
+    var idx_path: []u8 = undefined;
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try p3Populate(eng, &ids);
+        try eng.checkpoint(); // full checkpoint saves the derived snapshots
+        idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges.idx", .{eng.graph_dir.path});
+    }
+    defer testing.allocator.free(idx_path);
+
+    // On-disk snapshot shape: header + P3_N 40 B records + CRC, new magic.
+    {
+        const data = try readFileBytes(testing.allocator, idx_path);
+        defer testing.allocator.free(data);
+        try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
+        try testing.expectEqual(@as(u64, P3_N), std.mem.readInt(u64, data[16..24], .little));
+        try testing.expectEqual(@as(usize, SNAPSHOT_HEADER + P3_N * 40 + 4), data.len);
+    }
+
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Nothing hydrated at open (Phase A) — the getEdge below is the
+        // first-access that runs the counter-gated LOAD.
+        try testing.expectEqual(@as(u32, 0), eng.derived_materialize_runs);
+        for (ids, 0..) |id, i| {
+            try expectEdgePid(eng, id, if (i < 3) 0 else p3Pid(i));
+        }
+        // Clean restart: snapshot LOADED, not rebuilt.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
+    }
+}
+
+test "P3 old-format snapshot (GSEIDX2, 32 B records) → clean version-reject → rebuild recovers ids from adjacency" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE8} ** 16;
+    const cfg = test_support.testConfig();
+
+    var ids: [P3_N]u64 = undefined;
+    var idx_path: []u8 = undefined;
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try p3Populate(eng, &ids);
+        try eng.checkpoint();
+        idx_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges.idx", .{eng.graph_dir.path});
+    }
+    defer testing.allocator.free(idx_path);
+
+    // Swap in the byte-exact pre-P3 snapshot a v0.2.23 binary would have
+    // written: OLD magic, 32 B records, SAME (matching!) checkpoint counter —
+    // so the ONLY thing standing between this file and a misparse is the
+    // format gate, not the staleness counter.
+    try downgradeEdgeSnapshotToV2(testing.allocator, idx_path);
+
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        for (ids, 0..) |id, i| {
+            try expectEdgePid(eng, id, if (i < 3) 0 else p3Pid(i));
+        }
+        // The old-format file was REJECTED (never misparsed) and the whole
+        // derived set was rebuilt from durable adjacency — v2 blocks carry the
+        // ids, so they survive the version bump with zero loss.
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+    }
+}
+
+test "P3 crash between edge writes and checkpoint → recovery → getEdge ids exact (rebuild path)" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE9} ** 16;
+    const cfg = test_support.testConfig(); // sync_each_commit: WAL tail survives
+
+    var ids: [P3_N]u64 = undefined;
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        // Durable baseline (nodes + clean empty edge snapshot). Node CREATION
+        // must be durable here because manifest.next_node_id is checkpoint-
+        // granular (recovery replays page images, it does not re-derive
+        // manifest counters — pre-existing property, see the P2 crash note).
+        const n = try p3Nodes(eng);
+        try eng.checkpoint();
+        // Every EDGE below lives ONLY in the fsynced WAL tail — the crash
+        // window under test is "edge writes → crash → recovery".
+        try p3Edges(eng, n, &ids);
+        // SIMULATED CRASH: no checkpoint, no close.
+        eng.deinit();
+    }
+
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        for (ids, 0..) |id, i| {
+            try expectEdgePid(eng, id, if (i < 3) 0 else p3Pid(i));
+        }
+        // Crash restart: the pre-crash snapshot is stale (WAL replay advanced
+        // the manifest counter), so the edge_index was REBUILT from the
+        // WAL-recovered adjacency — ids exact.
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+    }
+}
+
+test "P3 mixed v1/v2 adjacency → rebuild → v1 edges surface id 0, v2 edges real ids" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xEA} ** 16;
+    const cfg = test_support.testConfig();
+
+    const pid: u64 = 0xCAFE_0000_0000_0077;
+    var node_a: u64 = 0;
+    var node_b: u64 = 0;
+    var node_c: u64 = 0;
+    var legacy_edge: u64 = 0;
+    var new_edge: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+
+        node_a = try eng.allocNode();
+        node_b = try eng.allocNode();
+        node_c = try eng.allocNode();
+        try eng.putNode(node_a, test_support.emptyNode(1));
+        try eng.putNode(node_b, test_support.emptyNode(1));
+        try eng.putNode(node_c, test_support.emptyNode(1));
+
+        // Legacy edge, then rewrite its (v2-created) block IN PLACE to v1 —
+        // byte-exactly a pre-P2 legacy store (same trick as the P2 crash test).
+        legacy_edge = try eng.addEdgeColocated(node_a, node_b, REL);
+        const v1_page = (try eng.getNode(node_a)).?.out_head;
+        {
+            const store = &eng.adj_out;
+            const frame = try store.buffer_pool.pin(store.file_id, v1_page);
+            const idx = store.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+            const off = PAGE_HEADER_SIZE;
+            data[off + 11] = 0; // entry_format = v1
+            std.mem.writeInt(u16, data[off + 12 ..][0..2], 24, .little);
+            @memset(data[off + 16 + 24 ..][0..8], 0);
+            store.buffer_pool.unpin(idx, true);
+        }
+        try eng.checkpoint();
+
+        // New edge WITH a real id: no-truncate rule chains a fresh v2 head
+        // block onto the v1 block — a mixed chain on ONE node.
+        new_edge = try eng.addEdgeColocatedWithPublicId(node_a, node_c, REL, pid);
+
+        // SIMULATED CRASH so the reopen is forced down the REBUILD path (the
+        // point under test: rebuildEdgeIndex carrying public_id across a
+        // mixed-format chain).
+        eng.deinit();
+    }
+
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        try expectEdgePid(eng, legacy_edge, 0); // v1 block → id 0 (fallback class)
+        try expectEdgePid(eng, new_edge, pid); // v2 block → exact id
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+    }
+}
+
+test "P3 existence index untouched: MERGE dedup (probeEdge) works on v2 edges, 28 B snapshot records" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xEB} ** 16;
+    const cfg = test_support.testConfig();
+
+    const pid: u64 = 0xD00D_0000_0000_0001;
+    var from: u64 = 0;
+    var to: u64 = 0;
+    var edge: u64 = 0;
+    var exist_path: []u8 = undefined;
+
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        from = try eng.allocNode();
+        to = try eng.allocNode();
+        try eng.putNode(from, test_support.emptyNode(1));
+        try eng.putNode(to, test_support.emptyNode(1));
+        edge = try eng.addEdgeColocatedWithPublicId(from, to, REL, pid);
+
+        // MERGE dedup probe finds the v2 edge (and nothing for other tuples).
+        var buf: [4]u64 = undefined;
+        const hits = try eng.probeEdge(from, REL, to, &buf);
+        try testing.expectEqual(@as(usize, 1), hits.len);
+        try testing.expectEqual(edge, hits[0]);
+        const misses = try eng.probeEdge(from, REL + 1, to, &buf);
+        try testing.expectEqual(@as(usize, 0), misses.len);
+
+        try eng.checkpoint();
+        exist_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges_exist.idx", .{eng.graph_dir.path});
+    }
+    defer testing.allocator.free(exist_path);
+
+    // The existence snapshot format is UNCHANGED: GSXIDX1 magic, 28 B records
+    // (from u64 + to u64 + rel u32 + edge_id u64) — no prop_head/public_id.
+    {
+        const data = try readFileBytes(testing.allocator, exist_path);
+        defer testing.allocator.free(data);
+        try testing.expectEqualStrings("GSXIDX1\x00", data[0..8]);
+        try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, data[16..24], .little));
+        try testing.expectEqual(@as(usize, SNAPSHOT_HEADER + 28 + 4), data.len);
+    }
+
+    // After a clean reopen (snapshot LOAD path) the probe still dedups.
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        var buf: [4]u64 = undefined;
+        const hits = try eng.probeEdge(from, REL, to, &buf);
+        try testing.expectEqual(@as(usize, 1), hits.len);
+        try testing.expectEqual(edge, hits[0]);
+        try expectEdgePid(eng, edge, pid);
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
