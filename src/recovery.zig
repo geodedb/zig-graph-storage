@@ -316,6 +316,39 @@ pub const Recovery = struct {
 
         // 8. Write fresh checkpoint
         try file_manager.syncAll();
+
+        // GAP-ENT-0011 (review F-1): when committed tail images were applied,
+        // the persisted checkpoint-era free.store is STALE with respect to the
+        // pages just replayed. The open path rebuilds + re-persists it (step
+        // 5b), but that happens AFTER this function returns — and this function
+        // is about to persist the ADVANCED last_checkpoint_lsn to both
+        // manifests. A crash (or an error-abort + retry of open) between the
+        // manifest write and step 5b would leave: advanced LSN + stale bitmap
+        // → the NEXT open sees an empty WAL tail, takes the clean path, and
+        // silently trusts the stale file (double allocation of live pages).
+        //
+        // Make an EMPTY free.store the crash-safe signal: truncate it to zero
+        // (+ fsync so the truncate is durable) BEFORE the advanced manifests
+        // land. loadFreeStore already treats a zero-length file as "no
+        // persisted bitmap" (returns false → rebuild fallback), so any
+        // crash/error anywhere in the rest of open leaves the stale bitmap
+        // GONE and the next open rebuilds. Truncate rather than unlink:
+        // free.store doubles as the registered `.free` store file, which this
+        // very function (and the next open) opens with `open_existing` — the
+        // file must keep existing. Correctness no longer depends on step 5b
+        // completing; `applied_committed_pages` stays as the fast-path signal
+        // for the current open. ftruncate is atomic: a crash mid-way leaves
+        // either the old content (WAL tail unchanged → recovery repeats and
+        // truncates again) or the empty file (rebuild), never a torn bitmap.
+        if (self.applied_committed_pages) {
+            const free_store_path = try std.fmt.allocPrint(self.allocator, "{s}/free.store", .{graph_dir.path});
+            defer self.allocator.free(free_store_path);
+            const free_file = try std.Io.Dir.cwd().openFile(io, free_store_path, .{ .mode = .read_write });
+            defer free_file.close(io);
+            try free_file.setLength(io, 0);
+            try free_file.sync(io);
+        }
+
         m.counter += 1;
         m.last_checkpoint_lsn = wal.currentLsn();
 

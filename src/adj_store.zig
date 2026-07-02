@@ -124,8 +124,15 @@ pub const AdjStore = struct {
 
     /// Remove an edge entry from a node's adjacency list.
     /// Scans all blocks for the matching edge_id and removes it by swapping with the last entry.
-    pub fn removeEdge(self: *AdjStore, head_page: PageId, edge_id: EdgeId) !void {
-        if (head_page == 0) return;
+    ///
+    /// Returns the page id of the block that was MUTATED (the swap-with-last +
+    /// count-- happen entirely inside the block holding the entry, which may be
+    /// any block of the chain, not just the head), or null when the edge was
+    /// not found (no page touched). GAP-ENT-0032: the caller must WAL-image
+    /// exactly this page — imaging only the chain head lets older WAL images of
+    /// a non-head block resurrect a committed delete on crash recovery.
+    pub fn removeEdge(self: *AdjStore, head_page: PageId, edge_id: EdgeId) !?PageId {
+        if (head_page == 0) return null;
 
         var current_page = head_page;
         var hops: u32 = 0;
@@ -151,7 +158,7 @@ pub const AdjStore = struct {
                     bh.payload_size = @intCast(@as(u32, bh.count) * edge_mod.entrySize(bh.entry_format));
                     self.writeBlockHeader(data, bh);
                     self.buffer_pool.unpin(frame_idx, true);
-                    return;
+                    return current_page;
                 }
             }
 
@@ -159,6 +166,7 @@ pub const AdjStore = struct {
             self.buffer_pool.unpin(frame_idx, false);
             current_page = next;
         }
+        return null;
     }
 
     pub const AdjEdgeIterator = struct {
@@ -503,7 +511,8 @@ test "removeEdge removes correct entry" {
     head = try store.addEdge(head, makeEdge(20, 2, 5));
     head = try store.addEdge(head, makeEdge(30, 3, 5));
 
-    try store.removeEdge(head, 2);
+    const mutated = try store.removeEdge(head, 2);
+    try testing.expectEqual(@as(?PageId, head), mutated);
 
     const count = try store.edgeCount(head);
     try testing.expectEqual(@as(u64, 2), count);

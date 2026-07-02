@@ -1550,16 +1550,24 @@ pub const GraphEngine = struct {
         try self.ensureDerivedHydrated();
         // Remove from source node's out adjacency list (from IS resident here).
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
-        try self.adj_out.removeEdge(from_rec.out_head, edge_id);
+        const out_mutated = try self.adj_out.removeEdge(from_rec.out_head, edge_id);
 
         // Remove from THIS shard's co-located incoming adjacency, keyed by `to`
         // via the page-backed directory. We do NOT read `to`'s NodeRec.
         const in_head = try self.in_head_dir.getHead(to);
-        try self.adj_in_remote.removeEdge(in_head, edge_id);
+        const in_mutated = try self.adj_in_remote.removeEdge(in_head, edge_id);
 
-        // Log dirty adjacency pages (out-adj head + in-index head).
-        if (from_rec.out_head != 0) try self.logPage(txn, .adj_out, from_rec.out_head);
-        if (in_head != 0) try self.logPage(txn, .in_idx, in_head);
+        // GAP-ENT-0032: WAL-image exactly the block each removal MUTATED.
+        // The entry may live in ANY block of the chain (removeEdge is a
+        // same-block swap-with-last + count--), not just the head — imaging
+        // only the head let older WAL images of a deeper block resurrect a
+        // committed delete (with its old public_id) on crash recovery, the
+        // same under-logging class as the label logVarChain fix. The head
+        // pointer itself never changes on remove, so the node record /
+        // in-dir page need no image; a not-found removal (null) touched no
+        // page and logs nothing.
+        if (out_mutated) |p| try self.logPage(txn, .adj_out, p);
+        if (in_mutated) |p| try self.logPage(txn, .in_idx, p);
 
         // PHASE 3: drop the edge-existence entry BEFORE removing the edge_index
         // record (we need its rel_type to form the key). No-op if absent.

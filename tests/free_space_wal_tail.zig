@@ -479,6 +479,160 @@ test "double crash: second crash before next checkpoint must not resurrect the s
     try assertParity(alloc, eng, &s);
 }
 
+test "review F-1: crash between recovery's manifest advance and the free-space re-persist must not resurrect the stale bitmap" {
+    // The residual window: recovery.recover() replays the committed WAL tail
+    // and persists the ADVANCED last_checkpoint_lsn to both manifests, but the
+    // free-space rebuild + re-persist happens later, in open step 5b. A crash
+    // (or an error-abort + retry of open) between the two leaves on disk:
+    // advanced LSN + stale checkpoint-era free.store. The next open then sees
+    // an empty WAL tail, takes the clean path, loadFreeStore() succeeds — and
+    // the stale bitmap silently hands live pages to the next writer.
+    //
+    // The fix makes an EMPTY free.store the crash-safe signal: recover()
+    // truncates free.store to zero (+ fsync) BEFORE writing the advanced
+    // manifests (truncate, not unlink — the file doubles as the registered
+    // `.free` store and must keep existing for open_existing), so any
+    // crash/error anywhere in the rest of open leaves no stale bitmap and
+    // the next open falls into the rebuild fallback (loadFreeStore treats
+    // size 0 as "no persisted bitmap").
+    //
+    // Simulate the window exactly: run RAW Recovery.recover() on the crashed
+    // dir (manifests advance; step 5b never runs), drop everything, then do a
+    // FULL open and assert it rebuilds instead of trusting the stale file.
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0xF9} ** 16;
+    const cfg = test_support.testConfig();
+
+    var s = try buildCrashScenario(alloc, td.path, uuid, cfg);
+    defer s.deinit(alloc);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var free_path_buf: [4096]u8 = undefined;
+    var free_path: []const u8 = undefined;
+
+    {
+        var gd = try gs.graph_dir.GraphDir.open(alloc, td.path, uuid);
+        defer gd.deinit();
+        free_path = try std.fmt.bufPrint(&free_path_buf, "{s}/free.store", .{gd.path});
+
+        var fm = gs.file_manager.FileManager.init(alloc, gd.path, cfg.page_size);
+        defer fm.deinit();
+        var pool = try gs.buffer_pool.BufferPool.init(alloc, cfg.page_size, 1024);
+        defer pool.deinit();
+
+        var rec = gs.recovery.Recovery.init(alloc, null);
+        defer rec.deinit();
+        _ = try rec.recover(&gd, &pool, &fm);
+
+        // Sanity: this recovery really did apply committed tail images (the
+        // window under test is real).
+        try testing.expect(rec.applied_committed_pages);
+
+        // Mechanism: recover() itself must have emptied the stale
+        // checkpoint-era free.store BEFORE persisting the advanced manifests.
+        {
+            const f = try std.Io.Dir.cwd().openFile(io, free_path, .{});
+            defer f.close(io);
+            const stat = try f.stat(io);
+            if (stat.size != 0) {
+                std.debug.print(
+                    "stale checkpoint-era free.store ({d} bytes) survived recovery — a crash here re-opens GAP-ENT-0011\n",
+                    .{stat.size},
+                );
+                return error.StaleFreeStoreSurvivedRecovery;
+            }
+        }
+        // SIMULATED CRASH inside the open window: recovery completed (manifests
+        // advanced) but open step 5b never ran. Everything recovery flushed is
+        // on disk (flushAll + syncAll ran inside recover), matching a kill -9
+        // right after the manifest write.
+    }
+
+    // Retry of open after the window-crash: WAL tail is now empty (clean
+    // path). Correctness must no longer depend on step 5b having completed.
+    const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+
+    try assertSnapshotAllocated(eng, &s.snap);
+    try hammerAllocations(alloc, eng);
+    try assertParity(alloc, eng, &s);
+}
+
+test "review F-2: saveFreeStore is atomic — a stale free.store.tmp from a killed save is consumed, never left behind" {
+    // saveFreeStore used to createFile() free.store IN PLACE (truncate +
+    // streaming write, no fsync): a torn write could leave a truncated file
+    // whose 5-bitmap legacy boundary silently EMPTIES the trailing
+    // in_idx/in_dir bitmaps on load (double-alloc through a different door),
+    // and elsewhere-truncation bricks the open. The atomic pattern
+    // (tmp + fsync + rename + dir fsync) makes truncation impossible: a kill
+    // before the rename leaves the OLD file intact and only a stale .tmp.
+    //
+    // Assert the rename pattern mechanically: seed a garbage free.store.tmp
+    // (exactly what a killed previous save leaves), checkpoint, and require
+    // (a) the tmp is consumed by the rename, (b) the real free.store is
+    // intact and loadable on a clean reopen.
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0xFA} ** 16;
+    const cfg = test_support.testConfig();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var snap: Snapshot = undefined;
+    var tmp_path_buf: [4096]u8 = undefined;
+    var tmp_path: []const u8 = undefined;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+
+        const a = try eng.allocNode();
+        try eng.putNode(a, emptyNode());
+        const b = try eng.allocNode();
+        try eng.putNode(b, emptyNode());
+        _ = try eng.addEdgeColocatedWithPublicId(a, b, REL, 0xBEEF_0000_0000_0002);
+        {
+            var rec = (try eng.getNode(a)).?;
+            rec.prop_head = try eng.putProperty(rec.prop_head, "base", .{ .int = 7 });
+            try eng.putNode(a, rec);
+        }
+
+        // A killed previous save left a garbage tmp behind.
+        tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}/free.store.tmp", .{eng.graph_dir.path});
+        {
+            const f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, "garbage-from-a-killed-save");
+        }
+
+        try eng.checkpoint();
+
+        // (a) The atomic save's rename must have CONSUMED the tmp file.
+        if (std.Io.Dir.cwd().openFile(io, tmp_path, .{})) |f| {
+            f.close(io);
+            std.debug.print("free.store.tmp survived a checkpoint — saveFreeStore is not tmp+rename atomic\n", .{});
+            return error.FreeStoreSaveNotAtomic;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        snap = try takeSnapshot(alloc, eng);
+        errdefer snap.deinit(alloc);
+
+        try eng.close();
+    }
+    defer snap.deinit(alloc);
+
+    // (b) Clean reopen loads the renamed free.store (not a rebuild fallback,
+    // and not the garbage): every checkpointed allocation is still allocated.
+    const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    try assertSnapshotAllocated(eng, &snap);
+}
+
 // ── Sharded engine: same crash pattern through the production entry point ──
 
 test "sharded crash restart: WAL-tail data survives post-reopen write pressure" {

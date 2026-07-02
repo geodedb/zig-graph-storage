@@ -82,9 +82,43 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
         offset += written;
     }
 
-    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf[0..offset]);
+    // GAP-ENT-0011 (review F-2): write ATOMICALLY — tmp + fsync + rename +
+    // dir fsync. The crash-recovery path made this file correctness-
+    // load-bearing (the rebuilt bitmap is re-persisted right after recovery),
+    // and the previous in-place createFile truncated the old file first: a
+    // torn write could land exactly at the 5-bitmap legacy boundary, which
+    // loadFreeStore parses as a legacy file with EMPTY in_idx/in_dir bitmaps
+    // (silent double allocation of live co-located-adjacency pages), and a
+    // truncation elsewhere bricks the open until the file is hand-deleted.
+    // With the rename as the commit point, a crash mid-save leaves the OLD
+    // file intact (on the recovery path that is the recovery-truncated EMPTY
+    // file → rebuild fallback).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tmp_path = try std.fmt.allocPrint(engine.allocator, "{s}.tmp", .{path});
+    defer engine.allocator.free(tmp_path);
+
+    {
+        // exclusive is omitted: a stale .tmp from a previous killed save may
+        // exist and must simply be overwritten.
+        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{
+            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+            .resolve_beneath = true,
+        });
+        defer tmp_file.close(io);
+        try tmp_file.writeStreamingAll(io, buf[0..offset]);
+        try tmp_file.sync(io);
+    }
+
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
+
+    // fsync the graph directory so the rename itself is durable (the recovery
+    // path relies on the renamed file surviving power loss, not just process
+    // crash). `.iterate = true` forces a real O_RDONLY|O_DIRECTORY fd — the
+    // default openDir uses O_PATH, on which fsync fails with EBADF.
+    var gdir = try std.Io.Dir.cwd().openDir(io, engine.graph_dir.path, .{ .iterate = true });
+    defer gdir.close(io);
+    const gdir_file = std.Io.File{ .handle = gdir.handle, .flags = .{ .nonblocking = false } };
+    try gdir_file.sync(io);
 }
 
 /// Try to load free space bitmaps from a persisted `free.store` file.
@@ -165,8 +199,14 @@ pub fn rebuildFreeSpaceFromDisk(engine: *GraphEngine) !void {
     };
 
     for (pairs) |pair| {
-        const pager = engine.file_manager.getPager(pair.fid) orelse continue;
-        const page_count = pager.pageCount() catch continue;
+        // Review F-4 (GAP-ENT-0011): this rebuild is the PRIMARY defense on
+        // the crash-recovery path. Swallowing a missing pager or an fstat
+        // error here would leave that store's bitmap EMPTY (all free) —
+        // silent double allocation, the very bug under repair. All seven
+        // store files are opened before this runs, so both failures are
+        // exceptional and must fail the open loudly.
+        const pager = engine.file_manager.getPager(pair.fid) orelse return error.StorePagerUnavailable;
+        const page_count = try pager.pageCount();
         if (page_count == 0) continue;
 
         try pair.fsm.ensureCapacity(page_count);

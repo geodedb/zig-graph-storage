@@ -433,7 +433,7 @@ test "P1: updateEdgePropHead + removeEdge on a v2 block preserve public_ids" {
 
     // Swap-remove of the FIRST entry moves the last entry (v2 stride) into
     // its slot — the mover's public_id must ride along.
-    try store.removeEdge(head, 101);
+    _ = try store.removeEdge(head, 101);
     {
         const got = try drainChain(&store, head, testing.allocator);
         defer testing.allocator.free(got);

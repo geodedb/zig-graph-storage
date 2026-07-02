@@ -536,6 +536,28 @@ fn addIntegrationTests(
     });
     const run_free_space_wal_tail = b.addRunArtifact(free_space_wal_tail_tests);
     free_space_wal_tail_step.dependOn(&run_free_space_wal_tail.step);
+
+    // GAP-ENT-0032 — committed edge REMOVE in a non-head adjacency block must
+    // stay deleted across a crash. removeEdgeTxn WAL-images the block the
+    // removal actually mutated (same class as the GAP-ENT-0011 logVarChain
+    // label fix), otherwise older WAL images of that page resurrect the edge
+    // with its old public_id.
+    const edge_remove_crash_step = b.step("test-edge-remove-crash", "Run edge-remove crash-recovery tests: a committed remove whose entry lives in a non-head adjacency block stays deleted after WAL replay (both directions, exact surviving public_ids)");
+    const edge_remove_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_remove_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_remove_crash = b.addRunArtifact(edge_remove_crash_tests);
+    edge_remove_crash_step.dependOn(&run_edge_remove_crash.step);
+
+    // Review F-5 (GAP-ENT-0011): CI runs `zig build test`, `test-integration`
+    // and `test-fuzz-regression` only — standalone named steps never run
+    // there. Silent-corruption crash-recovery regression guards must be gated,
+    // so hang both suites under the `test-integration` umbrella as well (they
+    // remain individually invokable via their named steps).
+    integration_step.dependOn(&run_free_space_wal_tail.step);
+    integration_step.dependOn(&run_edge_remove_crash.step);
 }
 
 fn addExample(
