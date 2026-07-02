@@ -522,6 +522,20 @@ fn addIntegrationTests(
     });
     const run_edge_inline_pubid = b.addRunArtifact(edge_inline_pubid_tests);
     edge_inline_pubid_step.dependOn(&run_edge_inline_pubid.step);
+
+    // GAP-ENT-0011 — free-space map vs WAL-tail allocations. Crash-restart
+    // tests proving pages allocated after the last checkpoint and recovered
+    // from the WAL tail are marked ALLOCATED in the restored free-space map
+    // (no double allocation of live pages, no invisible recovered nodes),
+    // including across a double crash before the next checkpoint.
+    const free_space_wal_tail_step = b.step("test-free-space-wal-tail", "Run free-space WAL-tail crash-recovery tests: recovered pages stay allocated, aggressive post-reopen allocation preserves full pre-crash parity");
+    const free_space_wal_tail_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/free_space_wal_tail.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_free_space_wal_tail = b.addRunArtifact(free_space_wal_tail_tests);
+    free_space_wal_tail_step.dependOn(&run_free_space_wal_tail.step);
 }
 
 fn addExample(

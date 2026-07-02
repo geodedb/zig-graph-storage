@@ -483,9 +483,32 @@ pub const GraphEngine = struct {
         // 5b. Restore free space bitmaps. Prefer the persisted free.store
         // file which accurately tracks freed pages. Fall back to rebuilding
         // from on-disk file sizes (lossy — freed pages appear allocated).
-        const loaded_free_store = try self.loadFreeStore();
-        if (!loaded_free_store) {
+        //
+        // GAP-ENT-0011 (free-space map vs WAL tail): free.store is written at
+        // CHECKPOINT time only. When recovery just replayed (and flushed)
+        // committed WAL-tail page images, pages allocated AFTER that
+        // checkpoint are still marked FREE in the persisted bitmap. Loading
+        // it would (1) hide recovered nodes — NodeStore.getNode/scanNodes
+        // gate on isAllocated — and (2) let allocPage hand a LIVE page to the
+        // next writer (double allocation → pinNew zeroes and overwrites
+        // committed data). So on a crash restart the persisted bitmap is
+        // untrusted: rebuild from on-disk file sizes (recovery flushAll'ed
+        // the replayed pages, so the files cover them). The rebuild is
+        // O(total pages) bit-sets — negligible next to the derived-index
+        // rebuild a crash restart already pays (the derived-snapshot load
+        // gate is counter-excluded on this same path). Then persist the
+        // rebuilt bitmap IMMEDIATELY: recovery already advanced
+        // last_checkpoint_lsn past the replayed tail, so a second crash
+        // before the next checkpoint would otherwise take the clean path on
+        // the NEXT open and trust the stale checkpoint-era file.
+        if (recovery.applied_committed_pages) {
             try self.rebuildFreeSpaceFromDisk();
+            try self.saveFreeStore();
+        } else {
+            const loaded_free_store = try self.loadFreeStore();
+            if (!loaded_free_store) {
+                try self.rebuildFreeSpaceFromDisk();
+            }
         }
 
         // 6. Load persisted label dictionary if it exists
@@ -1019,6 +1042,23 @@ pub const GraphEngine = struct {
         const frame_idx = self.buffer_pool.frameIndex(frame);
         defer self.buffer_pool.unpin(frame_idx, false);
         _ = try self.txn_manager.logPageUpdate(txn_id, @intFromEnum(file_id), page_id, frame.dataSlice());
+    }
+
+    /// WAL-image every page of a var-store chain (labels live there).
+    ///
+    /// Found by the GAP-ENT-0011 acceptance test: a var-store `ref` is
+    /// `first_page << 16`, NOT a page id. The label write paths used to log
+    /// the raw ref, imaging a far-away (nonexistent) page and leaving the
+    /// REAL label-block pages out of the WAL — so labels written since the
+    /// last checkpoint silently vanished on crash recovery.
+    fn logVarChain(self: *GraphEngine, txn_id: u64, ref: u64) anyerror!void {
+        var current = var_store_mod.VarStore.refFirstPage(ref);
+        var hops: u32 = 0;
+        while (current != 0) : (hops += 1) {
+            if (hops >= 100_000) return error.CircularChainDetected;
+            try self.logPage(txn_id, .var_store, current);
+            current = try self.var_store.nextChainPage(current);
+        }
     }
 
     /// Edge co-location (Phase B): public `logPage` for the migration rebuild
@@ -1759,8 +1799,10 @@ pub const GraphEngine = struct {
             rec.label_count = result.count;
             try self.node_store.putNode(node_id, rec);
 
-            // Log dirty pages: the var_store page holding the label block, and the node page
-            try self.logPage(txn, .var_store, result.head);
+            // Log dirty pages: the var_store chain holding the label block
+            // (result.head is a REF, not a page id — see logVarChain), and
+            // the node page.
+            try self.logVarChain(txn, result.head);
             try self.logPage(txn, .nodes, self.nodePageId(node_id));
         }
         try self.label_index.addNode(label, node_id);
@@ -1810,8 +1852,9 @@ pub const GraphEngine = struct {
         // H3-P4: removing a label can change index membership; mark stale.
         if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
 
-        // Log dirty pages: var_store page (if any) and node page
-        if (result.head != 0) try self.logPage(txn, .var_store, result.head);
+        // Log dirty pages: var_store chain (if any — result.head is a REF,
+        // not a page id, see logVarChain) and node page.
+        if (result.head != 0) try self.logVarChain(txn, result.head);
         try self.logPage(txn, .nodes, self.nodePageId(node_id));
         self.markDirty();
     }

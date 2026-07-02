@@ -55,6 +55,14 @@ pub const Recovery = struct {
     read_only: bool = false,
     /// Details about the last fail-closed WAL rejection, when present.
     last_failure: ?ReplayFailure = null,
+    /// GAP-ENT-0011: true when recovery APPLIED at least one committed
+    /// page-image from the WAL tail. The persisted free.store is written at
+    /// checkpoint time only, so in this case it is STALE with respect to the
+    /// pages just replayed+flushed (pages allocated after the checkpoint are
+    /// still marked FREE in it) and MUST NOT be trusted by the open path —
+    /// engine.open rebuilds the free-space bitmaps from on-disk file sizes
+    /// instead of loading the checkpoint-era snapshot.
+    applied_committed_pages: bool = false,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
@@ -253,12 +261,16 @@ pub const Recovery = struct {
             txn_states: *const std.AutoHashMap(u64, TxnRecoveryState),
             buffer_pool: *BufferPool,
             file_manager: *FileManager,
+            /// GAP-ENT-0011: set when a committed page image is applied, so
+            /// the open path knows the checkpoint-era free.store is stale.
+            applied_committed_pages: *bool,
 
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 if (rec.record_type != .page_update) return;
 
                 const state = ctx.txn_states.get(rec.txn_id) orelse return;
                 if (state != .committed) return;
+                ctx.applied_committed_pages.* = true;
 
                 const file_id: FileId = std.enums.fromInt(FileId, rec.file_id) orelse return error.InvalidFormat;
                 const frame = try ctx.buffer_pool.pinNew(file_id, rec.page_id);
@@ -295,6 +307,7 @@ pub const Recovery = struct {
             .txn_states = &txn_states,
             .buffer_pool = buffer_pool,
             .file_manager = file_manager,
+            .applied_committed_pages = &self.applied_committed_pages,
         };
         try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &replay_ctx, ReplayCtx.visit);
 

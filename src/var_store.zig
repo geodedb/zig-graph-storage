@@ -95,6 +95,25 @@ pub const VarStore = struct {
         return first_page << 16;
     }
 
+    /// Decode the FIRST PAGE ID of the chain a var-store reference points at.
+    /// A ref is `first_page << 16`, NOT a page id — callers that need the
+    /// on-disk page (e.g. to WAL-image the chain) must decode it here instead
+    /// of passing the raw ref around as if it were a page id.
+    pub fn refFirstPage(ref: u64) PageId {
+        return ref >> 16;
+    }
+
+    /// Read the next-page link of a chain page (0 = end of chain). Used by
+    /// the engine to WAL-image every page of a freshly written chain.
+    pub fn nextChainPage(self: *VarStore, page_id: PageId) !PageId {
+        const frame = try self.buffer_pool.pin(.var_store, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const page_data = frame.dataSlice();
+        const next = std.mem.bytesToValue(u64, page_data[PAGE_HEADER_SIZE..][0..8]);
+        self.buffer_pool.unpin(frame_idx, false);
+        return next;
+    }
+
     /// Read variable-length data by reference.
     /// Caller owns the returned slice and must free it.
     pub fn read(self: *VarStore, ref: u64, allocator: Allocator) ![]u8 {
