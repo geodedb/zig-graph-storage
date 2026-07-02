@@ -1699,9 +1699,24 @@ pub const GraphEngine = struct {
         // migration inside putProperty has already tombstoned the old slot.
         // Roll that tombstone back (best effort, allocation-free) so the
         // stored head still references a LIVE blob; the placed new blob is
-        // merely leaked until compaction. Crash-consistent: this txn is
-        // aborted, so none of its WAL page images replay. No-op for legacy
-        // ops / in-place slab rewrites (no tombstone recorded).
+        // merely leaked until compaction.
+        //
+        // Crash-consistency caveats (review 0022b I-1/I-2 — the pre-existing
+        // no-undo-abort family, GAP-ENT-0022(a), NOT closed here):
+        //  * An ABORTED txn's WAL images never replay, but the buffer pool's
+        //    steal policy may have evict-FLUSHED the tombstoned page before
+        //    this undo ran; if the process then crashes before the restored
+        //    page re-flushes, the tombstone is durable and the head dangles.
+        //    This fix strictly NARROWS the window (live process always
+        //    restores; only steal+crash loses), it does not eliminate it.
+        //  * CALLER-OWNED txns: a caller that receives an error from
+        //    putPropertyTxn MUST abort the txn. Committing anyway durably
+        //    logs a PARTIAL image set of a rolled-back op (the tombstoned
+        //    page may be imaged while the new blob's page is not) → dangling
+        //    head after crash-replay. Both in-repo callers abort; external
+        //    callers inherit this contract.
+        // No-op for legacy ops / in-place slab rewrites (no tombstone
+        // recorded).
         errdefer self.prop_store.undoLastSlabTombstone() catch {};
 
         // P4 (GAP prop-store slab packing): WAL-image EVERY props page the
