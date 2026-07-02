@@ -1694,6 +1694,16 @@ pub const GraphEngine = struct {
         else
             try self.prop_store.putPropertyLegacyOnly(owner, key, val);
 
+        // GAP-ENT-0022(b): if anything below fails, this call reports an
+        // error and OUR caller keeps the OLD head — but a slab relocation /
+        // migration inside putProperty has already tombstoned the old slot.
+        // Roll that tombstone back (best effort, allocation-free) so the
+        // stored head still references a LIVE blob; the placed new blob is
+        // merely leaked until compaction. Crash-consistent: this txn is
+        // aborted, so none of its WAL page images replay. No-op for legacy
+        // ops / in-place slab rewrites (no tombstone recorded).
+        errdefer self.prop_store.undoLastSlabTombstone() catch {};
+
         // P4 (GAP prop-store slab packing): WAL-image EVERY props page the
         // put dirtied. `new_head` is not necessarily a page id — a slab head
         // encodes tag|page|slot, so logging it raw would image a bogus page —
@@ -1752,6 +1762,12 @@ pub const GraphEngine = struct {
         errdefer self.txn_manager.abort(txn) catch {};
 
         const new_head = try self.putPropertyTxn(owner, key, val, txn);
+
+        // GAP-ENT-0022(b): a COMMIT failure is the last window in which this
+        // op errors after a slab relocation/migration tombstoned the old
+        // slot while the caller keeps the old head — roll the tombstone back
+        // (see putPropertyTxnImpl). The aborted txn's images never replay.
+        errdefer self.prop_store.undoLastSlabTombstone() catch {};
 
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");

@@ -1496,3 +1496,431 @@ test "GAP-ENT-0020 P5 index: exact index + chain cache stay correct across slab 
         try eng.lookupPropertyIndex(LABEL, "name", .{ .string = "species-0" }),
     );
 }
+
+// ============================================================================
+// GAP-ENT-0022(b) — slab error-path dangling head.
+//
+// From the v0.2.23 release review: putSlabProperty (snapshot old blob →
+// rebuild → place via appendSlabBlob / relocate / legacy-migrate → tombstone
+// the OLD slot) could error AFTER the old slot was tombstoned — or the ENGINE
+// could fail AFTER the put returned (WAL page-image logging, property-index
+// maintenance, commit) so the caller never stores the new head. Either way
+// the node record keeps the OLD head → the next read hits a tombstoned slot
+// → loud DataCorruption, PERMANENTLY, for that node.
+//
+// Invariant under test (enforced by the fix):
+//   At EVERY possible error exit of a property put, the head stored in the
+//   node record references a LIVE blob (old or new — stale-but-live is
+//   acceptable; dangling is not).
+//
+// Mechanisms: (1) inside PropStore every slab helper records its WAL-touch
+// BEFORE the first byte it mutates, so no slab error exit exists after a
+// page mutation; (2) the tombstone is always the LAST mutation of the op;
+// (3) the engine rolls the tombstone back (undoLastSlabTombstone) when it
+// fails after the put already relocated/migrated the blob.
+// ============================================================================
+
+/// One full engine-level OOM sweep: for k = 0,1,2,… fail the k-th allocation
+/// after the sweep point inside `op`, until the op finally succeeds. After
+/// every FAILED attempt the caller-visible head must still read back exactly
+/// `golden` — no DataCorruption, no partial set. Returns the new head from
+/// the successful attempt and the number of injected failures.
+fn oomSweepPut(
+    failing: *std.testing.FailingAllocator,
+    eng: *GraphEngine,
+    owner: u64,
+    key: []const u8,
+    val: PropertyValue,
+    golden: []const u8,
+) !struct { new_head: u64, failures: usize } {
+    var failures: usize = 0;
+    var k: usize = 0;
+    while (k < 50_000) : (k += 1) {
+        failing.fail_index = failing.alloc_index + k;
+        failing.has_induced_failure = false;
+        const attempt = eng.putProperty(owner, key, val);
+        failing.fail_index = std.math.maxInt(usize);
+        failing.has_induced_failure = false;
+        if (attempt) |new_head| {
+            return .{ .new_head = new_head, .failures = failures };
+        } else |_| {
+            failures += 1;
+            // THE invariant: the stored (old) head still references a LIVE
+            // blob carrying the pre-op property set.
+            try expectOracleText(&eng.prop_store, owner, golden);
+        }
+    }
+    return error.SweepNeverSucceeded;
+}
+
+test "GAP-ENT-0022(b) OOM sweep: every relocation error exit leaves the stored head live (old values)" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xB1} ** 16;
+    var cfg = gs.test_support.testConfig(); // page_size 4096
+    cfg.buffer_pool_pages = 512;
+
+    const alloc = testing.allocator;
+    const ps = gs.prop_store;
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const eng = try GraphEngine.create(failing.allocator(), td.path, uuid, cfg);
+    defer eng.close() catch {};
+    eng.prop_store.slab_packing = true;
+
+    // Node A first, sibling B second: A's blob is NOT the page tail, so a
+    // growing put on A must RELOCATE (new slot + tombstone), never grow in
+    // place — every attempt of the sweep exercises the dangerous path.
+    var head_a: u64 = 0;
+    head_a = try eng.putProperty(head_a, "name", .{ .string = "Panthera leo" });
+    head_a = try eng.putProperty(head_a, "rank", .{ .string = "species" });
+    head_a = try eng.putProperty(head_a, "year", .{ .int = 1758 });
+    const head_b = try eng.putProperty(0, "name", .{ .string = "Homo sapiens" });
+    try testing.expect(ps.isSlabHead(head_a));
+    try testing.expect(ps.isSlabHead(head_b));
+
+    const golden_a = "name=string:Panthera leo\n" ++
+        "rank=string:species\n" ++
+        "year=int:1758\n";
+    try expectOracleText(&eng.prop_store, head_a, golden_a);
+
+    var grown: [300]u8 = undefined;
+    @memset(&grown, 'g');
+    const res = try oomSweepPut(&failing, eng, head_a, "name", .{ .string = &grown }, golden_a);
+    try testing.expect(res.failures > 0); // the sweep injected real failures
+    try testing.expect(res.new_head != head_a); // and the final op relocated
+    try testing.expect(ps.isSlabHead(res.new_head));
+
+    // The successful attempt carries the full updated set…
+    var expected_new: std.ArrayList(u8) = .empty;
+    defer expected_new.deinit(alloc);
+    try expected_new.appendSlice(alloc, "name=string:");
+    try expected_new.appendSlice(alloc, &grown);
+    try expected_new.appendSlice(alloc, "\nrank=string:species\nyear=int:1758\n");
+    try expectOracleText(&eng.prop_store, res.new_head, expected_new.items);
+
+    // …and the never-touched sibling on the shared page was not disturbed by
+    // any of the failed/rolled-back attempts.
+    try expectOracleText(&eng.prop_store, head_b, "name=string:Homo sapiens\n");
+}
+
+test "GAP-ENT-0022(b) OOM sweep: every slab->legacy MIGRATION error exit leaves the stored head live" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xB2} ** 16;
+    var cfg = gs.test_support.testConfig(); // page_size 4096
+    cfg.buffer_pool_pages = 512;
+
+    const alloc = testing.allocator;
+    const ps = gs.prop_store;
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const eng = try GraphEngine.create(failing.allocator(), td.path, uuid, cfg);
+    defer eng.close() catch {};
+    eng.prop_store.slab_packing = true;
+
+    // A slab-resident node one big put away from outgrowing the slab layout
+    // (4 KB pages: 2000 + 2600 byte entries cannot share a slab blob).
+    var big1: [2000]u8 = undefined;
+    @memset(&big1, '1');
+    var big2: [2600]u8 = undefined;
+    @memset(&big2, '2');
+    const head_m = try eng.putProperty(0, "big1", .{ .string = &big1 });
+    try testing.expect(ps.isSlabHead(head_m));
+
+    var golden_m: std.ArrayList(u8) = .empty;
+    defer golden_m.deinit(alloc);
+    try golden_m.appendSlice(alloc, "big1=string:");
+    try golden_m.appendSlice(alloc, &big1);
+    try golden_m.appendSlice(alloc, "\n");
+    try expectOracleText(&eng.prop_store, head_m, golden_m.items);
+
+    // Sweep the MIGRATING put: tombstone + a fresh multi-page legacy chain.
+    const res = try oomSweepPut(&failing, eng, head_m, "big2", .{ .string = &big2 }, golden_m.items);
+    try testing.expect(res.failures > 0);
+    try testing.expect(!ps.isSlabHead(res.new_head)); // migrated to legacy
+
+    var expected_new: std.ArrayList(u8) = .empty;
+    defer expected_new.deinit(alloc);
+    try expected_new.appendSlice(alloc, "big1=string:");
+    try expected_new.appendSlice(alloc, &big1);
+    try expected_new.appendSlice(alloc, "\nbig2=string:");
+    try expected_new.appendSlice(alloc, &big2);
+    try expected_new.appendSlice(alloc, "\n");
+    try expectOracleText(&eng.prop_store, res.new_head, expected_new.items);
+}
+
+test "GAP-ENT-0022(b) crash variant: failed put -> keep running -> checkpoint -> reopen -> still readable" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xB3} ** 16;
+    var cfg = gs.test_support.testConfig();
+    cfg.buffer_pool_pages = 512;
+
+    const alloc = testing.allocator;
+    const ps = gs.prop_store;
+
+    var nid_a: gs.NodeId = undefined;
+    var head_a: u64 = 0;
+    var head_b: u64 = 0;
+    var golden_a: []u8 = &.{};
+    var golden_a_owned = false;
+    defer if (golden_a_owned) alloc.free(golden_a);
+
+    // ---- session 1: sweep OOM failures through a relocation, keep the
+    // engine running, store the head like a real caller, clean close. ----
+    {
+        var failing = std.testing.FailingAllocator.init(alloc, .{});
+        const eng = try GraphEngine.create(failing.allocator(), td.path, uuid, cfg);
+        eng.prop_store.slab_packing = true;
+
+        nid_a = try eng.allocNode();
+        try eng.putNode(nid_a, gs.test_support.emptyNode(1));
+        head_a = try eng.putProperty(0, "name", .{ .string = "Panthera leo" });
+        head_a = try eng.putProperty(head_a, "rank", .{ .string = "species" });
+        head_b = try eng.putProperty(0, "name", .{ .string = "Homo sapiens" });
+        var rec = (try eng.getNode(nid_a)).?;
+        rec.prop_head = head_a;
+        try eng.putNode(nid_a, rec);
+
+        const golden_old = "name=string:Panthera leo\nrank=string:species\n";
+        try expectOracleText(&eng.prop_store, head_a, golden_old);
+
+        // Sweep every allocation-failure window of the relocating put. All
+        // failed attempts leave dirty pages behind (rolled-back tombstones,
+        // leaked slots) — exactly the state that must survive the
+        // checkpoint + reopen below.
+        var grown: [300]u8 = undefined;
+        @memset(&grown, 'g');
+        const res = try oomSweepPut(&failing, eng, head_a, "name", .{ .string = &grown }, golden_old);
+        try testing.expect(res.failures > 0);
+
+        // The real caller stores the new head only on success.
+        rec = (try eng.getNode(nid_a)).?;
+        rec.prop_head = res.new_head;
+        try eng.putNode(nid_a, rec);
+        head_a = res.new_head;
+
+        {
+            var o = try readOracle(alloc, &eng.prop_store, head_a);
+            defer o.deinit();
+            golden_a = try formatOracle(alloc, &o);
+            golden_a_owned = true;
+        }
+
+        // One more DEEP failure after the stored head moved: arm the last
+        // failing index observed by the sweep (the deepest error exit) on a
+        // fresh grow. Whatever the outcome, the stored head must stay live.
+        var grown2: [400]u8 = undefined;
+        @memset(&grown2, 'h');
+        failing.fail_index = failing.alloc_index + (res.failures -| 1);
+        failing.has_induced_failure = false;
+        const late = eng.putProperty(head_a, "name", .{ .string = &grown2 });
+        failing.fail_index = std.math.maxInt(usize);
+        failing.has_induced_failure = false;
+        if (late) |h2| {
+            rec = (try eng.getNode(nid_a)).?;
+            rec.prop_head = h2;
+            try eng.putNode(nid_a, rec);
+            head_a = h2;
+            alloc.free(golden_a);
+            var o = try readOracle(alloc, &eng.prop_store, head_a);
+            defer o.deinit();
+            golden_a = try formatOracle(alloc, &o);
+        } else |_| {
+            try expectOracleText(&eng.prop_store, head_a, golden_a);
+        }
+
+        // Keep running: an unrelated write on the shared page still works.
+        head_b = try eng.putProperty(head_b, "rank", .{ .string = "species" });
+
+        // Clean close = checkpoint: the rolled-back tombstone pages flush.
+        try eng.close();
+    }
+
+    // ---- session 2: reopen — every stored head reads back, loudly NOT
+    // DataCorruption, despite the failed-op debris in the store. ----
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        const rec = (try eng.getNode(nid_a)).?;
+        try testing.expectEqual(head_a, rec.prop_head);
+        try expectOracleText(&eng.prop_store, rec.prop_head, golden_a);
+
+        try testing.expect(ps.isSlabHead(head_b));
+        const v = try eng.prop_store.getProperty(head_b, "rank", alloc);
+        try testing.expect(v != null);
+        defer property.freeDecoded(alloc, v.?);
+        try testing.expectEqualStrings("species", v.?.string);
+    }
+}
+
+test "GAP-ENT-0022 corruption: crafted slab slot directory fails loudly with DataCorruption (no UB)" {
+    const page_size: u32 = 4096;
+    var env = try Env.init(page_size, 32);
+    defer env.deinit();
+    var store = env.store();
+    store.slab_packing = true;
+
+    const ps = gs.prop_store;
+    const alloc = testing.allocator;
+
+    var head: u64 = 0;
+    head = try store.putProperty(head, "name", .{ .string = "Panthera leo" });
+    head = try store.putProperty(head, "rank", .{ .string = "species" });
+    try testing.expect(ps.isSlabHead(head));
+    const page = ps.slabPageId(head);
+    const slot = ps.slabSlot(head);
+
+    // Pristine page image so each crafted corruption starts from clean state.
+    const pristine = try alloc.alloc(u8, page_size);
+    defer alloc.free(pristine);
+    {
+        const frame = try env.pool().pin(.props, page);
+        const idx = env.pool().frameIndex(frame);
+        @memcpy(pristine, frame.dataSlice());
+        env.pool().unpin(idx, false);
+    }
+    const orig = ps.readSlabSlot(pristine, slot);
+
+    const Mutation = enum {
+        offset_past_directory,
+        len_overruns_directory,
+        slot_count_zero,
+        slot_count_absurd,
+        bad_layout_version,
+        blob_entry_count_absurd,
+    };
+
+    inline for ([_]Mutation{
+        .offset_past_directory,
+        .len_overruns_directory,
+        .slot_count_zero,
+        .slot_count_absurd,
+        .bad_layout_version,
+        .blob_entry_count_absurd,
+    }) |m| {
+        // Craft the corruption directly on the page.
+        {
+            const frame = try env.pool().pin(.props, page);
+            const idx = env.pool().frameIndex(frame);
+            const data = frame.dataSlice();
+            switch (m) {
+                .offset_past_directory => ps.writeSlabSlot(data, slot, page_size - 4, orig.len),
+                .len_overruns_directory => ps.writeSlabSlot(data, slot, orig.offset, page_size),
+                .slot_count_zero => ps.writeSlabSlotCount(data, 0),
+                .slot_count_absurd => ps.writeSlabSlotCount(data, 100_000),
+                .bad_layout_version => data[ps.SLAB_META_OFFSET] = 0xEE,
+                .blob_entry_count_absurd => std.mem.writeInt(
+                    u32,
+                    data[orig.offset..][0..4],
+                    0xFFFF_FFFF,
+                    .little,
+                ),
+            }
+            env.pool().unpin(idx, true);
+        }
+
+        // Reads fail loudly — DataCorruption, never stale data / UB. The
+        // probe key is ABSENT so the read must walk the whole blob/slot dir
+        // (a present key can legally return before reaching the corrupt
+        // tail — bounded and correct, so not asserted either way).
+        try testing.expectError(error.DataCorruption, store.getProperty(head, "zzz-absent", alloc));
+        {
+            var iter = store.getAllProperties(head);
+            defer iter.deinit();
+            var iter_failed = false;
+            while (iter.next()) |maybe| {
+                if (maybe == null) break;
+            } else |err| {
+                try testing.expectEqual(error.DataCorruption, err);
+                iter_failed = true;
+            }
+            try testing.expect(iter_failed);
+        }
+
+        // Writes fail loudly too (put must not relocate/migrate garbage).
+        try testing.expectError(
+            error.DataCorruption,
+            store.putProperty(head, "name", .{ .string = "clobber" }),
+        );
+        try testing.expectError(error.DataCorruption, store.removeProperty(head, "zzz-absent"));
+
+        // Restore the pristine image for the next crafted mutation.
+        {
+            const frame = try env.pool().pin(.props, page);
+            const idx = env.pool().frameIndex(frame);
+            @memcpy(frame.dataSlice(), pristine);
+            env.pool().unpin(idx, true);
+        }
+    }
+
+    // After the last restore the node is fully intact.
+    try expectOracleText(&store, head, "name=string:Panthera leo\nrank=string:species\n");
+}
+
+test "GAP-ENT-0022(b) unit: undoLastSlabTombstone revives the old slot after relocation and migration" {
+    const page_size: u32 = 4096;
+    var env = try Env.init(page_size, 64);
+    defer env.deinit();
+    var store = env.store();
+    store.slab_packing = true;
+
+    const ps = gs.prop_store;
+    const alloc = testing.allocator;
+
+    // --- relocation: A (non-tail, sibling B appended after) grows. ---
+    var head_a: u64 = 0;
+    head_a = try store.putProperty(head_a, "name", .{ .string = "Panthera leo" });
+    head_a = try store.putProperty(head_a, "rank", .{ .string = "species" });
+    const head_b = try store.putProperty(0, "name", .{ .string = "Homo sapiens" });
+    try testing.expect(ps.isSlabHead(head_a));
+
+    var grown: [300]u8 = undefined;
+    @memset(&grown, 'g');
+    const head_a2 = try store.putProperty(head_a, "name", .{ .string = &grown });
+    try testing.expect(head_a2 != head_a);
+
+    // The old head is dangling (this is exactly what a caller that never
+    // stored head_a2 would now be holding)…
+    try testing.expectError(error.DataCorruption, store.getProperty(head_a, "name", alloc));
+
+    // …until the engine-level rollback revives it with the OLD values.
+    try store.undoLastSlabTombstone();
+    try expectOracleText(&store, head_a, "name=string:Panthera leo\nrank=string:species\n");
+    // The relocated blob is stale-but-live debris (leaked until compaction).
+    var expected_new: std.ArrayList(u8) = .empty;
+    defer expected_new.deinit(alloc);
+    try expected_new.appendSlice(alloc, "name=string:");
+    try expected_new.appendSlice(alloc, &grown);
+    try expected_new.appendSlice(alloc, "\nrank=string:species\n");
+    try expectOracleText(&store, head_a2, expected_new.items);
+
+    // A second call is a no-op (the undo record is consumed)…
+    try store.undoLastSlabTombstone();
+    // …and so is a call after an op that wrote no tombstone (a same-size
+    // replace rewrites the slot in place — no relocation, no tombstone).
+    const head_b2 = try store.putProperty(head_b, "name", .{ .string = "Homo erectus" });
+    try testing.expectEqual(head_b, head_b2);
+    try store.undoLastSlabTombstone();
+    try expectOracleText(&store, head_b, "name=string:Homo erectus\n");
+
+    // --- migration (slab -> legacy chain): same rollback contract. ---
+    var big1: [2000]u8 = undefined;
+    @memset(&big1, '1');
+    var big2: [2600]u8 = undefined;
+    @memset(&big2, '2');
+    const head_m = try store.putProperty(0, "big1", .{ .string = &big1 });
+    try testing.expect(ps.isSlabHead(head_m));
+    const head_m2 = try store.putProperty(head_m, "big2", .{ .string = &big2 });
+    try testing.expect(!ps.isSlabHead(head_m2));
+    try testing.expectError(error.DataCorruption, store.getProperty(head_m, "big1", alloc));
+    try store.undoLastSlabTombstone();
+    {
+        const v = try store.getProperty(head_m, "big1", alloc);
+        try testing.expect(v != null);
+        defer property.freeDecoded(alloc, v.?);
+        try testing.expectEqualStrings(&big1, v.?.string);
+    }
+}

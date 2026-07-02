@@ -278,12 +278,25 @@ pub const PropStore = struct {
     touched_pages: [MAX_TOUCHED_PAGES]PageId = undefined,
     touched_len: u8 = 0,
 
+    /// GAP-ENT-0022(b): undo record for the slab-slot tombstone written by
+    /// the CURRENT op (at most one — putSlabProperty tombstones exactly once,
+    /// as its final mutation). Lets the ENGINE roll the tombstone back
+    /// (`undoLastSlabTombstone`) when it fails AFTER the put returned — WAL
+    /// page-image logging, property-index maintenance, or commit — because
+    /// its caller then never stores the new head and the old head would
+    /// reference a dead slot forever. Cleared by `resetTouched` at the top
+    /// of every mutating op.
+    last_slab_tombstone: ?SlabTombstoneUndo = null,
+
     pub const MAX_TOUCHED_PAGES: usize = 16;
+
+    const SlabTombstoneUndo = struct { page_id: PageId, slot: u32, offset: u32, len: u32 };
 
     /// P4: forget the previous op's dirtied-page set. Called at the top of
     /// every public mutating entry point.
     fn resetTouched(self: *PropStore) void {
         self.touched_len = 0;
+        self.last_slab_tombstone = null; // GAP-ENT-0022(b): per-op undo record
     }
 
     /// P4: record a page dirtied by the current mutating op (deduplicated).
@@ -641,11 +654,18 @@ pub const PropStore = struct {
                 const slot: u32 = state.slot_count;
                 const dir_needed: u64 = @as(u64, SLAB_SLOT_COUNT_SIZE) + (@as(u64, slot) + 1) * SLAB_SLOT_SIZE;
                 if (@as(u64, state.next_off) + blob_len <= @as(u64, data.len) - dir_needed) {
+                    // GAP-ENT-0022(b): record the WAL touch BEFORE the first
+                    // byte is mutated — no slab error exit may exist after a
+                    // page mutation (over-recording on a failed op is
+                    // harmless; the engine only images successful ops).
+                    self.recordTouched(fill_page) catch |err| {
+                        self.buffer_pool.unpin(frame_idx, false);
+                        return err;
+                    };
                     @memcpy(data[state.next_off..][0..blob.len], blob);
                     writeSlabSlot(data, slot, state.next_off, blob_len);
                     writeSlabSlotCount(data, slot + 1);
                     self.buffer_pool.unpin(frame_idx, true);
-                    try self.recordTouched(fill_page); // P4: WAL images the fill page
                     return encodeSlabHead(fill_page, slot);
                 }
             }
@@ -663,7 +683,19 @@ pub const PropStore = struct {
             self.free_space.freePage(new_page) catch {};
             return null;
         }
-        const frame = try self.buffer_pool.pinNew(.props, new_page); // zeroed
+        // GAP-ENT-0022(b): record the WAL touch and pin BEFORE any byte is
+        // written — after the first mutation below there is no error exit
+        // left in this branch, and a failure here releases the page instead
+        // of leaking it (a recorded-but-freed page is harmless: the engine
+        // never WAL-images a FAILED op's touched set).
+        self.recordTouched(new_page) catch |err| {
+            self.free_space.freePage(new_page) catch {};
+            return err;
+        };
+        const frame = self.buffer_pool.pinNew(.props, new_page) catch |err| { // zeroed
+            self.free_space.freePage(new_page) catch {};
+            return err;
+        };
         const frame_idx = self.buffer_pool.frameIndex(frame);
         const data = self.logical(frame.dataSlice());
         writeSlabLayoutVersion(data); // meta pad bytes are already zero
@@ -671,7 +703,6 @@ pub const PropStore = struct {
         writeSlabSlot(data, 0, SLAB_DATA_OFFSET, blob_len);
         writeSlabSlotCount(data, 1);
         self.buffer_pool.unpin(frame_idx, true);
-        try self.recordTouched(new_page); // P4: WAL images the fresh slab page
         self.current_fill_page = new_page;
         return encodeSlabHead(new_page, 0);
     }
@@ -740,6 +771,16 @@ pub const PropStore = struct {
         std.mem.writeInt(u32, new_blob_buf[0..4], kept + 1, .little);
         const rebuilt = new_blob_buf[0..w];
 
+        // GAP-ENT-0022(b) ordering invariant for everything below: at EVERY
+        // possible error exit the caller's OLD head must still reference a
+        // LIVE blob (the tombstone of the old slot is always the op's LAST
+        // mutation, and every helper records its WAL touch BEFORE its first
+        // page write). `page_id` is dirtied on every successful outcome —
+        // in-place rewrite (1)/(2) or the old-slot tombstone in (3)/(4) — so
+        // it is recorded up-front; over-recording on a failed op is harmless
+        // (the engine never WAL-images a failed op's touched set).
+        try self.recordTouched(page_id);
+
         // (1)/(2): in-place rewrite within the existing slot when it fits.
         {
             const frame = try self.buffer_pool.pin(.props, page_id);
@@ -750,19 +791,19 @@ pub const PropStore = struct {
                 return err;
             };
             self.buffer_pool.unpin(frame_idx, placed);
-            if (placed) {
-                try self.recordTouched(page_id); // P4: in-place rewrite dirtied it
-                return prop_head;
-            }
+            if (placed) return prop_head;
         }
 
-        // (3): relocate to a new slot (possibly a new fill page).
+        // (3): relocate to a new slot (possibly a new fill page). The old
+        // slot is tombstoned only AFTER the new placement fully succeeded.
         if (try self.appendSlabBlob(rebuilt)) |new_head| {
             try self.tombstoneSlabSlot(page_id, slot);
             return new_head;
         }
 
-        // (4): grown past slab capacity — migrate to a legacy chain.
+        // (4): grown past slab capacity — migrate to a legacy chain. Same
+        // ordering: a mid-migration error leaks fresh legacy pages (benign)
+        // but leaves the old slot — and therefore the old head — live.
         const legacy_head = try self.migrateBlobToLegacy(rebuilt);
         try self.tombstoneSlabSlot(page_id, slot);
         return legacy_head;
@@ -796,6 +837,15 @@ pub const PropStore = struct {
     /// it; a dangling read of a tombstoned slot fails loudly with
     /// DataCorruption instead of returning stale data).
     fn tombstoneSlabSlot(self: *PropStore, page_id: PageId, slot: u32) !void {
+        // GAP-ENT-0022(b): NO error exit may exist after the slot-directory
+        // write below — the caller's old head keeps pointing at this slot
+        // when the op fails, so tombstoning and THEN erroring would leave
+        // that head permanently dangling (every later read: DataCorruption).
+        // recordTouched therefore runs FIRST; the P4 contract is intact
+        // (the tombstone page is in the SAME op's touched set, so the engine
+        // WAL-images it together with the relocated/migrated blob's pages),
+        // and over-recording on a pin/span failure below is harmless.
+        try self.recordTouched(page_id);
         const frame = try self.buffer_pool.pin(.props, page_id);
         const frame_idx = self.buffer_pool.frameIndex(frame);
         const data = self.logical(frame.dataSlice());
@@ -805,10 +855,52 @@ pub const PropStore = struct {
         };
         writeSlabSlot(data, slot, span.offset, 0);
         self.buffer_pool.unpin(frame_idx, true);
-        // P4: the tombstone is a page mutation in its own right — it MUST be
-        // WAL-imaged together with the relocated/migrated blob's new pages,
-        // or a crash could replay one side without the other.
-        try self.recordTouched(page_id);
+        // GAP-ENT-0022(b): arm the engine-level rollback — if the ENGINE
+        // fails after this op returns (WAL image logging, property-index
+        // maintenance, commit), its errdefer calls undoLastSlabTombstone to
+        // bring the old slot back to life.
+        self.last_slab_tombstone = .{ .page_id = page_id, .slot = slot, .offset = span.offset, .len = span.len };
+    }
+
+    /// GAP-ENT-0022(b): best-effort rollback of the slab-slot tombstone
+    /// written by the MOST RECENT mutating op on this store. The engine's
+    /// put paths call this from an errdefer when they fail AFTER
+    /// PropStore.putProperty already relocated/migrated a slab blob and
+    /// tombstoned the old slot: the engine's caller then never stores the
+    /// returned new head, so without the rollback the node record would
+    /// reference a dead slot — permanent DataCorruption for that node.
+    ///
+    /// Effect: restores the old slot's length in the slot directory. The
+    /// blob bytes are still intact (a tombstone only zeroes the length; the
+    /// data region is never reused within the same op), so the old head
+    /// becomes fully readable again. The already-placed new blob is leaked
+    /// until P6 compaction — benign. No-op when the current op wrote no
+    /// tombstone (in-place rewrites, first writes, legacy ops, removes).
+    ///
+    /// Crash safety: only invoked on an op whose txn is aborted, so none of
+    /// that txn's WAL page images replay — recovery reproduces the pre-op
+    /// pages, which agree with this in-memory restoration (the restored page
+    /// is dirty and flushes with the next checkpoint).
+    ///
+    /// Allocation-free on the hot path (resident-page pin + one slot write):
+    /// it must be able to succeed under the very OOM that failed the op.
+    pub fn undoLastSlabTombstone(self: *PropStore) !void {
+        const undo = self.last_slab_tombstone orelse return;
+        self.last_slab_tombstone = null;
+        const frame = try self.buffer_pool.pin(.props, undo.page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = self.logical(frame.dataSlice());
+        const span = self.slabBlobSpan(data, undo.slot) catch |err| {
+            self.buffer_pool.unpin(frame_idx, false);
+            return err;
+        };
+        if (span.len != 0 or span.offset != undo.offset) {
+            // Defensive: not the tombstone this op wrote — leave it alone.
+            self.buffer_pool.unpin(frame_idx, false);
+            return;
+        }
+        writeSlabSlot(data, undo.slot, undo.offset, undo.len);
+        self.buffer_pool.unpin(frame_idx, true);
     }
 
     /// P2 fallback: write every entry of `blob` into a fresh LEGACY
@@ -865,6 +957,9 @@ pub const PropStore = struct {
             const val_size = try encodedSizeFromBytes(blob[off + 2 + key_len ..]);
             const entry_len = 2 + @as(usize, key_len) + val_size;
             if (std.mem.eql(u8, entry_key, key)) {
+                // GAP-ENT-0022(b): record the WAL touch BEFORE the first
+                // byte is mutated — no slab error exit after a page write.
+                try self.recordTouched(page_id);
                 const tail_len = span.len - (off + entry_len);
                 std.mem.copyForwards(u8, blob[off..][0..tail_len], blob[off + entry_len ..][0..tail_len]);
                 const new_len: u32 = @intCast(span.len - entry_len);
@@ -872,7 +967,6 @@ pub const PropStore = struct {
                 std.mem.writeInt(u32, blob[0..4], entry_count - 1, .little);
                 writeSlabSlot(data, slot, span.offset, new_len);
                 dirty = true;
-                try self.recordTouched(page_id); // P4: in-place shrink dirtied it
                 return;
             }
             off += entry_len;
@@ -2477,6 +2571,41 @@ test "QUAL-0044 T2: rebuildDirectory disables directory when data region overlap
     try testing.expect(gone == null);
 
     _ = extra_entry_size;
+}
+
+test "GAP-ENT-0022(b) W1: tombstone with exhausted touched-page budget leaves the old slot LIVE" {
+    // The dangerous mid-op state: a slab relocation/migration has placed the
+    // new blob and is about to tombstone the OLD slot, but the P4
+    // touched-page budget is already exhausted, so recording the tombstone
+    // page for WAL imaging fails. The tombstone must fail WITHOUT killing
+    // the slot — tombstoning first and then erroring would leave the node's
+    // stored head referencing a dead slot: permanent DataCorruption for the
+    // node (GAP-ENT-0022(b) error-exit map, window W1).
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    store.slab_packing = true;
+
+    var head: u64 = 0;
+    head = try store.putProperty(head, "name", .{ .string = "Panthera leo" });
+    _ = try store.putProperty(0, "name", .{ .string = "Homo sapiens" });
+    try testing.expect(isSlabHead(head));
+
+    store.resetTouched();
+    var i: u64 = 0;
+    while (i < PropStore.MAX_TOUCHED_PAGES) : (i += 1)
+        try store.recordTouched(1_000_000 + i);
+    try testing.expectError(
+        error.TooManyDirtyPropPages,
+        store.tombstoneSlabSlot(slabPageId(head), slabSlot(head)),
+    );
+
+    // Invariant: every error exit leaves the stored head referencing a LIVE
+    // blob — the failed tombstone must not have touched the slot directory.
+    const val = try store.getProperty(head, "name", testing.allocator);
+    try testing.expect(val != null);
+    defer property_mod.freeDecoded(testing.allocator, val.?);
+    try testing.expectEqualStrings("Panthera leo", val.?.string);
 }
 
 test {

@@ -148,7 +148,11 @@ pub const PropertyChainIndex = struct {
 
         errdefer {
             if (!gop.found_existing) {
-                _ = self.chains.remove(prop_head);
+                // GAP-ENT-0022(b): removeChain, not a bare map remove — the
+                // partially-built chain owns duped keys and list capacity
+                // that a bare remove leaked on this OOM path (exposed by
+                // the slab error-injection sweep).
+                self.removeChain(prop_head);
             } else {
                 gop.value_ptr.clear(self.allocator);
             }
