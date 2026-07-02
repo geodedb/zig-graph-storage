@@ -565,6 +565,20 @@ fn addIntegrationTests(
     const run_mmap_index = b.addRunArtifact(mmap_index_tests);
     mmap_index_step.dependOn(&run_mmap_index.step);
 
+    // GAP warm-reopen P2 — cross-index checkpoint-counter restamp: an
+    // edges-only session keeps every clean snapshot loadable (no O(graph)
+    // rebuild on the next open), dirty-never-restamped, torn-restamp crash
+    // window rejected, crash-stale + never-hydrated safety gate (no restamp
+    // blessing of stale snapshots).
+    const derived_restamp_step = b.step("test-derived-restamp", "Run derived-index counter-restamp tests: clean-snapshot restamp on full checkpoint, dirty-never-restamped, torn-restamp reject, crash-stale safety gate");
+    const derived_restamp_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/derived_restamp.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_derived_restamp = b.addRunArtifact(derived_restamp_tests);
+    derived_restamp_step.dependOn(&run_derived_restamp.step);
+
     // Review F-5 (GAP-ENT-0011): CI runs `zig build test`, `test-integration`
     // and `test-fuzz-regression` only — standalone named steps never run
     // there. Silent-corruption crash-recovery regression guards must be gated,
@@ -575,6 +589,8 @@ fn addIntegrationTests(
     // P1: the mmap-snapshot crash/corruption guards are the same class — gate
     // them under the integration umbrella too.
     integration_step.dependOn(&run_mmap_index.step);
+    // P2: the restamp crash/staleness guards likewise.
+    integration_step.dependOn(&run_derived_restamp.step);
 }
 
 fn addExample(

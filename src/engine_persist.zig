@@ -421,13 +421,24 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     // GAP-0900 L2: the derived-index snapshot save is the only O(graph-size)
     // step here. The light path skips it (recovery rebuilds from pages) and
     // leaves the dirty flags set so a later full checkpoint still persists them.
+    // GAP warm-reopen P2: capture which gated snapshots were CLEAN at the
+    // moment the dirty flags were consumed — those are the restamp candidates
+    // at the end of this checkpoint (a dirty index is saved, NEVER restamped).
+    var label_was_dirty = false;
+    var property_was_dirty = false;
+    var edge_was_dirty = false;
+    var edge_exist_was_dirty = false;
     if (save_derived) {
+        label_was_dirty = engine.label_index_dirty;
+        property_was_dirty = engine.property_index_dirty;
+        edge_was_dirty = engine.edge_index_dirty;
+        edge_exist_was_dirty = engine.edge_exist_index_dirty;
         try engine_index.saveDerivedIndexesConditional(
             engine,
-            engine.label_index_dirty,
-            engine.property_index_dirty,
-            engine.edge_index_dirty,
-            engine.edge_exist_index_dirty,
+            label_was_dirty,
+            property_was_dirty,
+            edge_was_dirty,
+            edge_exist_was_dirty,
         );
         engine.label_index_dirty = false;
         engine.property_index_dirty = false;
@@ -470,6 +481,41 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
         try engine.ordered_property_index.saveToFile(engine.graph_dir.path, engine.manifest.counter);
         engine.ordered_index_dirty = false;
         engine.metrics.ordered_index_saves += 1;
+    }
+
+    // GAP warm-reopen P2: cross-index counter re-stamp — the cure for "one
+    // dirty index counter-invalidates every clean snapshot". ORDERING: this
+    // runs LAST, strictly after (1) doCheckpoint durably wrote the manifest
+    // at the advanced counter, (2) every dirty derived snapshot save
+    // succeeded (stamped at that same counter), and (3) the label-dict /
+    // B+tree-catalog / ordered-index saves succeeded — so a restamp can
+    // never bless a clean snapshot while any part of this checkpoint failed
+    // partway (an error above propagates out before we get here). A crash
+    // anywhere before or during the restamps leaves each not-yet-restamped
+    // file counter-stale (→ rebuild, safe) and a torn restamp is rejected by
+    // the format's integrity check (→ rebuild, safe); see the per-format
+    // restampCounter docs for the exact torn-write analysis.
+    //
+    // Gated on derived_snapshots_trusted: only when the clean snapshots are
+    // KNOWN content-current for this session (established by create(), a
+    // counter-gated load, or a rebuild-then-save — see the engine field doc).
+    // Without the gate, a page-only session after a crash restart could
+    // stamp crash-stale snapshots current = silent data loss. When untrusted
+    // but this checkpoint saved ALL FOUR (post-rebuild path), the on-disk
+    // set is now content-current by construction — record that so the NEXT
+    // full checkpoint can restamp.
+    if (save_derived) {
+        if (engine.derived_snapshots_trusted) {
+            try engine_index.restampCleanDerivedSnapshots(
+                engine,
+                !label_was_dirty,
+                !property_was_dirty,
+                !edge_was_dirty,
+                !edge_exist_was_dirty,
+            );
+        } else if (label_was_dirty and property_was_dirty and edge_was_dirty and edge_exist_was_dirty) {
+            engine.derived_snapshots_trusted = true;
+        }
     }
 
     const end_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);

@@ -51,6 +51,14 @@ pub const Metrics = struct {
     derived_index_loads: u64 = 0,
     derived_index_rebuilds: u64 = 0,
 
+    // GAP warm-reopen P2: number of CLEAN derived-index snapshots whose
+    // persisted checkpoint_counter was cheaply re-stamped (header-only
+    // update, payload untouched) to the new manifest.counter by a FULL
+    // checkpoint, so a partially-dirty session (e.g. edges-only) does not
+    // counter-invalidate the untouched snapshots and force an O(graph)
+    // rebuild on the next open. A DIRTY index is saved, never restamped.
+    derived_index_restamps: u64 = 0,
+
     // H3-P1: per-(label,key) ordered-index restore path taken on the LAST open(),
     // wired in engine.open AFTER the metrics reset (same discipline as the
     // derived counters). At most one is 1 per open of a graph that HAS a

@@ -105,6 +105,30 @@ pub const FileManager = struct {
         return null;
     }
 
+    /// P1 review C1: re-open `file_id` from its path, replacing the cached
+    /// handle. REQUIRED after an atomic snapshot replacement (tmp + rename,
+    /// sorted_index_snapshot.writeAtomicReplace): the rename swaps the inode
+    /// under the path, so the cached fd — and any Pager wrapping it — would
+    /// keep addressing the REPLACED (old) inode. Updates the file slot and
+    /// the Pager's embedded handle IN PLACE so outstanding `*Pager` /
+    /// `*std.Io.File` pointers (stable slot addresses) observe the new
+    /// handle. Must not be called while I/O is in flight for this file
+    /// (checkpoint saves are externally serialized, like all mutation).
+    pub fn reopenFile(self: *FileManager, file_id: FileId) !void {
+        const idx = @intFromEnum(file_id);
+        if (self.files[idx] == null) return error.FileNotOpen;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.graph_dir, FILE_NAMES[idx] });
+        defer self.allocator.free(path);
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const fresh = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+
+        self.files[idx].?.close(io);
+        self.files[idx] = fresh;
+        if (self.pagers[idx]) |*p| p.file = fresh;
+    }
+
     /// Close all open files.
     pub fn deinit(self: *FileManager) void {
         for (&self.files) |*maybe_file| {

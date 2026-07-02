@@ -6,7 +6,9 @@ const index_snapshot_mod = @import("index_snapshot.zig");
 
 const Allocator = std.mem.Allocator;
 // SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
-const SNAPSHOT_MAGIC = "GSPIDX2\x00";
+/// GAP warm-reopen P2: pub so engine_index.restampCleanDerivedSnapshots can
+/// validate the file before an in-place counter restamp.
+pub const SNAPSHOT_MAGIC = "GSPIDX2\x00";
 
 // SEC-0044/SEC-0048: smallest bytes a single chain record consumes on disk
 // (prop_head u64 + entry_count u32, with zero entries).

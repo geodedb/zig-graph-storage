@@ -22,7 +22,9 @@ const NodeId = types.NodeId;
 const NodeSet = std.AutoHashMapUnmanaged(NodeId, void);
 
 // SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
-const SNAPSHOT_MAGIC = "GSLIDX2\x00";
+/// GAP warm-reopen P2: pub so engine_index.restampCleanDerivedSnapshots can
+/// validate the file before an in-place counter restamp.
+pub const SNAPSHOT_MAGIC = "GSLIDX2\x00";
 
 // SEC-0044/SEC-0048: smallest bytes a single label record consumes on disk
 // (label_id u32 + node_count u64, with zero nodes).

@@ -116,11 +116,11 @@ test "P1: clean reopen mmap-adopts; overlay mutations; checkpoint merges; next r
         // one, then checkpoint → the saver merges base ⊕ overlay ⊖ tombstones.
         try eng.removeEdge(fx.nodes[0], fx.nodes[1 + 3 % 5], fx.edges[3]);
         new_edge = try eng.addEdgeColocatedWithPublicId(fx.nodes[2], fx.nodes[3], REL, pid(999));
-        // Also dirty the label + property indexes: the counter gate requires
-        // ALL FOUR snapshots stamped at the same manifest counter (the
-        // pre-existing Lever-B contract, unchanged by P1) — an edge-only
-        // session would leave the label/prop snapshots counter-stale and
-        // force a full rebuild on the next open.
+        // Also dirty the label + property indexes so this test exercises the
+        // ALL-FOUR-saved checkpoint shape. (Since P2 an edge-only session no
+        // longer forces a rebuild — the full checkpoint RESTAMPS the clean
+        // label/prop snapshot counters; tests/derived_restamp.zig covers
+        // that path explicitly.)
         try eng.addLabel(fx.nodes[5], 3);
         var rec5 = (try eng.getNode(fx.nodes[5])).?;
         rec5.prop_head = try eng.putProperty(rec5.prop_head, "k", .{ .int = 42 });
@@ -356,6 +356,150 @@ test "P1 payload corruption is caught LAZILY as ChecksumMismatch at first touch 
         // error on access — the same class as a corrupt data page, NOT a
         // silent wrong answer (and no longer a silent whole-index rebuild).
         try testing.expectError(error.ChecksumMismatch, eng.getEdge(fx.edges[0]));
+        // Deterministic for the rest of the session (no flapping).
+        try testing.expectError(error.ChecksumMismatch, eng.getEdge(fx.edges[0]));
+    }
+
+    // I1 (P1 review): the first lazy ChecksumMismatch INVALIDATED the on-disk
+    // snapshot (magic zeroed) so the wedge cannot persist across reopens —
+    // without this, a read-only deployment would re-adopt the same corrupt
+    // file and error on the same key range forever.
+    {
+        const io = ioT();
+        var f = try std.Io.Dir.cwd().openFile(io, idx_path, .{});
+        defer f.close(io);
+        var magic_now: [8]u8 = undefined;
+        _ = try f.readPositionalAll(io, &magic_now, 0);
+        try testing.expectEqualSlices(u8, &([_]u8{0} ** 8), &magic_now);
+    }
+
+    // Next open: zeroed magic → InvalidFormat → counter-gate rebuild path →
+    // the index self-heals from durable adjacency and serves every edge.
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        for (fx.edges, 0..) |e, i| try expectEdgePid(eng, e, pid(i));
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_loads);
+        // Persist the healed snapshots; the following open loads clean again.
+        try eng.checkpoint();
+    }
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try expectEdgePid(eng, fx.edges[0], pid(0));
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+    }
+}
+
+// ============================================================================
+// P1 review C1 — the checkpoint save must NEVER rewrite the live-mmap'd
+// snapshot inode in place. The save now goes tmp + fsync + rename; the old
+// inode stays alive under the adopted mapping, so a mid-session FULL
+// checkpoint must leave the still-open engine fully readable (lookups,
+// probes, first-touch CRC verification of blocks never touched before the
+// checkpoint) — including after net-shrinking deletes (the old SIGBUS shape)
+// and across a second mutate+checkpoint cycle.
+// ============================================================================
+
+test "C1: mid-session full checkpoint; live base keeps serving reads (multi-block, net shrink, two cycles)" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xF6} ** 16;
+    const cfg = test_support.testConfig();
+
+    // Enough edges for a multi-block payload: 40 B/record, 64 KiB/block →
+    // 1638 records per block. 4000 edges ≈ 2.5 blocks.
+    const N: usize = 4000;
+    var nodes: [8]u64 = undefined;
+    var edges: [N]u64 = undefined;
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        for (&nodes) |*n| {
+            n.* = try eng.allocNode();
+            try eng.putNode(n.*, test_support.emptyNode(1));
+        }
+        for (&edges, 0..) |*e, i| {
+            e.* = try eng.addEdgeColocatedWithPublicId(nodes[i % 4], nodes[4 + i % 4], REL, pid(i));
+        }
+        try eng.checkpoint();
+    }
+
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Adopt the base but touch ONLY a handful of low records — most
+        // blocks must get their FIRST CRC verification after the checkpoint
+        // below, through the old mapping.
+        try expectEdgePid(eng, edges[0], pid(0));
+        try expectEdgePid(eng, edges[1], pid(1));
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+
+        // NET SHRINK: delete half the edges (the merged snapshot written by
+        // the checkpoint is markedly smaller than the mapped one — the exact
+        // shape that SIGBUS'd with an in-place truncate+rewrite), plus a few
+        // adds so the overlay is non-trivial.
+        var i: usize = 0;
+        while (i < N / 2) : (i += 1) {
+            try eng.removeEdge(nodes[i % 4], nodes[4 + i % 4], edges[i]);
+        }
+        const extra1 = try eng.addEdgeColocatedWithPublicId(nodes[0], nodes[7], REL, pid(N + 1));
+
+        // Mid-session FULL checkpoint — rewrites both edge snapshots via
+        // rename while the mapping is live.
+        try eng.checkpoint();
+
+        // KEEP READING through the previously-adopted base: every surviving
+        // edge (first-touch verifies untouched blocks of the OLD inode),
+        // every deleted edge stays gone, probes stay exact.
+        i = N / 2;
+        while (i < N) : (i += 1) {
+            try expectEdgePid(eng, edges[i], pid(i));
+        }
+        i = 0;
+        while (i < N / 2) : (i += 1) {
+            try testing.expectEqual(@as(?gs.edge.EdgeEntry, null), try eng.getEdge(edges[i]));
+        }
+        try expectEdgePid(eng, extra1, pid(N + 1));
+        try testing.expectEqual(@as(usize, N / 2 + 1), eng.edgeIndexCount());
+        try testing.expectEqual(eng.edgeIndexCount(), eng.edgeExistRecordCount());
+        var buf: [8]u64 = undefined;
+        const hits = try eng.probeEdge(nodes[0], REL, nodes[7], &buf);
+        try testing.expectEqual(@as(usize, 1), hits.len);
+        try testing.expectEqual(extra1, hits[0]);
+
+        // SECOND mutate + checkpoint cycle on the SAME still-open engine,
+        // then read again (the first rename already swapped the inode under
+        // the path; the fd must have been reopened for this save to land in
+        // the right file).
+        try eng.removeEdge(nodes[(N - 1) % 4], nodes[4 + (N - 1) % 4], edges[N - 1]);
+        const extra2 = try eng.addEdgeColocatedWithPublicId(nodes[1], nodes[6], REL, pid(N + 2));
+        try eng.checkpoint();
+
+        i = N / 2;
+        while (i < N - 1) : (i += 1) {
+            try expectEdgePid(eng, edges[i], pid(i));
+        }
+        try testing.expectEqual(@as(?gs.edge.EdgeEntry, null), try eng.getEdge(edges[N - 1]));
+        try expectEdgePid(eng, extra2, pid(N + 2));
+        try testing.expectEqual(@as(usize, N / 2 + 1), eng.edgeIndexCount());
+    }
+
+    // Reopen: adopts the LAST renamed-in snapshot (counter-current, loads,
+    // no rebuild) with the exact merged state.
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        var i: usize = N / 2;
+        while (i < N - 1) : (i += 1) {
+            try expectEdgePid(eng, edges[i], pid(i));
+        }
+        try testing.expectEqual(@as(?gs.edge.EdgeEntry, null), try eng.getEdge(edges[0]));
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(usize, N / 2 + 1), eng.edgeIndexCount());
     }
 }
 
@@ -457,7 +601,7 @@ test "BENCH 1M-edge snapshot load: legacy read+build vs mmap-adopt" {
         var m = edge_index_map.EdgeIndexMap.init(a);
         defer m.deinit();
         const t0 = nowNs();
-        m.adoptBase((try sorted.load(a, &f, "GSEIDX4\x00", 40)).?);
+        try m.adoptBase((try sorted.load(a, &f, "GSEIDX4\x00", 40)).?);
         adopt_ns = @intCast(nowNs() - t0);
         try testing.expectEqual(BENCH_N, m.count());
 

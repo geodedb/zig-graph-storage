@@ -94,7 +94,10 @@ pub const EdgeExistenceIndex = struct {
     overflow: std.AutoHashMapUnmanaged(ExistKey, std.ArrayListUnmanaged(EdgeId)),
     /// Behavioral O(1) proof: candidate ids walked on the most recent `probe`.
     /// For a one-edge tuple this is 1; it tracks bucket size for the matched
-    /// key, NOT the parent's out-degree.
+    /// key, NOT the parent's out-degree. Since P1 (review M3, semantics
+    /// note): in mmap-backed mode this counts overlay candidates PLUS the
+    /// full contiguous base run for the key INCLUDING tombstoned records —
+    /// still O(candidates-for-key), never O(out-degree).
     last_probe_entries_examined: usize = 0,
 
     /// GAP warm-reopen P1: immutable mmap'd sorted snapshot base (adopted at
@@ -148,13 +151,19 @@ pub const EdgeExistenceIndex = struct {
         self.base = null;
     }
 
-    /// Adopt a loaded sorted snapshot as the immutable base (takes ownership;
-    /// clear/deinit unmaps it). The index MUST be empty.
-    pub fn adoptBase(self: *EdgeExistenceIndex, loaded: snapshot.Loaded) void {
-        std.debug.assert(self.primary.count() == 0);
-        std.debug.assert(self.overflow.count() == 0);
-        std.debug.assert(self.tombstones.count() == 0);
-        std.debug.assert(self.base == null);
+    /// Adopt a loaded sorted snapshot as the immutable base (takes ownership
+    /// ON SUCCESS; on error the caller still owns `loaded` and must deinit
+    /// it). The index MUST be empty.
+    /// M6 (P1 review): real errors, not Debug-only asserts — a double adopt
+    /// in ReleaseFast would leak a mapping.
+    pub fn adoptBase(
+        self: *EdgeExistenceIndex,
+        loaded: snapshot.Loaded,
+    ) error{ BaseAlreadyAdopted, IndexNotEmpty }!void {
+        if (self.base != null) return error.BaseAlreadyAdopted;
+        if (self.primary.count() != 0 or self.overflow.count() != 0 or self.tombstones.count() != 0) {
+            return error.IndexNotEmpty;
+        }
         self.base = loaded;
     }
 
@@ -177,7 +186,13 @@ pub const EdgeExistenceIndex = struct {
             n += e.value_ptr.items.len;
         }
         if (self.base) |b| {
-            n += (std.math.cast(usize, b.record_count) orelse 0) - self.tombstones.count();
+            // M2 (P1 review): a failed cast must be a hard stop, not `orelse
+            // 0` — subtracting tombstones from 0 would underflow usize. The
+            // loader already rejects such files (FileTooLarge on 32-bit
+            // targets), so this is unreachable in practice.
+            const base_records = std.math.cast(usize, b.record_count) orelse
+                @panic("edge-existence snapshot record_count exceeds usize");
+            n += base_records - self.tombstones.count();
         }
         return n;
     }
@@ -381,6 +396,10 @@ pub const EdgeExistenceIndex = struct {
             }
         }
         if (self.base) |*b| {
+            // M4 (P1 review): sequential full-payload scan — lift the
+            // load-time MADV_RANDOM for its duration (see EdgeIndexMap).
+            b.adviseSequential();
+            defer b.adviseRandom();
             var i: u64 = 0;
             while (i < b.record_count) : (i += 1) {
                 const rec = decodeRecord(try b.recordAt(i));
@@ -489,7 +508,7 @@ test "base mode: probe merges base run, put is idempotent vs base, remove tombst
 
     var idx = EdgeExistenceIndex.init(std.testing.allocator);
     defer idx.deinit();
-    idx.adoptBase((try snapshot.load(std.testing.allocator, &file, TEST_BASE_MAGIC, RECORD_SIZE)).?);
+    try idx.adoptBase((try snapshot.load(std.testing.allocator, &file, TEST_BASE_MAGIC, RECORD_SIZE)).?);
     try std.testing.expectEqual(@as(usize, 4), idx.recordCount());
 
     var buf: [8]EdgeId = undefined;
@@ -571,7 +590,7 @@ test "base mode parity oracle: randomized put/remove/probe vs reference multimap
 
     var idx = EdgeExistenceIndex.init(a);
     defer idx.deinit();
-    idx.adoptBase((try snapshot.load(a, &file, TEST_BASE_MAGIC, RECORD_SIZE)).?);
+    try idx.adoptBase((try snapshot.load(a, &file, TEST_BASE_MAGIC, RECORD_SIZE)).?);
 
     // Reference: hashmap of record -> void (the live record set).
     var ref = std.AutoHashMap(ExistRecord, void).init(a);

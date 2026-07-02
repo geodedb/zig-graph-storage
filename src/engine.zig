@@ -205,6 +205,35 @@ pub const GraphEngine = struct {
     /// MUST be exactly 1 across any number of concurrent first-accesses.
     derived_materialize_runs: u32 = 0,
 
+    /// GAP warm-reopen P2: TRUE when the invariant "every gated derived
+    /// snapshot (label/prop/edge/edge-exist) whose dirty flag is FALSE is
+    /// content-identical to its in-memory index" is KNOWN to hold. Only
+    /// under this invariant may a full checkpoint cheaply RE-STAMP a clean
+    /// snapshot's counter to the new manifest.counter (restampClean-
+    /// DerivedSnapshots) instead of leaving it counter-stale.
+    ///
+    /// Transitions:
+    ///   * create(): true — all four dirty flags start true, so the
+    ///     invariant holds vacuously (the first full checkpoint SAVES all
+    ///     four, making it hold materially).
+    ///   * open(): FALSE — the dirty flags start clean but the on-disk
+    ///     snapshots are UNKNOWN: after a crash restart they are stale
+    ///     (recovery bumped manifest.counter past their stamp) even though
+    ///     nothing in this session dirtied them. Restamping here would
+    ///     bless crash-stale indexes = silent data loss. A page-only
+    ///     session that never hydrates therefore never restamps (its
+    ///     snapshots stay counter-stale → next open rebuilds, exactly the
+    ///     pre-P2 behavior).
+    ///   * materializeDerivedIndexes(): true — LOAD branch: memory :=
+    ///     snapshot with all flags clean (holds materially); REBUILD
+    ///     branch: all four flags set dirty (holds vacuously; the next full
+    ///     checkpoint saves them).
+    ///   * full checkpoint that saved ALL FOUR (all were dirty): true.
+    /// Mutations never clear it: any derived mutation sets that index's
+    /// dirty flag first, which removes the index from the invariant's
+    /// scope until the next save.
+    derived_snapshots_trusted: bool = false,
+
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
         const self = try allocator.create(GraphEngine);
@@ -228,6 +257,9 @@ pub const GraphEngine = struct {
         self.derived_hydrated = std.atomic.Value(bool).init(true);
         self.derived_hydrate_mutex = std.Io.Mutex.init;
         self.derived_materialize_runs = 0;
+        // P2: all four dirty flags are true → the clean-snapshot invariant
+        // holds vacuously (see the field doc).
+        self.derived_snapshots_trusted = true;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -368,6 +400,10 @@ pub const GraphEngine = struct {
         self.derived_hydrated = std.atomic.Value(bool).init(false);
         self.derived_hydrate_mutex = std.Io.Mutex.init;
         self.derived_materialize_runs = 0;
+        // P2: the on-disk snapshots are UNKNOWN until the counter gate runs
+        // (they may be crash-stale behind clean dirty flags) — restamping is
+        // forbidden until materializeDerivedIndexes establishes the invariant.
+        self.derived_snapshots_trusted = false;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -743,6 +779,12 @@ pub const GraphEngine = struct {
         } else {
             self.metrics.derived_index_loads = 1;
         }
+        // P2: either branch establishes the clean-snapshot invariant — LOAD:
+        // memory := snapshot with all dirty flags clean (holds materially);
+        // REBUILD: all four flags just went dirty (holds vacuously) and the
+        // next full checkpoint's save makes it material. From here on, a full
+        // checkpoint may restamp clean snapshots (see the field doc).
+        self.derived_snapshots_trusted = true;
     }
 
     fn rebuildEdgeIndex(self: *GraphEngine) !void {

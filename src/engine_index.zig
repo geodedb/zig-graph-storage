@@ -17,6 +17,17 @@ const EdgeIndexEntry = engine_mod.EdgeIndexEntry;
 const edge_index_map_mod = @import("edge_index_map.zig");
 const edge_exist_index_mod = @import("edge_exist_index.zig");
 const sorted_snapshot = @import("sorted_index_snapshot.zig");
+// GAP warm-reopen P2 (counter restamp of clean snapshots):
+const index_snapshot_mod = @import("index_snapshot.zig");
+const label_index_mod = @import("label_index.zig");
+const property_chain_index_mod = @import("property_chain_index.zig");
+const file_manager_mod = @import("file_manager.zig");
+
+/// File names of the two sorted edge snapshots, shared with FileManager so
+/// the atomic-replace save (tmp + rename) and the fd reopen target the same
+/// path.
+const EDGE_IDX_NAME = file_manager_mod.FILE_NAMES[@intFromEnum(types.FileId.edge_idx)];
+const EDGE_EXIST_IDX_NAME = file_manager_mod.FILE_NAMES[@intFromEnum(types.FileId.edge_exist_idx)];
 // GAP-ENT-0024 P3 rule, still in force: the magic IS the snapshot format
 // version — bumping it makes the loader REJECT an old snapshot outright
 // (error.InvalidFormat → materializeDerivedIndexes' `catch false` → clean
@@ -369,12 +380,10 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !bool {
 pub fn saveDerivedIndexes(engine: *GraphEngine) !void {
     const label_file = engine.file_manager.getFile(.label_idx) orelse return error.LabelIndexFileNotOpen;
     const prop_file = engine.file_manager.getFile(.prop_idx) orelse return error.PropertyIndexFileNotOpen;
-    const edge_file = engine.file_manager.getFile(.edge_idx) orelse return error.EdgeIndexFileNotOpen;
-    const edge_exist_file = engine.file_manager.getFile(.edge_exist_idx) orelse return error.EdgeExistIndexFileNotOpen;
     try engine.label_index.saveToFile(label_file, engine.manifest.counter);
     try engine.property_index.saveToFile(prop_file, engine.manifest.counter);
-    try saveEdgeIndex(engine, edge_file);
-    try saveEdgeExistIndex(engine, edge_exist_file);
+    try saveEdgeIndex(engine);
+    try saveEdgeExistIndex(engine);
 }
 
 /// Save only the derived index snapshots whose dirty flag is set.
@@ -394,14 +403,82 @@ pub fn saveDerivedIndexesConditional(
         try engine.property_index.saveToFile(prop_file, engine.manifest.counter);
     }
     if (edge_dirty) {
-        const edge_file = engine.file_manager.getFile(.edge_idx) orelse return error.EdgeIndexFileNotOpen;
-        try saveEdgeIndex(engine, edge_file);
+        try saveEdgeIndex(engine);
     }
     // PHASE 3: persist the existence-index snapshot when dirty (skipped by the
     // light checkpoint, exactly like edge_index — recovery rebuilds from pages).
     if (edge_exist_dirty) {
-        const edge_exist_file = engine.file_manager.getFile(.edge_exist_idx) orelse return error.EdgeExistIndexFileNotOpen;
-        try saveEdgeExistIndex(engine, edge_exist_file);
+        try saveEdgeExistIndex(engine);
+    }
+}
+
+/// GAP warm-reopen P2: after a successful FULL checkpoint, cheaply RE-STAMP
+/// the persisted counter of every CLEAN gated snapshot to the (just advanced
+/// and durably written) manifest.counter — a header-only update, the payload
+/// is never rewritten. Without this, a session that dirties only SOME
+/// indexes (e.g. edges-only ingest) counter-invalidates the untouched
+/// snapshots: the all-four load gate then rejects the whole set on the next
+/// open and pays the O(graph) rebuild for indexes that were semantically
+/// current the entire time.
+///
+/// PRECONDITIONS (enforced by the caller, engine_persist.checkpointEx):
+///   * runs LAST — strictly after doCheckpoint persisted manifest@counter,
+///     after every dirty snapshot save, and after the label-dict / catalog /
+///     ordered-index saves, so a restamp can never bless a snapshot while
+///     any part of the checkpoint failed;
+///   * a `*_clean` flag is only passed true when that index's dirty flag was
+///     false when the saves were gated — a DIRTY index is saved, NEVER
+///     restamped (its snapshot content is genuinely stale);
+///   * engine.derived_snapshots_trusted is true — the clean snapshots are
+///     KNOWN content-current for this session (see the field doc; without it
+///     a crash-stale snapshot hiding behind clean flags could be blessed).
+///
+/// Crash-safety is delegated to the per-format restamp helpers: both are
+/// old-counter-or-new-counter-or-rejected — a torn restamp fails the
+/// format's integrity check at load and routes to the rebuild path. A
+/// restamp helper returning false (missing/foreign/corrupt file) is left
+/// as-is: that file stays counter-stale and the next open rebuilds, which is
+/// always safe.
+///
+/// MAPPED-INODE NOTE: the edge/exist restamps may write the very inode a
+/// live adopted base has mmap'd; that is safe by construction — see
+/// sorted_index_snapshot.restampCounter. The legacy label/prop snapshots are
+/// never mmap'd.
+pub fn restampCleanDerivedSnapshots(
+    engine: *GraphEngine,
+    label_clean: bool,
+    property_clean: bool,
+    edge_clean: bool,
+    edge_exist_clean: bool,
+) !void {
+    const counter = engine.manifest.counter;
+    if (label_clean) {
+        if (engine.file_manager.getFile(.label_idx)) |f| {
+            if (try index_snapshot_mod.restampCounter(f, label_index_mod.SNAPSHOT_MAGIC, counter)) {
+                engine.metrics.derived_index_restamps += 1;
+            }
+        }
+    }
+    if (property_clean) {
+        if (engine.file_manager.getFile(.prop_idx)) |f| {
+            if (try index_snapshot_mod.restampCounter(f, property_chain_index_mod.SNAPSHOT_MAGIC, counter)) {
+                engine.metrics.derived_index_restamps += 1;
+            }
+        }
+    }
+    if (edge_clean) {
+        if (engine.file_manager.getFile(.edge_idx)) |f| {
+            if (try sorted_snapshot.restampCounter(engine.allocator, f, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE, counter)) {
+                engine.metrics.derived_index_restamps += 1;
+            }
+        }
+    }
+    if (edge_exist_clean) {
+        if (engine.file_manager.getFile(.edge_exist_idx)) |f| {
+            if (try sorted_snapshot.restampCounter(engine.allocator, f, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE, counter)) {
+                engine.metrics.derived_index_restamps += 1;
+            }
+        }
     }
 }
 
@@ -412,8 +489,18 @@ pub fn saveDerivedIndexesConditional(
 // untouched), sorts the fixed-width records in place, and writes them with the
 // per-block CRC directory. The loader mmap-adopts the file as the immutable
 // base — NO whole-file read, NO hashmap build.
+//
+// P1 review C1 (mapped-inode rule): the save REPLACES the file atomically
+// (tmp + fsync + rename via writeAtomicReplace) instead of truncating and
+// rewriting it in place. A mid-session full checkpoint therefore never
+// touches the inode the live adopted base has mmap'd — the base keeps
+// serving the old inode (still the correct live view together with the
+// overlay/tombstones) for the rest of the session, and the next open adopts
+// the new file. The FileManager fd is reopened after the rename so later
+// fd-based access (counter restamp, next-session-in-process loads) targets
+// the CURRENT inode, not the replaced one.
 
-fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
+fn saveEdgeIndex(engine: *GraphEngine) !void {
     const n = engine.edge_index.count();
     const payload = try engine.allocator.alloc(u8, n * EDGE_RECORD_SIZE);
     defer engine.allocator.free(payload);
@@ -433,15 +520,31 @@ fn saveEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !void {
     if (ctx.i != n) return error.InvalidFormat;
 
     sorted_snapshot.sortRecords(payload, EDGE_RECORD_SIZE, edge_index_map_mod.recordLess);
-    try sorted_snapshot.write(engine.allocator, file.*, EDGE_SNAPSHOT_MAGIC, engine.manifest.counter, EDGE_RECORD_SIZE, payload);
+    try sorted_snapshot.writeAtomicReplace(
+        engine.allocator,
+        engine.graph_dir.path,
+        EDGE_IDX_NAME,
+        EDGE_SNAPSHOT_MAGIC,
+        engine.manifest.counter,
+        EDGE_RECORD_SIZE,
+        payload,
+    );
+    try engine.file_manager.reopenFile(.edge_idx);
 }
 
 fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
     // mmap-adopt: O(header + directory) instead of O(snapshot). Any error
     // (old GSEIDX3/GSEIDX2 magic, torn write, truncation, header/dir CRC)
     // propagates to materializeDerivedIndexes' `catch false` → clean rebuild.
-    const loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE)) orelse return null;
-    engine.edge_index.adoptBase(loaded);
+    var loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE)) orelse return null;
+    errdefer loaded.deinit();
+    // I1 (P1 review): arm the one-shot bit-rot self-invalidation — a lazy
+    // payload ChecksumMismatch zeroes the file's magic so the NEXT open
+    // rebuilds instead of re-adopting the corrupt snapshot forever.
+    const path = try std.fmt.allocPrint(engine.allocator, "{s}/{s}", .{ engine.graph_dir.path, EDGE_IDX_NAME });
+    defer engine.allocator.free(path);
+    try loaded.enableInvalidateOnCorruption(path);
+    try engine.edge_index.adoptBase(loaded);
     return loaded.checkpoint_counter;
 }
 
@@ -449,7 +552,7 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
 // PHASE 3: edge-existence index snapshot (mirrors saveEdgeIndex/loadEdgeIndex).
 // ---------------------------------------------------------------------------
 
-fn saveEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !void {
+fn saveEdgeExistIndex(engine: *GraphEngine) !void {
     const n = engine.edge_exist_index.recordCount();
     const payload = try engine.allocator.alloc(u8, n * EDGE_EXIST_RECORD_SIZE);
     defer engine.allocator.free(payload);
@@ -471,11 +574,24 @@ fn saveEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !void {
     if (ctx.i != n) return error.InvalidFormat;
 
     sorted_snapshot.sortRecords(payload, EDGE_EXIST_RECORD_SIZE, edge_exist_index_mod.recordLess);
-    try sorted_snapshot.write(engine.allocator, file.*, EDGE_EXIST_SNAPSHOT_MAGIC, engine.manifest.counter, EDGE_EXIST_RECORD_SIZE, payload);
+    try sorted_snapshot.writeAtomicReplace(
+        engine.allocator,
+        engine.graph_dir.path,
+        EDGE_EXIST_IDX_NAME,
+        EDGE_EXIST_SNAPSHOT_MAGIC,
+        engine.manifest.counter,
+        EDGE_EXIST_RECORD_SIZE,
+        payload,
+    );
+    try engine.file_manager.reopenFile(.edge_exist_idx);
 }
 
 fn loadEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !?u64 {
-    const loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE)) orelse return null;
-    engine.edge_exist_index.adoptBase(loaded);
+    var loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE)) orelse return null;
+    errdefer loaded.deinit();
+    const path = try std.fmt.allocPrint(engine.allocator, "{s}/{s}", .{ engine.graph_dir.path, EDGE_EXIST_IDX_NAME });
+    defer engine.allocator.free(path);
+    try loaded.enableInvalidateOnCorruption(path);
+    try engine.edge_exist_index.adoptBase(loaded);
     return loaded.checkpoint_counter;
 }

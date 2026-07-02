@@ -111,17 +111,20 @@ pub const EdgeIndexMap = struct {
         self.base = null;
     }
 
-    /// Adopt a loaded sorted snapshot as the immutable base (takes ownership;
-    /// deinit/clearAndFree unmaps it). The map MUST be empty — this is the
-    /// counter-gated load path's O(1) replacement for the record-by-record
-    /// hashmap build.
-    pub fn adoptBase(self: *EdgeIndexMap, loaded: snapshot.Loaded) void {
-        std.debug.assert(self.overlay.count() == 0);
-        std.debug.assert(self.tombstones.count() == 0);
-        std.debug.assert(self.base == null);
+    /// Adopt a loaded sorted snapshot as the immutable base (takes ownership
+    /// ON SUCCESS; on error the caller still owns `loaded` and must deinit
+    /// it). The map MUST be empty — this is the counter-gated load path's
+    /// O(1) replacement for the record-by-record hashmap build.
+    /// M6 (P1 review): real errors, not Debug-only asserts — a double adopt
+    /// in ReleaseFast would leak a mapping and corrupt live_count.
+    pub fn adoptBase(
+        self: *EdgeIndexMap,
+        loaded: snapshot.Loaded,
+    ) error{ BaseAlreadyAdopted, IndexNotEmpty, SnapshotTooLarge }!void {
+        if (self.base != null) return error.BaseAlreadyAdopted;
+        if (self.overlay.count() != 0 or self.tombstones.count() != 0) return error.IndexNotEmpty;
+        self.live_count = std.math.cast(usize, loaded.record_count) orelse return error.SnapshotTooLarge;
         self.base = loaded;
-        self.live_count = std.math.cast(usize, loaded.record_count) orelse
-            @panic("edge index snapshot record_count exceeds usize");
     }
 
     /// Drop everything, INCLUDING the mmap base. Only call with no live
@@ -227,6 +230,11 @@ pub const EdgeIndexMap = struct {
             try f(ctx, e.key_ptr.*, e.value_ptr.*);
         }
         if (self.base) |*b| {
+            // M4 (P1 review): this is a strictly sequential full-payload
+            // scan; lift the load-time MADV_RANDOM for its duration so the
+            // kernel reads ahead (hundreds of MB at ingest scale).
+            b.adviseSequential();
+            defer b.adviseRandom();
             var i: u64 = 0;
             while (i < b.record_count) : (i += 1) {
                 const rec = try b.recordAt(i);
@@ -297,7 +305,7 @@ test "mmap base: lookups served from the mapped file; overlay/tombstones shadow 
 
     var m = EdgeIndexMap.init(t.allocator);
     defer m.deinit();
-    m.adoptBase((try snapshot.load(t.allocator, &file, TEST_MAGIC, RECORD_SIZE)).?);
+    try m.adoptBase((try snapshot.load(t.allocator, &file, TEST_MAGIC, RECORD_SIZE)).?);
 
     try t.expectEqual(@as(usize, 5), m.count());
     for (ids) |id| {
@@ -344,7 +352,7 @@ test "forEachLive yields exactly the merged view" {
 
     var m = EdgeIndexMap.init(t.allocator);
     defer m.deinit();
-    m.adoptBase((try snapshot.load(t.allocator, &file, TEST_MAGIC, RECORD_SIZE)).?);
+    try m.adoptBase((try snapshot.load(t.allocator, &file, TEST_MAGIC, RECORD_SIZE)).?);
 
     try m.remove(4); // tombstoned base record
     try m.put(6, testEntry(600)); // shadowed base record
@@ -383,7 +391,7 @@ test "parity oracle: randomized workload vs reference hashmap (incl. deletes/tom
 
     var m = EdgeIndexMap.init(t.allocator);
     defer m.deinit();
-    m.adoptBase((try snapshot.load(t.allocator, &file, TEST_MAGIC, RECORD_SIZE)).?);
+    try m.adoptBase((try snapshot.load(t.allocator, &file, TEST_MAGIC, RECORD_SIZE)).?);
 
     var ref = std.AutoHashMap(u64, EdgeIndexEntry).init(t.allocator);
     defer ref.deinit();

@@ -178,6 +178,153 @@ pub fn loadHeader(file: *std.Io.File, expected_magic: []const u8, min_record_siz
     };
 }
 
+// ---------------------------------------------------------------------------
+// GAP warm-reopen P2: cheap checkpoint_counter re-stamp.
+//
+// The legacy container's trailing CRC32C covers the WHOLE file (magic |
+// counter | item_count | payload), so changing the counter naively would
+// require re-reading the entire payload to recompute the trailer — exactly
+// the O(file) work a restamp must avoid. Instead we exploit that CRC32C is
+// AFFINE over GF(2): for two equal-length messages M and M' = M ⊕ D, the
+// init/xorout contributions cancel and
+//
+//     crc(M') = crc(M) ⊕ rawcrc(D)
+//
+// where rawcrc is the pure-linear CRC (init 0, xorout 0). Our delta D is
+// zero everywhere except the 8 counter bytes at offset 8, so
+//
+//     rawcrc(D) = zeroExtend(rawcrc8(old ⊕ new), bytes_after_counter)
+//
+// (leading zero bytes leave a zero register unchanged; the trailing zero
+// bytes are applied in O(log n) with the zlib crc32_combine GF(2)-matrix
+// method). Total restamp cost: two 8/4-byte reads, O(log file) arithmetic,
+// two small writes, one fsync.
+// ---------------------------------------------------------------------------
+
+/// Reflected CRC-32C (Castagnoli) polynomial — the bit-reversed form of
+/// 0x1EDC6F41, i.e. the polynomial `Crc32Iscsi` implements.
+const CRC32C_POLY_REFLECTED: u32 = 0x82F63B78;
+
+/// Pure-linear (init 0, xorout 0) reflected CRC32C update.
+fn crcRawUpdate(reg: u32, bytes: []const u8) u32 {
+    var r = reg;
+    for (bytes) |byte| {
+        r ^= byte;
+        var k: u8 = 0;
+        while (k < 8) : (k += 1) {
+            r = if (r & 1 != 0) (r >> 1) ^ CRC32C_POLY_REFLECTED else r >> 1;
+        }
+    }
+    return r;
+}
+
+fn gf2MatrixTimes(mat: *const [32]u32, vec: u32) u32 {
+    var sum: u32 = 0;
+    var v = vec;
+    var i: usize = 0;
+    while (v != 0) : (v >>= 1) {
+        if (v & 1 != 0) sum ^= mat[i];
+        i += 1;
+    }
+    return sum;
+}
+
+fn gf2MatrixSquare(dst: *[32]u32, src: *const [32]u32) void {
+    for (dst, 0..) |*d, i| d.* = gf2MatrixTimes(src, src[i]);
+}
+
+/// Advance the raw CRC register over `len` ZERO bytes in O(log len) — the
+/// zlib crc32_combine matrix method, with the CRC32C polynomial.
+fn crcZeroExtend(crc: u32, len: u64) u32 {
+    if (len == 0 or crc == 0) return crc;
+
+    var odd: [32]u32 = undefined; // operator for one zero BIT
+    odd[0] = CRC32C_POLY_REFLECTED;
+    var row: u32 = 1;
+    for (odd[1..]) |*p| {
+        p.* = row;
+        row <<= 1;
+    }
+    var even: [32]u32 = undefined;
+    gf2MatrixSquare(&even, &odd); // two zero bits
+    gf2MatrixSquare(&odd, &even); // four zero bits
+
+    var result = crc;
+    var n = len;
+    while (true) {
+        gf2MatrixSquare(&even, &odd); // first pass: eight bits = one byte
+        if (n & 1 != 0) result = gf2MatrixTimes(&even, result);
+        n >>= 1;
+        if (n == 0) break;
+        gf2MatrixSquare(&odd, &even);
+        if (n & 1 != 0) result = gf2MatrixTimes(&odd, result);
+        n >>= 1;
+        if (n == 0) break;
+    }
+    return result;
+}
+
+/// GAP warm-reopen P2: re-stamp the checkpoint_counter of an existing legacy
+/// snapshot (magic | counter | item_count | payload | whole-file CRC32C) to
+/// `new_counter` WITHOUT reading or rewriting the payload — see the delta
+/// derivation above. Used by the full checkpoint for CLEAN (not re-saved)
+/// indexes so a partially-dirty session does not counter-invalidate them.
+///
+/// CRASH SAFETY (torn restamp): two separately-positioned small writes
+/// (8-byte counter, 4-byte trailer). A crash landing any strict subset — or
+/// a torn fraction of either — leaves counter and trailer inconsistent → the
+/// loader's whole-file CRC check fails (error.ChecksumMismatch) → callers'
+/// existing `catch false` → rebuild. Both landed = valid new stamp; neither
+/// = old stamp (counter-stale → rebuild). Accepted-but-corrupt is impossible.
+///
+/// CORRUPTION TRANSPARENCY: the old trailer is used WITHOUT verifying it
+/// (verification would be the O(file) read this helper exists to avoid). If
+/// the file is already corrupt (stored ≠ computed), the delta shifts BOTH
+/// sides by the same value, so the mismatch — and the loader's rejection —
+/// is preserved, never masked.
+///
+/// Returns false (file untouched) when there is nothing safe to restamp:
+/// empty/never-written, too short, or foreign/old magic. Returns true when
+/// the file now carries `new_counter` (including the already-stamped no-op).
+pub fn restampCounter(file: *std.Io.File, expected_magic: []const u8, new_counter: u64) !bool {
+    if (expected_magic.len != 8) return error.InvalidMagicLength;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const stat = try file.stat(io);
+    if (stat.size == 0) return false;
+    const size: usize = std.math.cast(usize, stat.size) orelse return false;
+    if (size < expected_magic.len + HEADER_FIELDS_SIZE + CHECKSUM_SIZE) return false;
+
+    var head: [16]u8 = undefined;
+    const hn = try file.readPositionalAll(io, &head, 0);
+    if (hn != head.len) return false;
+    if (!std.mem.eql(u8, head[0..8], expected_magic)) return false;
+
+    const old_counter = std.mem.readInt(u64, head[8..16], .little);
+    if (old_counter == new_counter) return true;
+
+    var trailer: [CHECKSUM_SIZE]u8 = undefined;
+    const tn = try file.readPositionalAll(io, &trailer, size - CHECKSUM_SIZE);
+    if (tn != trailer.len) return false;
+    const old_crc = std.mem.readInt(u32, &trailer, .little);
+
+    var delta: [8]u8 = undefined;
+    std.mem.writeInt(u64, &delta, old_counter ^ new_counter, .little);
+
+    // Bytes covered by the CRC after the counter field: item_count + payload.
+    const tail_len: u64 = @intCast(size - CHECKSUM_SIZE - (expected_magic.len + 8));
+    const new_crc = old_crc ^ crcZeroExtend(crcRawUpdate(0, &delta), tail_len);
+
+    var counter_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &counter_buf, new_counter, .little);
+    try file.writePositionalAll(io, &counter_buf, expected_magic.len);
+    var crc_buf: [CHECKSUM_SIZE]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, new_crc, .little);
+    try file.writePositionalAll(io, &crc_buf, size - CHECKSUM_SIZE);
+    try file.sync(io);
+    return true;
+}
+
 pub fn readBounded(file: *std.Io.File, offset: *u64, remaining: *usize, buf: []u8) !void {
     if (buf.len > remaining.*) return error.InvalidFormat;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -473,6 +620,105 @@ test "PERF-0052: loadPayload enforces the count bound (SEC-0044/0048)" {
 
     // min_record_size of 8 → at most 1 item fits; maxInt(u64) must be rejected.
     try std.testing.expectError(error.InvalidFormat, loadPayload(std.testing.allocator, &file, "GSTEST1\x00", 8));
+}
+
+test "restampCounter: delta-updated trailer CRC matches a full recompute across payload sizes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var prng = std.Random.DefaultPrng.init(0xD3714);
+    const rnd = prng.random();
+
+    const sizes = [_]usize{ 0, 1, 7, 8, 63, 64, 65, 1000, 4096, 70_000 };
+    for (sizes, 0..) |payload_len, case| {
+        var namebuf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&namebuf, "snap{d}.bin", .{case});
+        var file = try tmp.dir.createFile(io, name, .{ .read = true, .truncate = true });
+        defer file.close(io);
+
+        const payload = try std.testing.allocator.alloc(u8, payload_len);
+        defer std.testing.allocator.free(payload);
+        rnd.bytes(payload);
+
+        var w = SnapshotWriter.init(std.testing.allocator);
+        defer w.deinit();
+        try w.writeHeader("GSTEST1\x00", rnd.int(u64), 3);
+        try w.writeBytes(payload);
+        try w.finalize(file);
+
+        const new_counter = rnd.int(u64);
+        try std.testing.expect(try restampCounter(&file, "GSTEST1\x00", new_counter));
+
+        // Loader accepts (whole-file CRC valid) and sees the new counter.
+        var loaded = (try loadFile(std.testing.allocator, &file, "GSTEST1\x00")).?;
+        defer loaded.deinit();
+        try std.testing.expectEqual(new_counter, loaded.checkpoint_counter);
+
+        // Ground truth: the stored trailer equals a from-scratch CRC of the
+        // modified body — proves the GF(2) delta path bit-exactly.
+        const stat = try file.stat(io);
+        const size: usize = @intCast(stat.size);
+        const buf = try std.testing.allocator.alloc(u8, size);
+        defer std.testing.allocator.free(buf);
+        _ = try file.readPositionalAll(io, buf, 0);
+        const stored = std.mem.readInt(u32, buf[size - CHECKSUM_SIZE ..][0..CHECKSUM_SIZE], .little);
+        try std.testing.expectEqual(Crc32.hash(buf[0 .. size - CHECKSUM_SIZE]), stored);
+    }
+}
+
+test "restampCounter: torn restamp (counter landed, trailer did not) is rejected at load → rebuild path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var file = try tmp.dir.createFile(io, "snapshot.bin", .{ .read = true, .truncate = true });
+    defer file.close(io);
+    var w = SnapshotWriter.init(std.testing.allocator);
+    defer w.deinit();
+    try w.writeHeader("GSTEST1\x00", 10, 1);
+    try w.writeBytes(&[_]u8{0xEE} ** 32);
+    try w.finalize(file);
+
+    // Crash window: only the counter write hit the disk.
+    var counter_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &counter_buf, 11, .little);
+    try file.writePositionalAll(io, &counter_buf, 8);
+
+    try std.testing.expectError(error.ChecksumMismatch, loadFile(std.testing.allocator, &file, "GSTEST1\x00"));
+    try std.testing.expectError(error.ChecksumMismatch, loadHeader(&file, "GSTEST1\x00", 8));
+}
+
+test "restampCounter: skips empty files and foreign magic; preserves an existing corruption mismatch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var empty = try tmp.dir.createFile(io, "empty.bin", .{ .read = true, .truncate = true });
+    defer empty.close(io);
+    try std.testing.expect(!(try restampCounter(&empty, "GSTEST1\x00", 5)));
+
+    var foreign = try tmp.dir.createFile(io, "foreign.bin", .{ .read = true, .truncate = true });
+    defer foreign.close(io);
+    var w = SnapshotWriter.init(std.testing.allocator);
+    defer w.deinit();
+    try w.writeHeader("GSOTHER\x00", 1, 1);
+    try w.writeBytes(&[_]u8{1} ** 8);
+    try w.finalize(foreign);
+    try std.testing.expect(!(try restampCounter(&foreign, "GSTEST1\x00", 5)));
+
+    // Pre-corrupted file: restamp must not mask the corruption.
+    var corrupt = try tmp.dir.createFile(io, "corrupt.bin", .{ .read = true, .truncate = true });
+    defer corrupt.close(io);
+    var w2 = SnapshotWriter.init(std.testing.allocator);
+    defer w2.deinit();
+    try w2.writeHeader("GSTEST1\x00", 1, 1);
+    try w2.writeBytes(&[_]u8{2} ** 16);
+    try w2.finalize(corrupt);
+    var flip: [1]u8 = .{0xFF};
+    try corrupt.writePositionalAll(io, &flip, 8 + HEADER_FIELDS_SIZE + 3); // payload byte
+    try std.testing.expect(try restampCounter(&corrupt, "GSTEST1\x00", 5));
+    try std.testing.expectError(error.ChecksumMismatch, loadFile(std.testing.allocator, &corrupt, "GSTEST1\x00"));
 }
 
 test "PERF-0052: loadPayload rejects a corrupted payload byte (SEC-0051)" {
