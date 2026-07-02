@@ -516,6 +516,17 @@ pub const ShardedGraphEngine = struct {
         return self.shards[s_from].addEdgeColocated(from, to, rel_type);
     }
 
+    /// GAP-ENT-0024 P2: co-located edge add carrying the geode-minted 64-bit
+    /// PUBLIC edge id inline. Routes to shard(from) exactly like `addEdge` —
+    /// one single-shard WAL txn; the id rides both durable adjacency records
+    /// (adj_out + adj_in_remote) in v2 blocks, so the edge needs NO
+    /// `__geode_internal_edge_id` property page. `addEdge` remains the
+    /// legacy public_id==0 path.
+    pub fn addEdgeColocatedWithPublicId(self: *ShardedGraphEngine, from: NodeId, to: NodeId, rel_type: u32, public_id: u64) anyerror!EdgeId {
+        const s_from = shard_count_mod.shardOfNode(from);
+        return self.shards[s_from].addEdgeColocatedWithPublicId(from, to, rel_type, public_id);
+    }
+
     pub fn removeEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
         // Edge co-location (Phase C): a co-located edge lives ENTIRELY on
         // shard(from) — out-adjacency, edge_index, existence index AND incoming

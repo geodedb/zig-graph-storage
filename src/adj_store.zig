@@ -36,9 +36,9 @@ pub const AdjStore = struct {
     free_space: *FreeSpaceManager,
     file_id: FileId,
     page_size: u32,
-    /// v1 (24 B-entry) capacity per block. Kept as the struct field because
-    /// the production writer still creates v1 blocks in P1; use
-    /// `capacityFor` when parsing an existing block.
+    /// Capacity of the blocks the PRODUCTION WRITER creates (v2, 32 B
+    /// entries, since P2). Use `capacityFor` when parsing an existing block —
+    /// legacy v1 blocks hold more (24 B) entries.
     entries_per_block: u32,
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, file_id: FileId, page_size: u32) AdjStore {
@@ -47,7 +47,7 @@ pub const AdjStore = struct {
             .free_space = free_space,
             .file_id = file_id,
             .page_size = page_size,
-            .entries_per_block = edge_mod.entriesPerBlock(page_size, edge_mod.ENTRY_FORMAT_V1),
+            .entries_per_block = edge_mod.entriesPerBlock(page_size, edge_mod.ENTRY_FORMAT_V2),
         };
     }
 
@@ -57,76 +57,65 @@ pub const AdjStore = struct {
     }
 
     /// Add an edge entry to a node's adjacency list (O(1) head-insert).
-    /// If head_page is 0 (no existing list), allocates a new block and returns its page_id as the new head.
-    /// If the head block has space, inserts there. If the head block is full, allocates a new head
-    /// block whose overflow points to the old head.
+    /// If the head block has space, inserts there. Otherwise allocates a new
+    /// head block whose overflow points to the old head (0 head = new chain).
     /// Returns the head page_id (may be unchanged or new).
+    ///
+    /// Block-format policy (GAP-ENT-0024 P2 write path):
+    ///   * Every NEW block is created v2 (32 B entries, inline public_id) —
+    ///     the single construction site below serves the empty-head, the
+    ///     full-head-overflow and the no-truncate paths.
+    ///   * A v2 head with space takes an in-place append; `entry.public_id`
+    ///     persists.
+    ///   * A v1 (legacy) head with space takes an in-place 24 B append ONLY
+    ///     when `entry.public_id == 0` (legacy callers — bit-for-bit the
+    ///     pre-P2 behavior, no format churn). A REAL public_id is NEVER
+    ///     silently truncated into a v1 record and the v1 block is NEVER
+    ///     rewritten to v2: a fresh v2 block becomes the new head, chained to
+    ///     the old one. v1 blocks stay read-only-FORMAT forever (in-place
+    ///     field mutation of EXISTING v1 entries remains allowed elsewhere).
     pub fn addEdge(self: *AdjStore, head_page: PageId, entry: EdgeEntry) !PageId {
-        if (head_page == 0) {
-            // No existing list: allocate a new block.
-            // P1: the production writer still creates v1 blocks (read-both
-            // only; the v2 write path is P2), so a caller-supplied public_id
-            // is not persisted on this path yet.
-            const new_page = try self.free_space.allocPage();
-            const frame = try self.buffer_pool.pinNew(self.file_id, new_page);
+        if (head_page != 0) {
+            const frame = try self.buffer_pool.pin(self.file_id, head_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
-
             const data = frame.dataSlice();
-            // Zero out the page (pinNew already does this)
-            // Write block header with count=1
-            self.writeBlockHeader(data, .{
-                .next_block = 0,
-                .count = 1,
-                .kind = 0,
-                .entry_format = edge_mod.ENTRY_FORMAT_V1,
-                .payload_size = @intCast(edge_mod.entrySize(edge_mod.ENTRY_FORMAT_V1)),
-                .checksum = 0,
-            });
-            // Write the entry at slot 0
-            self.writeEntry(data, 0, entry, edge_mod.ENTRY_FORMAT_V1);
+            var bh = try self.readBlockHeader(data);
 
-            self.buffer_pool.unpin(frame_idx, true);
-            return new_page;
+            const has_space = bh.count < @as(u16, @intCast(self.capacityFor(bh.entry_format)));
+            // No-truncate rule: a v1 slot cannot carry a real public_id.
+            const would_drop_public_id =
+                bh.entry_format == edge_mod.ENTRY_FORMAT_V1 and entry.public_id != 0;
+            if (has_space and !would_drop_public_id) {
+                // In-place append at the BLOCK's stride/format.
+                self.writeEntry(data, bh.count, entry, bh.entry_format);
+                bh.count += 1;
+                bh.payload_size = @intCast(@as(u32, bh.count) * edge_mod.entrySize(bh.entry_format));
+                self.writeBlockHeader(data, bh);
+                self.buffer_pool.unpin(frame_idx, true);
+                return head_page;
+            }
+            // Full head, or v1 head that must not absorb a real public_id:
+            // leave it untouched and allocate a fresh v2 head in front of it.
+            self.buffer_pool.unpin(frame_idx, false);
         }
 
-        // Head-insert: only check the head block. If it has space, insert
-        // there (O(1)). If full, allocate a new block as the new head and
-        // chain the old head as its overflow (O(1)). This avoids the O(blocks)
-        // walk that the previous tail-append strategy required.
-        const frame = try self.buffer_pool.pin(self.file_id, head_page);
-        const frame_idx = self.buffer_pool.frameIndex(frame);
-        const data = frame.dataSlice();
-        var bh = try self.readBlockHeader(data);
-
-        if (bh.count < @as(u16, @intCast(self.capacityFor(bh.entry_format)))) {
-            // Space in the head block -- insert at the BLOCK's stride/format
-            // (a v2 head block persists entry.public_id; a v1 head block
-            // stores the 24 B prefix).
-            self.writeEntry(data, bh.count, entry, bh.entry_format);
-            bh.count += 1;
-            bh.payload_size = @intCast(@as(u32, bh.count) * edge_mod.entrySize(bh.entry_format));
-            self.writeBlockHeader(data, bh);
-            self.buffer_pool.unpin(frame_idx, true);
-            return head_page;
-        }
-
-        // Head block is full -- allocate a new head that points to the old head
-        self.buffer_pool.unpin(frame_idx, false);
-
+        // Single block-construction site: a fresh v2 block as the new head;
+        // the old head (0 for a new chain) becomes its overflow.
         const new_page = try self.free_space.allocPage();
         const new_frame = try self.buffer_pool.pinNew(self.file_id, new_page);
         const new_frame_idx = self.buffer_pool.frameIndex(new_frame);
 
         const new_data = new_frame.dataSlice();
+        // pinNew zeroes the page; write header with count=1, then slot 0.
         self.writeBlockHeader(new_data, .{
             .next_block = head_page,
             .count = 1,
             .kind = 0,
-            .entry_format = edge_mod.ENTRY_FORMAT_V1,
-            .payload_size = @intCast(edge_mod.entrySize(edge_mod.ENTRY_FORMAT_V1)),
+            .entry_format = edge_mod.ENTRY_FORMAT_V2,
+            .payload_size = @intCast(edge_mod.entrySize(edge_mod.ENTRY_FORMAT_V2)),
             .checksum = 0,
         });
-        self.writeEntry(new_data, 0, entry, edge_mod.ENTRY_FORMAT_V1);
+        self.writeEntry(new_data, 0, entry, edge_mod.ENTRY_FORMAT_V2);
         self.buffer_pool.unpin(new_frame_idx, true);
         return new_page;
     }
@@ -335,9 +324,9 @@ pub const AdjStore = struct {
     }
 
     /// Write one entry at the given block format. Writing v1 stores only the
-    /// 24-byte prefix — the entry's `public_id` is dropped (legacy blocks
-    /// cannot carry it; P2's writer allocates a v2 block instead of ever
-    /// silently truncating a real public id into a v1 tail).
+    /// 24-byte prefix — the entry's `public_id` is dropped, which is why
+    /// `addEdge` only ever writes v1 records for `public_id == 0` entries
+    /// (a real public id gets a fresh v2 block instead — no-truncate rule).
     fn writeEntry(self: *const AdjStore, data: []u8, slot: u16, entry: EdgeEntry, entry_format: u8) void {
         const off = self.entryOffset(slot, entry_format);
         const size = edge_mod.entrySize(entry_format);

@@ -1363,6 +1363,16 @@ pub const GraphEngine = struct {
     /// traversal has a single uniform source of truth (the legacy `NodeRec.in_head`
     /// field is left write-dead for new edges).
     pub fn addEdgeColocatedTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
+        return self.addEdgeColocatedTxnWithPublicId(from, to, rel_type, txn, 0);
+    }
+
+    /// GAP-ENT-0024 P2: co-located edge add carrying the caller's 64-bit
+    /// PUBLIC edge id (geode-minted) INLINE in BOTH durable adjacency records
+    /// (adj_out + adj_in_remote) — new blocks are v2 so the id persists, and
+    /// AdjStore never truncates a real id into a legacy v1 tail block (it
+    /// allocates a fresh v2 block instead). `public_id == 0` means "no public
+    /// id" (legacy callers; readers fall back to the id property).
+    pub fn addEdgeColocatedTxnWithPublicId(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId, public_id: u64) anyerror!EdgeId {
         try self.ensureWritable();
         // Phase A: mutates edge_index + edge_exist_index — materialize first.
         try self.ensureDerivedHydrated();
@@ -1379,6 +1389,7 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = public_id,
         };
         var from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         const new_out_head = try self.adj_out.addEdge(from_rec.out_head, out_entry);
@@ -1392,6 +1403,7 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = public_id,
         };
         const old_in_head = try self.in_head_dir.getHead(to);
         const new_in_head = try self.adj_in_remote.addEdge(old_in_head, in_entry);
@@ -1427,6 +1439,13 @@ pub const GraphEngine = struct {
     /// ShardedGraphEngine routes BOTH same-shard and cross-endpoint edges here
     /// (on shard(from)); the cross-shard 2PC add path was removed in Phase C.
     pub fn addEdgeColocated(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
+        return self.addEdgeColocatedWithPublicId(from, to, rel_type, 0);
+    }
+
+    /// GAP-ENT-0024 P2: auto-commit variant of
+    /// `addEdgeColocatedTxnWithPublicId` — the geode adapter's target surface
+    /// for new edges (inline id, NO `__geode_internal_edge_id` property).
+    pub fn addEdgeColocatedWithPublicId(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, public_id: u64) anyerror!EdgeId {
         var __obs_span = observability.startOperationSpan("add_edge");
         defer __obs_span.end(null);
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
@@ -1434,7 +1453,7 @@ pub const GraphEngine = struct {
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
-        const edge_id = try self.addEdgeColocatedTxn(from, to, rel_type, txn);
+        const edge_id = try self.addEdgeColocatedTxnWithPublicId(from, to, rel_type, txn, public_id);
 
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");

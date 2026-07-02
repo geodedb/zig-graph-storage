@@ -69,22 +69,30 @@ const MadeEdge = struct {
     seen: bool = false,
 };
 
-/// Sum the on-disk size of every shard's props.store under `data_dir`.
-/// ShardedGraphEngine.create lays shards out as
-/// `data_dir/<parent-uuid-hex>/graphs/<derived-shard-uuid-hex>/props.store`.
-fn totalPropsStoreBytes(allocator: Allocator, data_dir: []const u8, base_uuid: [16]u8) !u64 {
+/// Sum the on-disk size of one store file (e.g. "props.store",
+/// "adj_out.store", "adj_in_remote.store") across every shard under
+/// `data_dir`. ShardedGraphEngine.create lays shards out as
+/// `data_dir/<parent-uuid-hex>/graphs/<derived-shard-uuid-hex>/<file_name>`.
+fn totalShardStoreBytes(allocator: Allocator, data_dir: []const u8, base_uuid: [16]u8, file_name: []const u8) !u64 {
     const io = std.Io.Threaded.global_single_threaded.io();
     const parent_hex = sharded_engine.uuidHex(base_uuid);
     var total: u64 = 0;
     for (0..shard_count.SHARD_COUNT) |s| {
         const suuid = shard_uuid.deriveShardUuid(base_uuid, s);
         const hex = sharded_engine.uuidHex(suuid);
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}/graphs/{s}/props.store", .{ data_dir, parent_hex, hex });
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}/graphs/{s}/{s}", .{ data_dir, parent_hex, hex, file_name });
         defer allocator.free(path);
-        const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue, // store not created yet => 0 bytes
+            else => return err,
+        };
         total += st.size;
     }
     return total;
+}
+
+fn totalPropsStoreBytes(allocator: Allocator, data_dir: []const u8, base_uuid: [16]u8) !u64 {
+    return totalShardStoreBytes(allocator, data_dir, base_uuid, "props.store");
 }
 
 test "GAP edge-inline-public-id P0 baseline: legacy id-property parity oracle + one-page-per-edge cost lock-in" {
@@ -469,16 +477,51 @@ test "P1: addEdge append into an existing v2 block writes the v2 stride (public_
     try testing.expectEqual(@as(u64, 0xC002), got[1].public_id);
 }
 
-test "P1: writers unchanged — fresh blocks are still v1 and drop public_id (P2 flips this)" {
+// ============================================================================
+// P2 — v2 write path.
+//
+// NEW adjacency blocks are created v2 (entry_format=1, 32 B entries) by every
+// block-construction site; a caller-supplied public_id persists. Appends into
+// an EXISTING v1 block obey the no-truncate rule:
+//   * public_id == 0 (legacy callers): append the 24 B v1 record in place —
+//     bit-for-bit today's behavior, no format churn.
+//   * public_id != 0: NEVER truncate into a 24 B record and NEVER rewrite the
+//     v1 block — allocate a fresh v2 block as the new head, linked to the old
+//     chain. v1 blocks stay read-only-FORMAT forever.
+// ============================================================================
+
+/// Raw 16-byte EdgeBlockHeader image of an adjacency page — read WITHOUT
+/// AdjStore's parser so tests can assert on-disk formats independently.
+const RawBlockHeader = struct {
+    next_block: u64,
+    count: u16,
+    entry_format: u8,
+    payload_size: u16,
+};
+
+fn readRawBlockHeader(pool: *BufferPool, file_id: anytype, page_id: u64) !RawBlockHeader {
+    const frame = try pool.pin(file_id, page_id);
+    const idx = pool.frameIndex(frame);
+    defer pool.unpin(idx, false);
+    const data = frame.dataSlice();
+    const off = PAGE_HEADER_SIZE;
+    return .{
+        .next_block = std.mem.readInt(u64, data[off..][0..8], .little),
+        .count = std.mem.readInt(u16, data[off + 8 ..][0..2], .little),
+        .entry_format = data[off + 11],
+        .payload_size = std.mem.readInt(u16, data[off + 12 ..][0..2], .little),
+    };
+}
+
+test "P2: fresh writer blocks are v2 — public_id round-trips through addEdge" {
     var env = try AdjEnv.init();
     env.fixup();
     defer env.deinit();
     var store = env.store();
 
-    // New chain through the production writer: block is created v1 (the
-    // legacy zero-init byte), so a caller-supplied public_id is NOT stored
-    // yet. This pins P1's "read-both only" scope; the P2 write path replaces
-    // this expectation with round-tripping.
+    // New chain through the production writer: the block is created v2, so
+    // the caller-supplied public_id IS stored (this replaces the P1 pin that
+    // fresh blocks were still v1).
     const head = try store.addEdge(0, .{
         .neighbor = 10,
         .edge_id = 1,
@@ -487,11 +530,128 @@ test "P1: writers unchanged — fresh blocks are still v1 and drop public_id (P2
         .public_id = 77,
     });
 
+    const bh = try readRawBlockHeader(&env.base.pool, .adj_out, head);
+    try testing.expectEqual(@as(u8, 1), bh.entry_format);
+    try testing.expectEqual(@as(u16, 1), bh.count);
+    try testing.expectEqual(@as(u16, 32), bh.payload_size);
+
     const got = try drainChain(&store, head, testing.allocator);
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqual(@as(u64, 1), got[0].edge_id);
-    try testing.expectEqual(@as(u64, 0), got[0].public_id);
+    try testing.expectEqual(@as(u64, 77), got[0].public_id);
+}
+
+test "P2: no-truncate rule — real public_id + v1 tail => fresh v2 head, v1 block untouched" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    // Legacy v1 head block with plenty of free slots.
+    const v1_raw = [_]RawEdge{
+        .{ .neighbor = 10, .edge_id = 1, .rel_type = 5 },
+        .{ .neighbor = 20, .edge_id = 2, .rel_type = 5 },
+    };
+    const v1_page = try writeRawBlock(&env.base.pool, &env.base.fsm, 0, &v1_raw, 0);
+
+    // Append an edge CARRYING a real public_id: despite the free space, the
+    // writer must NOT drop the id into a 24 B record and must NOT rewrite the
+    // v1 block — it allocates a fresh v2 head chained to the v1 block.
+    const new_head = try store.addEdge(v1_page, .{
+        .neighbor = 30,
+        .edge_id = 3,
+        .rel_type = 5,
+        .prop_head = 0,
+        .public_id = 0x9001,
+    });
+    try testing.expect(new_head != v1_page);
+
+    const new_bh = try readRawBlockHeader(&env.base.pool, .adj_out, new_head);
+    try testing.expectEqual(@as(u8, 1), new_bh.entry_format);
+    try testing.expectEqual(@as(u16, 1), new_bh.count);
+    try testing.expectEqual(v1_page, new_bh.next_block);
+
+    // The v1 block is read-only-FORMAT: still v1, still exactly 2 entries.
+    const old_bh = try readRawBlockHeader(&env.base.pool, .adj_out, v1_page);
+    try testing.expectEqual(@as(u8, 0), old_bh.entry_format);
+    try testing.expectEqual(@as(u16, 2), old_bh.count);
+    try testing.expectEqual(@as(u16, 48), old_bh.payload_size);
+
+    // Mixed v1→v2 chain enumerates correctly: real id for new, 0 for old.
+    const got = try drainChain(&store, new_head, testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(@as(u64, 3), got[0].edge_id);
+    try testing.expectEqual(@as(u64, 0x9001), got[0].public_id);
+    try testing.expectEqual(@as(u64, 0), got[1].public_id);
+    try testing.expectEqual(@as(u64, 0), got[2].public_id);
+    try testing.expectEqual(@as(u64, 3), try store.edgeCount(new_head));
+}
+
+test "P2: legacy exception — public_id==0 appends in place into a v1 tail (bit-for-bit legacy)" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    const v1_raw = [_]RawEdge{
+        .{ .neighbor = 10, .edge_id = 1, .rel_type = 5 },
+        .{ .neighbor = 20, .edge_id = 2, .rel_type = 5 },
+    };
+    const v1_page = try writeRawBlock(&env.base.pool, &env.base.fsm, 0, &v1_raw, 0);
+
+    // Legacy caller (public_id == 0): append INTO the v1 block — same head,
+    // still v1, count+1, 24 B stride. No block-format churn for legacy writers.
+    const head = try store.addEdge(v1_page, .{
+        .neighbor = 30,
+        .edge_id = 3,
+        .rel_type = 5,
+        .prop_head = 0,
+        .public_id = 0,
+    });
+    try testing.expectEqual(v1_page, head);
+
+    const bh = try readRawBlockHeader(&env.base.pool, .adj_out, v1_page);
+    try testing.expectEqual(@as(u8, 0), bh.entry_format);
+    try testing.expectEqual(@as(u16, 3), bh.count);
+    try testing.expectEqual(@as(u16, 72), bh.payload_size); // 3 * 24 B
+
+    const got = try drainChain(&store, head, testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    for (got) |g| try testing.expectEqual(@as(u64, 0), g.public_id);
+}
+
+test "P2: FULL v1 head + public_id==0 => overflow block is v2 (new blocks are always v2)" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    // Hand-build a COMPLETELY FULL v1 block.
+    const v1_cap = edge_mod.entriesPerBlock(ADJ_PAGE_SIZE, edge_mod.ENTRY_FORMAT_V1);
+    const full = try testing.allocator.alloc(RawEdge, v1_cap);
+    defer testing.allocator.free(full);
+    for (full, 0..) |*e, i| {
+        e.* = .{ .neighbor = i + 1, .edge_id = i + 1, .rel_type = 5 };
+    }
+    const v1_page = try writeRawBlock(&env.base.pool, &env.base.fsm, 0, full, 0);
+
+    // Even a LEGACY append (public_id == 0) that overflows allocates a v2
+    // block — only in-place v1 appends stay v1.
+    const new_head = try store.addEdge(v1_page, .{
+        .neighbor = 999,
+        .edge_id = 9999,
+        .rel_type = 5,
+        .prop_head = 0,
+        .public_id = 0,
+    });
+    try testing.expect(new_head != v1_page);
+    const bh = try readRawBlockHeader(&env.base.pool, .adj_out, new_head);
+    try testing.expectEqual(@as(u8, 1), bh.entry_format);
+    try testing.expectEqual(v1_page, bh.next_block);
+    try testing.expectEqual(@as(u64, v1_cap + 1), try store.edgeCount(new_head));
 }
 
 test "P1: unknown entry_format is rejected as corruption, never misparsed" {
@@ -508,6 +668,403 @@ test "P1: unknown entry_format is rejected as corruption, never misparsed" {
     var it = store.expand(head, null);
     defer it.deinit();
     try testing.expectError(error.DataCorruption, it.next());
+}
+
+// ============================================================================
+// P2 — engine-level scenario-2: the inline-id write path end to end.
+// ============================================================================
+
+const GraphEngine = gs.GraphEngine;
+
+const S2_EDGES = 5000;
+/// Nonzero, unique public ids — high tag keeps them disjoint from edge_ids.
+fn s2PublicId(i: usize) u64 {
+    return 0x5EA0_0000_0000_0000 | @as(u64, @intCast(i + 1));
+}
+
+const S2Edge = struct {
+    edge_id: u64,
+    from: u64,
+    to: u64,
+    public_id: u64,
+    seen: bool = false,
+};
+
+test "P2 scenario-2: addEdgeColocatedWithPublicId — zero props growth, <=40 B/edge adjacency per direction, exact parity both directions" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE2} ** 16;
+
+    var eng = try ShardedGraphEngine.create(testing.allocator, td.path, uuid, baselineConfig());
+    defer eng.close() catch {};
+
+    // 2 sources + 2 sinks => 5000 edges pack into LONG chains (~2500 entries
+    // per out chain), so block-fill amortizes and the bytes/edge measurement
+    // reflects the true v2 record cost (32 B + block overhead), not
+    // one-mostly-empty-page-per-node fragmentation.
+    var froms: [2]u64 = undefined;
+    var tos: [2]u64 = undefined;
+    for (&froms) |*f| {
+        f.* = try eng.allocNode();
+        try eng.putNode(f.*, test_support.emptyNode(1));
+    }
+    for (&tos) |*t| {
+        t.* = try eng.allocNode();
+        try eng.putNode(t.*, test_support.emptyNode(1));
+    }
+
+    // Baseline sizes BEFORE any edge exists (growth isolates the edge cost
+    // from fixed per-shard store overhead).
+    try eng.checkpoint();
+    const props_before = try totalShardStoreBytes(testing.allocator, td.path, uuid, "props.store");
+    const out_before = try totalShardStoreBytes(testing.allocator, td.path, uuid, "adj_out.store");
+    const in_before = try totalShardStoreBytes(testing.allocator, td.path, uuid, "adj_in_remote.store");
+
+    const made = try testing.allocator.alloc(S2Edge, S2_EDGES);
+    defer testing.allocator.free(made);
+
+    // NO edge property is written — the public id goes INLINE.
+    for (made, 0..) |*m, i| {
+        const from = froms[i % 2];
+        const to = tos[(i / 2) % 2];
+        const pid = s2PublicId(i);
+        const id = try eng.addEdgeColocatedWithPublicId(from, to, REL, pid);
+        m.* = .{ .edge_id = id, .from = from, .to = to, .public_id = pid };
+    }
+    try eng.checkpoint();
+
+    // ------------------------------------------------------------------
+    // (b) props.store contains ZERO edge chains: byte-identical to the
+    //     pre-edge state (compare with 8218.2 B/edge on the legacy path).
+    // ------------------------------------------------------------------
+    const props_after = try totalShardStoreBytes(testing.allocator, td.path, uuid, "props.store");
+    try testing.expectEqual(props_before, props_after);
+
+    // ------------------------------------------------------------------
+    // (c) adjacency growth ≤ 40 B/edge amortized, PER DIRECTION (each edge
+    //     writes one 32 B v2 record into adj_out and one into adj_in_remote;
+    //     40 B allows block-header + partial-tail-block amortization).
+    // ------------------------------------------------------------------
+    const out_growth = (try totalShardStoreBytes(testing.allocator, td.path, uuid, "adj_out.store")) - out_before;
+    const in_growth = (try totalShardStoreBytes(testing.allocator, td.path, uuid, "adj_in_remote.store")) - in_before;
+    std.debug.print(
+        "\n[GAP edge-inline-public-id P2] {d} edges: props growth = {d} B, adj_out growth = {d} B ({d:.1} B/edge), adj_in_remote growth = {d} B ({d:.1} B/edge)\n",
+        .{
+            S2_EDGES,
+            props_after - props_before,
+            out_growth,
+            @as(f64, @floatFromInt(out_growth)) / @as(f64, @floatFromInt(S2_EDGES)),
+            in_growth,
+            @as(f64, @floatFromInt(in_growth)) / @as(f64, @floatFromInt(S2_EDGES)),
+        },
+    );
+    try testing.expect(out_growth <= 40 * S2_EDGES);
+    try testing.expect(in_growth <= 40 * S2_EDGES);
+
+    // ------------------------------------------------------------------
+    // (a) parity FORWARD: exact (from, to, rel_type, public_id) set, and no
+    //     edge carries a property chain (prop_head == 0 everywhere).
+    // ------------------------------------------------------------------
+    var by_id = std.AutoHashMap(u64, usize).init(testing.allocator);
+    defer by_id.deinit();
+    for (made, 0..) |m, idx| try by_id.putNoClobber(m.edge_id, idx);
+
+    var fwd: usize = 0;
+    for (froms) |n| {
+        var it = try eng.expandOutIter(n, null);
+        defer it.deinit();
+        while (try it.next()) |e| {
+            const m = &made[by_id.get(e.edge_id) orelse return error.UnknownEdgeEnumerated];
+            try testing.expect(!m.seen);
+            m.seen = true;
+            try testing.expectEqual(m.from, n);
+            try testing.expectEqual(m.to, e.neighbor);
+            try testing.expectEqual(REL, e.rel_type);
+            try testing.expectEqual(m.public_id, e.public_id);
+            try testing.expectEqual(@as(u32, 0), e.prop_head);
+            fwd += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, S2_EDGES), fwd);
+    for (made) |m| try testing.expect(m.seen);
+
+    // ------------------------------------------------------------------
+    // (a) parity REVERSE via FanInEdgeIterator: the adj_in_remote copy
+    //     carries the exact public_id too.
+    // ------------------------------------------------------------------
+    for (made) |*m| m.seen = false;
+    var rev: usize = 0;
+    for (tos) |t| {
+        var it = try eng.expandInIter(t, null);
+        defer it.deinit();
+        while (try it.next()) |e| {
+            const m = &made[by_id.get(e.edge_id) orelse return error.UnknownEdgeEnumerated];
+            try testing.expect(!m.seen);
+            m.seen = true;
+            try testing.expectEqual(m.to, t);
+            try testing.expectEqual(m.from, e.neighbor); // in-entry neighbor = source
+            try testing.expectEqual(REL, e.rel_type);
+            try testing.expectEqual(m.public_id, e.public_id);
+            rev += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, S2_EDGES), rev);
+    for (made) |m| try testing.expect(m.seen);
+
+    try testing.expectEqual(@as(u64, S2_EDGES), try eng.edgeCount());
+}
+
+test "P2 mixed chain: legacy-then-new edges on the SAME from-node — public_id 0 for old, real for new" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE3} ** 16;
+
+    var eng = try ShardedGraphEngine.create(testing.allocator, td.path, uuid, baselineConfig());
+    defer eng.close() catch {};
+
+    const from = try eng.allocNode();
+    try eng.putNode(from, test_support.emptyNode(1));
+    var tos: [6]u64 = undefined;
+    for (&tos) |*t| {
+        t.* = try eng.allocNode();
+        try eng.putNode(t.*, test_support.emptyNode(1));
+    }
+
+    // 3 LEGACY edges (addEdge — the public_id==0 delegate), then 3 NEW edges
+    // carrying real ids, all fanning out from the SAME node.
+    var legacy_ids: [3]u64 = undefined;
+    var new_ids: [3]u64 = undefined;
+    for (0..3) |i| legacy_ids[i] = try eng.addEdge(from, tos[i], REL);
+    for (0..3) |i| new_ids[i] = try eng.addEdgeColocatedWithPublicId(from, tos[3 + i], REL, 0xF00D_0000 + @as(u64, @intCast(i)));
+
+    var it = try eng.expandOutIter(from, null);
+    defer it.deinit();
+    var n: usize = 0;
+    while (try it.next()) |e| : (n += 1) {
+        var matched = false;
+        for (legacy_ids) |lid| {
+            if (e.edge_id == lid) {
+                try testing.expectEqual(@as(u64, 0), e.public_id);
+                matched = true;
+            }
+        }
+        for (new_ids, 0..) |nid, i| {
+            if (e.edge_id == nid) {
+                try testing.expectEqual(0xF00D_0000 + @as(u64, @intCast(i)), e.public_id);
+                matched = true;
+            }
+        }
+        try testing.expect(matched);
+    }
+    try testing.expectEqual(@as(usize, 6), n);
+
+    // Reverse direction: each sink sees its one edge with the right id.
+    for (tos, 0..) |t, i| {
+        var in_it = try eng.expandInIter(t, null);
+        defer in_it.deinit();
+        const e = (try in_it.next()).?;
+        try testing.expectEqual(from, e.neighbor);
+        if (i < 3) {
+            try testing.expectEqual(@as(u64, 0), e.public_id);
+        } else {
+            try testing.expectEqual(0xF00D_0000 + @as(u64, @intCast(i - 3)), e.public_id);
+        }
+        try testing.expectEqual(@as(?edge_mod.EdgeEntry, null), try in_it.next());
+    }
+}
+
+// ============================================================================
+// P2 — crash safety: the v2 block allocation + chain link ride the existing
+// page-image WAL redo. Established crash pattern (Lever B / edge_colocation):
+// commit writes, then deinit() WITHOUT close()/checkpoint() — only the
+// fsynced WAL survives; reopen must replay it.
+// ============================================================================
+
+test "P2 crash: fresh v2 block linked into a v1 chain replays via WAL page-image redo" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE4} ** 16;
+    const cfg = test_support.testConfig(); // sync_each_commit => WAL tail survives the crash
+
+    const pid: u64 = 0xCAFE_F00D_0000_0001;
+    var node_a: u64 = 0;
+    var node_b: u64 = 0;
+    var node_c: u64 = 0;
+    var legacy_edge: u64 = 0;
+    var new_edge: u64 = 0;
+    var v1_page: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+
+        node_a = try eng.allocNode();
+        node_b = try eng.allocNode();
+        node_c = try eng.allocNode();
+        try eng.putNode(node_a, test_support.emptyNode(1));
+        try eng.putNode(node_b, test_support.emptyNode(1));
+        try eng.putNode(node_c, test_support.emptyNode(1));
+
+        // One legacy edge — its fresh block is v2 (public_id 0). Rewrite that
+        // block IN PLACE to v1 (drop the trailing 8 zero bytes per record):
+        // this is byte-exactly what a pre-P2 legacy store looks like, without
+        // hand-allocating pages behind the free-space manager's back.
+        legacy_edge = try eng.addEdgeColocated(node_a, node_b, REL);
+        v1_page = (try eng.getNode(node_a)).?.out_head;
+        {
+            const store = &eng.adj_out;
+            const frame = try store.buffer_pool.pin(store.file_id, v1_page);
+            const idx = store.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+            const off = PAGE_HEADER_SIZE;
+            try testing.expectEqual(@as(u8, 1), data[off + 11]); // was created v2
+            try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, data[off + 8 ..][0..2], .little));
+            data[off + 11] = 0; // entry_format = v1
+            std.mem.writeInt(u16, data[off + 12 ..][0..2], 24, .little); // payload = 1 * 24 B
+            @memset(data[off + 16 + 24 ..][0..8], 0); // scrub the dead public_id bytes
+            store.buffer_pool.unpin(idx, true);
+        }
+        // Make the legacy-shaped store DURABLE (checkpoint flushes the page
+        // and truncates the WAL) — the crash window below starts clean.
+        try eng.checkpoint();
+
+        // The append under test: v1 head with free space + real public_id =>
+        // AdjStore allocates a fresh v2 block and links it as the new head.
+        // The new page image + node-record update are WAL-logged and fsynced
+        // by the commit.
+        new_edge = try eng.addEdgeColocatedWithPublicId(node_a, node_c, REL, pid);
+
+        // SIMULATED CRASH: no checkpoint, no close.
+        eng.deinit();
+    }
+
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Chain shape after redo: v2 head (the new edge) -> v1 tail (legacy).
+        const head = (try eng.getNode(node_a)).?.out_head;
+        try testing.expect(head != v1_page);
+        const head_bh = try readRawBlockHeader(eng.adj_out.buffer_pool, eng.adj_out.file_id, head);
+        try testing.expectEqual(@as(u8, 1), head_bh.entry_format);
+        try testing.expectEqual(@as(u16, 1), head_bh.count);
+        try testing.expectEqual(v1_page, head_bh.next_block);
+        const tail_bh = try readRawBlockHeader(eng.adj_out.buffer_pool, eng.adj_out.file_id, v1_page);
+        try testing.expectEqual(@as(u8, 0), tail_bh.entry_format);
+        try testing.expectEqual(@as(u16, 1), tail_bh.count);
+
+        // Parity oracle: the exact edge set with exact public_ids.
+        var it = try eng.expandOutIter(node_a, null);
+        defer it.deinit();
+        const e_new = (try it.next()).?; // head block first
+        try testing.expectEqual(new_edge, e_new.edge_id);
+        try testing.expectEqual(node_c, e_new.neighbor);
+        try testing.expectEqual(pid, e_new.public_id);
+        const e_old = (try it.next()).?;
+        try testing.expectEqual(legacy_edge, e_old.edge_id);
+        try testing.expectEqual(node_b, e_old.neighbor);
+        try testing.expectEqual(@as(u64, 0), e_old.public_id);
+        try testing.expectEqual(@as(?edge_mod.EdgeEntry, null), try it.next());
+
+        // Reverse copy (adj_in_remote) recovered the inline id too.
+        var in_it = try eng.expandInRemoteIter(node_c, null);
+        defer in_it.deinit();
+        const in_e = (try in_it.next()).?;
+        try testing.expectEqual(new_edge, in_e.edge_id);
+        try testing.expectEqual(node_a, in_e.neighbor);
+        try testing.expectEqual(pid, in_e.public_id);
+        try testing.expectEqual(@as(?edge_mod.EdgeEntry, null), try in_it.next());
+    }
+}
+
+test "P2 crash: plain v2 appends (multi-block chain) replay with exact public_ids" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xE5} ** 16;
+    const cfg = baselineConfig(); // 8192 pages, sync_each_commit default
+
+    // > entriesPerBlock(8192, v2) = 254, so the single out chain MUST spill
+    // into a second freshly-allocated v2 block inside the crash window.
+    const N: usize = 300;
+
+    var from: u64 = 0;
+    var tos: [2]u64 = undefined;
+    var made: [N]S2Edge = undefined;
+
+    {
+        var eng = try ShardedGraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+
+        from = try eng.allocNode();
+        try eng.putNode(from, test_support.emptyNode(1));
+        for (&tos) |*t| {
+            t.* = try eng.allocNode();
+            try eng.putNode(t.*, test_support.emptyNode(1));
+        }
+        // Durable baseline: nodes exist, zero edges.
+        try eng.checkpoint();
+
+        // Every edge write below lands ONLY in the fsynced WAL tail.
+        for (&made, 0..) |*m, i| {
+            const to = tos[i % 2];
+            const pid = 0xB0B0_0000_0000_0000 | @as(u64, @intCast(i + 1));
+            const id = try eng.addEdgeColocatedWithPublicId(from, to, REL, pid);
+            m.* = .{ .edge_id = id, .from = from, .to = to, .public_id = pid };
+        }
+
+        // SIMULATED CRASH: no checkpoint, no close.
+        eng.deinit();
+    }
+
+    {
+        var eng = try ShardedGraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        var by_id = std.AutoHashMap(u64, usize).init(testing.allocator);
+        defer by_id.deinit();
+        for (made, 0..) |m, idx| try by_id.putNoClobber(m.edge_id, idx);
+
+        // Forward: exact set + exact ids across the recovered 2-block chain.
+        var fwd: usize = 0;
+        {
+            var it = try eng.expandOutIter(from, null);
+            defer it.deinit();
+            while (try it.next()) |e| {
+                const m = &made[by_id.get(e.edge_id) orelse return error.UnknownEdgeEnumerated];
+                try testing.expect(!m.seen);
+                m.seen = true;
+                try testing.expectEqual(m.to, e.neighbor);
+                try testing.expectEqual(m.public_id, e.public_id);
+                try testing.expectEqual(@as(u32, 0), e.prop_head);
+                fwd += 1;
+            }
+        }
+        try testing.expectEqual(N, fwd);
+        for (made) |m| try testing.expect(m.seen);
+
+        // Reverse via FanInEdgeIterator.
+        for (&made) |*m| m.seen = false;
+        var rev: usize = 0;
+        for (tos) |t| {
+            var it = try eng.expandInIter(t, null);
+            defer it.deinit();
+            while (try it.next()) |e| {
+                const m = &made[by_id.get(e.edge_id) orelse return error.UnknownEdgeEnumerated];
+                try testing.expect(!m.seen);
+                m.seen = true;
+                try testing.expectEqual(m.to, t);
+                try testing.expectEqual(m.from, e.neighbor);
+                try testing.expectEqual(m.public_id, e.public_id);
+                rev += 1;
+            }
+        }
+        try testing.expectEqual(N, rev);
+
+        // NOTE: eng.edgeCount() is NOT asserted here — manifest.edge_count is
+        // checkpoint-granular (recovery replays page images; it does not
+        // re-derive manifest counters), a PRE-EXISTING property unrelated to
+        // the v2 write path. The adjacency parity above is the P2 oracle.
+    }
 }
 
 test {
