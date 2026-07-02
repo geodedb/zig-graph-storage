@@ -19,7 +19,6 @@ const FileId = types.FileId;
 const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
 
 const BLOCK_HEADER_SIZE: u32 = @sizeOf(EdgeBlockHeader);
-const ENTRY_SIZE: u32 = @sizeOf(EdgeEntry);
 
 /// Maximum hops allowed in an adjacency-block chain traversal before
 /// assuming the chain is corrupt or circular (SEC-0042).
@@ -27,12 +26,19 @@ pub const MAX_CHAIN_HOPS: u32 = 100_000;
 
 /// Adjacency block storage for outgoing/incoming edges.
 /// Each adjacency list is a chain of pages, each containing an EdgeBlockHeader
-/// followed by an array of EdgeEntry records.
+/// followed by an array of edge records at the stride of THAT block's
+/// `entry_format` (GAP-ENT-0024 read-both): v1 blocks hold 24 B records
+/// (no public_id — readers surface 0), v2 blocks hold 32 B records with the
+/// inline public_id. Chains may mix formats block-by-block; every reader and
+/// in-place mutator below parses each block by its own header byte.
 pub const AdjStore = struct {
     buffer_pool: *BufferPool,
     free_space: *FreeSpaceManager,
     file_id: FileId,
     page_size: u32,
+    /// v1 (24 B-entry) capacity per block. Kept as the struct field because
+    /// the production writer still creates v1 blocks in P1; use
+    /// `capacityFor` when parsing an existing block.
     entries_per_block: u32,
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, file_id: FileId, page_size: u32) AdjStore {
@@ -41,8 +47,13 @@ pub const AdjStore = struct {
             .free_space = free_space,
             .file_id = file_id,
             .page_size = page_size,
-            .entries_per_block = edge_mod.entriesPerBlock(page_size),
+            .entries_per_block = edge_mod.entriesPerBlock(page_size, edge_mod.ENTRY_FORMAT_V1),
         };
+    }
+
+    /// Per-block entry capacity for a (validated) entry format.
+    fn capacityFor(self: *const AdjStore, entry_format: u8) u32 {
+        return edge_mod.entriesPerBlock(self.page_size, entry_format);
     }
 
     /// Add an edge entry to a node's adjacency list (O(1) head-insert).
@@ -52,7 +63,10 @@ pub const AdjStore = struct {
     /// Returns the head page_id (may be unchanged or new).
     pub fn addEdge(self: *AdjStore, head_page: PageId, entry: EdgeEntry) !PageId {
         if (head_page == 0) {
-            // No existing list: allocate a new block
+            // No existing list: allocate a new block.
+            // P1: the production writer still creates v1 blocks (read-both
+            // only; the v2 write path is P2), so a caller-supplied public_id
+            // is not persisted on this path yet.
             const new_page = try self.free_space.allocPage();
             const frame = try self.buffer_pool.pinNew(self.file_id, new_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
@@ -64,12 +78,12 @@ pub const AdjStore = struct {
                 .next_block = 0,
                 .count = 1,
                 .kind = 0,
-                ._reserved = 0,
-                .payload_size = ENTRY_SIZE,
+                .entry_format = edge_mod.ENTRY_FORMAT_V1,
+                .payload_size = @intCast(edge_mod.entrySize(edge_mod.ENTRY_FORMAT_V1)),
                 .checksum = 0,
             });
             // Write the entry at slot 0
-            self.writeEntry(data, 0, entry);
+            self.writeEntry(data, 0, entry, edge_mod.ENTRY_FORMAT_V1);
 
             self.buffer_pool.unpin(frame_idx, true);
             return new_page;
@@ -84,11 +98,13 @@ pub const AdjStore = struct {
         const data = frame.dataSlice();
         var bh = try self.readBlockHeader(data);
 
-        if (bh.count < @as(u16, @intCast(self.entries_per_block))) {
-            // Space in the head block -- insert here
-            self.writeEntry(data, bh.count, entry);
+        if (bh.count < @as(u16, @intCast(self.capacityFor(bh.entry_format)))) {
+            // Space in the head block -- insert at the BLOCK's stride/format
+            // (a v2 head block persists entry.public_id; a v1 head block
+            // stores the 24 B prefix).
+            self.writeEntry(data, bh.count, entry, bh.entry_format);
             bh.count += 1;
-            bh.payload_size = @intCast(@as(u32, bh.count) * ENTRY_SIZE);
+            bh.payload_size = @intCast(@as(u32, bh.count) * edge_mod.entrySize(bh.entry_format));
             self.writeBlockHeader(data, bh);
             self.buffer_pool.unpin(frame_idx, true);
             return head_page;
@@ -106,11 +122,11 @@ pub const AdjStore = struct {
             .next_block = head_page,
             .count = 1,
             .kind = 0,
-            ._reserved = 0,
-            .payload_size = ENTRY_SIZE,
+            .entry_format = edge_mod.ENTRY_FORMAT_V1,
+            .payload_size = @intCast(edge_mod.entrySize(edge_mod.ENTRY_FORMAT_V1)),
             .checksum = 0,
         });
-        self.writeEntry(new_data, 0, entry);
+        self.writeEntry(new_data, 0, entry, edge_mod.ENTRY_FORMAT_V1);
         self.buffer_pool.unpin(new_frame_idx, true);
         return new_page;
     }
@@ -131,15 +147,17 @@ pub const AdjStore = struct {
 
             var i: u16 = 0;
             while (i < bh.count) : (i += 1) {
-                const e = self.readEntry(data, i);
+                const e = self.readEntry(data, i, bh.entry_format);
                 if (e.edge_id == edge_id) {
-                    // Found it: swap with last entry and decrement count
+                    // Found it: swap with last entry and decrement count.
+                    // Same-block move at the block's own stride, so a v2
+                    // mover keeps its public_id.
                     if (i < bh.count - 1) {
-                        const last = self.readEntry(data, bh.count - 1);
-                        self.writeEntry(data, i, last);
+                        const last = self.readEntry(data, bh.count - 1, bh.entry_format);
+                        self.writeEntry(data, i, last, bh.entry_format);
                     }
                     bh.count -= 1;
-                    bh.payload_size = @intCast(@as(u32, bh.count) * ENTRY_SIZE);
+                    bh.payload_size = @intCast(@as(u32, bh.count) * edge_mod.entrySize(bh.entry_format));
                     self.writeBlockHeader(data, bh);
                     self.buffer_pool.unpin(frame_idx, true);
                     return;
@@ -181,7 +199,7 @@ pub const AdjStore = struct {
                 const bh = try self.store.readBlockHeader(data);
 
                 while (self.current_index < bh.count) {
-                    const entry = self.store.readEntry(data, self.current_index);
+                    const entry = self.store.readEntry(data, self.current_index, bh.entry_format);
                     self.current_index += 1;
 
                     if (self.rel_type) |rt| {
@@ -230,14 +248,17 @@ pub const AdjStore = struct {
 
             var i: u16 = 0;
             while (i < bh.count) : (i += 1) {
-                const e = self.readEntry(data, i);
+                const e = self.readEntry(data, i, bh.entry_format);
                 if (e.edge_id == edge_id) {
+                    // In-place rewrite at the block's own format; public_id
+                    // is preserved (v2) or remains absent on disk (v1).
                     self.writeEntry(data, i, .{
                         .neighbor = e.neighbor,
                         .edge_id = e.edge_id,
                         .rel_type = e.rel_type,
                         .prop_head = new_prop_head,
-                    });
+                        .public_id = e.public_id,
+                    }, bh.entry_format);
                     self.buffer_pool.unpin(frame_idx, true);
                     return true;
                 }
@@ -279,15 +300,18 @@ pub const AdjStore = struct {
         return PAGE_HEADER_SIZE;
     }
 
-    fn entryOffset(self: *const AdjStore, slot: u16) u32 {
-        return self.blockHeaderOffset() + BLOCK_HEADER_SIZE + @as(u32, slot) * ENTRY_SIZE;
+    fn entryOffset(self: *const AdjStore, slot: u16, entry_format: u8) u32 {
+        return self.blockHeaderOffset() + BLOCK_HEADER_SIZE + @as(u32, slot) * edge_mod.entrySize(entry_format);
     }
 
     fn readBlockHeader(self: *const AdjStore, data: []u8) error{DataCorruption}!EdgeBlockHeader {
         const off = self.blockHeaderOffset();
         const bytes = data[off..][0..BLOCK_HEADER_SIZE];
         const bh: EdgeBlockHeader = @bitCast(bytes.*);
-        if (bh.count > @as(u16, @intCast(self.entries_per_block))) return error.DataCorruption;
+        // Unknown entry formats are corruption — reject loudly, never parse
+        // entries at a guessed stride (GAP-ENT-0024 unguarded-consumer hazard).
+        if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return error.DataCorruption;
+        if (bh.count > @as(u16, @intCast(self.capacityFor(bh.entry_format)))) return error.DataCorruption;
         return bh;
     }
 
@@ -297,16 +321,27 @@ pub const AdjStore = struct {
         @memcpy(data[off..][0..BLOCK_HEADER_SIZE], bytes);
     }
 
-    fn readEntry(self: *const AdjStore, data: []u8, slot: u16) EdgeEntry {
-        const off = self.entryOffset(slot);
-        const bytes = data[off..][0..ENTRY_SIZE];
-        return @bitCast(bytes.*);
+    /// Parse one entry at the given block format. A v1 record is exactly the
+    /// 24-byte prefix of `EdgeEntry`; its `public_id` surfaces as 0.
+    fn readEntry(self: *const AdjStore, data: []u8, slot: u16, entry_format: u8) EdgeEntry {
+        const off = self.entryOffset(slot, entry_format);
+        if (entry_format == edge_mod.ENTRY_FORMAT_V2) {
+            const bytes = data[off..][0..edge_mod.ENTRY_SIZE_V2];
+            return @bitCast(bytes.*);
+        }
+        var entry = EdgeEntry{ .neighbor = 0, .edge_id = 0, .rel_type = 0, .prop_head = 0, .public_id = 0 };
+        @memcpy(std.mem.asBytes(&entry)[0..edge_mod.ENTRY_SIZE_V1], data[off..][0..edge_mod.ENTRY_SIZE_V1]);
+        return entry;
     }
 
-    fn writeEntry(self: *const AdjStore, data: []u8, slot: u16, entry: EdgeEntry) void {
-        const off = self.entryOffset(slot);
-        const bytes: *const [ENTRY_SIZE]u8 = @ptrCast(&entry);
-        @memcpy(data[off..][0..ENTRY_SIZE], bytes);
+    /// Write one entry at the given block format. Writing v1 stores only the
+    /// 24-byte prefix — the entry's `public_id` is dropped (legacy blocks
+    /// cannot carry it; P2's writer allocates a v2 block instead of ever
+    /// silently truncating a real public id into a v1 tail).
+    fn writeEntry(self: *const AdjStore, data: []u8, slot: u16, entry: EdgeEntry, entry_format: u8) void {
+        const off = self.entryOffset(slot, entry_format);
+        const size = edge_mod.entrySize(entry_format);
+        @memcpy(data[off..][0..size], std.mem.asBytes(&entry)[0..size]);
     }
 };
 

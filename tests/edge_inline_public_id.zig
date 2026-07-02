@@ -181,6 +181,335 @@ test "GAP edge-inline-public-id P0 baseline: legacy id-property parity oracle + 
     for (made) |m| try testing.expect(m.seen);
 }
 
+// ============================================================================
+// P1 — v2 EdgeEntry read path (block-granular read-both).
+//
+// EdgeBlockHeader's former `_reserved` byte (always written 0 by every block
+// creation site since the format's birth) becomes `entry_format`:
+//   0 = v1: 24 B entries (neighbor u64, edge_id u64, rel_type u32, prop_head u32)
+//   1 = v2: 32 B entries (+ public_id u64)
+// Readers parse BOTH formats per block; v1 entries surface `public_id = 0`.
+// Writers are UNCHANGED in P1 (new blocks are still v1) — the tests below
+// hand-construct raw v1/v2 block bytes independently of the production
+// writer so they stay an oracle for it.
+// ============================================================================
+
+const edge_mod = gs.edge;
+const AdjStore = gs.adj_store.AdjStore;
+const BufferPool = gs.buffer_pool.BufferPool;
+const FreeSpaceManager = gs.free_space.FreeSpaceManager;
+const PAGE_HEADER_SIZE = edge_mod.PAGE_HEADER_SIZE;
+
+const ADJ_PAGE_SIZE: u32 = 4096;
+
+/// Raw edge tuple for hand-built blocks.
+const RawEdge = struct {
+    neighbor: u64,
+    edge_id: u64,
+    rel_type: u32,
+    prop_head: u32 = 0,
+    public_id: u64 = 0,
+};
+
+/// Hand-write one adjacency block page with raw bytes: EdgeBlockHeader at
+/// PAGE_HEADER_SIZE, then `entries` at the format's stride. Deliberately does
+/// NOT go through AdjStore's writer — this is the on-disk-format oracle.
+/// Byte layout (little-endian, matching the extern-struct layout on x86-64):
+///   +0  next_block  u64
+///   +8  count       u16
+///   +10 kind        u8
+///   +11 entry_format u8   (0 = v1/24 B, 1 = v2/32 B)
+///   +12 payload_size u16
+///   +14 checksum    u16
+fn writeRawBlock(
+    pool: *BufferPool,
+    fsm: *FreeSpaceManager,
+    entry_format: u8,
+    entries: []const RawEdge,
+    next_block: u64,
+) !u64 {
+    const page_id = try fsm.allocPage();
+    const frame = try pool.pinNew(.adj_out, page_id);
+    const frame_idx = pool.frameIndex(frame);
+    const data = frame.dataSlice();
+
+    const esz: usize = if (entry_format == 1) 32 else 24;
+    const off: usize = PAGE_HEADER_SIZE;
+    std.mem.writeInt(u64, data[off..][0..8], next_block, .little);
+    std.mem.writeInt(u16, data[off + 8 ..][0..2], @intCast(entries.len), .little);
+    data[off + 10] = 0; // kind: mixed
+    data[off + 11] = entry_format;
+    std.mem.writeInt(u16, data[off + 12 ..][0..2], @intCast(entries.len * esz), .little);
+    std.mem.writeInt(u16, data[off + 14 ..][0..2], 0, .little); // checksum (unused)
+
+    var eoff: usize = off + 16;
+    for (entries) |e| {
+        std.mem.writeInt(u64, data[eoff..][0..8], e.neighbor, .little);
+        std.mem.writeInt(u64, data[eoff + 8 ..][0..8], e.edge_id, .little);
+        std.mem.writeInt(u32, data[eoff + 16 ..][0..4], e.rel_type, .little);
+        std.mem.writeInt(u32, data[eoff + 20 ..][0..4], e.prop_head, .little);
+        if (entry_format == 1) {
+            std.mem.writeInt(u64, data[eoff + 24 ..][0..8], e.public_id, .little);
+        }
+        eoff += esz;
+    }
+
+    pool.unpin(frame_idx, true);
+    return page_id;
+}
+
+/// Drain an AdjStore chain into a caller-owned slice.
+fn drainChain(store: *AdjStore, head: u64, allocator: Allocator) ![]edge_mod.EdgeEntry {
+    var it = store.expand(head, null);
+    defer it.deinit();
+    var list: std.ArrayList(edge_mod.EdgeEntry) = .empty;
+    errdefer list.deinit(allocator);
+    while (try it.next()) |e| try list.append(allocator, e);
+    return list.toOwnedSlice(allocator);
+}
+
+const AdjEnv = struct {
+    base: test_support.SingleStoreEnv,
+
+    fn init() !AdjEnv {
+        return .{ .base = try test_support.SingleStoreEnv.init(
+            testing.allocator,
+            .adj_out,
+            "adj_out.store",
+            ADJ_PAGE_SIZE,
+            32,
+        ) };
+    }
+
+    /// Must run AFTER the env struct has reached its final address.
+    fn fixup(self: *AdjEnv) void {
+        self.base.register();
+    }
+
+    fn store(self: *AdjEnv) AdjStore {
+        return AdjStore.init(&self.base.pool, &self.base.fsm, .adj_out, ADJ_PAGE_SIZE);
+    }
+
+    fn deinit(self: *AdjEnv) void {
+        self.base.deinit();
+    }
+};
+
+test "P1: hand-built v1 block enumerates correctly with public_id=0" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    const raw = [_]RawEdge{
+        .{ .neighbor = 10, .edge_id = 1, .rel_type = 5, .prop_head = 7 },
+        .{ .neighbor = 20, .edge_id = 2, .rel_type = 5 },
+        .{ .neighbor = 30, .edge_id = 3, .rel_type = 6 },
+    };
+    const head = try writeRawBlock(&env.base.pool, &env.base.fsm, 0, &raw, 0);
+
+    const got = try drainChain(&store, head, testing.allocator);
+    defer testing.allocator.free(got);
+
+    try testing.expectEqual(@as(usize, 3), got.len);
+    for (got, raw) |g, r| {
+        try testing.expectEqual(r.neighbor, g.neighbor);
+        try testing.expectEqual(r.edge_id, g.edge_id);
+        try testing.expectEqual(r.rel_type, g.rel_type);
+        try testing.expectEqual(r.prop_head, g.prop_head);
+        // v1 blocks carry no public_id: readers must surface 0.
+        try testing.expectEqual(@as(u64, 0), g.public_id);
+    }
+    try testing.expectEqual(@as(u64, 3), try store.edgeCount(head));
+}
+
+test "P1: hand-built v2 block enumerates correctly with stored public_ids" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    const raw = [_]RawEdge{
+        .{ .neighbor = 11, .edge_id = 101, .rel_type = 5, .prop_head = 9, .public_id = 0xDEAD_BEEF_0000_0001 },
+        .{ .neighbor = 22, .edge_id = 102, .rel_type = 5, .public_id = 0xDEAD_BEEF_0000_0002 },
+        .{ .neighbor = 33, .edge_id = 103, .rel_type = 6, .public_id = std.math.maxInt(u64) },
+    };
+    const head = try writeRawBlock(&env.base.pool, &env.base.fsm, 1, &raw, 0);
+
+    const got = try drainChain(&store, head, testing.allocator);
+    defer testing.allocator.free(got);
+
+    try testing.expectEqual(@as(usize, 3), got.len);
+    for (got, raw) |g, r| {
+        try testing.expectEqual(r.neighbor, g.neighbor);
+        try testing.expectEqual(r.edge_id, g.edge_id);
+        try testing.expectEqual(r.rel_type, g.rel_type);
+        try testing.expectEqual(r.prop_head, g.prop_head);
+        try testing.expectEqual(r.public_id, g.public_id);
+    }
+    try testing.expectEqual(@as(u64, 3), try store.edgeCount(head));
+
+    // rel_type filtering still works on v2 blocks.
+    var it = store.expand(head, 6);
+    defer it.deinit();
+    const only = (try it.next()).?;
+    try testing.expectEqual(@as(u64, 103), only.edge_id);
+    try testing.expectEqual(std.math.maxInt(u64), only.public_id);
+    try testing.expectEqual(@as(?edge_mod.EdgeEntry, null), try it.next());
+}
+
+test "P1: mixed chain (v2 head -> v1 overflow) enumerates across the format boundary" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    // Old v1 block deeper in the chain (legacy data)...
+    const v1_raw = [_]RawEdge{
+        .{ .neighbor = 10, .edge_id = 1, .rel_type = 5 },
+        .{ .neighbor = 20, .edge_id = 2, .rel_type = 5 },
+        .{ .neighbor = 30, .edge_id = 3, .rel_type = 5 },
+    };
+    const v1_page = try writeRawBlock(&env.base.pool, &env.base.fsm, 0, &v1_raw, 0);
+
+    // ...chained from a newer v2 head block (head-insert order).
+    const v2_raw = [_]RawEdge{
+        .{ .neighbor = 44, .edge_id = 204, .rel_type = 5, .public_id = 0xAA00_0000_0000_0004 },
+        .{ .neighbor = 55, .edge_id = 205, .rel_type = 5, .public_id = 0xAA00_0000_0000_0005 },
+    };
+    const head = try writeRawBlock(&env.base.pool, &env.base.fsm, 1, &v2_raw, v1_page);
+
+    const got = try drainChain(&store, head, testing.allocator);
+    defer testing.allocator.free(got);
+
+    // Head block first (v2, ids surface), then the v1 tail (ids 0).
+    try testing.expectEqual(@as(usize, 5), got.len);
+    try testing.expectEqual(@as(u64, 204), got[0].edge_id);
+    try testing.expectEqual(@as(u64, 0xAA00_0000_0000_0004), got[0].public_id);
+    try testing.expectEqual(@as(u64, 205), got[1].edge_id);
+    try testing.expectEqual(@as(u64, 0xAA00_0000_0000_0005), got[1].public_id);
+    for (got[2..], v1_raw) |g, r| {
+        try testing.expectEqual(r.edge_id, g.edge_id);
+        try testing.expectEqual(r.neighbor, g.neighbor);
+        try testing.expectEqual(@as(u64, 0), g.public_id);
+    }
+    try testing.expectEqual(@as(u64, 5), try store.edgeCount(head));
+}
+
+test "P1: updateEdgePropHead + removeEdge on a v2 block preserve public_ids" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    const raw = [_]RawEdge{
+        .{ .neighbor = 11, .edge_id = 101, .rel_type = 5, .public_id = 0xB001 },
+        .{ .neighbor = 22, .edge_id = 102, .rel_type = 5, .public_id = 0xB002 },
+        .{ .neighbor = 33, .edge_id = 103, .rel_type = 5, .public_id = 0xB003 },
+    };
+    const head = try writeRawBlock(&env.base.pool, &env.base.fsm, 1, &raw, 0);
+
+    // In-place prop_head update must keep the entry's public_id intact.
+    try testing.expect(try store.updateEdgePropHead(head, 102, 42));
+    {
+        const got = try drainChain(&store, head, testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqual(@as(usize, 3), got.len);
+        for (got) |g| {
+            if (g.edge_id == 102) {
+                try testing.expectEqual(@as(u32, 42), g.prop_head);
+                try testing.expectEqual(@as(u64, 0xB002), g.public_id);
+            }
+        }
+    }
+
+    // Swap-remove of the FIRST entry moves the last entry (v2 stride) into
+    // its slot — the mover's public_id must ride along.
+    try store.removeEdge(head, 101);
+    {
+        const got = try drainChain(&store, head, testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqual(@as(usize, 2), got.len);
+        for (got) |g| {
+            switch (g.edge_id) {
+                102 => try testing.expectEqual(@as(u64, 0xB002), g.public_id),
+                103 => try testing.expectEqual(@as(u64, 0xB003), g.public_id),
+                else => return error.UnexpectedEdge,
+            }
+        }
+    }
+}
+
+test "P1: addEdge append into an existing v2 block writes the v2 stride (public_id round-trips)" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    const raw = [_]RawEdge{
+        .{ .neighbor = 11, .edge_id = 101, .rel_type = 5, .public_id = 0xC001 },
+    };
+    const head = try writeRawBlock(&env.base.pool, &env.base.fsm, 1, &raw, 0);
+
+    // Append through the production writer: the block is v2, so the entry is
+    // written at the 32 B stride and its public_id persists.
+    const new_head = try store.addEdge(head, .{
+        .neighbor = 22,
+        .edge_id = 102,
+        .rel_type = 5,
+        .prop_head = 0,
+        .public_id = 0xC002,
+    });
+    try testing.expectEqual(head, new_head); // space in the head block
+
+    const got = try drainChain(&store, head, testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(u64, 0xC001), got[0].public_id);
+    try testing.expectEqual(@as(u64, 0xC002), got[1].public_id);
+}
+
+test "P1: writers unchanged — fresh blocks are still v1 and drop public_id (P2 flips this)" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    // New chain through the production writer: block is created v1 (the
+    // legacy zero-init byte), so a caller-supplied public_id is NOT stored
+    // yet. This pins P1's "read-both only" scope; the P2 write path replaces
+    // this expectation with round-tripping.
+    const head = try store.addEdge(0, .{
+        .neighbor = 10,
+        .edge_id = 1,
+        .rel_type = 5,
+        .prop_head = 0,
+        .public_id = 77,
+    });
+
+    const got = try drainChain(&store, head, testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(@as(u64, 1), got[0].edge_id);
+    try testing.expectEqual(@as(u64, 0), got[0].public_id);
+}
+
+test "P1: unknown entry_format is rejected as corruption, never misparsed" {
+    var env = try AdjEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = env.store();
+
+    const raw = [_]RawEdge{
+        .{ .neighbor = 10, .edge_id = 1, .rel_type = 5 },
+    };
+    const head = try writeRawBlock(&env.base.pool, &env.base.fsm, 2, &raw, 0);
+
+    var it = store.expand(head, null);
+    defer it.deinit();
+    try testing.expectError(error.DataCorruption, it.next());
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
