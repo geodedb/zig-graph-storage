@@ -581,6 +581,19 @@ fn addIntegrationTests(
     const run_label_crash_replay = b.addRunArtifact(label_crash_replay_tests);
     label_crash_replay_step.dependOn(&run_label_crash_replay.step);
 
+    // Edge-prop-head WAL under-logging — setEdgeProperty rewrites prop_heads
+    // in-place in possibly NON-HEAD adjacency blocks of BOTH chains; the
+    // mutated pages must be WAL-imaged in the SAME txn as the property
+    // write or the committed property silently vanishes on crash replay.
+    const edge_prop_crash_step = b.step("test-edge-prop-crash", "Run edge-property crash tests: committed setEdgeProperty on non-head adjacency blocks (both directions) survives WAL replay, incl. older-image resurrection in the same tail");
+    const edge_prop_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_prop_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_prop_crash = b.addRunArtifact(edge_prop_crash_tests);
+    edge_prop_crash_step.dependOn(&run_edge_prop_crash.step);
+
     // GAP warm-reopen P1 — mmap-adopted edge-index snapshots (GSEIDX4/GSXIDX2):
     // clean-reopen adopt, checkpoint merge (base + overlay - tombstones),
     // dirty-gate no-op persist, crash-rebuild via counter gate, corrupt/
@@ -625,6 +638,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_wal_recovery_counters.step);
     // Label WAL-imaging crash guards likewise.
     integration_step.dependOn(&run_label_crash_replay.step);
+    // Edge-prop-head under-logging crash guards likewise.
+    integration_step.dependOn(&run_edge_prop_crash.step);
 }
 
 fn addExample(

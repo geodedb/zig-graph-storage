@@ -38,12 +38,25 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
     const found_prop_head = edge_entry.prop_head;
 
+    // Edge-prop-head WAL imaging: ONE txn spans the property write AND the
+    // in-place adjacency prop_head rewrites below. The old shape committed
+    // the property pages in their own auto-commit txn and then mutated the
+    // adjacency blocks with NO WAL imaging at all — on crash replay the
+    // property chain came back but nothing referenced it (the entry's
+    // prop_head replayed from the checkpoint image, or from an OLDER image
+    // of the same block written when the edge was added), silently losing
+    // the committed property. Same under-logging class as the edge-remove
+    // non-head fix: image exactly the page each rewrite mutated, in the
+    // SAME txn, so replay is all-or-nothing.
+    const txn = try engine.txn_manager.begin();
+    errdefer engine.txn_manager.abort(txn) catch {};
+
     // 3. Write property, get new prop_head.
     //    GAP prop-store slab packing (P5): edge property chains are
     //    LEGACY-ONLY. The head is packed as u32 below (adjacency entries +
     //    edge index), which cannot represent a slab head (tag bit 63), so
     //    slab allocation is gated off for this owner class.
-    const new_head_u64 = try engine.putPropertyLegacy(@as(u64, found_prop_head), key, value);
+    const new_head_u64 = try engine.putPropertyLegacyTxn(@as(u64, found_prop_head), key, value, txn);
     // Loud invariant guard: a slab-encoded head must never reach the u32
     // packing. Unreachable via the legacy-only put above; fails hard (never
     // truncates) if the gate is ever bypassed.
@@ -59,9 +72,16 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     //    which only ever touched one engine). `to` is not resident here, so we do
     //    NOT read its NodeRec.
     if (new_head != found_prop_head) {
-        _ = try engine.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head);
+        // The entry may live in ANY block of either chain (not just the
+        // head); AdjStore reports the exact PageId it mutated and that page
+        // is WAL-imaged under the spanning txn.
+        if (try engine.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head)) |p| {
+            try engine.logPagePublic(txn, .adj_out, p);
+        }
         const in_head = try engine.in_head_dir.getHead(to);
-        _ = try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head);
+        if (try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head)) |p| {
+            try engine.logPagePublic(txn, .in_idx, p);
+        }
 
         // Keep edge index prop_head in sync (no-op if the edge is absent).
         // GAP warm-reopen P1: a base-resident entry is copied into the overlay
@@ -75,6 +95,8 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
         // (blessed-stale, the 0018-class silent-loss shape).
         engine.edge_index_dirty = true;
     }
+
+    try engine.txn_manager.commit(txn);
 
     if (found_prop_head != 0 and found_prop_head != new_head) {
         engine.property_index.removeChain(found_prop_head);

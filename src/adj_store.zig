@@ -232,9 +232,14 @@ pub const AdjStore = struct {
 
     /// Update the prop_head of an existing edge entry in the adjacency chain.
     /// Scans the chain starting at head_page for the given edge_id.
-    /// Returns true if found and updated, false if edge not found.
-    pub fn updateEdgePropHead(self: *AdjStore, head_page: PageId, edge_id: EdgeId, new_prop_head: u32) !bool {
-        if (head_page == 0) return false;
+    ///
+    /// Returns the PageId of the block that was MUTATED (which may be any
+    /// block of the chain, not just the head) so the caller can WAL-image
+    /// exactly that page in the same txn as the property write — the same
+    /// contract as `removeEdge` (edge-remove non-head imaging fix). Returns
+    /// null when the edge was not found (no page touched, nothing to log).
+    pub fn updateEdgePropHead(self: *AdjStore, head_page: PageId, edge_id: EdgeId, new_prop_head: u32) !?PageId {
+        if (head_page == 0) return null;
 
         var current_page = head_page;
         var hops: u32 = 0;
@@ -259,7 +264,7 @@ pub const AdjStore = struct {
                         .public_id = e.public_id,
                     }, bh.entry_format);
                     self.buffer_pool.unpin(frame_idx, true);
-                    return true;
+                    return current_page;
                 }
             }
 
@@ -267,7 +272,7 @@ pub const AdjStore = struct {
             self.buffer_pool.unpin(frame_idx, false);
             current_page = next;
         }
-        return false;
+        return null;
     }
 
     /// Count edges in the adjacency list.
@@ -570,9 +575,10 @@ test "updateEdgePropHead updates matching edge" {
     head = try store.addEdge(head, makeEdge(20, 2, 5));
     head = try store.addEdge(head, makeEdge(30, 3, 5));
 
-    // Update prop_head for edge_id=2
-    const found = try store.updateEdgePropHead(head, 2, 42);
-    try testing.expect(found);
+    // Update prop_head for edge_id=2 — the mutated page is the (single)
+    // head block, and the caller gets it back for WAL imaging.
+    const mutated = try store.updateEdgePropHead(head, 2, 42);
+    try testing.expectEqual(@as(?PageId, head), mutated);
 
     // Verify via expand
     var iter = store.expand(head, null);
@@ -587,7 +593,7 @@ test "updateEdgePropHead updates matching edge" {
     }
 }
 
-test "updateEdgePropHead returns false for missing edge" {
+test "updateEdgePropHead returns null for missing edge" {
     var env = try TestEnv.init();
     env.fixup();
     defer env.deinit();
@@ -597,19 +603,19 @@ test "updateEdgePropHead returns false for missing edge" {
     var head: PageId = 0;
     head = try store.addEdge(head, makeEdge(10, 1, 5));
 
-    const found = try store.updateEdgePropHead(head, 999, 42);
-    try testing.expect(!found);
+    const mutated = try store.updateEdgePropHead(head, 999, 42);
+    try testing.expectEqual(@as(?PageId, null), mutated);
 }
 
-test "updateEdgePropHead on empty list returns false" {
+test "updateEdgePropHead on empty list returns null" {
     var env = try TestEnv.init();
     env.fixup();
     defer env.deinit();
 
     var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
 
-    const found = try store.updateEdgePropHead(0, 1, 42);
-    try testing.expect(!found);
+    const mutated = try store.updateEdgePropHead(0, 1, 42);
+    try testing.expectEqual(@as(?PageId, null), mutated);
 }
 
 test "edgeCount on empty list returns 0" {

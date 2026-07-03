@@ -417,8 +417,9 @@ test "P1: updateEdgePropHead + removeEdge on a v2 block preserve public_ids" {
     };
     const head = try writeRawBlock(&env.base.pool, &env.base.fsm, 1, &raw, 0);
 
-    // In-place prop_head update must keep the entry's public_id intact.
-    try testing.expect(try store.updateEdgePropHead(head, 102, 42));
+    // In-place prop_head update must keep the entry's public_id intact
+    // (updateEdgePropHead now reports the mutated PageId for WAL imaging).
+    try testing.expectEqual(@as(?u64, head), try store.updateEdgePropHead(head, 102, 42));
     {
         const got = try drainChain(&store, head, testing.allocator);
         defer testing.allocator.free(got);
