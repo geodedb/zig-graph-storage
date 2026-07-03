@@ -289,8 +289,24 @@ test "QUAL-0044 T4: prop_store page-directory reader never panics on random page
     var vs = VarStore.init(&base.pool, &base.fsm, 4096);
     var store = PropStore.init(&base.pool, &base.fsm, &vs, 4096);
 
-    // Create one real property page to get a valid page id.
+    // Create one real property chain to get a valid head.
+    //
+    // Since the v0.2.24 slab migration, putProperty returns a TAGGED slab
+    // ref (bit 63 | 39-bit page id | 24-bit slot) for new chains — not a
+    // raw page id. Treating that tagged head as a PageId is exactly the
+    // hostile-page-id class GAP-0031(a) guards against: bit 63 makes the
+    // pager's `page_id * page_size` byte-offset multiply overflow u64,
+    // which panicked in Debug (the original T4 crash) and wrapped to a
+    // bogus offset in ReleaseFast. Assert the pager now rejects it loudly.
     const head = try store.putProperty(0, "seed_key", .{ .int = 1 });
+    if (gs.prop_store.isSlabHead(head)) {
+        try std.testing.expectError(error.InvalidPageId, base.pool.pin(.props, head));
+    }
+    // The on-disk page that actually backs the chain head (slab-aware).
+    const head_page: u64 = if (gs.prop_store.isSlabHead(head))
+        gs.prop_store.slabPageId(head)
+    else
+        head;
 
     var prng = std.Random.DefaultPrng.init(FUZZ_SEED ^ 0x4444);
     const rng = prng.random();
@@ -304,7 +320,7 @@ test "QUAL-0044 T4: prop_store page-directory reader never panics on random page
         // Overwrite the page with random bytes, then call getProperty.
         // The reader must handle any garbage gracefully.
         {
-            const frame = try base.pool.pin(.props, head);
+            const frame = try base.pool.pin(.props, head_page);
             const frame_idx = base.pool.frameIndex(frame);
             rng.bytes(frame.dataSlice());
             base.pool.unpin(frame_idx, true);
