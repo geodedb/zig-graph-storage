@@ -168,3 +168,100 @@ test "SEC-0041: full open fails closed on a corrupted cross-shard record" {
 // prepare, and edges are now single-shard (no such record is ever emitted). The
 // reconciler's streaming fail-closed behavior on forged records remains covered
 // by the SEC-0041 tests above.
+
+test "M1: reconciled legacy 2PC edge id is never re-issued by post-open edge creates" {
+    // A LEGACY (pre-co-location) dangling prepared cross-shard edge carries an
+    // edge id allocated by the old 2PC path. The reconciler re-applies that
+    // edge AFTER the per-shard counter heal — the heal cannot see it (the
+    // prepare payload is not a committed page image), so `payload.edge_id` can
+    // sit ABOVE the healed next_edge_id. Without a post-reconcile counter
+    // bump, allocEdge later re-issues exactly that id and the edge_index put
+    // silently overwrites the reconciled edge.
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x86} ** 16;
+    const cfg = test_support.testConfig();
+    const stride: u64 = @intCast(graph_storage.shard_count.SHARD_COUNT);
+
+    var from: u64 = 0;
+    var to: u64 = 0;
+    var reconciled_eid: u64 = 0;
+    const gid: u64 = 0xBEEF_0001;
+
+    {
+        var eng = try graph_storage.ShardedGraphEngine.create(
+            testing.allocator,
+            td.path,
+            uuid,
+            cfg,
+        );
+        errdefer eng.close() catch {};
+
+        from = try eng.shards[0].allocNode(); // source shard 0
+        to = try eng.shards[5].allocNode(); // target shard 5
+        try eng.putNode(from, test_support.emptyNode(1));
+        try eng.putNode(to, test_support.emptyNode(1));
+        // Durable baseline: the WAL tail below holds NO committed edge page
+        // images, so the per-shard heal leaves next_edge_id at this value.
+        try eng.checkpoint();
+
+        // Dangling edge id: in shard 0's residue class, several strides ABOVE
+        // the (checkpoint-durable, heal-invisible) counter.
+        reconciled_eid = eng.shards[0].manifest.next_edge_id + stride * 4;
+
+        // Legacy 2PC shape: prepare on source (shard 0) + prepare on target
+        // (shard 5) + COMMIT decision logged only by the peer — the source
+        // crashed before its local decision, leaving its prepare dangling.
+        var prep_src: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
+        two_pc.encodePreparePayload(&prep_src, gid, .source, 5, reconciled_eid, from, to, 1);
+        _ = try two_pc.appendPrepare(eng.shards[0], prep_src, 41);
+        var prep_tgt: [two_pc.PREPARE_PAYLOAD_SIZE]u8 = undefined;
+        two_pc.encodePreparePayload(&prep_tgt, gid, .target, 0, reconciled_eid, from, to, 1);
+        _ = try two_pc.appendPrepare(eng.shards[5], prep_tgt, 42);
+        _ = try two_pc.appendDecision(eng.shards[5], .cross_shard_commit, gid, 42);
+
+        // SIMULATED CRASH.
+        eng.deinit();
+    }
+
+    var eng = try graph_storage.ShardedGraphEngine.open(
+        testing.allocator,
+        td.path,
+        uuid,
+        cfg,
+    );
+    defer eng.close() catch {};
+
+    // The reconciler re-applied the committed dangling edge (legacy record:
+    // public_id 0 by construction).
+    const got = (try eng.getEdge(reconciled_eid)) orelse return error.ReconciledEdgeMissing;
+    try testing.expectEqual(to, got.neighbor);
+    try testing.expectEqual(@as(u64, 0), got.public_id);
+
+    // Counter bumped ABOVE the reconciled id, residue class preserved.
+    if (eng.shards[0].manifest.next_edge_id <= reconciled_eid) {
+        std.debug.print(
+            "shard 0 next_edge_id {d} not raised above reconciled legacy edge id {d} — the id WILL be re-issued\n",
+            .{ eng.shards[0].manifest.next_edge_id, reconciled_eid },
+        );
+    }
+    try testing.expect(eng.shards[0].manifest.next_edge_id > reconciled_eid);
+    try testing.expectEqual(reconciled_eid % stride, eng.shards[0].manifest.next_edge_id % stride);
+
+    // Aggressive creates through the normal edge-id path: more strides than
+    // the gap between the healed counter and the reconciled id, so a missing
+    // bump MUST collide.
+    for (0..8) |i| {
+        const eid = try eng.addEdgeColocatedWithPublicId(from, to, 1, 0xAB00_0000 | @as(u64, @intCast(i + 1)));
+        if (eid == reconciled_eid) {
+            std.debug.print("allocEdge RE-ISSUED reconciled legacy edge id {d}\n", .{eid});
+            return error.EdgeSlotReissued;
+        }
+    }
+
+    // The reconciled edge is still byte-intact — a collision would have
+    // overwritten its edge_index entry with a nonzero public id.
+    const after = (try eng.getEdge(reconciled_eid)) orelse return error.ReconciledEdgeLost;
+    try testing.expectEqual(@as(u64, 0), after.public_id);
+    try testing.expectEqual(to, after.neighbor);
+}

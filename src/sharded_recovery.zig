@@ -148,6 +148,22 @@ pub fn reconcilePendingPrepares(self: *ShardedGraphEngine) !ReconcileStats {
             const committed = (st & 0b010) != 0;
             const aborted = (st & 0b100) != 0;
             if (committed and !aborted) {
+                // M1: the legacy prepare's edge id was minted by the OLD 2PC
+                // path and is invisible to the per-shard counter heal (a
+                // prepare payload is not a committed page image), so it can
+                // sit ABOVE the healed next_edge_id — allocEdge would later
+                // re-issue exactly that id and the edge_index put would
+                // silently overwrite the reconciled edge. Raise the counter
+                // above it BEFORE anything can allocate. Applies even when
+                // the adjacency itself proved durable (the early idempotence
+                // return below): durable adjacency does not imply a durable
+                // counter. Persistence rides the same discipline as the
+                // `edge_count += 1` below: the in-memory manifest reaches
+                // disk at the next checkpoint, whose manifest write precedes
+                // the WAL truncation that retires this prepare — any crash
+                // before that re-runs reconciliation and recomputes the bump
+                // idempotently.
+                bumpEdgeCounterAboveReconciled(eng, payload.edge_id);
                 // Always attempt to replay adjacency: the check inside
                 // replayAdjacencyIfNeeded is idempotent (source uses
                 // edge_index.contains; target re-applies adj_in which is
@@ -174,6 +190,24 @@ pub fn reconcilePendingPrepares(self: *ShardedGraphEngine) !ReconcileStats {
         }
     }
     return stats;
+}
+
+/// M1: ensure this shard's edge-id allocator can never re-issue a reconciled
+/// legacy 2PC edge id. Only ids in the shard's OWN residue class can ever be
+/// minted here (allocEdge advances by the stride within the class), so a
+/// foreign-residue payload id — the target-role case, whose edge id was
+/// allocated on the source shard — needs (and gets) no bump.
+fn bumpEdgeCounterAboveReconciled(eng: *GraphEngine, edge_id: u64) void {
+    const stride: u64 = if (eng.config.base_shard_index != null)
+        @intCast(sharded_engine.SHARD_COUNT)
+    else
+        1;
+    // The current counter is the authoritative carrier of the shard's residue
+    // class (allocEdge preserves it; the per-shard heal preserves it per I1).
+    if (edge_id % stride != eng.manifest.next_edge_id % stride) return;
+    if (eng.manifest.next_edge_id <= edge_id) {
+        eng.manifest.next_edge_id = edge_id + stride;
+    }
 }
 
 fn replayAdjacencyIfNeeded(

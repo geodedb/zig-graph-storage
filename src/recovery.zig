@@ -91,6 +91,18 @@ pub const Recovery = struct {
     /// the shard's residue, so `max + stride` preserves it). Set by the
     /// engine open path before `recover` runs.
     id_stride: u64 = 1,
+    /// The shard's residue class mod `id_stride` (0 for a standalone
+    /// engine). Every id this shard's allocator ever mints is ≡ this value,
+    /// so the harvest FILTERS on it: a LEGACY pre-co-location `.adj_in`
+    /// image can carry edge ids allocated on the SOURCE shard (a foreign
+    /// residue class); healing from one would move `next_edge_id` into the
+    /// foreign class permanently and `shardOfNode(edge_id)` routing would
+    /// misroute every edge subsequently created here (silent getEdge loss).
+    /// Foreign-residue ids are owned — and healed — by their owning shard's
+    /// own images, so skipping them here is exact, not lossy. The same
+    /// guard applies to node ids for symmetry (same invariant). Set by the
+    /// engine open path alongside `id_stride`.
+    shard_residue: u64 = 0,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
@@ -457,6 +469,9 @@ pub const Recovery = struct {
                     const rec = std.mem.bytesToValue(node_mod.NodeRec, body[off..][0..@sizeOf(node_mod.NodeRec)]);
                     if (node_mod.isEmpty(&rec)) continue;
                     const node_id = page_id * npp + slot;
+                    // Residue guard (I1): never harvest an id outside this
+                    // shard's residue class — see `shard_residue`.
+                    if (node_id % self.id_stride != self.shard_residue) continue;
                     if (node_id > self.max_replayed_node_id) {
                         self.max_replayed_node_id = node_id;
                     }
@@ -477,6 +492,11 @@ pub const Recovery = struct {
                     // edge_id is at byte offset 8 of both v1 and v2 entries.
                     const off: usize = @intCast(i * esz + 8);
                     const edge_id = std.mem.readInt(u64, entries[off..][0..8], .little);
+                    // Residue guard (I1): legacy pre-co-location `.adj_in`
+                    // images can carry SOURCE-shard (foreign-residue) edge
+                    // ids — healing from one permanently misroutes getEdge.
+                    // See `shard_residue`.
+                    if (edge_id % self.id_stride != self.shard_residue) continue;
                     if (edge_id > self.max_replayed_edge_id) {
                         self.max_replayed_edge_id = edge_id;
                     }

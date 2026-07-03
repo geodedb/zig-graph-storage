@@ -448,6 +448,14 @@ pub const GraphEngine = struct {
             @intCast(@import("sharded_store.zig").SHARD_COUNT)
         else
             1;
+        // Residue guard (I1): the harvest must skip legacy foreign-residue
+        // ids (pre-co-location `.adj_in` images carry source-shard edge ids)
+        // or the healed counter leaves the shard's id class and shardOfNode
+        // routing breaks for every subsequently created edge.
+        recovery.shard_residue = if (cfg.base_shard_index) |base|
+            @as(u64, @intCast(base)) % recovery.id_stride
+        else
+            0;
         defer recovery.deinit();
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
         self.read_only = recovery.read_only;

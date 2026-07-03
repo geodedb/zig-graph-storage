@@ -335,6 +335,178 @@ test "double crash: healed counters survive a second crash before the next check
     try assertParity(alloc, eng, &s);
 }
 
+/// Append a checksummed WAL record to a shard engine's WAL and fsync it —
+/// simulates a record a LEGACY (pre-co-location) binary wrote to this shard's
+/// WAL tail before crashing.
+fn appendShardRecord(
+    eng: *GraphEngine,
+    record_type: gs.wal_record.WalRecordType,
+    txn_id: u64,
+    file_id: u8,
+    page_id: u64,
+    payload: []const u8,
+) !void {
+    var rec = gs.wal_record.WalRecord{
+        .lsn = 0,
+        .txn_id = txn_id,
+        .record_type = record_type,
+        .file_id = file_id,
+        .page_id = page_id,
+        .payload = payload,
+        .checksum = 0,
+    };
+    rec.checksum = rec.computeChecksum();
+    _ = try eng.wal.appendRecord(&rec);
+    try eng.wal.sync();
+}
+
+test "I1: foreign-residue ids in a legacy replayed image never poison a shard's healed counters" {
+    // A LEGACY pre-co-location sharded graph's WAL tail can carry target-side
+    // `.adj_in` images whose edge ids were allocated on the SOURCE shard — a
+    // different residue class mod SHARD_COUNT. If such an id is the harvest
+    // max, the heal would set next_edge_id into the FOREIGN residue class
+    // forever after, and `shardOfNode(edge_id)` routing makes every edge
+    // subsequently created on this shard invisible to getEdge (silent
+    // misrouting). Same invariant for node ids (symmetry guard).
+    //
+    // Hand-craft such a tail on shard 0: one committed txn carrying
+    //   * an `.adj_in` block image with TWO edge ids — one in shard 0's
+    //     residue class (must be harvested) and a HIGHER foreign-residue one
+    //     (must be skipped);
+    //   * a `.nodes` page image with TWO non-empty slots — one in-class,
+    //     one foreign-residue and higher (skipped).
+    // After recovery both healed counters must sit exactly one stride above
+    // the IN-CLASS maxima, stay in shard 0's residue class, and fresh
+    // node/edge creates must keep routing.
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0xC6} ** 16;
+    const cfg = test_support.testConfig();
+
+    const stride: u64 = @intCast(gs.shard_count.SHARD_COUNT);
+    const page_size: usize = cfg.page_size;
+
+    var from0: u64 = 0;
+    var sink0: u64 = 0;
+    var base_next_edge: u64 = 0;
+    var base_next_node: u64 = 0;
+
+    // In-class edge id (residue 0, above the baseline counter) and a HIGHER
+    // foreign-residue one (residue 3) — the poison candidate.
+    const own_edge_id: u64 = stride * 600; // 9600, ≡ 0 (mod 16)
+    const foreign_edge_id: u64 = stride * 4096 + 3; // 65539, ≡ 3 (mod 16)
+
+    // Node page 100 at npp=84 holds ids 8400..8483. 8400 ≡ 0 (in-class),
+    // 8407 ≡ 7 (foreign, higher).
+    const node_page: u64 = 100;
+    const npp: u64 = gs.node.nodesPerPage(cfg.page_size);
+    const own_node_id: u64 = node_page * npp; // 8400
+    const foreign_node_slot: u64 = 7;
+    const foreign_node_id: u64 = own_node_id + foreign_node_slot; // 8407
+    try testing.expectEqual(@as(u64, 0), own_node_id % stride);
+    try testing.expectEqual(@as(u64, 7), foreign_node_id % stride);
+
+    {
+        var eng = try ShardedGraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+
+        from0 = try eng.shards[0].allocNode();
+        try eng.putNode(from0, emptyNode());
+        sink0 = try eng.shards[0].allocNode();
+        try eng.putNode(sink0, emptyNode());
+        try eng.checkpoint(); // durable counter baseline; tail below is legacy-crafted.
+        base_next_edge = eng.shards[0].manifest.next_edge_id;
+        base_next_node = eng.shards[0].manifest.next_node_id;
+        try testing.expect(own_edge_id > base_next_edge);
+        try testing.expect(own_node_id > base_next_node);
+
+        // Crafted `.adj_in` block image: v2 block, two entries.
+        const adj_img = try alloc.alloc(u8, page_size);
+        defer alloc.free(adj_img);
+        @memset(adj_img, 0);
+        const hdr_off = gs.page.PAGE_HEADER_SIZE;
+        const bh = gs.edge.EdgeBlockHeader{
+            .next_block = 0,
+            .count = 2,
+            .kind = 0,
+            .entry_format = gs.edge.ENTRY_FORMAT_V2,
+            .payload_size = 0,
+            .checksum = 0,
+        };
+        @memcpy(adj_img[hdr_off..][0..@sizeOf(gs.edge.EdgeBlockHeader)], std.mem.asBytes(&bh));
+        const entries_off = hdr_off + @sizeOf(gs.edge.EdgeBlockHeader);
+        const e_own = gs.edge.EdgeEntry{
+            .neighbor = sink0,
+            .edge_id = own_edge_id,
+            .rel_type = REL,
+            .prop_head = 0,
+            .public_id = 0,
+        };
+        const e_foreign = gs.edge.EdgeEntry{
+            .neighbor = from0,
+            .edge_id = foreign_edge_id,
+            .rel_type = REL,
+            .prop_head = 0,
+            .public_id = 0,
+        };
+        @memcpy(adj_img[entries_off..][0..32], std.mem.asBytes(&e_own));
+        @memcpy(adj_img[entries_off + 32 ..][0..32], std.mem.asBytes(&e_foreign));
+
+        // Crafted `.nodes` page image: slot 0 (id 8400, in-class) and slot 7
+        // (id 8407, foreign) non-empty (any nonzero byte in the 48-byte rec).
+        const node_img = try alloc.alloc(u8, page_size);
+        defer alloc.free(node_img);
+        @memset(node_img, 0);
+        const body_off = gs.node.PAGE_HEADER_SIZE;
+        node_img[body_off] = 1; // slot 0 non-empty
+        node_img[body_off + @as(usize, @intCast(foreign_node_slot)) * @sizeOf(gs.node.NodeRec)] = 1; // slot 7 non-empty
+
+        // One committed legacy txn in shard 0's WAL tail.
+        const txn_id: u64 = 0x5001;
+        try appendShardRecord(eng.shards[0], .begin_txn, txn_id, 0, 0, &.{});
+        try appendShardRecord(eng.shards[0], .page_update, txn_id, @intFromEnum(gs.types.FileId.adj_in), 60, adj_img);
+        try appendShardRecord(eng.shards[0], .page_update, txn_id, @intFromEnum(gs.types.FileId.nodes), node_page, node_img);
+        try appendShardRecord(eng.shards[0], .commit_txn, txn_id, 0, 0, &.{});
+
+        // SIMULATED CRASH.
+        eng.deinit();
+    }
+
+    var eng = try ShardedGraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+
+    // Healed counters: exactly one stride above the IN-CLASS maxima, still in
+    // shard 0's residue class. A foreign-residue heal poisons the class
+    // permanently (every future edge on this shard misroutes).
+    if (eng.shards[0].manifest.next_edge_id % stride != 0) {
+        std.debug.print(
+            "shard 0 next_edge_id {d} left residue class 0 (≡ {d} mod {d}) — healed from a foreign-residue legacy id\n",
+            .{ eng.shards[0].manifest.next_edge_id, eng.shards[0].manifest.next_edge_id % stride, stride },
+        );
+    }
+    try testing.expectEqual(own_edge_id + stride, eng.shards[0].manifest.next_edge_id);
+    try testing.expectEqual(@as(u64, 0), eng.shards[0].manifest.next_edge_id % stride);
+    try testing.expectEqual(own_node_id + stride, eng.shards[0].manifest.next_node_id);
+    try testing.expectEqual(@as(u64, 0), eng.shards[0].manifest.next_node_id % stride);
+
+    // New edges must keep routing: a foreign-residue counter would mint an id
+    // whose shardOfNode routes getEdge to the WRONG shard (null here).
+    const eid = try eng.addEdgeColocatedWithPublicId(from0, sink0, REL, newPid(0));
+    try testing.expectEqual(@as(u64, 0), eid % stride);
+    const got = (try eng.getEdge(eid)) orelse {
+        std.debug.print("new edge id {d} (≡ {d} mod {d}) misrouted — getEdge cannot see it\n", .{ eid, eid % stride, stride });
+        return error.NewEdgeMisrouted;
+    };
+    try testing.expectEqual(newPid(0), got.public_id);
+
+    // Same for nodes.
+    const nid = try eng.shards[0].allocNode();
+    try testing.expectEqual(@as(u64, 0), nid % stride);
+    try eng.putNode(nid, emptyNode());
+    _ = (try eng.getNode(nid)) orelse return error.NewNodeMisrouted;
+}
+
 test "sharded: counter healing preserves the shard id stride (no re-issue, ids keep routing)" {
     const alloc = testing.allocator;
     var td = try test_support.TestDataDir.init(alloc);
