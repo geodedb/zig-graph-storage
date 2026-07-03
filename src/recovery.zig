@@ -15,6 +15,8 @@ const types = @import("types.zig");
 const metrics_mod = @import("metrics.zig");
 const config_mod = @import("config.zig");
 const page_mod = @import("page.zig");
+const node_mod = @import("node.zig");
+const edge_mod = @import("edge.zig");
 
 const BufferPool = buffer_pool_mod.BufferPool;
 const WalManager = wal_mod.WalManager;
@@ -63,6 +65,32 @@ pub const Recovery = struct {
     /// engine.open rebuilds the free-space bitmaps from on-disk file sizes
     /// instead of loading the checkpoint-era snapshot.
     applied_committed_pages: bool = false,
+    /// WAL-recovery counter staleness: the manifest id counters
+    /// (`next_node_id`, `next_edge_id`, `next_txn_id`) are persisted at
+    /// CHECKPOINT time only, so after replaying a committed WAL tail they
+    /// lag the replayed records — counter-bounded scans miss them and, far
+    /// worse, `allocNode`/`allocEdge` RE-ISSUE their ids (silent overwrite
+    /// of committed data). Recovery therefore tracks the maximum node id /
+    /// edge id observed in the committed page images it APPLIES (replay
+    /// already visits every one of them, so this is O(replayed bytes) with
+    /// zero extra I/O — a post-replay store page-scan would be O(store
+    /// size) and defeat the fast-restart work) plus the maximum txn id seen
+    /// anywhere in the tail, and re-derives the counters BEFORE persisting
+    /// the advanced `last_checkpoint_lsn`. Counters and LSN travel in the
+    /// SAME atomic A/B manifest write, so no crash can leave "advanced LSN
+    /// + stale counters" on disk (the invariant the free.store
+    /// truncate-signal protects for its separate file holds here by
+    /// construction: heal-then-write, both slots).
+    max_replayed_node_id: u64 = 0,
+    max_replayed_edge_id: u64 = 0,
+    max_seen_txn_id: u64 = 0,
+    /// Id-allocation stride: 1 for a standalone engine, SHARD_COUNT for a
+    /// sharded member (node/edge ids are residue-classed per shard, so the
+    /// healed counter must advance by the stride to keep `shardOfNode`
+    /// routing correct — every id observed in this shard's stores carries
+    /// the shard's residue, so `max + stride` preserves it). Set by the
+    /// engine open path before `recover` runs.
+    id_stride: u64 = 1,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
@@ -215,6 +243,13 @@ pub const Recovery = struct {
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 ctx.saw_records.* = true;
 
+                // Counter healing: txn ids appear on EVERY record type, so
+                // the classify pass (which already reads them all) is the
+                // cheapest complete source for the txn-id watermark.
+                if (rec.txn_id > ctx.recovery.max_seen_txn_id) {
+                    ctx.recovery.max_seen_txn_id = rec.txn_id;
+                }
+
                 switch (rec.record_type) {
                     .begin_txn => try ctx.txn_states.put(rec.txn_id, .active),
                     .commit_txn => try ctx.txn_states.put(rec.txn_id, .committed),
@@ -261,6 +296,7 @@ pub const Recovery = struct {
             txn_states: *const std.AutoHashMap(u64, TxnRecoveryState),
             buffer_pool: *BufferPool,
             file_manager: *FileManager,
+            recovery: *Recovery,
             /// GAP-ENT-0011: set when a committed page image is applied, so
             /// the open path knows the checkpoint-era free.store is stale.
             applied_committed_pages: *bool,
@@ -299,6 +335,10 @@ pub const Recovery = struct {
                     }
                 }
 
+                // Counter healing: harvest the id maxima from the image just
+                // applied while it is pinned anyway (O(replayed bytes)).
+                ctx.recovery.trackReplayedIdMaxima(file_id, rec.page_id, data);
+
                 ctx.buffer_pool.unpin(frame_idx, true);
             }
         };
@@ -307,6 +347,7 @@ pub const Recovery = struct {
             .txn_states = &txn_states,
             .buffer_pool = buffer_pool,
             .file_manager = file_manager,
+            .recovery = self,
             .applied_committed_pages = &self.applied_committed_pages,
         };
         try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &replay_ctx, ReplayCtx.visit);
@@ -349,6 +390,30 @@ pub const Recovery = struct {
             try free_file.sync(io);
         }
 
+        // Counter healing: re-derive the manifest id counters from the ids
+        // actually observed in the replayed committed images (+ the WAL
+        // tail's txn-id watermark) so records replayed from the tail are
+        // scan-visible and their slots are NEVER re-issued. This MUST happen
+        // before the advanced-LSN manifest writes below: they are the same
+        // atomic A/B write, so a crash anywhere either repeats replay (old
+        // manifest, old LSN) or lands healed counters together with the
+        // advanced LSN — "advanced LSN + stale counters" is unrepresentable.
+        //
+        // `max + stride` (not `max + 1`) keeps sharded id residues intact;
+        // every id observed in this shard's stores carries the shard's
+        // residue, so the healed counter stays in the shard's id class.
+        // Over-shoot is impossible: every observed id was durably allocated.
+        if (self.max_replayed_node_id != 0 and m.next_node_id <= self.max_replayed_node_id) {
+            m.next_node_id = self.max_replayed_node_id + self.id_stride;
+        }
+        if (self.max_replayed_edge_id != 0 and m.next_edge_id <= self.max_replayed_edge_id) {
+            m.next_edge_id = self.max_replayed_edge_id + self.id_stride;
+        }
+        // Txn ids advance by 1 regardless of sharding (TxnManager.begin).
+        if (self.max_seen_txn_id != 0 and m.next_txn_id <= self.max_seen_txn_id) {
+            m.next_txn_id = self.max_seen_txn_id + 1;
+        }
+
         m.counter += 1;
         m.last_checkpoint_lsn = wal.currentLsn();
 
@@ -362,6 +427,63 @@ pub const Recovery = struct {
         try m.writeToFileWithKey(self.allocator, manifest_path_b, self.encryption_key);
 
         return m;
+    }
+
+    /// Counter healing: extract the maximum node id / edge id present in a
+    /// committed page image being applied by replay.
+    ///
+    /// * `.nodes` pages are fixed 48-byte NodeRec slots; a non-empty slot at
+    ///   (page, slot) IS the allocation of node id `page * npp + slot`
+    ///   (deleted-but-flagged records still count — their id was issued).
+    /// * `.adj_out` / `.adj_in` / `.in_idx` pages are adjacency edge blocks;
+    ///   every entry carries the internal edge id inline. Every edge has an
+    ///   out-entry, so `.adj_out` alone covers all post-checkpoint edges —
+    ///   the in-side blocks are harvested too because it is free and guards
+    ///   any future write path that images only the in-side.
+    ///
+    /// Defensive on shape: an image that does not parse as a valid block
+    /// contributes nothing (the maxima are a lower-bound harvest; replay
+    /// itself never validated payload shape and this pass must not turn a
+    /// previously replayable WAL into a failed recovery).
+    fn trackReplayedIdMaxima(self: *Recovery, file_id: FileId, page_id: u64, data: []const u8) void {
+        switch (file_id) {
+            .nodes => {
+                if (data.len <= node_mod.PAGE_HEADER_SIZE) return;
+                const npp: u64 = node_mod.nodesPerPage(@intCast(data.len));
+                const body = data[node_mod.PAGE_HEADER_SIZE..];
+                var slot: u64 = 0;
+                while (slot < npp) : (slot += 1) {
+                    const off: usize = @intCast(slot * @sizeOf(node_mod.NodeRec));
+                    const rec = std.mem.bytesToValue(node_mod.NodeRec, body[off..][0..@sizeOf(node_mod.NodeRec)]);
+                    if (node_mod.isEmpty(&rec)) continue;
+                    const node_id = page_id * npp + slot;
+                    if (node_id > self.max_replayed_node_id) {
+                        self.max_replayed_node_id = node_id;
+                    }
+                }
+            },
+            .adj_out, .adj_in, .in_idx => {
+                const hdr_off = page_mod.PAGE_HEADER_SIZE;
+                const bh_size = @sizeOf(edge_mod.EdgeBlockHeader);
+                if (data.len < hdr_off + bh_size) return;
+                const bh = std.mem.bytesToValue(edge_mod.EdgeBlockHeader, data[hdr_off..][0..bh_size]);
+                if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return;
+                const cap = edge_mod.entriesPerBlock(@intCast(data.len), bh.entry_format);
+                if (bh.count > cap) return;
+                const esz = edge_mod.entrySize(bh.entry_format);
+                const entries = data[hdr_off + bh_size ..];
+                var i: u32 = 0;
+                while (i < bh.count) : (i += 1) {
+                    // edge_id is at byte offset 8 of both v1 and v2 entries.
+                    const off: usize = @intCast(i * esz + 8);
+                    const edge_id = std.mem.readInt(u64, entries[off..][0..8], .little);
+                    if (edge_id > self.max_replayed_edge_id) {
+                        self.max_replayed_edge_id = edge_id;
+                    }
+                }
+            },
+            else => {},
+        }
     }
 };
 

@@ -551,6 +551,22 @@ fn addIntegrationTests(
     const run_edge_remove_crash = b.addRunArtifact(edge_remove_crash_tests);
     edge_remove_crash_step.dependOn(&run_edge_remove_crash.step);
 
+    // WAL-recovery counter staleness — recovery replays committed WAL-tail
+    // page images but left manifest.next_node_id/next_edge_id/next_txn_id at
+    // checkpoint-era values: replayed records invisible to counter-bounded
+    // scans AND their slots re-issued to new writes (silent overwrite of
+    // committed data). Crash-restart tests proving the counters are
+    // re-derived from the replayed images, persisted crash-safely, and never
+    // re-issue a live slot (single-engine + sharded stride).
+    const wal_recovery_counters_step = b.step("test-wal-recovery-counters", "Run WAL-recovery counter-staleness crash tests: manifest id counters re-derived from the replayed tail, scans see every committed record, aggressive creates never re-issue a replayed slot, double-crash safe");
+    const wal_recovery_counters_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/wal_recovery_counters.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_wal_recovery_counters = b.addRunArtifact(wal_recovery_counters_tests);
+    wal_recovery_counters_step.dependOn(&run_wal_recovery_counters.step);
+
     // GAP warm-reopen P1 — mmap-adopted edge-index snapshots (GSEIDX4/GSXIDX2):
     // clean-reopen adopt, checkpoint merge (base + overlay - tombstones),
     // dirty-gate no-op persist, crash-rebuild via counter gate, corrupt/
@@ -591,6 +607,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_mmap_index.step);
     // P2: the restamp crash/staleness guards likewise.
     integration_step.dependOn(&run_derived_restamp.step);
+    // WAL-recovery counter healing is the same silent-corruption class.
+    integration_step.dependOn(&run_wal_recovery_counters.step);
 }
 
 fn addExample(

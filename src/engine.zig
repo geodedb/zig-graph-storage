@@ -441,6 +441,13 @@ pub const GraphEngine = struct {
         // 4. Run recovery (loads manifest, replays WAL)
         var recovery = Recovery.init(allocator, cfg.encryption_key);
         recovery.legacy_policy = cfg.legacy_policy;
+        // Counter healing (WAL-recovery counter staleness): a sharded member
+        // allocates node/edge ids at SHARD_COUNT stride, so recovery must
+        // re-derive counters in the same residue class (see Recovery.id_stride).
+        recovery.id_stride = if (cfg.base_shard_index != null)
+            @intCast(@import("sharded_store.zig").SHARD_COUNT)
+        else
+            1;
         defer recovery.deinit();
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
         self.read_only = recovery.read_only;
