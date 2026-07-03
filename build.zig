@@ -567,6 +567,20 @@ fn addIntegrationTests(
     const run_wal_recovery_counters = b.addRunArtifact(wal_recovery_counters_tests);
     wal_recovery_counters_step.dependOn(&run_wal_recovery_counters.step);
 
+    // Label WAL imaging — regression guards for the raw-ref vs page-id
+    // confusion on the label var-chain write paths (addLabelTxn /
+    // removeLabelTxn image the FULL chain via logVarChain + the node page).
+    // Crash tests: add+remove replay to the exact label set, last-label
+    // removal replays label_head=0, MULTI-PAGE chains replay byte-exactly.
+    const label_crash_replay_step = b.step("test-label-crash-replay", "Run label WAL-imaging crash tests: crash-window label add/remove (incl. multi-page var chains) replays to the exact label set");
+    const label_crash_replay_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/label_crash_replay.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_label_crash_replay = b.addRunArtifact(label_crash_replay_tests);
+    label_crash_replay_step.dependOn(&run_label_crash_replay.step);
+
     // GAP warm-reopen P1 — mmap-adopted edge-index snapshots (GSEIDX4/GSXIDX2):
     // clean-reopen adopt, checkpoint merge (base + overlay - tombstones),
     // dirty-gate no-op persist, crash-rebuild via counter gate, corrupt/
@@ -609,6 +623,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_derived_restamp.step);
     // WAL-recovery counter healing is the same silent-corruption class.
     integration_step.dependOn(&run_wal_recovery_counters.step);
+    // Label WAL-imaging crash guards likewise.
+    integration_step.dependOn(&run_label_crash_replay.step);
 }
 
 fn addExample(
