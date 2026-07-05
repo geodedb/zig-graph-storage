@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tp = @import("thread_pool");
 const observability = @import("observability");
 const Allocator = std.mem.Allocator;
@@ -1493,10 +1494,49 @@ pub const GraphEngine = struct {
     /// AdjStore never truncates a real id into a legacy v1 tail block (it
     /// allocates a fresh v2 block instead). `public_id == 0` means "no public
     /// id" (legacy callers; readers fall back to the id property).
+    ///
+    /// CONTRACT — create-node-before-edge (GAP-ENT-0037, 0027-train review
+    /// I2): `to` must already have been putNode'd DURABLY (its create
+    /// committed to the WAL of the shard that owns it) before this call.
+    /// This function deliberately never touches `to`'s node record (`to` may
+    /// live on another shard), so nothing in the write itself can enforce
+    /// or repair the invariant. If it is violated — `to` was allocNode'd but
+    /// its putNode never became durable (caller skipped it, or a crash under
+    /// deferred WAL lost shard(to)'s create while THIS shard's edge commit
+    /// survived: the pre-existing cross-shard-atomicity gap) — then after a
+    /// crash the id-counter heal cannot see `to` (no node record in any
+    /// replayed image), recovery re-issues its id, and the surviving
+    /// in-edge silently ALIASES onto whatever unrelated node is created
+    /// under the re-issued id. geode always putNodes before edges; any new
+    /// caller must do the same. Debug builds assert the resident-shard half
+    /// of the contract below; the cross-shard half is uncheckable here by
+    /// construction. No release-mode behavior change (stays fail-open —
+    /// this is a documented contract, not a validation gate).
     pub fn addEdgeColocatedTxnWithPublicId(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId, public_id: u64) anyerror!EdgeId {
         try self.ensureWritable();
         // Phase A: mutates edge_index + edge_exist_index — materialize first.
         try self.ensureDerivedHydrated();
+
+        // GAP-ENT-0037: debug-only contract check (see doc comment). Only the
+        // resident half is checkable: when `to` routes to THIS engine
+        // (standalone, or `to`'s residue class is this shard's), its node
+        // record must already exist. A cross-shard `to` is not resident here
+        // and cannot be probed without breaking single-shard write locality.
+        if (comptime builtin.mode == .Debug) {
+            const to_resident = if (self.config.base_shard_index) |base|
+                to % @as(u64, @intCast(@import("sharded_store.zig").SHARD_COUNT)) == @as(u64, @intCast(base))
+            else
+                true;
+            if (to_resident) {
+                const to_exists = ((self.node_store.getNode(to) catch null) != null);
+                if (!to_exists) {
+                    std.debug.panic(
+                        "addEdgeColocatedTxnWithPublicId: `to`={d} has no node record on its owning shard — the create-node-before-edge contract was violated (putNode `to` durably before adding edges to it; a dangling in-edge would alias onto a re-issued node id after crash recovery)",
+                        .{to},
+                    );
+                }
+            }
+        }
         const edge_id = self.manifest.next_edge_id;
         const stride: u64 = if (self.config.base_shard_index != null)
             @intCast(@import("sharded_store.zig").SHARD_COUNT)
