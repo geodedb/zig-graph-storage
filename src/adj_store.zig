@@ -24,6 +24,64 @@ const BLOCK_HEADER_SIZE: u32 = @sizeOf(EdgeBlockHeader);
 /// assuming the chain is corrupt or circular (SEC-0042).
 pub const MAX_CHAIN_HOPS: u32 = 100_000;
 
+// ============================================================================
+// GAP adjacency slab packing — tagged slab head refs (read path since P1).
+//
+// LAYOUT DISCRIMINATION (the prop-store slab discipline, verbatim): a TAG BIT
+// in the chain head ref itself.
+//   * Legacy block-chain head: the bare PageId of the head block; bit 63 is
+//     CLEAR (page ids are allocated sequentially and never approach 2^63).
+//     Reads via the existing chain walk, unchanged, forever.
+//   * Slab head: bit 63 is SET. The remaining bits pack (block, slot):
+//     bits [24..63) = slab block page id (39 bits), bits [0..24) = slot index
+//     (24 bits). Many small chains share one slab block; the slot directory
+//     maps each slot to its contiguous run of v2 entries (layout spec in
+//     edge.zig, SLAB section).
+//
+// WHY the tag lives in the head ref and not only the block header: to read a
+// block at all you must first know its page id, but a legacy head uses the
+// FULL u64 as the page id while a slab head packs (page, slot) into it — so
+// the discriminator must be in the head. The slab block ALSO stamps
+// entry_format = ENTRY_FORMAT_SLAB (defense-in-depth: slab reads reject a
+// block whose format byte is wrong, and legacy chain walks reject slab blocks
+// — a slab block is NEVER linked into a block chain).
+//
+// `NodeRec.out_head` / `NodeRec.in_head` (u64) and `in_head_dir` values are
+// unchanged in width and opaque to every layer above AdjStore.
+// ============================================================================
+
+/// Tag bit marking a slab-packed head ref (vs a legacy bare block page id).
+pub const SLAB_HEAD_TAG_BIT: u64 = @as(u64, 1) << 63;
+/// Number of low bits of a slab head used for the slot index.
+const SLAB_HEAD_SLOT_BITS: u6 = 24;
+const SLAB_HEAD_SLOT_MASK: u64 = (@as(u64, 1) << SLAB_HEAD_SLOT_BITS) - 1;
+/// Maximum page id encodable in a slab head (64 - 1 tag - 24 slot = 39).
+const SLAB_HEAD_MAX_PAGE_ID: u64 = @as(u64, 1) << (64 - 1 - SLAB_HEAD_SLOT_BITS);
+
+/// True when a chain head ref is a slab-packed (block, slot) pointer (bit 63
+/// set) rather than a legacy bare block page id. Head 0 (= empty chain) is
+/// untagged and stays the universal "no chain" sentinel.
+pub fn isSlabHead(head: u64) bool {
+    return (head & SLAB_HEAD_TAG_BIT) != 0;
+}
+
+/// Encode a slab head ref from (slab block page id, slot index).
+pub fn encodeSlabHead(page_id: PageId, slot: u32) u64 {
+    std.debug.assert(page_id < SLAB_HEAD_MAX_PAGE_ID);
+    std.debug.assert(@as(u64, slot) <= SLAB_HEAD_SLOT_MASK);
+    return SLAB_HEAD_TAG_BIT | (page_id << SLAB_HEAD_SLOT_BITS) | (@as(u64, slot) & SLAB_HEAD_SLOT_MASK);
+}
+
+/// Decode the slab block page id from a slab head ref.
+pub fn slabHeadPageId(head: u64) PageId {
+    return (head & ~SLAB_HEAD_TAG_BIT) >> SLAB_HEAD_SLOT_BITS;
+}
+
+/// Decode the slot index from a slab head ref.
+pub fn slabHeadSlot(head: u64) u32 {
+    return @intCast(head & SLAB_HEAD_SLOT_MASK);
+}
+
 /// Adjacency block storage for outgoing/incoming edges.
 /// Each adjacency list is a chain of pages, each containing an EdgeBlockHeader
 /// followed by an array of edge records at the stride of THAT block's
@@ -36,6 +94,15 @@ pub const AdjStore = struct {
     free_space: *FreeSpaceManager,
     file_id: FileId,
     page_size: u32,
+    /// Bytes reserved at the tail of every page for the page-level AES-GCM
+    /// authentication tag when at-rest encryption is enabled (the pager
+    /// writes the tag into the final `tail_reserve` bytes on flush). The
+    /// SLAB slot directory grows backward from `page_size - tail_reserve`,
+    /// so it never collides with the tag — the same reservation PropStore
+    /// makes for its backward-growing key directory. Legacy v1/v2 chain
+    /// blocks grow forward only and are unaffected. Set by the engine to
+    /// the encryption tag size when a key is configured, 0 otherwise.
+    tail_reserve: u32 = 0,
     /// Capacity of the blocks the PRODUCTION WRITER creates (v2, 32 B
     /// entries, since P2). Use `capacityFor` when parsing an existing block —
     /// legacy v1 blocks hold more (24 B) entries. Named `writer_...` (review
@@ -77,6 +144,10 @@ pub const AdjStore = struct {
     ///     the old one. v1 blocks stay read-only-FORMAT forever (in-place
     ///     field mutation of EXISTING v1 entries remains allowed elsewhere).
     pub fn addEdge(self: *AdjStore, head_page: PageId, entry: EdgeEntry) !PageId {
+        // P1: nothing writes slab chains yet — reject a tagged head loudly
+        // rather than misparse the (block, slot) ref as a block page id.
+        // The P2 writer teaches this path slab appends + graduation.
+        if (isSlabHead(head_page)) return error.SlabChainWriteNotSupported;
         if (head_page != 0) {
             const frame = try self.buffer_pool.pin(self.file_id, head_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
@@ -132,6 +203,8 @@ pub const AdjStore = struct {
     /// exactly this page — imaging only the chain head lets older WAL images of
     /// a non-head block resurrect a committed delete on crash recovery.
     pub fn removeEdge(self: *AdjStore, head_page: PageId, edge_id: EdgeId) !?PageId {
+        // P1: slab chains are read-only — see addEdge.
+        if (isSlabHead(head_page)) return error.SlabChainWriteNotSupported;
         if (head_page == 0) return null;
 
         var current_page = head_page;
@@ -176,6 +249,15 @@ pub const AdjStore = struct {
         current_index: u16 = 0,
         rel_type: ?u32,
         hops: u32 = 0,
+        /// Slab mode (GAP adjacency slab packing): non-null when the iterator
+        /// was opened on a bit-63-tagged slab head. `current_page` is the slab
+        /// block's page id and iteration walks the slot's single contiguous
+        /// run instead of a block chain. The pin/unpin discipline is identical
+        /// to chain mode (pin held between next() calls; released at
+        /// exhaustion or deinit), so every existing consumer — engine expand
+        /// iterators, FanInEdgeIterator, index rebuild scans — inherits slab
+        /// support with no signature change.
+        slab_slot: ?u32 = null,
 
         pub fn deinit(self: *AdjEdgeIterator) void {
             if (self.current_frame_idx) |idx| {
@@ -185,6 +267,7 @@ pub const AdjStore = struct {
         }
 
         pub fn next(self: *AdjEdgeIterator) anyerror!?EdgeEntry {
+            if (self.slab_slot) |slot| return self.nextSlab(slot);
             while (self.current_page != 0) {
                 if (self.current_frame_idx == null) {
                     if (self.hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
@@ -219,10 +302,57 @@ pub const AdjStore = struct {
 
             return null;
         }
+
+        /// Slab-mode iteration: one pinned slab block, one contiguous run of
+        /// v2 entries. On a parse error the active pin is left for deinit()
+        /// to release — the same discipline as the chain path above.
+        fn nextSlab(self: *AdjEdgeIterator, slot: u32) anyerror!?EdgeEntry {
+            while (self.current_page != 0) {
+                if (self.current_frame_idx == null) {
+                    const frame = try self.store.buffer_pool.pin(self.store.file_id, self.current_page);
+                    self.current_frame_idx = self.store.buffer_pool.frameIndex(frame);
+                }
+
+                const frame = &self.store.buffer_pool.frames[self.current_frame_idx.?];
+                const data = frame.dataSlice();
+                const run = try self.store.resolveSlabRun(data, slot);
+
+                while (self.current_index < run.entry_count) {
+                    const entry = readSlabRunEntry(data, run.offset, self.current_index);
+                    self.current_index += 1;
+
+                    if (self.rel_type) |rt| {
+                        if (entry.rel_type == rt) {
+                            return entry;
+                        }
+                    } else {
+                        return entry;
+                    }
+                }
+
+                // Run exhausted — a slab chain is a single run, no next block.
+                self.store.buffer_pool.unpin(self.current_frame_idx.?, false);
+                self.current_frame_idx = null;
+                self.current_page = 0;
+            }
+
+            return null;
+        }
     };
 
     /// Return an iterator over edge entries starting from head_page (O(1) allocation path).
+    /// `head_page` is a chain head REF: a legacy bare block page id (chain
+    /// walk, unchanged) or a bit-63-tagged slab (block, slot) ref (single-run
+    /// slab read). Read-both is permanent.
     pub fn expand(self: *AdjStore, head_page: PageId, rel_type_filter: ?u32) AdjEdgeIterator {
+        if (isSlabHead(head_page)) {
+            return .{
+                .store = self,
+                .current_page = slabHeadPageId(head_page),
+                .slab_slot = slabHeadSlot(head_page),
+                .rel_type = rel_type_filter,
+            };
+        }
         return .{
             .store = self,
             .current_page = head_page,
@@ -239,6 +369,8 @@ pub const AdjStore = struct {
     /// contract as `removeEdge` (edge-remove non-head imaging fix). Returns
     /// null when the edge was not found (no page touched, nothing to log).
     pub fn updateEdgePropHead(self: *AdjStore, head_page: PageId, edge_id: EdgeId, new_prop_head: u32) !?PageId {
+        // P1: slab chains are read-only — see addEdge.
+        if (isSlabHead(head_page)) return error.SlabChainWriteNotSupported;
         if (head_page == 0) return null;
 
         var current_page = head_page;
@@ -275,9 +407,17 @@ pub const AdjStore = struct {
         return null;
     }
 
-    /// Count edges in the adjacency list.
+    /// Count edges in the adjacency list (legacy chain walk or slab run).
     pub fn edgeCount(self: *AdjStore, head_page: PageId) !u64 {
         if (head_page == 0) return 0;
+
+        if (isSlabHead(head_page)) {
+            const frame = try self.buffer_pool.pin(self.file_id, slabHeadPageId(head_page));
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            defer self.buffer_pool.unpin(frame_idx, false);
+            const run = try self.resolveSlabRun(frame.dataSlice(), slabHeadSlot(head_page));
+            return run.entry_count;
+        }
 
         var count: u64 = 0;
         var current_page = head_page;
@@ -346,6 +486,44 @@ pub const AdjStore = struct {
         const off = self.entryOffset(slot, entry_format);
         const size = edge_mod.entrySize(entry_format);
         @memcpy(data[off..][0..size], std.mem.asBytes(&entry)[0..size]);
+    }
+
+    // Slab helpers (GAP adjacency slab packing — layout spec in edge.zig)
+
+    /// Parse + validate the header of a SLAB block reached via a tagged head.
+    /// Rejects loudly: wrong format byte (a tagged head must land on a slab
+    /// block), a chained slab block (slab blocks are never linked), or a slot
+    /// directory that cannot fit the page.
+    fn readSlabBlockHeader(self: *const AdjStore, data: []const u8) error{DataCorruption}!EdgeBlockHeader {
+        const off = self.blockHeaderOffset();
+        const bytes = data[off..][0..BLOCK_HEADER_SIZE];
+        const bh: EdgeBlockHeader = @bitCast(bytes.*);
+        if (bh.entry_format != edge_mod.ENTRY_FORMAT_SLAB) return error.DataCorruption;
+        if (bh.next_block != 0) return error.DataCorruption;
+        const dir_bytes = @as(u64, bh.count) * edge_mod.SLAB_DIR_ENTRY_SIZE;
+        if (edge_mod.SLAB_RUNS_OFFSET + dir_bytes + self.tail_reserve > data.len) return error.DataCorruption;
+        return bh;
+    }
+
+    /// Resolve a slab (block, slot) to its validated run. The live-head
+    /// invariant makes a tombstoned or out-of-range slot reached via a stored
+    /// head ref corruption — never silently empty.
+    fn resolveSlabRun(self: *const AdjStore, data: []const u8, slot: u32) error{DataCorruption}!edge_mod.SlabSlot {
+        const bh = try self.readSlabBlockHeader(data);
+        if (slot >= bh.count) return error.DataCorruption;
+        const run = edge_mod.readSlabSlot(data, self.tail_reserve, slot);
+        if (run.offset == edge_mod.SLAB_SLOT_TOMBSTONE) return error.DataCorruption;
+        if (run.offset < edge_mod.SLAB_RUNS_OFFSET) return error.DataCorruption;
+        const run_end = @as(u64, run.offset) + @as(u64, run.entry_count) * edge_mod.ENTRY_SIZE_V2;
+        if (run_end > edge_mod.slabDirStart(data.len, self.tail_reserve, bh.count)) return error.DataCorruption;
+        return run;
+    }
+
+    /// Read entry `idx` of a validated slab run (always the v2 32 B stride).
+    fn readSlabRunEntry(data: []const u8, run_offset: u32, idx: u16) EdgeEntry {
+        const off = @as(usize, run_offset) + @as(usize, idx) * edge_mod.ENTRY_SIZE_V2;
+        const bytes = data[off..][0..edge_mod.ENTRY_SIZE_V2];
+        return @bitCast(bytes.*);
     }
 };
 
@@ -712,6 +890,195 @@ test "SEC-0042: edgeCount detects circular chain" {
     try makeSelfLoop(&store, head);
 
     try testing.expectError(error.CircularChainDetected, store.edgeCount(head));
+}
+
+// ============================================================================
+// GAP adjacency slab packing — P1 slab READ path unit tests.
+// ============================================================================
+
+test "slab head refs: bit-63 tag encode/decode round-trip; legacy heads untagged" {
+    // Legacy bare page ids (incl. 0 = empty chain) are never slab heads.
+    try testing.expect(!isSlabHead(0));
+    try testing.expect(!isSlabHead(1));
+    try testing.expect(!isSlabHead(0x7FFF_FFFF_FFFF_FFFF));
+
+    const head = encodeSlabHead(12345, 678);
+    try testing.expect(isSlabHead(head));
+    try testing.expectEqual(@as(PageId, 12345), slabHeadPageId(head));
+    try testing.expectEqual(@as(u32, 678), slabHeadSlot(head));
+
+    // Extremes of both fields survive the round trip.
+    const big = encodeSlabHead((@as(u64, 1) << 39) - 1, (1 << 24) - 1);
+    try testing.expect(isSlabHead(big));
+    try testing.expectEqual((@as(u64, 1) << 39) - 1, slabHeadPageId(big));
+    try testing.expectEqual(@as(u32, (1 << 24) - 1), slabHeadSlot(big));
+}
+
+/// Hand-build one SLAB block page: EdgeBlockHeader (entry_format = SLAB,
+/// count = number of slots), v2-strided runs packed forward from
+/// SLAB_RUNS_OFFSET, slot directory grown backward from the page tail.
+/// `runs[i].len == 0` writes slot i as a TOMBSTONE. Raw bytes, deliberately
+/// not the (future P2) production writer — the on-disk-format oracle.
+fn writeRawSlabBlock(store: *AdjStore, runs: []const []const EdgeEntry) !PageId {
+    const page_id = try store.free_space.allocPage();
+    const frame = try store.buffer_pool.pinNew(store.file_id, page_id);
+    const frame_idx = store.buffer_pool.frameIndex(frame);
+    const data = frame.dataSlice();
+
+    const off: usize = PAGE_HEADER_SIZE;
+    std.mem.writeInt(u64, data[off..][0..8], 0, .little); // next_block: never chained
+    std.mem.writeInt(u16, data[off + 8 ..][0..2], @intCast(runs.len), .little); // count = slots
+    data[off + 10] = 0; // kind
+    data[off + 11] = edge_mod.ENTRY_FORMAT_SLAB;
+
+    var run_off: u32 = edge_mod.SLAB_RUNS_OFFSET;
+    for (runs, 0..) |run, i| {
+        if (run.len == 0) {
+            edge_mod.writeSlabSlot(data, 0, @intCast(i), .{ .offset = edge_mod.SLAB_SLOT_TOMBSTONE, .entry_count = 0 });
+            continue;
+        }
+        edge_mod.writeSlabSlot(data, 0, @intCast(i), .{ .offset = run_off, .entry_count = @intCast(run.len) });
+        for (run) |e| {
+            @memcpy(data[run_off..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e)[0..edge_mod.ENTRY_SIZE_V2]);
+            run_off += edge_mod.ENTRY_SIZE_V2;
+        }
+    }
+    std.mem.writeInt(u16, data[off + 12 ..][0..2], @intCast(run_off - edge_mod.SLAB_RUNS_OFFSET), .little); // payload_size
+    std.mem.writeInt(u16, data[off + 14 ..][0..2], 0, .little); // checksum (unused)
+
+    store.buffer_pool.unpin(frame_idx, true);
+    return page_id;
+}
+
+fn v2Edge(neighbor: u64, edge_id: u64, rel_type: u32, public_id: u64) EdgeEntry {
+    return .{ .neighbor = neighbor, .edge_id = edge_id, .rel_type = rel_type, .prop_head = 0, .public_id = public_id };
+}
+
+test "slab read path: each tagged (block, slot) head enumerates exactly its run" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const run_a = [_]EdgeEntry{v2Edge(10, 101, 5, 0xA1)};
+    const run_b = [_]EdgeEntry{ v2Edge(20, 201, 5, 0xB1), v2Edge(30, 202, 6, 0xB2) };
+    const run_c = [_]EdgeEntry{ v2Edge(40, 301, 7, 0xC1), v2Edge(50, 302, 7, 0xC2), v2Edge(60, 303, 8, 0xC3) };
+    const page = try writeRawSlabBlock(&store, &.{ &run_a, &run_b, &run_c });
+
+    // Chain A: single entry.
+    {
+        const head = encodeSlabHead(page, 0);
+        try testing.expectEqual(@as(u64, 1), try store.edgeCount(head));
+        var it = store.expand(head, null);
+        defer it.deinit();
+        const e = (try it.next()).?;
+        try testing.expectEqual(@as(u64, 10), e.neighbor);
+        try testing.expectEqual(@as(u64, 101), e.edge_id);
+        try testing.expectEqual(@as(u64, 0xA1), e.public_id);
+        try testing.expectEqual(@as(?EdgeEntry, null), try it.next());
+    }
+    // Chain B: two entries, exact order, exact fields.
+    {
+        const head = encodeSlabHead(page, 1);
+        try testing.expectEqual(@as(u64, 2), try store.edgeCount(head));
+        var it = store.expand(head, null);
+        defer it.deinit();
+        const e0 = (try it.next()).?;
+        try testing.expectEqual(@as(u64, 201), e0.edge_id);
+        try testing.expectEqual(@as(u64, 0xB1), e0.public_id);
+        const e1 = (try it.next()).?;
+        try testing.expectEqual(@as(u64, 202), e1.edge_id);
+        try testing.expectEqual(@as(u32, 6), e1.rel_type);
+        try testing.expectEqual(@as(?EdgeEntry, null), try it.next());
+    }
+    // Chain C via rel_type filter: only the rel 7 pair surfaces.
+    {
+        const head = encodeSlabHead(page, 2);
+        try testing.expectEqual(@as(u64, 3), try store.edgeCount(head));
+        var it = store.expand(head, 7);
+        defer it.deinit();
+        try testing.expectEqual(@as(u64, 301), ((try it.next()).?).edge_id);
+        try testing.expectEqual(@as(u64, 302), ((try it.next()).?).edge_id);
+        try testing.expectEqual(@as(?EdgeEntry, null), try it.next());
+    }
+}
+
+test "slab + legacy chains coexist in one store; a chain linked INTO a slab block is corruption" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    // Legacy chain through the production writer.
+    var legacy_head: PageId = 0;
+    legacy_head = try store.addEdge(legacy_head, makeEdge(70, 401, 5));
+    legacy_head = try store.addEdge(legacy_head, makeEdge(80, 402, 5));
+
+    // Slab block beside it.
+    const run = [_]EdgeEntry{v2Edge(90, 501, 5, 0xD1)};
+    const slab_page = try writeRawSlabBlock(&store, &.{&run});
+
+    // Both heads read correctly through the same store.
+    try testing.expectEqual(@as(u64, 2), try store.edgeCount(legacy_head));
+    try testing.expectEqual(@as(u64, 1), try store.edgeCount(encodeSlabHead(slab_page, 0)));
+
+    // An UNTAGGED head pointing at a slab block is a chain walk into a slab
+    // block — rejected as corruption, never parsed at a guessed stride.
+    var it = store.expand(slab_page, null);
+    defer it.deinit();
+    try testing.expectError(error.DataCorruption, it.next());
+}
+
+test "slab read path rejects tombstoned, out-of-range, and out-of-bounds slots as corruption" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const run = [_]EdgeEntry{v2Edge(10, 601, 5, 0xE1)};
+    const tomb = [_]EdgeEntry{}; // empty run => tombstone slot
+    const page = try writeRawSlabBlock(&store, &.{ &run, &tomb });
+
+    // Tombstoned slot behind a stored head ref violates the live-head
+    // invariant — corruption, never silently empty.
+    {
+        var it = store.expand(encodeSlabHead(page, 1), null);
+        defer it.deinit();
+        try testing.expectError(error.DataCorruption, it.next());
+        try testing.expectError(error.DataCorruption, store.edgeCount(encodeSlabHead(page, 1)));
+    }
+    // Slot index beyond the directory.
+    {
+        var it = store.expand(encodeSlabHead(page, 9), null);
+        defer it.deinit();
+        try testing.expectError(error.DataCorruption, it.next());
+    }
+    // Corrupt slot 0's run bounds so it overruns the slot directory.
+    {
+        const frame = try store.buffer_pool.pin(store.file_id, page);
+        const idx = store.buffer_pool.frameIndex(frame);
+        edge_mod.writeSlabSlot(frame.dataSlice(), 0, 0, .{ .offset = edge_mod.SLAB_RUNS_OFFSET, .entry_count = 4000 });
+        store.buffer_pool.unpin(idx, true);
+
+        var it = store.expand(encodeSlabHead(page, 0), null);
+        defer it.deinit();
+        try testing.expectError(error.DataCorruption, it.next());
+    }
+}
+
+test "P1 mutators reject slab heads loudly (slab writes land in P2)" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    const run = [_]EdgeEntry{v2Edge(10, 701, 5, 0xF1)};
+    const page = try writeRawSlabBlock(&store, &.{&run});
+    const head = encodeSlabHead(page, 0);
+
+    try testing.expectError(error.SlabChainWriteNotSupported, store.addEdge(head, makeEdge(20, 702, 5)));
+    try testing.expectError(error.SlabChainWriteNotSupported, store.removeEdge(head, 701));
+    try testing.expectError(error.SlabChainWriteNotSupported, store.updateEdgePropHead(head, 701, 42));
 }
 
 test {

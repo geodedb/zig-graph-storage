@@ -600,3 +600,115 @@ test "sharded: counter healing preserves the shard id stride (no re-issue, ids k
         try testing.expectEqual(edge_ids.len, n);
     }
 }
+
+test "adjacency slab: an edge id living ONLY in a replayed slab-block image is healed (never re-issued)" {
+    // GAP adjacency slab packing P1 hard requirement: the recovery counter
+    // harvest must learn SLAB adjacency images (entry_format = 2 — many small
+    // chains' v2-entry runs behind a backward-growing slot directory) in the
+    // SAME phase that introduces the layout. Without it, `entry_format >
+    // ENTRY_FORMAT_V2` silently skips the image, the healed next_edge_id
+    // stays below an id committed in a slab run, and the next allocEdge
+    // RE-ISSUES that id — the exact counter-staleness class this suite
+    // closed for chain blocks, reintroduced for slab chains.
+    //
+    // Hand-craft shard 0's WAL tail with one committed slab image:
+    //   * slot 0: live run carrying the in-class maximum edge id;
+    //   * slot 1: live run with a HIGHER foreign-residue id (residue guard
+    //     must skip it — I1);
+    //   * slot 2: tombstoned;
+    //   * slot 3: malformed (run overruns the directory) — skipped without
+    //     aborting slot 0's harvest.
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0xC7} ** 16;
+    const cfg = test_support.testConfig();
+
+    const stride: u64 = @intCast(gs.shard_count.SHARD_COUNT);
+    const page_size: usize = cfg.page_size;
+
+    var from0: u64 = 0;
+    var sink0: u64 = 0;
+
+    const slab_max_edge_id: u64 = stride * 800; // ≡ 0 (mod 16), in-class
+    const foreign_edge_id: u64 = stride * 5000 + 3; // higher, ≡ 3 — skipped
+
+    {
+        var eng = try ShardedGraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+
+        from0 = try eng.shards[0].allocNode();
+        try eng.putNode(from0, emptyNode());
+        sink0 = try eng.shards[0].allocNode();
+        try eng.putNode(sink0, emptyNode());
+        try eng.checkpoint(); // durable counter baseline; the tail below is crafted.
+        try testing.expect(slab_max_edge_id > eng.shards[0].manifest.next_edge_id);
+
+        // Crafted SLAB `.adj_out` block image.
+        const img = try alloc.alloc(u8, page_size);
+        defer alloc.free(img);
+        @memset(img, 0);
+        const hdr_off = gs.page.PAGE_HEADER_SIZE;
+        const bh = gs.edge.EdgeBlockHeader{
+            .next_block = 0, // slab blocks are never chained
+            .count = 4, // slot-directory size
+            .kind = 0,
+            .entry_format = gs.edge.ENTRY_FORMAT_SLAB,
+            .payload_size = 0,
+            .checksum = 0,
+        };
+        @memcpy(img[hdr_off..][0..@sizeOf(gs.edge.EdgeBlockHeader)], std.mem.asBytes(&bh));
+
+        const esz = gs.edge.ENTRY_SIZE_V2;
+        // Slot 0: live run, one v2 entry carrying the in-class max.
+        const run0: u32 = gs.edge.SLAB_RUNS_OFFSET;
+        const e_own = gs.edge.EdgeEntry{
+            .neighbor = sink0,
+            .edge_id = slab_max_edge_id,
+            .rel_type = REL,
+            .prop_head = 0,
+            .public_id = 0,
+        };
+        @memcpy(img[run0..][0..esz], std.mem.asBytes(&e_own));
+        gs.edge.writeSlabSlot(img, 0, 0, .{ .offset = run0, .entry_count = 1 });
+        // Slot 1: higher foreign-residue id — the residue guard must skip it.
+        const run1: u32 = run0 + esz;
+        const e_foreign = gs.edge.EdgeEntry{
+            .neighbor = from0,
+            .edge_id = foreign_edge_id,
+            .rel_type = REL,
+            .prop_head = 0,
+            .public_id = 0,
+        };
+        @memcpy(img[run1..][0..esz], std.mem.asBytes(&e_foreign));
+        gs.edge.writeSlabSlot(img, 0, 1, .{ .offset = run1, .entry_count = 1 });
+        // Slot 2: tombstone.
+        gs.edge.writeSlabSlot(img, 0, 2, .{ .offset = gs.edge.SLAB_SLOT_TOMBSTONE, .entry_count = 0 });
+        // Slot 3: malformed — run overruns the slot directory.
+        gs.edge.writeSlabSlot(img, 0, 3, .{ .offset = run0, .entry_count = 60000 });
+
+        // One committed txn carrying the slab image in shard 0's WAL tail.
+        const txn_id: u64 = 0x51AB;
+        try appendShardRecord(eng.shards[0], .begin_txn, txn_id, 0, 0, &.{});
+        try appendShardRecord(eng.shards[0], .page_update, txn_id, @intFromEnum(gs.types.FileId.adj_out), 60, img);
+        try appendShardRecord(eng.shards[0], .commit_txn, txn_id, 0, 0, &.{});
+
+        // SIMULATED CRASH.
+        eng.deinit();
+    }
+
+    var eng = try ShardedGraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+
+    // Healed counter: exactly one stride above the slab run's in-class max,
+    // still in shard 0's residue class.
+    try testing.expectEqual(slab_max_edge_id + stride, eng.shards[0].manifest.next_edge_id);
+    try testing.expectEqual(@as(u64, 0), eng.shards[0].manifest.next_edge_id % stride);
+
+    // No re-issue: the next edge minted lands ABOVE the slab id and routes.
+    const eid = try eng.addEdgeColocatedWithPublicId(from0, sink0, REL, newPid(100));
+    try testing.expect(eid > slab_max_edge_id);
+    try testing.expectEqual(@as(u64, 0), eid % stride);
+    const got = (try eng.getEdge(eid)) orelse return error.NewEdgeMisrouted;
+    try testing.expectEqual(newPid(100), got.public_id);
+}

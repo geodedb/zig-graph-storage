@@ -300,6 +300,14 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
         @import("encryption.zig").TAG_SIZE
     else
         0;
+    // Same reservation for the adjacency stores' SLAB slot directories (GAP
+    // adjacency slab packing): a slab block's directory grows backward from
+    // the page end exactly like the prop-store key directory. Legacy v1/v2
+    // chain blocks grow forward only and never reached the tail, so this is
+    // a no-op for them.
+    self.adj_out.tail_reserve = self.prop_store.tail_reserve;
+    self.adj_in.tail_reserve = self.prop_store.tail_reserve;
+    self.adj_in_remote.tail_reserve = self.prop_store.tail_reserve;
 
     // Label dictionary, label store, and label index
     self.label_dict = LabelDictionary.init(allocator);
