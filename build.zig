@@ -523,6 +523,22 @@ fn addIntegrationTests(
     const run_edge_inline_pubid = b.addRunArtifact(edge_inline_pubid_tests);
     edge_inline_pubid_step.dependOn(&run_edge_inline_pubid.step);
 
+    // GAP adjacency-slab-packing P0/P1 — baseline oracle for the
+    // block-per-chain adjacency cost (~16.5 KB/edge for low-fanout graphs) +
+    // enumeration parity both directions (out-chain walk + FanInEdgeIterator
+    // scatter), and the slab-block read path (tagged bit-63 (block,slot) head
+    // refs; slot-directory runs of v2 entries; recovery-harvest coverage).
+    // The baseline scenario stays green through all phases: legacy chains
+    // keep working forever.
+    const adjacency_slab_step = b.step("test-adjacency-slab", "Run adjacency slab-packing tests: block-per-chain baseline lock-in (bytes/edge + parity oracle) and slab-block read-both (tagged heads, slot runs, harvest)");
+    const adjacency_slab_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab = b.addRunArtifact(adjacency_slab_tests);
+    adjacency_slab_step.dependOn(&run_adjacency_slab.step);
+
     // GAP-ENT-0011 — free-space map vs WAL-tail allocations. Crash-restart
     // tests proving pages allocated after the last checkpoint and recovered
     // from the WAL tail are marked ALLOCATED in the restored free-space map
@@ -640,6 +656,9 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_label_crash_replay.step);
     // Edge-prop-head under-logging crash guards likewise.
     integration_step.dependOn(&run_edge_prop_crash.step);
+    // Adjacency-slab read-both + harvest coverage (silent-counter-staleness
+    // class once slab writers land) likewise.
+    integration_step.dependOn(&run_adjacency_slab.step);
 }
 
 fn addExample(

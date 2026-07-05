@@ -17,6 +17,7 @@ const config_mod = @import("config.zig");
 const page_mod = @import("page.zig");
 const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
+const encryption_mod = @import("encryption.zig");
 
 const BufferPool = buffer_pool_mod.BufferPool;
 const WalManager = wal_mod.WalManager;
@@ -537,12 +538,21 @@ pub const Recovery = struct {
     ///   every entry carries the internal edge id inline. Every edge has an
     ///   out-entry, so `.adj_out` alone covers all post-checkpoint edges —
     ///   the in-side blocks are harvested too because it is free and guards
-    ///   any future write path that images only the in-side.
+    ///   any future write path that images only the in-side. BOTH adjacency
+    ///   shapes are parsed: legacy v1/v2 block-chain blocks (entries at the
+    ///   block's own stride) AND slab blocks (GAP adjacency slab packing —
+    ///   `entry_format == ENTRY_FORMAT_SLAB`, many chains' v2-entry runs
+    ///   behind a backward-growing slot directory). Slab runs MUST be
+    ///   harvested: ids living only in a replayed slab image would otherwise
+    ///   escape the counter heal and be re-issued (the exact staleness class
+    ///   this heal closes).
     ///
     /// Defensive on shape: an image that does not parse as a valid block
     /// contributes nothing (the maxima are a lower-bound harvest; replay
     /// itself never validated payload shape and this pass must not turn a
-    /// previously replayable WAL into a failed recovery).
+    /// previously replayable WAL into a failed recovery). For slab images
+    /// that is per-SLOT: a malformed slot is skipped, well-formed siblings
+    /// still contribute.
     fn trackReplayedIdMaxima(self: *Recovery, file_id: FileId, page_id: u64, data: []const u8) void {
         switch (file_id) {
             .nodes => {
@@ -568,6 +578,10 @@ pub const Recovery = struct {
                 const bh_size = @sizeOf(edge_mod.EdgeBlockHeader);
                 if (data.len < hdr_off + bh_size) return;
                 const bh = std.mem.bytesToValue(edge_mod.EdgeBlockHeader, data[hdr_off..][0..bh_size]);
+                if (bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB) {
+                    self.harvestSlabAdjImage(data, bh);
+                    return;
+                }
                 if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return;
                 const cap = edge_mod.entriesPerBlock(@intCast(data.len), bh.entry_format);
                 if (bh.count > cap) return;
@@ -633,10 +647,10 @@ pub const Recovery = struct {
                 const pager_ptr = file_manager.getPager(file_id) orelse break :blk 0;
                 if (scratch.len != pager_ptr.page_size) break :blk 0; // defensive
                 pager_ptr.readPage(page_id, scratch) catch break :blk 0;
-                break :blk liveRecordCensus(file_id, scratch);
+                break :blk self.liveRecordCensus(file_id, scratch);
             };
         }
-        const new_census = liveRecordCensus(file_id, data);
+        const new_census = self.liveRecordCensus(file_id, data);
         const delta = @as(i64, @intCast(new_census)) - @as(i64, @intCast(gop.value_ptr.*));
         switch (file_id) {
             .nodes => self.replayed_node_delta += delta,
@@ -649,7 +663,12 @@ pub const Recovery = struct {
     /// Count the LIVE records in a `.nodes` or `.adj_out` page image.
     /// Defensive on shape (mirrors `trackReplayedIdMaxima`): an image that
     /// does not parse as a valid page contributes zero.
-    fn liveRecordCensus(file_id: FileId, data: []const u8) u64 {
+    ///
+    /// Handles BOTH adjacency shapes, exactly like the id harvest: legacy
+    /// v1/v2 chain blocks (`count` IS the census — swap-compaction keeps
+    /// them dense) AND slab blocks (`censusSlabAdjImage`). `self` is read
+    /// only for the slab tail rule (`encryption_key`), never mutated.
+    fn liveRecordCensus(self: *const Recovery, file_id: FileId, data: []const u8) u64 {
         switch (file_id) {
             .nodes => {
                 if (data.len <= node_mod.PAGE_HEADER_SIZE) return 0;
@@ -673,6 +692,15 @@ pub const Recovery = struct {
                 const bh_size = @sizeOf(edge_mod.EdgeBlockHeader);
                 if (data.len < hdr_off + bh_size) return 0;
                 const bh = std.mem.bytesToValue(edge_mod.EdgeBlockHeader, data[hdr_off..][0..bh_size]);
+                if (bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB) {
+                    // 0025 count heal × adjacency slab packing: slab out-runs
+                    // ARE this page's out-entries, so the census counts them
+                    // — through the SAME parse the id harvest uses (see
+                    // `censusSlabAdjImage`). If slab images censused 0, every
+                    // post-slab crash replay would diff 0-minus-before and
+                    // walk the healed edge_count BACKWARD.
+                    return self.censusSlabAdjImage(data, bh);
+                }
                 if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return 0;
                 const cap = edge_mod.entriesPerBlock(@intCast(data.len), bh.entry_format);
                 if (bh.count > cap) return 0;
@@ -681,6 +709,82 @@ pub const Recovery = struct {
                 return bh.count;
             },
             else => return 0,
+        }
+    }
+
+    /// 0025 stats-count healing × adjacency slab packing: census the live
+    /// out-entries of a SLAB adjacency image — the sum of `entry_count`
+    /// across the LIVE, bounds-valid slots of the slot directory.
+    ///
+    /// Validation is deliberately IDENTICAL, guard for guard, to
+    /// `harvestSlabAdjImage` (keep the two in lockstep): unchained header,
+    /// directory in bounds under the same tail rule, per-slot tombstone and
+    /// bounds defensiveness — a malformed slot contributes zero without
+    /// aborting its well-formed siblings. The run entries themselves need no
+    /// inspection: slab removal compacts the run (mirroring the chain
+    /// blocks' swap-compaction), so a live slot's `entry_count` IS its live
+    /// census — and unlike the id harvest there is NO residue filter (the
+    /// census counts THIS shard's store contents, not id-allocator classes;
+    /// see the heal-site comment in `recover`).
+    fn censusSlabAdjImage(self: *const Recovery, data: []const u8, bh: edge_mod.EdgeBlockHeader) u64 {
+        if (bh.next_block != 0) return 0;
+        const tail_reserve: u32 = if (self.encryption_key != null) encryption_mod.TAG_SIZE else 0;
+        const dir_bytes = @as(u64, bh.count) * edge_mod.SLAB_DIR_ENTRY_SIZE;
+        if (edge_mod.SLAB_RUNS_OFFSET + dir_bytes + tail_reserve > data.len) return 0;
+        const dir_start = edge_mod.slabDirStart(data.len, tail_reserve, bh.count);
+
+        var live: u64 = 0;
+        var s: u32 = 0;
+        while (s < bh.count) : (s += 1) {
+            const slot = edge_mod.readSlabSlot(data, tail_reserve, s);
+            if (slot.offset == edge_mod.SLAB_SLOT_TOMBSTONE) continue;
+            if (slot.offset < edge_mod.SLAB_RUNS_OFFSET) continue;
+            const run_end = @as(u64, slot.offset) + @as(u64, slot.entry_count) * edge_mod.ENTRY_SIZE_V2;
+            if (run_end > dir_start) continue;
+            live += slot.entry_count;
+        }
+        return live;
+    }
+
+    /// Harvest edge-id maxima from a SLAB adjacency image (GAP adjacency slab
+    /// packing): iterate the slot directory, and for every LIVE, bounds-valid
+    /// slot walk its contiguous run of v2 (32 B) entries. Defensive per slot:
+    /// tombstoned, truncated, or out-of-bounds slots contribute nothing and
+    /// never abort the harvest of well-formed siblings. The layout (incl. the
+    /// AES-GCM tail reservation mirrored from the slab writer) lives in
+    /// edge.zig's SLAB section.
+    fn harvestSlabAdjImage(self: *Recovery, data: []const u8, bh: edge_mod.EdgeBlockHeader) void {
+        // Slab blocks are never chained; a nonzero next_block is not a slab
+        // block we understand — contribute nothing.
+        if (bh.next_block != 0) return;
+        // Same tail rule as the slab writer: the slot directory grows
+        // backward from (page end - tag reserve) when at-rest encryption is
+        // configured (WAL payloads are plaintext frames, but the LAYOUT
+        // reserves the tail whenever a key is configured).
+        const tail_reserve: u32 = if (self.encryption_key != null) encryption_mod.TAG_SIZE else 0;
+        const dir_bytes = @as(u64, bh.count) * edge_mod.SLAB_DIR_ENTRY_SIZE;
+        if (edge_mod.SLAB_RUNS_OFFSET + dir_bytes + tail_reserve > data.len) return;
+        const dir_start = edge_mod.slabDirStart(data.len, tail_reserve, bh.count);
+
+        var s: u32 = 0;
+        while (s < bh.count) : (s += 1) {
+            const slot = edge_mod.readSlabSlot(data, tail_reserve, s);
+            if (slot.offset == edge_mod.SLAB_SLOT_TOMBSTONE) continue;
+            if (slot.offset < edge_mod.SLAB_RUNS_OFFSET) continue;
+            const run_end = @as(u64, slot.offset) + @as(u64, slot.entry_count) * edge_mod.ENTRY_SIZE_V2;
+            if (run_end > dir_start) continue;
+
+            var i: u32 = 0;
+            while (i < slot.entry_count) : (i += 1) {
+                // edge_id is at byte offset 8 of every v2 run entry.
+                const off: usize = @intCast(@as(u64, slot.offset) + @as(u64, i) * edge_mod.ENTRY_SIZE_V2 + 8);
+                const edge_id = std.mem.readInt(u64, data[off..][0..8], .little);
+                // Residue guard (I1): same rule as the block-chain harvest.
+                if (edge_id % self.id_stride != self.shard_residue) continue;
+                if (edge_id > self.max_replayed_edge_id) {
+                    self.max_replayed_edge_id = edge_id;
+                }
+            }
         }
     }
 };
@@ -1980,7 +2084,6 @@ test "SEC-0037: recovery does not regress on-disk write_count below the persiste
     // nonce already used on disk with different plaintext. Recovery must seed
     // the replayed frame to max(on-disk, logged) so the counter never regresses.
     const allocator = testing.allocator;
-    const encryption_mod = @import("encryption.zig");
 
     var setup = try setupTestGraph(allocator);
     defer {
@@ -2253,6 +2356,157 @@ test "0025 mechanism: replay heals manifest node/edge counts from applied images
     const on_disk_b = (try Manifest.readFromFile(allocator, path_b)) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 7), on_disk_b.node_count);
     try testing.expectEqual(@as(u64, 10), on_disk_b.edge_count);
+}
+
+/// Build a minimal SLAB adjacency page image (GAP adjacency slab packing) for
+/// the harvest unit tests below: header stamped ENTRY_FORMAT_SLAB with
+/// `slot_count` directory entries; the caller fills runs + slots.
+fn stampSlabHeader(img: []u8, slot_count: u16) void {
+    const bh = edge_mod.EdgeBlockHeader{
+        .next_block = 0,
+        .count = slot_count,
+        .kind = 0,
+        .entry_format = edge_mod.ENTRY_FORMAT_SLAB,
+        .payload_size = 0,
+        .checksum = 0,
+    };
+    @memcpy(img[page_mod.PAGE_HEADER_SIZE..][0..@sizeOf(edge_mod.EdgeBlockHeader)], std.mem.asBytes(&bh));
+}
+
+fn slabRunEntry(edge_id: u64) edge_mod.EdgeEntry {
+    return .{ .neighbor = 1, .edge_id = edge_id, .rel_type = 7, .prop_head = 0, .public_id = 0 };
+}
+
+test "adjacency slab: counter harvest learns slab-block WAL images (ids in slab runs never escape the heal)" {
+    // Plan hard requirement (GAP adjacency slab packing P1): the counter
+    // harvest MUST parse slab adjacency images in the same phase that
+    // introduces the slab layout. Before this, `entry_format == 2` fell into
+    // the `> ENTRY_FORMAT_V2` skip — an edge id living ONLY in a replayed
+    // slab run would escape the heal and be re-issued after a crash (the
+    // exact silent-staleness class the counter heal closed for chain blocks).
+    var rec = Recovery.init(testing.allocator, null);
+    defer rec.deinit();
+    rec.id_stride = 16;
+    rec.shard_residue = 0;
+
+    const img = try testing.allocator.alloc(u8, 4096);
+    defer testing.allocator.free(img);
+    @memset(img, 0);
+    stampSlabHeader(img, 4);
+
+    const in_class_small: u64 = 16 * 3; // ≡ 0 (mod 16)
+    const in_class_max: u64 = 16 * 700; // ≡ 0 — the value the heal must learn
+    const foreign_higher: u64 = 16 * 9000 + 5; // ≡ 5 — residue guard must skip
+
+    // Slot 0: live 2-entry run [small, max] — both in-class.
+    const run0: u32 = edge_mod.SLAB_RUNS_OFFSET;
+    var e = slabRunEntry(in_class_small);
+    @memcpy(img[run0..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    e = slabRunEntry(in_class_max);
+    @memcpy(img[run0 + edge_mod.ENTRY_SIZE_V2 ..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.writeSlabSlot(img, 0, 0, .{ .offset = run0, .entry_count = 2 });
+
+    // Slot 1: live run carrying a HIGHER foreign-residue id — skipped (I1).
+    const run1: u32 = run0 + 2 * edge_mod.ENTRY_SIZE_V2;
+    e = slabRunEntry(foreign_higher);
+    @memcpy(img[run1..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.writeSlabSlot(img, 0, 1, .{ .offset = run1, .entry_count = 1 });
+
+    // Slot 2: tombstone — contributes nothing.
+    edge_mod.writeSlabSlot(img, 0, 2, .{ .offset = edge_mod.SLAB_SLOT_TOMBSTONE, .entry_count = 0 });
+
+    // Slot 3: malformed (run overruns the slot directory) — skipped
+    // defensively WITHOUT aborting the well-formed siblings above.
+    edge_mod.writeSlabSlot(img, 0, 3, .{ .offset = run0, .entry_count = 4000 });
+
+    rec.trackReplayedIdMaxima(.adj_out, 60, img);
+    try testing.expectEqual(in_class_max, rec.max_replayed_edge_id);
+
+    // Sensitivity proof: restamp the SAME image with an UNKNOWN format byte
+    // (3) — a fresh harvest learns nothing. This is exactly the pre-P1
+    // treatment of format 2, so this test fails loudly if slab images ever
+    // fall back into the unknown-format skip.
+    var rec2 = Recovery.init(testing.allocator, null);
+    defer rec2.deinit();
+    rec2.id_stride = 16;
+    rec2.shard_residue = 0;
+    img[page_mod.PAGE_HEADER_SIZE + 11] = edge_mod.ENTRY_FORMAT_SLAB + 1;
+    rec2.trackReplayedIdMaxima(.adj_out, 60, img);
+    try testing.expectEqual(@as(u64, 0), rec2.max_replayed_edge_id);
+
+    // A chained "slab" block is not a layout we understand — nothing learned
+    // (slab blocks are never linked into chains).
+    var rec3 = Recovery.init(testing.allocator, null);
+    defer rec3.deinit();
+    rec3.id_stride = 16;
+    rec3.shard_residue = 0;
+    img[page_mod.PAGE_HEADER_SIZE + 11] = edge_mod.ENTRY_FORMAT_SLAB;
+    std.mem.writeInt(u64, img[page_mod.PAGE_HEADER_SIZE..][0..8], 99, .little); // next_block != 0
+    rec3.trackReplayedIdMaxima(.adj_out, 60, img);
+    try testing.expectEqual(@as(u64, 0), rec3.max_replayed_edge_id);
+}
+
+test "adjacency slab: harvest reads the slot directory above the AES-GCM tail reservation" {
+    // With at-rest encryption configured the slab slot directory grows
+    // backward from (page end - TAG_SIZE) — the pager owns the final tag
+    // bytes. The harvest must mirror that base or it misparses every slot
+    // (garbage offsets → nothing harvested → ids escape the heal).
+    const key = [_]u8{0x42} ** 32;
+    var rec = Recovery.init(testing.allocator, key);
+    defer rec.deinit();
+    // Standalone-engine defaults: id_stride 1, shard_residue 0.
+
+    const img = try testing.allocator.alloc(u8, 4096);
+    defer testing.allocator.free(img);
+    @memset(img, 0);
+    stampSlabHeader(img, 1);
+
+    const eid: u64 = 424_242;
+    const e = slabRunEntry(eid);
+    @memcpy(img[edge_mod.SLAB_RUNS_OFFSET..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.writeSlabSlot(img, encryption_mod.TAG_SIZE, 0, .{ .offset = edge_mod.SLAB_RUNS_OFFSET, .entry_count = 1 });
+
+    rec.trackReplayedIdMaxima(.adj_out, 60, img);
+    try testing.expectEqual(eid, rec.max_replayed_edge_id);
+}
+
+test "0025 x adjacency slab: edge census counts slab-run entries exactly as the harvest parses them" {
+    // Merge coherence (0025 stats-count heal × adjacency slab packing): slab
+    // out-runs ARE out-entries, so the census must count a replayed slab
+    // image's live run entries through the same per-slot guards as the id
+    // harvest. If a slab image censused 0, every post-slab crash replay
+    // would diff 0-minus-before and walk the healed edge_count BACKWARD.
+    var rec = Recovery.init(testing.allocator, null);
+    defer rec.deinit();
+
+    const img = try testing.allocator.alloc(u8, 4096);
+    defer testing.allocator.free(img);
+    @memset(img, 0);
+    stampSlabHeader(img, 4);
+
+    // Slot 0: live 2-entry run; slot 1: live 1-entry run — census 3.
+    const run0: u32 = edge_mod.SLAB_RUNS_OFFSET;
+    var e = slabRunEntry(100);
+    @memcpy(img[run0..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    e = slabRunEntry(101);
+    @memcpy(img[run0 + edge_mod.ENTRY_SIZE_V2 ..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.writeSlabSlot(img, 0, 0, .{ .offset = run0, .entry_count = 2 });
+    const run1: u32 = run0 + 2 * edge_mod.ENTRY_SIZE_V2;
+    e = slabRunEntry(102);
+    @memcpy(img[run1..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.writeSlabSlot(img, 0, 1, .{ .offset = run1, .entry_count = 1 });
+
+    // Slot 2: tombstone; slot 3: malformed (run overruns the directory) —
+    // both contribute zero WITHOUT discarding the live siblings above.
+    edge_mod.writeSlabSlot(img, 0, 2, .{ .offset = edge_mod.SLAB_SLOT_TOMBSTONE, .entry_count = 0 });
+    edge_mod.writeSlabSlot(img, 0, 3, .{ .offset = run0, .entry_count = 4000 });
+
+    try testing.expectEqual(@as(u64, 3), rec.liveRecordCensus(.adj_out, img));
+
+    // A chained "slab" header is not a layout we understand — census 0, the
+    // same skip the harvest applies.
+    std.mem.writeInt(u64, img[page_mod.PAGE_HEADER_SIZE..][0..8], 99, .little);
+    try testing.expectEqual(@as(u64, 0), rec.liveRecordCensus(.adj_out, img));
 }
 
 test {
