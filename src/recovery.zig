@@ -103,6 +103,22 @@ pub const Recovery = struct {
     /// guard applies to node ids for symmetry (same invariant). Set by the
     /// engine open path alongside `id_stride`.
     shard_residue: u64 = 0,
+    /// GAP-ENT-0025: stats-count healing. `manifest.node_count`/`edge_count`
+    /// are persisted at CHECKPOINT time only (like the id counters above), so
+    /// after replaying a committed WAL tail they misreport until the next
+    /// checkpoint. These signed deltas accumulate the net change in LIVE
+    /// records (non-empty, non-deleted node slots; adjacency out-entries)
+    /// across the committed page images replay APPLIES: each applied image is
+    /// censused against the page's previous state — the pre-replay on-disk
+    /// page on first touch, the previously applied image thereafter — so the
+    /// per-image differences telescope to final-vs-pre-replay per page. The
+    /// deltas are folded into the manifest counts BEFORE the advanced-LSN
+    /// manifest write, so counts and LSN travel in the same atomic A/B image.
+    /// STATS-ONLY (no slot-allocation or scan-bound consumer reads these
+    /// counts) and best-effort by design; see `trackReplayedCountDeltas` for
+    /// the honest precision statement.
+    replayed_node_delta: i64 = 0,
+    replayed_edge_delta: i64 = 0,
 
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
@@ -303,6 +319,18 @@ pub const Recovery = struct {
             return m;
         }
 
+        // GAP-ENT-0025: per-page previous-census state for the stats-count
+        // heal. Key packs (file_id, page_id); value is the live-record census
+        // of the LAST image applied to that page (seeded from the pre-replay
+        // on-disk page on first touch). The scratch buffer holds that one
+        // on-disk read; sized from the pool because replay frames are
+        // pool-sized (== pager-sized on every reachable path — SEC-0010
+        // rejects a page-size mismatch right after recovery).
+        var census_prev = std.AutoHashMap(u128, u64).init(self.allocator);
+        defer census_prev.deinit();
+        const census_scratch = try self.allocator.alloc(u8, buffer_pool.page_size);
+        defer self.allocator.free(census_scratch);
+
         // 5. Replay committed page_update records into buffer pool.
         const ReplayCtx = struct {
             txn_states: *const std.AutoHashMap(u64, TxnRecoveryState),
@@ -312,6 +340,9 @@ pub const Recovery = struct {
             /// GAP-ENT-0011: set when a committed page image is applied, so
             /// the open path knows the checkpoint-era free.store is stale.
             applied_committed_pages: *bool,
+            /// GAP-ENT-0025: see above.
+            census_prev: *std.AutoHashMap(u128, u64),
+            census_scratch: []u8,
 
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 if (rec.record_type != .page_update) return;
@@ -351,6 +382,20 @@ pub const Recovery = struct {
                 // applied while it is pinned anyway (O(replayed bytes)).
                 ctx.recovery.trackReplayedIdMaxima(file_id, rec.page_id, data);
 
+                // GAP-ENT-0025: stats-count healing — census the applied
+                // image against the page's previous state (O(replayed bytes)
+                // plus one pread per DISTINCT replayed page). Infallible:
+                // the count heal must never turn a replayable WAL into a
+                // failed recovery.
+                ctx.recovery.trackReplayedCountDeltas(
+                    ctx.census_prev,
+                    ctx.file_manager,
+                    ctx.census_scratch,
+                    file_id,
+                    rec.page_id,
+                    data,
+                );
+
                 ctx.buffer_pool.unpin(frame_idx, true);
             }
         };
@@ -361,6 +406,8 @@ pub const Recovery = struct {
             .file_manager = file_manager,
             .recovery = self,
             .applied_committed_pages = &self.applied_committed_pages,
+            .census_prev = &census_prev,
+            .census_scratch = census_scratch,
         };
         try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &replay_ctx, ReplayCtx.visit);
 
@@ -424,6 +471,45 @@ pub const Recovery = struct {
         // Txn ids advance by 1 regardless of sharding (TxnManager.begin).
         if (self.max_seen_txn_id != 0 and m.next_txn_id <= self.max_seen_txn_id) {
             m.next_txn_id = self.max_seen_txn_id + 1;
+        }
+
+        // GAP-ENT-0025: stats-count healing — fold the live-record deltas
+        // observed across the applied committed images into the checkpoint-era
+        // counts, in the SAME atomic A/B manifest write as the id counters and
+        // the advanced LSN ("advanced LSN + stale counts" is unrepresentable,
+        // and the double-crash case reads the healed values back for free).
+        // Saturating arithmetic: a (defensive, should-be-impossible) negative
+        // overshoot clamps at 0 instead of wrapping — these are stats, never
+        // slot/scan inputs, so clamping is safe and wrapping never is.
+        //
+        // PRECISION — exact in the common case, honest about three gaps:
+        //  * EXACT when every replayed page's pre-replay on-disk content is
+        //    its checkpoint-era content or the page is new (the checkpoint
+        //    flushed everything, so this holds unless the crashed run wrote
+        //    the page to disk again AFTER the checkpoint).
+        //  * UNDER-counts records that a post-checkpoint dirty-page EVICTION
+        //    (or a checkpoint that crashed between flush and manifest write)
+        //    already flushed to disk: the before-census sees them, the
+        //    checkpoint-era count does not.
+        //  * OVER-counts when the before-read of a torn/unreadable on-disk
+        //    page falls back to census 0 (the checkpoint-era live records of
+        //    that page are counted twice), and UNDER-counts checkpoint-era
+        //    stale content of a freed-then-reused adjacency page.
+        // Node counts census non-empty, non-DELETED slots; edge counts census
+        // `.adj_out` out-entries only (every edge has exactly one; `.adj_in` /
+        // `.in_idx` in-entries would double-count and legacy `.adj_in` images
+        // can carry foreign shards' edges). Unlike the id heal there is NO
+        // residue filter: the counts describe THIS shard's store contents
+        // (what getStorageStats scans), not the id allocator's class.
+        if (self.replayed_node_delta >= 0) {
+            m.node_count +|= @abs(self.replayed_node_delta);
+        } else {
+            m.node_count -|= @abs(self.replayed_node_delta);
+        }
+        if (self.replayed_edge_delta >= 0) {
+            m.edge_count +|= @abs(self.replayed_edge_delta);
+        } else {
+            m.edge_count -|= @abs(self.replayed_edge_delta);
         }
 
         m.counter += 1;
@@ -503,6 +589,98 @@ pub const Recovery = struct {
                 }
             },
             else => {},
+        }
+    }
+
+    /// GAP-ENT-0025: stats-count healing — accumulate the net live-record
+    /// delta contributed by one applied committed page image.
+    ///
+    /// Only `.nodes` (node count) and `.adj_out` (edge count — every edge has
+    /// exactly one out-entry) pages participate; in-side files are excluded
+    /// (double-count, and legacy `.adj_in` images can carry foreign shards'
+    /// edges, which are counted by their source shard's own images).
+    ///
+    /// Per page the diffs telescope: the first image is censused against the
+    /// pre-replay ON-DISK page (checkpoint-era in the common case — see the
+    /// precision note at the heal site in `recover`), later images against
+    /// the previous image, so the page's total contribution is exactly
+    /// final-applied-census minus pre-replay-census.
+    ///
+    /// INFALLIBLE by contract: a failed map insert (OOM), unreadable on-disk
+    /// before-image, or unparseable image degrades the estimate (documented)
+    /// but must never turn a previously replayable WAL into a failed
+    /// recovery — same discipline as `trackReplayedIdMaxima`.
+    fn trackReplayedCountDeltas(
+        self: *Recovery,
+        census_prev: *std.AutoHashMap(u128, u64),
+        file_manager: *FileManager,
+        scratch: []u8,
+        file_id: FileId,
+        page_id: u64,
+        data: []const u8,
+    ) void {
+        switch (file_id) {
+            .nodes, .adj_out => {},
+            else => return,
+        }
+        const key: u128 = (@as(u128, @intFromEnum(file_id)) << 64) | page_id;
+        const gop = census_prev.getOrPut(key) catch return; // OOM: best-effort stats, skip.
+        if (!gop.found_existing) {
+            // First tail image of this page: seed from the pre-replay on-disk
+            // page. Any read failure (page beyond EOF = allocated after the
+            // checkpoint, torn page, hostile id) counts as an empty page.
+            gop.value_ptr.* = blk: {
+                const pager_ptr = file_manager.getPager(file_id) orelse break :blk 0;
+                if (scratch.len != pager_ptr.page_size) break :blk 0; // defensive
+                pager_ptr.readPage(page_id, scratch) catch break :blk 0;
+                break :blk liveRecordCensus(file_id, scratch);
+            };
+        }
+        const new_census = liveRecordCensus(file_id, data);
+        const delta = @as(i64, @intCast(new_census)) - @as(i64, @intCast(gop.value_ptr.*));
+        switch (file_id) {
+            .nodes => self.replayed_node_delta += delta,
+            .adj_out => self.replayed_edge_delta += delta,
+            else => unreachable,
+        }
+        gop.value_ptr.* = new_census;
+    }
+
+    /// Count the LIVE records in a `.nodes` or `.adj_out` page image.
+    /// Defensive on shape (mirrors `trackReplayedIdMaxima`): an image that
+    /// does not parse as a valid page contributes zero.
+    fn liveRecordCensus(file_id: FileId, data: []const u8) u64 {
+        switch (file_id) {
+            .nodes => {
+                if (data.len <= node_mod.PAGE_HEADER_SIZE) return 0;
+                const npp: u64 = node_mod.nodesPerPage(@intCast(data.len));
+                const body = data[node_mod.PAGE_HEADER_SIZE..];
+                var live: u64 = 0;
+                var slot: u64 = 0;
+                while (slot < npp) : (slot += 1) {
+                    const off: usize = @intCast(slot * @sizeOf(node_mod.NodeRec));
+                    const rec = std.mem.bytesToValue(node_mod.NodeRec, body[off..][0..@sizeOf(node_mod.NodeRec)]);
+                    // Unlike the id harvest, a DELETED-flagged slot is NOT
+                    // live: its id was issued but the node is gone.
+                    if (node_mod.isEmpty(&rec)) continue;
+                    if (node_mod.isDeleted(&rec)) continue;
+                    live += 1;
+                }
+                return live;
+            },
+            .adj_out => {
+                const hdr_off = page_mod.PAGE_HEADER_SIZE;
+                const bh_size = @sizeOf(edge_mod.EdgeBlockHeader);
+                if (data.len < hdr_off + bh_size) return 0;
+                const bh = std.mem.bytesToValue(edge_mod.EdgeBlockHeader, data[hdr_off..][0..bh_size]);
+                if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return 0;
+                const cap = edge_mod.entriesPerBlock(@intCast(data.len), bh.entry_format);
+                if (bh.count > cap) return 0;
+                // Entry removal swap-compacts the block (AdjStore.removeEdge),
+                // so `count` IS the live out-entry census — no tombstones.
+                return bh.count;
+            },
+            else => return 0,
         }
     }
 };
@@ -1916,6 +2094,165 @@ test "SEC-0037: recovery does not regress on-disk write_count below the persiste
     _ = try verify_pager.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &verify_raw, 4096); // page 1 offset
     const post_write_count = page_mod.readWriteCount(&verify_raw);
     try testing.expect(post_write_count >= on_disk_write_count);
+}
+
+test "0025 mechanism: replay heals manifest node/edge counts from applied images (telescoping, in-side and garbage excluded)" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // Checkpoint-era manifest: 5 nodes, 7 edges persisted.
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .node_count = 5,
+        .edge_count = 7,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+    defer wal.deinit();
+
+    var begin_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin_rec);
+
+    const live_rec = node_mod.NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1, // non-empty ⇒ live
+    };
+    var deleted_rec = live_rec;
+    deleted_rec.flags = node_mod.NODE_FLAG_DELETED; // issued id, NOT live
+
+    const body_off = node_mod.PAGE_HEADER_SIZE;
+    const rec_size = @sizeOf(node_mod.NodeRec);
+
+    // Nodes page 3, image 1: one live slot (census 1).
+    var node_img1: [4096]u8 = undefined;
+    @memset(&node_img1, 0);
+    @memcpy(node_img1[body_off..][0..rec_size], std.mem.asBytes(&live_rec));
+    var up1 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = @intFromEnum(FileId.nodes), .page_id = 3, .payload = &node_img1, .checksum = 0 };
+    _ = try wal.appendRecord(&up1);
+
+    // Nodes page 3, image 2 (SUPERSEDES image 1): slots 0+2 live, slot 1
+    // DELETED-flagged (census 2). The two per-image diffs must telescope to
+    // +2 for this page — not +1+2=+3.
+    var node_img2: [4096]u8 = undefined;
+    @memset(&node_img2, 0);
+    @memcpy(node_img2[body_off..][0..rec_size], std.mem.asBytes(&live_rec));
+    @memcpy(node_img2[body_off + rec_size ..][0..rec_size], std.mem.asBytes(&deleted_rec));
+    @memcpy(node_img2[body_off + 2 * rec_size ..][0..rec_size], std.mem.asBytes(&live_rec));
+    var up2 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = @intFromEnum(FileId.nodes), .page_id = 3, .payload = &node_img2, .checksum = 0 };
+    _ = try wal.appendRecord(&up2);
+
+    // Adjacency block builder: v2 block with `n` entries.
+    const mkAdj = struct {
+        fn mk(buf: *[4096]u8, n: u16) void {
+            @memset(buf, 0);
+            const hdr_off = page_mod.PAGE_HEADER_SIZE;
+            const bh = edge_mod.EdgeBlockHeader{
+                .next_block = 0,
+                .count = n,
+                .kind = 0,
+                .entry_format = edge_mod.ENTRY_FORMAT_V2,
+                .payload_size = 0,
+                .checksum = 0,
+            };
+            @memcpy(buf[hdr_off..][0..@sizeOf(edge_mod.EdgeBlockHeader)], std.mem.asBytes(&bh));
+            var i: u16 = 0;
+            while (i < n) : (i += 1) {
+                const e = edge_mod.EdgeEntry{
+                    .neighbor = 1,
+                    .edge_id = 100 + i,
+                    .rel_type = 1,
+                    .prop_head = 0,
+                    .public_id = 0,
+                };
+                @memcpy(buf[hdr_off + @sizeOf(edge_mod.EdgeBlockHeader) + @as(usize, i) * 32 ..][0..32], std.mem.asBytes(&e));
+            }
+        }
+    }.mk;
+
+    // `.adj_out` page 9: 3 out-entries ⇒ +3 edges.
+    var adj_out_img: [4096]u8 = undefined;
+    mkAdj(&adj_out_img, 3);
+    var up3 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = @intFromEnum(FileId.adj_out), .page_id = 9, .payload = &adj_out_img, .checksum = 0 };
+    _ = try wal.appendRecord(&up3);
+
+    // `.adj_in` page 4 (4 entries) and `.in_idx` page 2 (2 entries): in-side
+    // copies — MUST NOT contribute (they would double-count the out-entries).
+    var adj_in_img: [4096]u8 = undefined;
+    mkAdj(&adj_in_img, 4);
+    var up4 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = @intFromEnum(FileId.adj_in), .page_id = 4, .payload = &adj_in_img, .checksum = 0 };
+    _ = try wal.appendRecord(&up4);
+    var in_idx_img: [4096]u8 = undefined;
+    mkAdj(&in_idx_img, 2);
+    var up5 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = @intFromEnum(FileId.in_idx), .page_id = 2, .payload = &in_idx_img, .checksum = 0 };
+    _ = try wal.appendRecord(&up5);
+
+    // `.adj_out` page 11 with a GARBAGE block header (unknown entry_format,
+    // nonzero count): contributes nothing and — the infallibility contract —
+    // must not fail recovery.
+    var garbage_img: [4096]u8 = undefined;
+    @memset(&garbage_img, 0);
+    const garbage_bh = edge_mod.EdgeBlockHeader{
+        .next_block = 0,
+        .count = 50, // would poison the edge delta if the format guard failed
+        .kind = 0,
+        .entry_format = 0xFF,
+        .payload_size = 0,
+        .checksum = 0,
+    };
+    @memcpy(garbage_img[page_mod.PAGE_HEADER_SIZE..][0..@sizeOf(edge_mod.EdgeBlockHeader)], std.mem.asBytes(&garbage_bh));
+    var up6 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = @intFromEnum(FileId.adj_out), .page_id = 11, .payload = &garbage_img, .checksum = 0 };
+    _ = try wal.appendRecord(&up6);
+
+    var commit_rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&commit_rec);
+    try wal.sync();
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // 5 + 2 live node slots; 7 + 3 out-entries. In-side and garbage images
+    // contributed nothing.
+    try testing.expectEqual(@as(u64, 7), recovered.node_count);
+    try testing.expectEqual(@as(u64, 10), recovered.edge_count);
+    try testing.expectEqual(@as(i64, 2), recovery.replayed_node_delta);
+    try testing.expectEqual(@as(i64, 3), recovery.replayed_edge_delta);
+
+    // Healed counts are DURABLE: both manifest slots carry them (they rode
+    // the same A/B write as the advanced LSN).
+    const on_disk_a = (try Manifest.readFromFile(allocator, path_a)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 7), on_disk_a.node_count);
+    try testing.expectEqual(@as(u64, 10), on_disk_a.edge_count);
+    const path_b = try setup.graph_dir.manifestPath(allocator, .b);
+    defer allocator.free(path_b);
+    const on_disk_b = (try Manifest.readFromFile(allocator, path_b)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 7), on_disk_b.node_count);
+    try testing.expectEqual(@as(u64, 10), on_disk_b.edge_count);
 }
 
 test {

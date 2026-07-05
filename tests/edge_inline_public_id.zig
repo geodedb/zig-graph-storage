@@ -1061,10 +1061,12 @@ test "P2 crash: plain v2 appends (multi-block chain) replay with exact public_id
         }
         try testing.expectEqual(N, rev);
 
-        // NOTE: eng.edgeCount() is NOT asserted here — manifest.edge_count is
-        // checkpoint-granular (recovery replays page images; it does not
-        // re-derive manifest counters), a PRE-EXISTING property unrelated to
-        // the v2 write path. The adjacency parity above is the P2 oracle.
+        // Count heal (GAP-ENT-0025): manifest.edge_count is re-derived from
+        // the applied adjacency images during replay, so the crash-recovered
+        // count now matches the adjacency parity proven above. (Historically
+        // it stayed checkpoint-granular — 0 here — and was deliberately not
+        // asserted.)
+        try testing.expectEqual(@as(u64, @intCast(N)), try eng.edgeCount());
     }
 }
 

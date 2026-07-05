@@ -335,6 +335,94 @@ test "double crash: healed counters survive a second crash before the next check
     try assertParity(alloc, eng, &s);
 }
 
+test "0025: recovery re-derives manifest node/edge counts from the replayed WAL tail" {
+    // Count heal (the stats sibling of the id-counter heal above):
+    // `manifest.node_count`/`edge_count` used to stay checkpoint-stale after
+    // crash recovery. Scenario: durable baseline (3 nodes, 1 edge) →
+    // checkpoint → crash window (creates, edge adds, one node DELETE, one
+    // edge REMOVE) → crash → reopen. The healed counts must equal what a
+    // clean shutdown would have persisted. The pool is sized so nothing is
+    // eviction-flushed inside the crash window: the on-disk before-images
+    // recovery diffs against are exactly checkpoint-era — the case the heal
+    // is exact for (see the precision note in recovery.zig).
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0xC7} ** 16;
+    var cfg = test_support.testConfig();
+    cfg.buffer_pool_pages = 512;
+
+    const n_new: usize = 100; // ids span TWO node pages (npp = 84 @ 4096)
+    const m_new: usize = 40;
+
+    var expected_nodes: u64 = 0;
+    var expected_edges: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+
+        const a = try eng.allocNode();
+        try eng.putNode(a, emptyNode());
+        const b = try eng.allocNode();
+        try eng.putNode(b, emptyNode());
+        const c = try eng.allocNode();
+        try eng.putNode(c, emptyNode());
+        const e0 = try eng.addEdgeColocatedWithPublicId(a, b, REL, pid(999));
+        try eng.checkpoint(); // counts durable as of HERE: 3 nodes, 1 edge.
+        try testing.expectEqual(@as(u64, 3), eng.manifest.node_count);
+        try testing.expectEqual(@as(u64, 1), eng.manifest.edge_count);
+
+        // Crash window: creates on an existing AND a fresh node page, edge
+        // adds into an existing adjacency block, one delete of a
+        // checkpoint-era node, one remove of a checkpoint-era edge.
+        for (0..n_new) |_| {
+            const id = try eng.allocNode();
+            try eng.putNode(id, emptyNode());
+        }
+        for (0..m_new) |i| {
+            _ = try eng.addEdgeColocatedWithPublicId(a, b, REL, pid(i));
+        }
+        try eng.deleteNode(c);
+        try eng.removeEdge(a, b, e0);
+
+        expected_nodes = 3 + n_new - 1;
+        expected_edges = 1 + m_new - 1;
+        try testing.expectEqual(expected_nodes, eng.manifest.node_count);
+        try testing.expectEqual(expected_edges, eng.manifest.edge_count);
+
+        // SIMULATED CRASH: everything after the checkpoint lives only in the
+        // fsynced WAL tail.
+        eng.deinit();
+    }
+
+    // First reopen: replay must heal the counts.
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        const got_nodes = eng.manifest.node_count;
+        const got_edges = eng.manifest.edge_count;
+        eng.deinit(); // SECOND CRASH, immediately (empty tail follows).
+        if (got_nodes == 3 and expected_nodes != 3) {
+            std.debug.print(
+                "manifest.node_count stuck at checkpoint-era 3 (expected {d}) — counts not healed by replay\n",
+                .{expected_nodes},
+            );
+        }
+        try testing.expectEqual(expected_nodes, got_nodes);
+        try testing.expectEqual(expected_edges, got_edges);
+    }
+
+    // Second reopen sees an EMPTY WAL tail: the healed counts must have been
+    // persisted by the FIRST recovery (they ride the same atomic A/B manifest
+    // write as the advanced checkpoint LSN).
+    const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    try testing.expectEqual(expected_nodes, eng.manifest.node_count);
+    try testing.expectEqual(expected_edges, eng.manifest.edge_count);
+    try testing.expectEqual(expected_nodes, try eng.nodeCount());
+    try testing.expectEqual(expected_edges, try eng.edgeCount());
+}
+
 /// Append a checksummed WAL record to a shard engine's WAL and fsync it —
 /// simulates a record a LEGACY (pre-co-location) binary wrote to this shard's
 /// WAL tail before crashing.
