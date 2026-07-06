@@ -1115,6 +1115,19 @@ pub const GraphEngine = struct {
     /// REAL label-block pages out of the WAL — so labels written since the
     /// last checkpoint silently vanished on crash recovery.
     fn logVarChain(self: *GraphEngine, txn_id: u64, ref: u64) anyerror!void {
+        if (ref == 0) return;
+        // GAP var-store slab packing (P2): a slab head packs (block, slot), NOT
+        // a `first_page << 16` ref — the whole var-chain is ONE shared slab
+        // block (never chained). Image that single block; walking it as a page
+        // chain would trip the marker/data_len guard AND miss the real page.
+        // This is the GAP-ENT-0030-critical decode: image the DECODED page id,
+        // never the raw head. Must be slab-aware BEFORE any slab head is ever
+        // persisted (landed ahead of the slab writer for exactly this reason).
+        if (var_store_mod.isSlabHead(ref)) {
+            const page_id = var_store_mod.slabHeadPageId(ref);
+            if (page_id == 0) return error.DataCorruption; // page 0 reserved (F1)
+            return self.logPage(txn_id, .var_store, page_id);
+        }
         var current = var_store_mod.VarStore.refFirstPage(ref);
         var hops: u32 = 0;
         while (current != 0) : (hops += 1) {
@@ -1935,16 +1948,31 @@ pub const GraphEngine = struct {
         // Phase A: mutates label_index — materialize first.
         try self.ensureDerivedHydrated();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
+        const old_head = rec.label_head;
+        // GAP-ENT-0022(b): forget any prior op's tombstone before the label
+        // store may write a new one below.
+        self.var_store.resetSlabUndo();
         const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
+        // GAP-ENT-0022(b): the label store writes the NEW block, then
+        // tombstones the OLD slab slot (tombstone LAST). If anything below
+        // fails, our caller keeps the OLD head — so revive that tombstoned slot
+        // (best-effort, allocation-free) rather than leave the old head
+        // dangling. No-op for legacy frees / first writes / dedup no-ops.
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
         if (result.count != rec.label_count or result.head != rec.label_head) {
             rec.label_head = result.head;
             rec.label_count = result.count;
             try self.node_store.putNode(node_id, rec);
 
-            // Log dirty pages: the var_store chain holding the label block
-            // (result.head is a REF, not a page id — see logVarChain), and
-            // the node page.
+            // WAL-image every var-store page the mutation dirtied. `result.head`
+            // is a REF/slab head, NOT a page id — logVarChain decodes it (slab
+            // block image vs legacy chain walk). The OLD head's block ALSO
+            // needs imaging when it is a slab block, because the label store
+            // tombstoned its old slot in the SAME op (a different block from
+            // the new fill block, in general) — image it so the tombstone is
+            // durable and the slot never resurrects on replay.
             try self.logVarChain(txn, result.head);
+            if (var_store_mod.isSlabHead(old_head)) try self.logVarChain(txn, old_head);
             try self.logPage(txn, .nodes, self.nodePageId(node_id));
         }
         try self.label_index.addNode(label, node_id);
@@ -1970,6 +1998,12 @@ pub const GraphEngine = struct {
 
         try self.addLabelTxn(node_id, label, txn);
 
+        // GAP-ENT-0022(b): a COMMIT failure is the last window where this op
+        // errors after addLabelTxn tombstoned the old slab slot while the
+        // caller keeps the old head — revive it. The aborted txn's images
+        // never replay.
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
+
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");
     }
@@ -1980,7 +2014,14 @@ pub const GraphEngine = struct {
         // Phase A: mutates label_index — materialize first.
         try self.ensureDerivedHydrated();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
+        const old_head = rec.label_head;
+        // GAP-ENT-0022(b): forget any prior op's tombstone before removeLabel
+        // may write a new one.
+        self.var_store.resetSlabUndo();
         const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
+        // GAP-ENT-0022(b): revive the old slab slot if a later step fails (see
+        // addLabelTxn).
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
         rec.label_head = result.head;
         rec.label_count = result.count;
         try self.node_store.putNode(node_id, rec);
@@ -1994,9 +2035,12 @@ pub const GraphEngine = struct {
         // H3-P4: removing a label can change index membership; mark stale.
         if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
 
-        // Log dirty pages: var_store chain (if any — result.head is a REF,
-        // not a page id, see logVarChain) and node page.
+        // Log dirty pages: the NEW var-store block/chain (if any — result.head
+        // is a REF/slab head, not a page id; logVarChain decodes it), the OLD
+        // slab block whose slot removeLabel tombstoned in this op (so the
+        // tombstone is durable / never resurrects), and the node page.
         if (result.head != 0) try self.logVarChain(txn, result.head);
+        if (var_store_mod.isSlabHead(old_head)) try self.logVarChain(txn, old_head);
         try self.logPage(txn, .nodes, self.nodePageId(node_id));
         self.markDirty();
     }
@@ -2011,6 +2055,10 @@ pub const GraphEngine = struct {
         errdefer self.txn_manager.abort(txn) catch {};
 
         try self.removeLabelTxn(node_id, label, txn);
+
+        // GAP-ENT-0022(b): revive the tombstoned old slab slot on a commit
+        // failure (see addLabel).
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
 
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");

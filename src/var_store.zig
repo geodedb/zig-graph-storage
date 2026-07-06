@@ -142,6 +142,23 @@ fn writeVarSlabSlot(data: []u8, tail_reserve: u32, idx: u32, slot: VarSlabSlot) 
     std.mem.writeInt(u32, data[base + 4 ..][0..4], slot.byte_len, .little);
 }
 
+/// Stamp a fresh VarSlab block header (P2 writer): next_page = 0 (never
+/// chained), marker = VAR_SLAB_MARKER (aliases the legacy `data_len` window so
+/// a mis-typed read self-rejects), slot_count.
+fn writeVarSlabHeader(data: []u8, slot_count: u32) void {
+    const off = PAGE_HEADER_SIZE;
+    std.mem.writeInt(u64, data[off..][0..8], 0, .little);
+    std.mem.writeInt(u32, data[off + 8 ..][0..4], VAR_SLAB_MARKER, .little);
+    std.mem.writeInt(u32, data[off + 12 ..][0..4], slot_count, .little);
+}
+
+/// Overwrite just the slot_count field of an existing VarSlab header (P2
+/// writer appends: a new slot becomes visible only via this bump AFTER its run
+/// bytes + directory entry are written).
+fn writeVarSlabSlotCount(data: []u8, slot_count: u32) void {
+    std.mem.writeInt(u32, data[PAGE_HEADER_SIZE + 12 ..][0..4], slot_count, .little);
+}
+
 pub const VarStore = struct {
     buffer_pool: *BufferPool,
     free_space: *FreeSpaceManager,
@@ -155,13 +172,52 @@ pub const VarStore = struct {
     /// (the P2 writer path); 0 otherwise, including all P1 read-both fixtures.
     tail_reserve: u32 = 0,
 
+    /// GAP var-store slab packing (P2): when true, `write` packs a NEW small
+    /// var-chain (a whole byte run) as a SLOT in the shared `current_fill_page`
+    /// instead of allocating a whole >=page_size page per record — so many
+    /// small strings/label blocks share one page. Runs that exceed the
+    /// graduation threshold (or trip the page-id encode limit) fall back to the
+    /// legacy one-page-per-chain layout. Default OFF this pass: the engine
+    /// keeps producing legacy heads in production until the crash gate is
+    /// soaked and the engine default is flipped ON (the plan's P6/P7, mirroring
+    /// prop_store). Tests opt in with `slab_packing = true`.
+    slab_packing: bool = false,
+
+    /// The shared "current fill page" NEW slab runs append to. In-memory only:
+    /// after a reopen the first slab write simply starts a fresh fill page
+    /// (mirrors prop_store.current_fill_page — a copied/stale VarStore value
+    /// can never corrupt a page because append state is re-derived from the
+    /// page itself, never cached).
+    current_fill_page: ?PageId = null,
+
+    /// GAP-ENT-0022(b): undo record for the slab-slot tombstone written by the
+    /// CURRENT top-level op (at most one — a var-chain free tombstones exactly
+    /// one slot). Lets the ENGINE roll the tombstone back
+    /// (`undoLastSlabTombstone`) when it fails AFTER `free` returned but before
+    /// the node record durably points at the NEW head — otherwise the stored
+    /// (old) head would reference a dead slot forever. Reset by the engine
+    /// (`resetSlabUndo`) at the top of each label op.
+    last_slab_tombstone: ?SlabTombstoneUndo = null,
+
+    const SlabTombstoneUndo = struct { page_id: PageId, slot: u32, offset: u32, byte_len: u32 };
+
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, page_size: u32) VarStore {
         return .{
             .buffer_pool = buffer_pool,
             .free_space = free_space,
             .page_size = page_size,
             .tail_reserve = 0,
+            .slab_packing = false,
+            .current_fill_page = null,
+            .last_slab_tombstone = null,
         };
+    }
+
+    /// GAP-ENT-0022(b): forget the previous op's slab-slot tombstone. The
+    /// engine calls this at the top of each label mutation, before the
+    /// label_store call that may tombstone the old slab slot.
+    pub fn resetSlabUndo(self: *VarStore) void {
+        self.last_slab_tombstone = null;
     }
 
     /// Usable data bytes per page.
@@ -339,13 +395,14 @@ pub const VarStore = struct {
     }
 
     /// Free variable-length data by reference.
-    /// Walks the page chain and frees each page.
+    /// Walks the page chain and frees each page (legacy), or slot-tombstones a
+    /// slab-packed run (P2 — a slab head packs (block, slot), NOT a page id, so
+    /// a chain-style free would free the SHARED block out from under its other
+    /// live slots). The tombstone is the op's LAST mutation and records an undo
+    /// so the engine can revive the slot if a later step of the same op fails
+    /// (the GAP-ENT-0022(b) live-head invariant).
     pub fn free(self: *VarStore, ref: u64) !void {
-        // P1: nothing writes slab chains yet, and a slab head packs (block,
-        // slot) — NOT a page id — so a chain-style free would free the SHARED
-        // slab block out from under its other slots. Reject loudly rather than
-        // corrupt; the P2 writer teaches free() slab-slot tombstoning.
-        if (isSlabHead(ref)) return error.SlabChainFreeNotSupported;
+        if (isSlabHead(ref)) return self.tombstoneSlabSlot(ref);
 
         const start_page: PageId = ref >> 16;
         if (start_page == 0) return;
@@ -367,6 +424,74 @@ pub const VarStore = struct {
 
             current_page = next_page;
         }
+    }
+
+    /// P2: mark a slab (block, slot) run dead — set its slot-directory offset
+    /// to VAR_SLAB_SLOT_TOMBSTONE (distinct from a LIVE empty-string run, whose
+    /// offset stays a real byte offset with byte_len == 0). Other slots in the
+    /// shared block are untouched. The block itself is NOT reclaimed here
+    /// (compaction is a separate pass — mirrors prop_store, which leaves dead
+    /// slots until P6): packing, not slot reclamation, delivers the bytes/node
+    /// win.
+    ///
+    /// GAP-ENT-0022(b) ordering: the caller's OLD head keeps pointing at this
+    /// slot until the engine durably swings the node record to the NEW head, so
+    /// the tombstone must be the op's LAST mutation and it arms an undo record.
+    /// The run is validated (loudly) BEFORE the mutation; there is no error exit
+    /// after the slot write.
+    fn tombstoneSlabSlot(self: *VarStore, ref: u64) !void {
+        const page_id = slabHeadPageId(ref);
+        if (page_id == 0) return error.DataCorruption; // page 0 reserved (F1)
+        const slot = slabHeadSlot(ref);
+
+        const frame = try self.buffer_pool.pin(.var_store, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        // Validate + snapshot the run for the undo record BEFORE mutating: a
+        // tombstoned / out-of-range / out-of-bounds slot reached via a stored
+        // head is corruption (the live-head invariant), never a silent no-op.
+        const run = self.resolveSlabRun(data, slot) catch |err| {
+            self.buffer_pool.unpin(frame_idx, false);
+            return err;
+        };
+        writeVarSlabSlot(data, self.tail_reserve, slot, .{ .offset = VAR_SLAB_SLOT_TOMBSTONE, .byte_len = 0 });
+        self.buffer_pool.unpin(frame_idx, true);
+        // Arm the engine-level rollback (GAP-ENT-0022(b)).
+        self.last_slab_tombstone = .{ .page_id = page_id, .slot = slot, .offset = run.offset, .byte_len = run.byte_len };
+    }
+
+    /// GAP-ENT-0022(b): best-effort rollback of the slab-slot tombstone written
+    /// by the MOST RECENT op on this store. The engine calls this from an
+    /// errdefer when a label op fails AFTER `free` tombstoned the old slot but
+    /// before the node record durably referenced the new head — without it the
+    /// stored (old) head would reference a dead slot: permanent DataCorruption
+    /// for that node.
+    ///
+    /// Effect: restores the old slot's (offset, byte_len). The run bytes are
+    /// still intact (a tombstone only rewrites the directory entry; the data
+    /// region is never reused within the same op), so the old head reads again.
+    /// Allocation-free (resident-page pin + one slot write) so it can succeed
+    /// under the very OOM that failed the op. No-op when the current op wrote no
+    /// tombstone (first writes, legacy frees, dedup no-ops).
+    ///
+    /// Crash safety: only invoked on an op whose txn aborts, so none of that
+    /// txn's WAL page images replay — recovery reproduces the pre-op pages,
+    /// which agree with this in-memory restoration (the restored page is dirty
+    /// and flushes with the next checkpoint).
+    pub fn undoLastSlabTombstone(self: *VarStore) !void {
+        const undo = self.last_slab_tombstone orelse return;
+        self.last_slab_tombstone = null;
+        const frame = try self.buffer_pool.pin(.var_store, undo.page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        const cur = readVarSlabSlot(data, self.tail_reserve, undo.slot);
+        if (cur.offset != VAR_SLAB_SLOT_TOMBSTONE) {
+            // Defensive: not the tombstone this op wrote — leave it alone.
+            self.buffer_pool.unpin(frame_idx, false);
+            return;
+        }
+        writeVarSlabSlot(data, self.tail_reserve, undo.slot, .{ .offset = undo.offset, .byte_len = undo.byte_len });
+        self.buffer_pool.unpin(frame_idx, true);
     }
 };
 
@@ -771,15 +896,81 @@ test "P1 slab read path rejects tombstoned, out-of-range, out-of-bounds, and pag
     }
 }
 
-test "P1: free() rejects slab heads loudly (slab-slot tombstoning lands in P2)" {
+test "P2: free() slot-tombstones a slab run; sibling slots stay live and readable" {
     var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
     env.register();
     defer env.deinit();
     var store = VarStore.init(&env.pool, &env.fsm, 4096);
 
-    const runs = [_][]const u8{"x"};
+    const runs = [_][]const u8{ "alpha payload", "beta payload", "gamma payload" };
     const page = try writeRawSlabVarBlock(&store, &runs);
-    try testing.expectError(error.SlabChainFreeNotSupported, store.free(encodeSlabHead(page, 0)));
+    const free_before = env.fsm.freeCount();
+
+    // Tombstone the MIDDLE slot.
+    try store.free(encodeSlabHead(page, 1));
+
+    // The shared block is NOT reclaimed (tombstone-only; no chain-free).
+    try testing.expectEqual(free_before, env.fsm.freeCount());
+
+    // The tombstoned slot now errors loudly (live-head invariant) …
+    try testing.expectError(error.DataCorruption, store.read(encodeSlabHead(page, 1), testing.allocator));
+
+    // … while the sibling slots remain byte-identical and untouched.
+    {
+        const a = try store.read(encodeSlabHead(page, 0), testing.allocator);
+        defer testing.allocator.free(a);
+        try testing.expectEqualStrings("alpha payload", a);
+        const c = try store.read(encodeSlabHead(page, 2), testing.allocator);
+        defer testing.allocator.free(c);
+        try testing.expectEqualStrings("gamma payload", c);
+    }
+}
+
+test "P2: undoLastSlabTombstone revives the slot the current op tombstoned" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    const runs = [_][]const u8{ "keep-me", "revive-me" };
+    const page = try writeRawSlabVarBlock(&store, &runs);
+
+    store.resetSlabUndo();
+    try store.free(encodeSlabHead(page, 1));
+    try testing.expectError(error.DataCorruption, store.read(encodeSlabHead(page, 1), testing.allocator));
+
+    // The engine's failure path calls this: the slot comes back to life with
+    // byte-identical content, and the undo record is consumed (idempotent).
+    try store.undoLastSlabTombstone();
+    {
+        const revived = try store.read(encodeSlabHead(page, 1), testing.allocator);
+        defer testing.allocator.free(revived);
+        try testing.expectEqualStrings("revive-me", revived);
+    }
+    try store.undoLastSlabTombstone(); // no-op second time
+    {
+        const still = try store.read(encodeSlabHead(page, 1), testing.allocator);
+        defer testing.allocator.free(still);
+        try testing.expectEqualStrings("revive-me", still);
+    }
+
+    // Sibling untouched throughout.
+    const keep = try store.read(encodeSlabHead(page, 0), testing.allocator);
+    defer testing.allocator.free(keep);
+    try testing.expectEqualStrings("keep-me", keep);
+}
+
+test "P2: free() on an already-tombstoned slab slot errors (live-head invariant)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    const runs = [_][]const u8{"solo"};
+    const page = try writeRawSlabVarBlock(&store, &runs);
+    try store.free(encodeSlabHead(page, 0));
+    // Double-free of a dead slot is corruption, not a silent no-op.
+    try testing.expectError(error.DataCorruption, store.free(encodeSlabHead(page, 0)));
 }
 
 test {
