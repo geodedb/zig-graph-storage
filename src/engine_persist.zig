@@ -309,6 +309,13 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.adj_in.tail_reserve = self.prop_store.tail_reserve;
     self.adj_in_remote.tail_reserve = self.prop_store.tail_reserve;
 
+    // GAP adjacency slab packing (P2): opt-in per config. New small chains on
+    // all three adjacency stores pack into shared slab blocks. Reads stay
+    // slab-aware regardless (read-both), so toggling this never strands data.
+    self.adj_out.slab_packing = cfg.adjacency_slab_packing;
+    self.adj_in.slab_packing = cfg.adjacency_slab_packing;
+    self.adj_in_remote.slab_packing = cfg.adjacency_slab_packing;
+
     // Label dictionary, label store, and label index
     self.label_dict = LabelDictionary.init(allocator);
     errdefer self.label_dict.deinit();
