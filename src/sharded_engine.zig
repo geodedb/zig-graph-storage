@@ -437,23 +437,28 @@ pub const ShardedGraphEngine = struct {
     }
 
     /// G1. Resolve the recovery tail-affected page set to the OWNING node ids
-    /// across ALL shards, deduped and ascending (caller frees). An EMPTY slice
-    /// is the "full rebuild" / "nothing to reconcile" sentinel.
+    /// across ALL shards, deduped and ascending (caller frees). THREE-WAY
+    /// signal, matching `GraphEngine.tailAffectedNodeIds`:
+    ///   * `null`             — a full REBUILD is required (some shard's capture
+    ///     overflowed / was off, or its tail touched props pages it cannot
+    ///     attribute). The external index MUST rebuild wholesale.
+    ///   * non-null EMPTY     — nothing to reconcile (no shard had a
+    ///     node-affecting committed tail).
+    ///   * non-null non-empty — the unioned affected node ids.
     ///
-    /// SOUNDNESS across shards: if ANY shard requires a rebuild (its capture
-    /// overflowed/was off, or its tail touched props pages it cannot attribute
-    /// — see `GraphEngine.resolveTailAffectedNodeIds`) the WHOLE result is
-    /// empty, because a partial cross-shard set would look complete and leave
-    /// the external index silently stale on the un-reconciled shard. Shards
-    /// with no committed tail contribute nothing (not a rebuild signal).
-    pub fn tailAffectedNodeIds(self: *ShardedGraphEngine, allocator: Allocator) ![]NodeId {
+    /// SOUNDNESS across shards: if ANY shard requires a rebuild the WHOLE
+    /// result is `null` (never a partial cross-shard set, which would look
+    /// complete and leave the external index silently stale on the
+    /// un-reconciled shard). Shards with no committed tail contribute nothing
+    /// (an empty, non-null per-shard result — not a rebuild signal).
+    pub fn tailAffectedNodeIds(self: *ShardedGraphEngine, allocator: Allocator) !?[]NodeId {
         var set: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
         defer set.deinit(allocator);
         for (self.shards) |eng| {
             const ids = (try eng.resolveTailAffectedNodeIds(allocator)) orelse
                 // A shard needs a full rebuild → the external index must
                 // rebuild wholesale; never return a partial cross-shard set.
-                return try allocator.alloc(NodeId, 0);
+                return null;
             defer allocator.free(ids);
             for (ids) |id| try set.put(allocator, id, {});
         }

@@ -1936,7 +1936,7 @@ test "PHASE G G1: tailAffectedNodeIds resolves a nodes-page tail to exactly the 
     // the 3 new nodes (their page holds only them).
     const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     defer engine.deinit();
-    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
     defer testing.allocator.free(got);
     std.mem.sort(NodeId, &new_ids, {}, std.sort.asc(NodeId));
     try testing.expectEqualSlices(NodeId, &new_ids, got);
@@ -1958,12 +1958,14 @@ test "PHASE G G1: tailAffectedNodeIds is empty on a clean reopen (no tail)" {
     defer engine.deinit();
     // Clean reopen: pre-recovery frontier == durable frontier, no captured tail.
     try testing.expectEqual(engine.durableFrontierLsn(), engine.preRecoveryFrontierLsn());
-    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    // No tail → non-null EMPTY ("nothing to reconcile"), distinct from the
+    // null "rebuild required" sentinel exercised by the overflow test below.
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
-test "PHASE G G1: tailAffectedNodeIds is empty when the tail capture is unavailable (overflow)" {
+test "PHASE G G1: tailAffectedNodeIds is null (rebuild required) when the tail capture is unavailable (overflow)" {
     var td = try testDataDir();
     defer td.deinit();
     const uuid = [_]u8{0x49} ** 16;
@@ -1990,9 +1992,11 @@ test "PHASE G G1: tailAffectedNodeIds is empty when the tail capture is unavaila
     // frontier still shows a tail was applied → must fall back to full rebuild.
     testing.allocator.free(engine.tail_affected_pages.?);
     engine.tail_affected_pages = null;
+    // A committed tail with no usable capture returns the null "rebuild
+    // required" sentinel — NOT an empty slice (which would read as "nothing to
+    // reconcile" and leave the external index silently stale on the tail node).
     const got = try engine.tailAffectedNodeIds(testing.allocator);
-    defer testing.allocator.free(got);
-    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expect(got == null);
 }
 
 test "PHASE G reverse-map: an in-place property value change (props-only tail) resolves the changed node" {
@@ -2026,7 +2030,7 @@ test "PHASE G reverse-map: an in-place property value change (props-only tail) r
     const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     defer engine.deinit();
     try testing.expect(engine.tail_affected_pages != null);
-    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(NodeId, &[_]NodeId{1}, got);
 }
@@ -2065,7 +2069,7 @@ test "PHASE G reverse-map: fill-page co-tenant is resolved (not a rebuild) on an
     // nodes-page pass alone would have force-rebuilt.
     const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     defer engine.deinit();
-    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(NodeId, &[_]NodeId{ 1, 2 }, got);
 }

@@ -1373,20 +1373,29 @@ pub const GraphEngine = struct {
     /// (`tail_affected_pages`) to the OWNING node ids, for an external derived
     /// index that reconciles the bounded WAL tail after a crash reopen.
     ///
-    /// Returns an owned, ascending, deduped slice (caller frees with
-    /// `allocator.free`). An EMPTY slice is the "no bounded reconcile" sentinel
-    /// — see `resolveTailAffectedNodeIds` for exactly when. The empty-on-doubt
-    /// discipline mirrors Path B: NEVER return a partial set that looks
-    /// complete (a missed node ⇒ a stale external index ⇒ silently-wrong query
-    /// results).
+    /// THREE-WAY signal (a thin pass-through of the core
+    /// `resolveTailAffectedNodeIds`, kept distinct so "rebuild required" is
+    /// never mistaken for "nothing to do"):
+    ///   * `null`             — a full REBUILD is required: the affected-page
+    ///     capture was unavailable / overflowed, or a tail props slot could not
+    ///     be attributed to a node. The external index MUST rebuild wholesale.
+    ///   * non-null EMPTY     — nothing to reconcile: a clean reopen, or a
+    ///     committed tail that touched no node-owning pages. The external index
+    ///     is already current.
+    ///   * non-null non-empty — the resolved (super)set of affected node ids
+    ///     (owned, ascending, deduped; caller frees with `allocator.free`).
+    /// Collapsing `null` into an empty slice would let a caller read "rebuild
+    /// required" as "nothing to do" ⇒ a stale external index ⇒ silently-wrong
+    /// query results; the distinct `null` prevents exactly that. A non-null set
+    /// is never a partial-but-complete-looking slice (empty-on-doubt mirrors
+    /// Path B — genuine doubt returns `null`, never a truncated set).
     ///
     /// LIFECYCLE: reads `tail_affected_pages` without consuming it, but gs's
     /// own lazy derived hydration frees that set on first access — so the
     /// external reconcile MUST call this after open() and BEFORE the first
     /// accessor that triggers derived hydration.
-    pub fn tailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) ![]NodeId {
-        return (try self.resolveTailAffectedNodeIds(allocator)) orelse
-            try allocator.alloc(NodeId, 0);
+    pub fn tailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) !?[]NodeId {
+        return self.resolveTailAffectedNodeIds(allocator);
     }
 
     /// G1 core (also the per-shard primitive the ShardedGraphEngine aggregate

@@ -520,7 +520,7 @@ test "PHASE G G1: ShardedGraphEngine tailAffectedNodeIds unions per-shard node i
 
     // Aggregate G1: exactly the K tail ids, deduped + ascending across shards.
     {
-        const got = try eng.tailAffectedNodeIds(testing.allocator);
+        const got = (try eng.tailAffectedNodeIds(testing.allocator)).?;
         defer testing.allocator.free(got);
         std.mem.sort(u64, &tail_ids, {}, std.sort.asc(u64));
         try testing.expectEqualSlices(u64, &tail_ids, got);
@@ -533,11 +533,12 @@ test "PHASE G G1: ShardedGraphEngine tailAffectedNodeIds unions per-shard node i
     try testing.expect(owner.durableFrontierLsn() > owner.preRecoveryFrontierLsn());
 
     // Poison: if ANY shard needs a rebuild (its capture unavailable while a
-    // tail was applied), the WHOLE aggregate is empty — never a partial set.
+    // tail was applied), the WHOLE aggregate is the null "rebuild required"
+    // sentinel — never a partial set, and never an empty slice that would read
+    // as "nothing to reconcile".
     try testing.expect(owner.tail_affected_pages != null);
     testing.allocator.free(owner.tail_affected_pages.?);
     owner.tail_affected_pages = null;
     const poisoned = try eng.tailAffectedNodeIds(testing.allocator);
-    defer testing.allocator.free(poisoned);
-    try testing.expectEqual(@as(usize, 0), poisoned.len);
+    try testing.expect(poisoned == null);
 }
