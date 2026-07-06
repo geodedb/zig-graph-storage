@@ -121,6 +121,22 @@ pub const Recovery = struct {
     replayed_node_delta: i64 = 0,
     replayed_edge_delta: i64 = 0,
 
+    /// WAL-aware derived-index durability Phase 3 (tail reconcile): the set of
+    /// (file_id, page_id) pairs this recovery APPLIED via committed page_update
+    /// records — the bounded tail-affected page set. The engine copies it out
+    /// at OPEN and, at first-access derived-index hydration, reconciles ONLY
+    /// these pages into the loaded snapshot instead of rebuilding O(graph).
+    /// Keyed `(file_id << 64) | page_id`; deduplicated; bounded by the tail LSN
+    /// range. `affected_pages_overflow` latches on an OOM insert so the engine
+    /// falls back to a full rebuild (a partial set would reconcile incorrectly).
+    affected_pages: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    affected_pages_overflow: bool = false,
+    /// Opt-in: only the standalone engine open path (which reconciles the tail
+    /// into its loaded derived-index snapshot) sets this true and `deinit()`s
+    /// the map. Every other recover() caller (unit tests, sharded/other paths
+    /// that rebuild) leaves it false → no allocation, no ownership to free.
+    capture_affected_pages: bool = false,
+
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
             .allocator = allocator,
@@ -139,6 +155,30 @@ pub const Recovery = struct {
             // teardown, not a cryptographic algorithm operation.
             std.crypto.secureZero(u8, key);
         }
+        self.affected_pages.deinit(self.allocator);
+    }
+
+    /// Phase 3 tail reconcile: record a (file_id, page_id) that replay applied
+    /// from a committed page_update. Best-effort — an OOM latches
+    /// `affected_pages_overflow` so the engine rebuilds instead of reconciling
+    /// from an incomplete set (an under-count would leave stale index entries).
+    fn recordAffectedPage(self: *Recovery, file_id: FileId, page_id: u64) void {
+        if (!self.capture_affected_pages) return;
+        const key: u128 = (@as(u128, @intFromEnum(file_id)) << 64) | page_id;
+        self.affected_pages.put(self.allocator, key, {}) catch {
+            self.affected_pages_overflow = true;
+        };
+    }
+
+    /// Number of distinct tail-affected pages (test/observability).
+    pub fn affectedPageCount(self: *const Recovery) usize {
+        return self.affected_pages.count();
+    }
+
+    /// True when (file_id, page_id) is in the tail-affected set (test helper).
+    pub fn hasAffectedPage(self: *const Recovery, file_id: FileId, page_id: u64) bool {
+        const key: u128 = (@as(u128, @intFromEnum(file_id)) << 64) | page_id;
+        return self.affected_pages.contains(key);
     }
 
     /// Recover a graph from its directory.
@@ -353,6 +393,12 @@ pub const Recovery = struct {
                 ctx.applied_committed_pages.* = true;
 
                 const file_id: FileId = std.enums.fromInt(FileId, rec.file_id) orelse return error.InvalidFormat;
+
+                // Phase 3 tail reconcile: record the applied (file_id, page_id)
+                // so the engine can reconcile ONLY the tail-touched pages into
+                // the loaded derived-index snapshot at first-access hydration.
+                ctx.recovery.recordAffectedPage(file_id, rec.page_id);
+
                 const frame = try ctx.buffer_pool.pinNew(file_id, rec.page_id);
                 const frame_idx = ctx.buffer_pool.frameIndex(frame);
                 const data = frame.dataSlice();
@@ -982,6 +1028,74 @@ test "recovery with committed transaction: changes visible after recovery" {
     }
     // The data should match since we wrote the full page
     try testing.expect(all_match);
+}
+
+test "Phase 3 Task 3.1: replay records the tail-affected (file_id,page_id) set" {
+    // A committed 3-page tail → recovery's affected-page set == exactly those
+    // 3 pages (dedup, bounded by the tail). The engine copies this at OPEN and
+    // reconciles only these pages into the loaded derived-index snapshot at
+    // first access, instead of an O(graph) rebuild.
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+
+    var begin_rec = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin_rec);
+
+    var page_data: [4096]u8 = undefined;
+    @memset(&page_data, 0xAB);
+    // Three distinct pages on the nodes file: 1, 2, 3. Page 2 is written TWICE
+    // to prove dedup (the affected set counts distinct pages, not records).
+    const page_ids = [_]u64{ 1, 2, 2, 3 };
+    for (page_ids) |pid| {
+        var update_rec = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .page_update, .file_id = @intFromEnum(FileId.nodes), .page_id = pid, .payload = &page_data, .checksum = 0 };
+        _ = try wal.appendRecord(&update_rec);
+    }
+
+    var commit_rec = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&commit_rec);
+    try wal.sync();
+    wal.deinit();
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    defer recovery.deinit();
+    recovery.capture_affected_pages = true;
+    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // Exactly 3 DISTINCT pages, all on the nodes file, no overflow.
+    try testing.expect(!recovery.affected_pages_overflow);
+    try testing.expectEqual(@as(usize, 3), recovery.affectedPageCount());
+    try testing.expect(recovery.hasAffectedPage(.nodes, 1));
+    try testing.expect(recovery.hasAffectedPage(.nodes, 2));
+    try testing.expect(recovery.hasAffectedPage(.nodes, 3));
+    // A page NOT in the tail is absent.
+    try testing.expect(!recovery.hasAffectedPage(.nodes, 4));
+    try testing.expect(!recovery.hasAffectedPage(.props, 1));
 }
 
 test "GAP-0030: recovery replays a large committed WAL tail" {

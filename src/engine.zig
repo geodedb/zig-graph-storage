@@ -78,6 +78,10 @@ const OrderedPropertyIndex = ordered_property_index_mod.OrderedPropertyIndex;
 /// here so every existing `engine_mod.EdgeIndexEntry` reference keeps working).
 pub const EdgeIndexEntry = edge_index_map_mod.EdgeIndexEntry;
 
+/// WAL-aware derived-index durability Phase 3: one tail-affected primary page,
+/// captured by recovery and consumed by the first-access tail reconcile.
+pub const TailPage = struct { file_id: types.FileId, page_id: u64 };
+
 /// Default worker count for the owned (no-`external_thread_pool`) path.
 /// Sized for the only consumer — `BufferPool.flushAllParallel`, capped at
 /// `MAX_CHUNKS = 64` short-lived I/O tasks per checkpoint. Four workers
@@ -246,6 +250,15 @@ pub const GraphEngine = struct {
     /// rebuild sets all four.
     derived_snapshots_trusted: bool = false,
 
+    /// WAL-aware derived-index durability Phase 3 (tail reconcile): the
+    /// tail-affected primary pages recovery applied at OPEN, copied out of the
+    /// (soon-deinit) Recovery for the DEFERRED first-access reconcile. Null
+    /// means "no bounded tail to reconcile" — either a clean reopen, or the
+    /// capture was unavailable/overflowed → materializeDerivedIndexes rebuilds
+    /// (always safe). Owned; freed and nulled once the reconcile consumes it
+    /// (or in cleanupResources on an un-hydrated teardown).
+    tail_affected_pages: ?[]TailPage = null,
+
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
         const self = try allocator.create(GraphEngine);
@@ -272,6 +285,7 @@ pub const GraphEngine = struct {
         // P2: all four dirty flags are true → the clean-snapshot invariant
         // holds vacuously (see the field doc).
         self.derived_snapshots_trusted = true;
+        self.tail_affected_pages = null; // fresh graph: no WAL tail to reconcile
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -416,6 +430,7 @@ pub const GraphEngine = struct {
         // (they may be crash-stale behind clean dirty flags) — restamping is
         // forbidden until materializeDerivedIndexes establishes the invariant.
         self.derived_snapshots_trusted = false;
+        self.tail_affected_pages = null; // set from recovery's captured set below
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -457,6 +472,10 @@ pub const GraphEngine = struct {
             @as(u64, @intCast(base)) % recovery.id_stride
         else
             0;
+        // WAL-aware derived-index durability Phase 3: capture the tail-affected
+        // (file_id,page_id) set so first-access hydration can reconcile ONLY the
+        // bounded tail into the loaded snapshot instead of an O(graph) rebuild.
+        recovery.capture_affected_pages = true;
         defer recovery.deinit();
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
         self.read_only = recovery.read_only;
@@ -558,6 +577,29 @@ pub const GraphEngine = struct {
         // last_checkpoint_lsn past the replayed tail, so a second crash
         // before the next checkpoint would otherwise take the clean path on
         // the NEXT open and trust the stale checkpoint-era file.
+        // WAL-aware derived-index durability Phase 3: copy the tail-affected
+        // page set out of `recovery` (about to deinit) for the DEFERRED
+        // first-access reconcile. Only when a committed tail was applied and the
+        // capture is COMPLETE — an overflow (OOM mid-capture) or an empty set
+        // leaves it null so materializeDerivedIndexes rebuilds (always safe; a
+        // partial set would leave stale index entries).
+        if (recovery.applied_committed_pages and
+            !recovery.affected_pages_overflow and
+            recovery.affected_pages.count() > 0)
+        {
+            const n = recovery.affected_pages.count();
+            const buf = try allocator.alloc(TailPage, n);
+            var it = recovery.affected_pages.keyIterator();
+            var i: usize = 0;
+            while (it.next()) |k| : (i += 1) {
+                buf[i] = .{
+                    .file_id = @enumFromInt(@as(u8, @intCast(k.* >> 64))),
+                    .page_id = @truncate(k.*),
+                };
+            }
+            self.tail_affected_pages = buf;
+        }
+
         if (recovery.applied_committed_pages) {
             try self.rebuildFreeSpaceFromDisk();
             try self.saveFreeStore();
@@ -1025,6 +1067,13 @@ pub const GraphEngine = struct {
     /// Internal cleanup of all engine resources. Always runs on close,
     /// even when errors have occurred.
     fn cleanupResources(self: *GraphEngine, allocator: Allocator) void {
+        // Phase 3 tail reconcile: free the captured tail-affected page set if
+        // the reconcile never consumed it (e.g. an engine closed before any
+        // derived-index first-access).
+        if (self.tail_affected_pages) |pages| {
+            allocator.free(pages);
+            self.tail_affected_pages = null;
+        }
         // Release the submitter slot before draining the pool. The TLS-
         // owner check inside releaseSubmitter (F-005) handles the case
         // where the engine was torn down from a thread other than the one
