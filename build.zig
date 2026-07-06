@@ -508,6 +508,20 @@ fn addIntegrationTests(
     const run_prop_store_slab = b.addRunArtifact(prop_store_slab_tests);
     prop_store_slab_step.dependOn(&run_prop_store_slab.step);
 
+    // GAP var-store slab packing P2 — WRITE-path acceptance gates: bytes/node
+    // re-measure, slab-vs-legacy parity, on-disk reopen, WAL imaging
+    // (logVarChain slab-aware), the crash gate (committed slab labels/strings
+    // survive a deinit-crash; uncommitted is invisible; every var_head live),
+    // clean-shutdown, and graduation-across-crash.
+    const var_store_slab_step = b.step("test-var-store-slab", "Run var-store slab-packing P2: bytes/node, parity, reopen, WAL imaging, and crash/graduation gates");
+    const var_store_slab_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/var_store_slab.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_var_store_slab = b.addRunArtifact(var_store_slab_tests);
+    var_store_slab_step.dependOn(&run_var_store_slab.step);
+
     // GAP edge-inline-public-id P0/P1 — baseline oracle for the per-edge
     // `__geode_internal_edge_id` LEGACY property cost (one ≥8 KB props page
     // per edge) + parity oracle over full edge enumeration, and the v1/v2
@@ -654,6 +668,7 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_wal_recovery_counters.step);
     // Label WAL-imaging crash guards likewise.
     integration_step.dependOn(&run_label_crash_replay.step);
+    integration_step.dependOn(&run_var_store_slab.step);
     // Edge-prop-head under-logging crash guards likewise.
     integration_step.dependOn(&run_edge_prop_crash.step);
     // Adjacency-slab read-both + harvest coverage (silent-counter-staleness
