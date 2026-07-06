@@ -414,6 +414,28 @@ pub const ShardedGraphEngine = struct {
         self.allocator.destroy(self);
     }
 
+    // ========================================================================
+    // PHASE G — crash-reopen exact-index reconcile: public API for an EXTERNAL
+    // derived index (e.g. geode's prop_exact.idx). ADDITIVE — pure reads over
+    // already-recovered state; no behaviour change to any existing path.
+    // ========================================================================
+
+    /// Number of shards backing this graph. The G2 durable-frontier / epoch
+    /// getters are PER-SHARD (each shard has its own manifest + recovery); an
+    /// external per-graph index compares against the owning shard via
+    /// `shard(s)` (geode already reads `shards[s].manifest`).
+    pub fn shardCount(self: *ShardedGraphEngine) usize {
+        _ = self;
+        return SHARD_COUNT;
+    }
+
+    /// Per-shard engine accessor for the G2 getters
+    /// (`shard(s).checkpointEpoch()` / `.durableFrontierLsn()` /
+    /// `.preRecoveryFrontierLsn()`).
+    pub fn shard(self: *ShardedGraphEngine, index: usize) *GraphEngine {
+        return self.shards[index];
+    }
+
     pub fn getNode(self: *ShardedGraphEngine, id: NodeId) anyerror!?NodeRec {
         return self.shards[shard_count_mod.shardOfNode(id)].getNode(id);
     }

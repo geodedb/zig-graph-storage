@@ -1847,3 +1847,49 @@ test "GAP-0900 L2: checkpointLight is O(dirty) — skips derived-index save, tru
         try testing.expectEqual(N, out.len);
     }
 }
+
+// ============================================================================
+// PHASE G — crash-reopen exact-index reconcile: gs public API tests (G2).
+// checkpointEpoch / durableFrontierLsn / preRecoveryFrontierLsn — stable
+// accessors over the manifest + recovery state. ADDITIVE; pure reads.
+// ============================================================================
+
+test "PHASE G G2: getters reflect manifest + recovery state across checkpoint and crash" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4B} ** 16;
+    const cfg = testConfig();
+
+    var epoch_after_ckpt: u64 = undefined;
+    var durable_after_ckpt: u64 = undefined;
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const epoch0 = engine.checkpointEpoch();
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(1));
+        try engine.checkpoint();
+        // A checkpoint advances the epoch and the durable frontier.
+        try testing.expect(engine.checkpointEpoch() > epoch0);
+        try testing.expect(engine.durableFrontierLsn() > 0);
+        epoch_after_ckpt = engine.checkpointEpoch();
+        durable_after_ckpt = engine.durableFrontierLsn();
+        try engine.close();
+    }
+    {
+        // Clean reopen: pre-recovery == durable; epoch preserved.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        try testing.expectEqual(engine.durableFrontierLsn(), engine.preRecoveryFrontierLsn());
+        try testing.expectEqual(epoch_after_ckpt, engine.checkpointEpoch());
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(2));
+        engine.deinit(); // committed tail, then crash
+    }
+    // Crash reopen with a replayed tail: durable advanced past pre-recovery;
+    // the epoch did NOT advance (recovery never bumps it); pre-recovery frontier
+    // == the last checkpoint's durable frontier.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try testing.expect(engine.durableFrontierLsn() > engine.preRecoveryFrontierLsn());
+    try testing.expectEqual(epoch_after_ckpt, engine.checkpointEpoch());
+    try testing.expectEqual(durable_after_ckpt, engine.preRecoveryFrontierLsn());
+}

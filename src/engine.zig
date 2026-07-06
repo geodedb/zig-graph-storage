@@ -1294,6 +1294,44 @@ pub const GraphEngine = struct {
         allocator.destroy(self);
     }
 
+    // ========================================================================
+    // PHASE G — crash-reopen exact-index reconcile: public API for an EXTERNAL
+    // derived index (e.g. geode's prop_exact.idx) to reconcile the bounded WAL
+    // tail instead of a full O(graph) rebuild after a crash reopen. ADDITIVE:
+    // pure reads over already-recovered state; no behaviour change to any
+    // existing path.
+    // ========================================================================
+
+    /// G2. The durable checkpoint epoch (manifest.checkpoint_epoch). Advances
+    /// ONLY at checkpoint, NEVER by a WAL-tail recovery — so an external index
+    /// snapshot stamped at epoch E stays valid-as-of its covered LSN across a
+    /// crash reopen (a genuine mismatch means a checkpoint ran after it). On a
+    /// sharded engine this is PER-SHARD; geode compares its per-graph
+    /// prop_exact.idx against the owning shard's value
+    /// (`sge.shard(s).checkpointEpoch()`).
+    pub fn checkpointEpoch(self: *GraphEngine) u64 {
+        return self.manifest.checkpoint_epoch;
+    }
+
+    /// G2. The durable committed frontier AFTER recovery
+    /// (manifest.last_checkpoint_lsn): a checkpoint sets it to the checkpoint
+    /// LSN; a WAL-tail recovery bumps it to the replayed tail end. An external
+    /// index whose covered_lsn < this has a committed tail to reconcile.
+    pub fn durableFrontierLsn(self: *GraphEngine) u64 {
+        return self.manifest.last_checkpoint_lsn;
+    }
+
+    /// G2. The durable committed frontier as it stood BEFORE this session's
+    /// recovery replayed (Path B's `tail_pre_recovery_lsn`). A sound
+    /// single-recovery reconcile requires the on-disk snapshot's covered_lsn ==
+    /// this value; if covered_lsn < this, a PRIOR un-checkpointed recovery
+    /// advanced the frontier past the snapshot and the captured tail slice is
+    /// incomplete → the external index must full-rebuild. Equals
+    /// durableFrontierLsn() on a clean reopen (no tail replayed).
+    pub fn preRecoveryFrontierLsn(self: *GraphEngine) u64 {
+        return self.tail_pre_recovery_lsn;
+    }
+
     /// Get a GraphStorage interface backed by this engine.
     pub fn storage(self: *GraphEngine) GraphStorage {
         return GraphStorage.init(GraphEngine, self);
