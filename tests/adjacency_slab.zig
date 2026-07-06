@@ -329,3 +329,117 @@ test "GAP adjacency-slab P2: slab packing collapses bytes/edge + full enumeratio
 
     try testing.expectEqual(@as(u64, N_EDGES), try eng.edgeCount());
 }
+
+// ============================================================================
+// P2 crash + harvest: the REAL slab writer's images in the WAL tail must
+// recover with every stored head referencing a live run (full parity, no
+// dangling slab heads), AND the recovery counter harvest must heal edge ids
+// that live only in replayed SLAB runs (else the counter-staleness class is
+// reintroduced for slab chains and allocEdge re-issues a committed id).
+// ============================================================================
+
+test "GAP adjacency-slab P2 crash+harvest: kill mid-slab-write recovers with live heads and heals slab-run ids" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0xB3} ** 16;
+
+    const NN: usize = 300;
+    const NE: usize = 400;
+    var node_ids: [NN]u64 = undefined;
+    var made: [NE]MadeEdge = undefined;
+
+    {
+        var eng = try ShardedGraphEngine.create(alloc, td.path, uuid, slabConfig());
+        errdefer eng.close() catch {};
+
+        // Durable baseline: nodes + checkpoint. Everything below lives only in
+        // the fsynced WAL tail (the crash window).
+        for (&node_ids) |*n| {
+            n.* = try eng.allocNode();
+            try eng.putNode(n.*, test_support.emptyNode(1));
+        }
+        try eng.checkpoint();
+
+        // Crash-window low-fanout edges — all slab-packed by the P2 writer.
+        var e: usize = 0;
+        var i: usize = 0;
+        while (i + 1 < NN and e < NE) : (i += 1) {
+            const p = publicId(e);
+            const id = try eng.addEdgeColocatedWithPublicId(node_ids[i], node_ids[i + 1], REL, p);
+            made[e] = .{ .edge_id = id, .from = node_ids[i], .to = node_ids[i + 1], .public_id = p };
+            e += 1;
+        }
+        i = 0;
+        while (i + 2 < NN and e < NE) : (i += 1) {
+            const p = publicId(e);
+            const id = try eng.addEdgeColocatedWithPublicId(node_ids[i], node_ids[i + 2], REL, p);
+            made[e] = .{ .edge_id = id, .from = node_ids[i], .to = node_ids[i + 2], .public_id = p };
+            e += 1;
+        }
+        try testing.expectEqual(NE, e);
+
+        // SIMULATED CRASH: no checkpoint, no close.
+        eng.deinit();
+    }
+
+    // Reopen: WAL replay reconstructs the slab-packed adjacency + heals counters.
+    var eng = try ShardedGraphEngine.open(alloc, td.path, uuid, slabConfig());
+    defer eng.close() catch {};
+
+    var by_id = std.AutoHashMap(u64, usize).init(alloc);
+    defer by_id.deinit();
+    for (made, 0..) |m, idx| try by_id.putNoClobber(m.edge_id, idx);
+
+    // (1) Live heads: full enumeration parity BOTH directions. A dangling slab
+    //     head (a stored head at a tombstoned/empty run) would DataCorruption
+    //     or silently drop edges here.
+    var seen = [_]bool{false} ** NE;
+    var fwd: usize = 0;
+    for (node_ids) |n| {
+        var it = try eng.expandOutIter(n, null);
+        defer it.deinit();
+        while (try it.next()) |edge| {
+            const idx = by_id.get(edge.edge_id) orelse return error.UnknownEdgeEnumerated;
+            try testing.expect(!seen[idx]);
+            seen[idx] = true;
+            try testing.expectEqual(made[idx].to, edge.neighbor);
+            try testing.expectEqual(made[idx].public_id, edge.public_id);
+            fwd += 1;
+        }
+    }
+    try testing.expectEqual(NE, fwd);
+    for (seen) |b| try testing.expect(b);
+
+    @memset(&seen, false);
+    var rev: usize = 0;
+    for (node_ids) |t| {
+        var it = try eng.expandInIter(t, null);
+        defer it.deinit();
+        while (try it.next()) |edge| {
+            const idx = by_id.get(edge.edge_id) orelse return error.UnknownEdgeEnumerated;
+            try testing.expect(!seen[idx]);
+            seen[idx] = true;
+            try testing.expectEqual(made[idx].from, edge.neighbor);
+            rev += 1;
+        }
+    }
+    try testing.expectEqual(NE, rev);
+    try testing.expectEqual(@as(u64, NE), try eng.edgeCount());
+
+    // (2) Harvest heal: edge ids that live ONLY in replayed slab runs must have
+    //     lifted the manifest counters — aggressive new edges never re-issue a
+    //     crash-window id (a stale counter would collide within ~25 creates on
+    //     the reused shard; 128 makes the miss overwhelming if unhealed).
+    var made_ids = std.AutoHashMap(u64, void).init(alloc);
+    defer made_ids.deinit();
+    for (made) |m| try made_ids.put(m.edge_id, {});
+    var k: usize = 0;
+    while (k < 128) : (k += 1) {
+        const id = try eng.addEdgeColocatedWithPublicId(node_ids[0], node_ids[1], REL, publicId(100000 + k));
+        if (made_ids.contains(id)) {
+            std.debug.print("post-crash addEdge RE-ISSUED slab-run edge id {d} — harvest missed slab images\n", .{id});
+            return error.EdgeSlotReissued;
+        }
+    }
+}
