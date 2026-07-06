@@ -10,16 +10,36 @@ const Allocator = std.mem.Allocator;
 // for on-disk format; not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 
-/// Header bytes preceding the payload: checkpoint_counter(u64) + item_count(u64).
-pub const HEADER_FIELDS_SIZE: usize = 16;
+/// WAL-aware derived-index durability (Path B): the header fields preceding the
+/// payload are now `checkpoint_epoch(u64) + covered_lsn(u64) + item_count(u64)`.
+///
+/// `checkpoint_epoch` is the durable freshness token the load gate compares
+/// against `manifest.checkpoint_epoch` (advanced ONLY at checkpoint, NOT by a
+/// WAL-tail recovery — see checkpoint.zig / manifest.zig). `covered_lsn` is the
+/// checkpoint LSN this snapshot reflects; the reader compares it against
+/// `wal.currentLsn()` to detect a WAL tail beyond the snapshot.
+///
+/// The ordered (H3) index shares this container but is NOT part of the WAL-tail
+/// epoch contract: it stamps its `manifest.counter` into the `checkpoint_epoch`
+/// slot and leaves `covered_lsn == 0`, keeping its existing counter gate. See
+/// ordered_property_index.zig.
+pub const HEADER_FIELDS_SIZE: usize = 24;
 
 /// Trailing CRC32 appended after the payload (SEC-0051).
 pub const CHECKSUM_SIZE: usize = 4;
 
+/// The durable freshness stamp a derived-index snapshot carries: the
+/// `checkpoint_epoch` it was saved at and the WAL LSN that checkpoint covered.
+pub const Stamp = struct {
+    epoch: u64,
+    covered_lsn: u64,
+};
+
 pub const LoadedSnapshot = struct {
     allocator: Allocator,
     data: []u8,
-    checkpoint_counter: u64,
+    checkpoint_epoch: u64,
+    covered_lsn: u64,
     item_count: u64,
     payload_offset: usize,
     payload_size: usize,
@@ -34,12 +54,13 @@ pub const LoadedSnapshot = struct {
 };
 
 pub const SnapshotHeader = struct {
-    checkpoint_counter: u64,
+    checkpoint_epoch: u64,
+    covered_lsn: u64,
     item_count: u64,
     payload_size: usize,
 };
 
-pub fn writeHeader(file: std.Io.File, offset: *u64, magic: []const u8, checkpoint_counter: u64, item_count: u64) !void {
+pub fn writeHeader(file: std.Io.File, offset: *u64, magic: []const u8, checkpoint_epoch: u64, covered_lsn: u64, item_count: u64) !void {
     if (magic.len != 8) return error.InvalidMagicLength;
     const io = std.Io.Threaded.global_single_threaded.io();
 
@@ -48,7 +69,11 @@ pub fn writeHeader(file: std.Io.File, offset: *u64, magic: []const u8, checkpoin
     try file.writePositionalAll(io, magic, offset.*);
     offset.* += magic.len;
 
-    std.mem.writeInt(u64, &u64_buf, checkpoint_counter, .little);
+    std.mem.writeInt(u64, &u64_buf, checkpoint_epoch, .little);
+    try file.writePositionalAll(io, &u64_buf, offset.*);
+    offset.* += 8;
+
+    std.mem.writeInt(u64, &u64_buf, covered_lsn, .little);
     try file.writePositionalAll(io, &u64_buf, offset.*);
     offset.* += 8;
 
@@ -106,8 +131,9 @@ pub fn loadFile(allocator: Allocator, file: *std.Io.File, expected_magic: []cons
     return .{
         .allocator = allocator,
         .data = data,
-        .checkpoint_counter = std.mem.readInt(u64, data[expected_magic.len..][0..8], .little),
-        .item_count = std.mem.readInt(u64, data[expected_magic.len + 8 ..][0..8], .little),
+        .checkpoint_epoch = std.mem.readInt(u64, data[expected_magic.len..][0..8], .little),
+        .covered_lsn = std.mem.readInt(u64, data[expected_magic.len + 8 ..][0..8], .little),
+        .item_count = std.mem.readInt(u64, data[expected_magic.len + 16 ..][0..8], .little),
         .payload_offset = payload_offset,
         .payload_size = size - payload_offset - CHECKSUM_SIZE,
     };
@@ -137,7 +163,8 @@ pub fn loadHeader(file: *std.Io.File, expected_magic: []const u8, min_record_siz
 
     const io = std.Io.Threaded.global_single_threaded.io();
 
-    var header_buf: [24]u8 = undefined;
+    // magic(8) + checkpoint_epoch(8) + covered_lsn(8) + item_count(8) = 32.
+    var header_buf: [32]u8 = undefined;
     const header_read = try file.readPositionalAll(io, &header_buf, 0);
     if (header_read != header_buf.len) return error.UnexpectedEndOfFile;
     if (!std.mem.eql(u8, header_buf[0..expected_magic.len], expected_magic)) {
@@ -162,7 +189,7 @@ pub fn loadHeader(file: *std.Io.File, expected_magic: []const u8, min_record_siz
     const stored_crc = std.mem.readInt(u32, &trailer_buf, .little);
     if (stored_crc != hasher.final()) return error.ChecksumMismatch;
 
-    const item_count = std.mem.readInt(u64, header_buf[expected_magic.len + 8 ..][0..8], .little);
+    const item_count = std.mem.readInt(u64, header_buf[expected_magic.len + 16 ..][0..8], .little);
     const payload_size = size - (expected_magic.len + HEADER_FIELDS_SIZE + CHECKSUM_SIZE);
 
     // SEC-0044/SEC-0048: reject counts that cannot possibly be backed by bytes.
@@ -172,32 +199,34 @@ pub fn loadHeader(file: *std.Io.File, expected_magic: []const u8, min_record_siz
     }
 
     return .{
-        .checkpoint_counter = std.mem.readInt(u64, header_buf[expected_magic.len..][0..8], .little),
+        .checkpoint_epoch = std.mem.readInt(u64, header_buf[expected_magic.len..][0..8], .little),
+        .covered_lsn = std.mem.readInt(u64, header_buf[expected_magic.len + 8 ..][0..8], .little),
         .item_count = item_count,
         .payload_size = payload_size,
     };
 }
 
 // ---------------------------------------------------------------------------
-// GAP warm-reopen P2: cheap checkpoint_counter re-stamp.
+// GAP warm-reopen P2 / WAL-aware durability: cheap freshness-stamp re-stamp.
 //
 // The legacy container's trailing CRC32C covers the WHOLE file (magic |
-// counter | item_count | payload), so changing the counter naively would
-// require re-reading the entire payload to recompute the trailer — exactly
-// the O(file) work a restamp must avoid. Instead we exploit that CRC32C is
-// AFFINE over GF(2): for two equal-length messages M and M' = M ⊕ D, the
-// init/xorout contributions cancel and
+// checkpoint_epoch | covered_lsn | item_count | payload), so changing the
+// stamp naively would require re-reading the entire payload to recompute the
+// trailer — exactly the O(file) work a restamp must avoid. Instead we exploit
+// that CRC32C is AFFINE over GF(2): for two equal-length messages M and
+// M' = M ⊕ D, the init/xorout contributions cancel and
 //
 //     crc(M') = crc(M) ⊕ rawcrc(D)
 //
 // where rawcrc is the pure-linear CRC (init 0, xorout 0). Our delta D is
-// zero everywhere except the 8 counter bytes at offset 8, so
+// zero everywhere except the 16 stamp bytes at offset 8 (checkpoint_epoch ++
+// covered_lsn), so
 //
-//     rawcrc(D) = zeroExtend(rawcrc8(old ⊕ new), bytes_after_counter)
+//     rawcrc(D) = zeroExtend(rawcrc16(old ⊕ new), bytes_after_stamps)
 //
 // (leading zero bytes leave a zero register unchanged; the trailing zero
 // bytes are applied in O(log n) with the zlib crc32_combine GF(2)-matrix
-// method). Total restamp cost: two 8/4-byte reads, O(log file) arithmetic,
+// method). Total restamp cost: two small reads, O(log file) arithmetic,
 // two small writes, one fsync.
 // ---------------------------------------------------------------------------
 
@@ -264,18 +293,21 @@ fn crcZeroExtend(crc: u32, len: u64) u32 {
     return result;
 }
 
-/// GAP warm-reopen P2: re-stamp the checkpoint_counter of an existing legacy
-/// snapshot (magic | counter | item_count | payload | whole-file CRC32C) to
-/// `new_counter` WITHOUT reading or rewriting the payload — see the delta
-/// derivation above. Used by the full checkpoint for CLEAN (not re-saved)
-/// indexes so a partially-dirty session does not counter-invalidate them.
+/// WAL-aware durability: re-stamp the (checkpoint_epoch, covered_lsn) of an
+/// existing legacy snapshot (magic | epoch | covered_lsn | item_count |
+/// payload | whole-file CRC32C) to `(new_epoch, new_covered_lsn)` WITHOUT
+/// reading or rewriting the payload — see the delta derivation above. Used by
+/// the full checkpoint for CLEAN (not re-saved) indexes so a partially-dirty
+/// session does not epoch-invalidate them: a clean index is unchanged, so it
+/// is valid as of the new checkpoint's LSN and gets both stamps advanced.
 ///
 /// CRASH SAFETY (torn restamp): two separately-positioned small writes
-/// (8-byte counter, 4-byte trailer). A crash landing any strict subset — or
-/// a torn fraction of either — leaves counter and trailer inconsistent → the
-/// loader's whole-file CRC check fails (error.ChecksumMismatch) → callers'
-/// existing `catch false` → rebuild. Both landed = valid new stamp; neither
-/// = old stamp (counter-stale → rebuild). Accepted-but-corrupt is impossible.
+/// (16-byte stamp region, 4-byte trailer). A crash landing any strict subset
+/// — or a torn fraction of either — leaves the stamps and trailer
+/// inconsistent → the loader's whole-file CRC check fails
+/// (error.ChecksumMismatch) → callers' existing `catch false` → rebuild. Both
+/// landed = valid new stamp; neither = old stamp (epoch-stale → rebuild).
+/// Accepted-but-corrupt is impossible.
 ///
 /// CORRUPTION TRANSPARENCY: the old trailer is used WITHOUT verifying it
 /// (verification would be the O(file) read this helper exists to avoid). If
@@ -285,8 +317,8 @@ fn crcZeroExtend(crc: u32, len: u64) u32 {
 ///
 /// Returns false (file untouched) when there is nothing safe to restamp:
 /// empty/never-written, too short, or foreign/old magic. Returns true when
-/// the file now carries `new_counter` (including the already-stamped no-op).
-pub fn restampCounter(file: *std.Io.File, expected_magic: []const u8, new_counter: u64) !bool {
+/// the file now carries the new stamps (including the already-stamped no-op).
+pub fn restampStamps(file: *std.Io.File, expected_magic: []const u8, new_epoch: u64, new_covered_lsn: u64) !bool {
     if (expected_magic.len != 8) return error.InvalidMagicLength;
     const io = std.Io.Threaded.global_single_threaded.io();
 
@@ -295,29 +327,34 @@ pub fn restampCounter(file: *std.Io.File, expected_magic: []const u8, new_counte
     const size: usize = std.math.cast(usize, stat.size) orelse return false;
     if (size < expected_magic.len + HEADER_FIELDS_SIZE + CHECKSUM_SIZE) return false;
 
-    var head: [16]u8 = undefined;
+    // magic(8) + checkpoint_epoch(8) + covered_lsn(8) = 24.
+    var head: [24]u8 = undefined;
     const hn = try file.readPositionalAll(io, &head, 0);
     if (hn != head.len) return false;
     if (!std.mem.eql(u8, head[0..8], expected_magic)) return false;
 
-    const old_counter = std.mem.readInt(u64, head[8..16], .little);
-    if (old_counter == new_counter) return true;
+    const old_epoch = std.mem.readInt(u64, head[8..16], .little);
+    const old_covered = std.mem.readInt(u64, head[16..24], .little);
+    if (old_epoch == new_epoch and old_covered == new_covered_lsn) return true;
 
     var trailer: [CHECKSUM_SIZE]u8 = undefined;
     const tn = try file.readPositionalAll(io, &trailer, size - CHECKSUM_SIZE);
     if (tn != trailer.len) return false;
     const old_crc = std.mem.readInt(u32, &trailer, .little);
 
-    var delta: [8]u8 = undefined;
-    std.mem.writeInt(u64, &delta, old_counter ^ new_counter, .little);
+    // Delta over the 16 stamp bytes at offset 8 (epoch ++ covered_lsn).
+    var delta: [16]u8 = undefined;
+    std.mem.writeInt(u64, delta[0..8], old_epoch ^ new_epoch, .little);
+    std.mem.writeInt(u64, delta[8..16], old_covered ^ new_covered_lsn, .little);
 
-    // Bytes covered by the CRC after the counter field: item_count + payload.
-    const tail_len: u64 = @intCast(size - CHECKSUM_SIZE - (expected_magic.len + 8));
+    // Bytes covered by the CRC after the stamp region: item_count + payload.
+    const tail_len: u64 = @intCast(size - CHECKSUM_SIZE - (expected_magic.len + 16));
     const new_crc = old_crc ^ crcZeroExtend(crcRawUpdate(0, &delta), tail_len);
 
-    var counter_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &counter_buf, new_counter, .little);
-    try file.writePositionalAll(io, &counter_buf, expected_magic.len);
+    var stamp_buf: [16]u8 = undefined;
+    std.mem.writeInt(u64, stamp_buf[0..8], new_epoch, .little);
+    std.mem.writeInt(u64, stamp_buf[8..16], new_covered_lsn, .little);
+    try file.writePositionalAll(io, &stamp_buf, expected_magic.len);
     var crc_buf: [CHECKSUM_SIZE]u8 = undefined;
     std.mem.writeInt(u32, &crc_buf, new_crc, .little);
     try file.writePositionalAll(io, &crc_buf, size - CHECKSUM_SIZE);
@@ -341,7 +378,8 @@ pub fn readBounded(file: *std.Io.File, offset: *u64, remaining: *usize, buf: []u
 /// the 4-byte trailer (SEC-0051), and flushes the whole snapshot to disk with a
 /// single `writePositionalAll`. This collapses the previous per-field positional
 /// write loop (~5 syscalls per entry) into one buffered pass while keeping the
-/// on-disk layout (magic | counter | item_count | payload | crc32) byte-identical.
+/// on-disk layout (magic | epoch | covered_lsn | item_count | payload | crc32)
+/// byte-identical.
 pub const SnapshotWriter = struct {
     buf: std.ArrayList(u8),
     allocator: Allocator,
@@ -354,13 +392,15 @@ pub const SnapshotWriter = struct {
         self.buf.deinit(self.allocator);
     }
 
-    /// Append the 8-byte magic and the 16-byte header (checkpoint_counter,
-    /// item_count). Mirrors `writeHeader`'s on-disk byte order exactly.
-    pub fn writeHeader(self: *SnapshotWriter, magic: []const u8, checkpoint_counter: u64, item_count: u64) !void {
+    /// Append the 8-byte magic and the 24-byte header (checkpoint_epoch,
+    /// covered_lsn, item_count). Mirrors `writeHeader`'s on-disk byte order.
+    pub fn writeHeader(self: *SnapshotWriter, magic: []const u8, checkpoint_epoch: u64, covered_lsn: u64, item_count: u64) !void {
         if (magic.len != 8) return error.InvalidMagicLength;
         try self.buf.appendSlice(self.allocator, magic);
         var u64_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &u64_buf, checkpoint_counter, .little);
+        std.mem.writeInt(u64, &u64_buf, checkpoint_epoch, .little);
+        try self.buf.appendSlice(self.allocator, &u64_buf);
+        std.mem.writeInt(u64, &u64_buf, covered_lsn, .little);
         try self.buf.appendSlice(self.allocator, &u64_buf);
         std.mem.writeInt(u64, &u64_buf, item_count, .little);
         try self.buf.appendSlice(self.allocator, &u64_buf);
@@ -475,7 +515,7 @@ pub fn loadPayload(allocator: Allocator, file: *std.Io.File, expected_magic: []c
     return loaded;
 }
 
-test "writeHeader + finalizeChecksum and loadFile round-trip checkpoint metadata" {
+test "writeHeader + finalizeChecksum and loadFile round-trip epoch + covered_lsn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -483,7 +523,7 @@ test "writeHeader + finalizeChecksum and loadFile round-trip checkpoint metadata
     defer file.close(std.Io.Threaded.global_single_threaded.io());
 
     var write_offset: u64 = 0;
-    try writeHeader(file, &write_offset, "GSTEST1\x00", 99, 7);
+    try writeHeader(file, &write_offset, "GSTEST1\x00", 99, 0xABCD_1234, 7);
     try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), "payload", write_offset);
     write_offset += "payload".len;
     try finalizeChecksum(std.testing.allocator, file, write_offset);
@@ -491,9 +531,16 @@ test "writeHeader + finalizeChecksum and loadFile round-trip checkpoint metadata
     var loaded = (try loadFile(std.testing.allocator, &file, "GSTEST1\x00")).?;
     defer loaded.deinit();
 
-    try std.testing.expectEqual(@as(u64, 99), loaded.checkpoint_counter);
+    try std.testing.expectEqual(@as(u64, 99), loaded.checkpoint_epoch);
+    try std.testing.expectEqual(@as(u64, 0xABCD_1234), loaded.covered_lsn);
     try std.testing.expectEqual(@as(u64, 7), loaded.item_count);
     try std.testing.expectEqualStrings("payload", loaded.payload());
+
+    // loadHeader agrees on the same stamps.
+    const hdr = (try loadHeader(&file, "GSTEST1\x00", 0)).?;
+    try std.testing.expectEqual(@as(u64, 99), hdr.checkpoint_epoch);
+    try std.testing.expectEqual(@as(u64, 0xABCD_1234), hdr.covered_lsn);
+    try std.testing.expectEqual(@as(u64, 7), hdr.item_count);
 }
 
 test "loadHeader rejects an item_count too large for the payload (SEC-0044/0048)" {
@@ -505,7 +552,7 @@ test "loadHeader rejects an item_count too large for the payload (SEC-0044/0048)
 
     // Tiny payload (8 bytes) but a huge declared item_count.
     var write_offset: u64 = 0;
-    try writeHeader(file, &write_offset, "GSTEST1\x00", 1, std.math.maxInt(u64));
+    try writeHeader(file, &write_offset, "GSTEST1\x00", 1, 0, std.math.maxInt(u64));
     try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &[_]u8{0} ** 8, write_offset);
     write_offset += 8;
     try finalizeChecksum(std.testing.allocator, file, write_offset);
@@ -524,12 +571,12 @@ test "loadHeader rejects a corrupted payload byte (SEC-0051)" {
     defer file.close(std.Io.Threaded.global_single_threaded.io());
 
     var write_offset: u64 = 0;
-    try writeHeader(file, &write_offset, "GSTEST1\x00", 5, 1);
+    try writeHeader(file, &write_offset, "GSTEST1\x00", 5, 0, 1);
     try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &[_]u8{0xAB} ** 8, write_offset);
     write_offset += 8;
     try finalizeChecksum(std.testing.allocator, file, write_offset);
 
-    // Flip a single payload byte, keeping the checkpoint_counter header intact.
+    // Flip a single payload byte, keeping the stamp header intact.
     var flip: [1]u8 = .{0x00};
     const payload_byte_offset: u64 = 8 + HEADER_FIELDS_SIZE; // magic + header fields
     try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), &flip, payload_byte_offset);
@@ -546,7 +593,7 @@ test "PERF-0052: SnapshotWriter output is byte-identical to writeHeader+finalize
     var legacy = try tmp.dir.createFile(io, "legacy.bin", .{ .read = true, .truncate = true });
     defer legacy.close(io);
     var write_offset: u64 = 0;
-    try writeHeader(legacy, &write_offset, "GSTEST1\x00", 0xDEAD, 2);
+    try writeHeader(legacy, &write_offset, "GSTEST1\x00", 0xDEAD, 0xBEEF, 2);
     try legacy.writePositionalAll(io, &[_]u8{ 1, 2, 3, 4, 5 }, write_offset);
     write_offset += 5;
     try finalizeChecksum(std.testing.allocator, legacy, write_offset);
@@ -556,7 +603,7 @@ test "PERF-0052: SnapshotWriter output is byte-identical to writeHeader+finalize
     defer buffered.close(io);
     var w = SnapshotWriter.init(std.testing.allocator);
     defer w.deinit();
-    try w.writeHeader("GSTEST1\x00", 0xDEAD, 2);
+    try w.writeHeader("GSTEST1\x00", 0xDEAD, 0xBEEF, 2);
     try w.writeBytes(&[_]u8{ 1, 2, 3, 4, 5 });
     try w.finalize(buffered);
 
@@ -584,7 +631,7 @@ test "PERF-0052: loadPayload round-trips and SnapshotReader honors bounds" {
 
     var w = SnapshotWriter.init(std.testing.allocator);
     defer w.deinit();
-    try w.writeHeader("GSTEST1\x00", 42, 1);
+    try w.writeHeader("GSTEST1\x00", 42, 0x7777, 1);
     try w.writeU64(0x1122334455667788);
     try w.writeU32(0xAABBCCDD);
     try w.writeU16(0xBEEF);
@@ -592,7 +639,8 @@ test "PERF-0052: loadPayload round-trips and SnapshotReader honors bounds" {
 
     var loaded = (try loadPayload(std.testing.allocator, &file, "GSTEST1\x00", 0)).?;
     defer loaded.deinit();
-    try std.testing.expectEqual(@as(u64, 42), loaded.checkpoint_counter);
+    try std.testing.expectEqual(@as(u64, 42), loaded.checkpoint_epoch);
+    try std.testing.expectEqual(@as(u64, 0x7777), loaded.covered_lsn);
     try std.testing.expectEqual(@as(u64, 1), loaded.item_count);
 
     var r = SnapshotReader.init(loaded.payload());
@@ -614,7 +662,7 @@ test "PERF-0052: loadPayload enforces the count bound (SEC-0044/0048)" {
 
     var w = SnapshotWriter.init(std.testing.allocator);
     defer w.deinit();
-    try w.writeHeader("GSTEST1\x00", 1, std.math.maxInt(u64));
+    try w.writeHeader("GSTEST1\x00", 1, 0, std.math.maxInt(u64));
     try w.writeBytes(&[_]u8{0} ** 8);
     try w.finalize(file);
 
@@ -622,7 +670,7 @@ test "PERF-0052: loadPayload enforces the count bound (SEC-0044/0048)" {
     try std.testing.expectError(error.InvalidFormat, loadPayload(std.testing.allocator, &file, "GSTEST1\x00", 8));
 }
 
-test "restampCounter: delta-updated trailer CRC matches a full recompute across payload sizes" {
+test "restampStamps: delta-updated trailer CRC matches a full recompute across payload sizes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -643,17 +691,19 @@ test "restampCounter: delta-updated trailer CRC matches a full recompute across 
 
         var w = SnapshotWriter.init(std.testing.allocator);
         defer w.deinit();
-        try w.writeHeader("GSTEST1\x00", rnd.int(u64), 3);
+        try w.writeHeader("GSTEST1\x00", rnd.int(u64), rnd.int(u64), 3);
         try w.writeBytes(payload);
         try w.finalize(file);
 
-        const new_counter = rnd.int(u64);
-        try std.testing.expect(try restampCounter(&file, "GSTEST1\x00", new_counter));
+        const new_epoch = rnd.int(u64);
+        const new_lsn = rnd.int(u64);
+        try std.testing.expect(try restampStamps(&file, "GSTEST1\x00", new_epoch, new_lsn));
 
-        // Loader accepts (whole-file CRC valid) and sees the new counter.
+        // Loader accepts (whole-file CRC valid) and sees BOTH new stamps.
         var loaded = (try loadFile(std.testing.allocator, &file, "GSTEST1\x00")).?;
         defer loaded.deinit();
-        try std.testing.expectEqual(new_counter, loaded.checkpoint_counter);
+        try std.testing.expectEqual(new_epoch, loaded.checkpoint_epoch);
+        try std.testing.expectEqual(new_lsn, loaded.covered_lsn);
 
         // Ground truth: the stored trailer equals a from-scratch CRC of the
         // modified body — proves the GF(2) delta path bit-exactly.
@@ -667,7 +717,7 @@ test "restampCounter: delta-updated trailer CRC matches a full recompute across 
     }
 }
 
-test "restampCounter: torn restamp (counter landed, trailer did not) is rejected at load → rebuild path" {
+test "restampStamps: torn restamp (stamps landed, trailer did not) is rejected at load → rebuild path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -676,48 +726,49 @@ test "restampCounter: torn restamp (counter landed, trailer did not) is rejected
     defer file.close(io);
     var w = SnapshotWriter.init(std.testing.allocator);
     defer w.deinit();
-    try w.writeHeader("GSTEST1\x00", 10, 1);
+    try w.writeHeader("GSTEST1\x00", 10, 100, 1);
     try w.writeBytes(&[_]u8{0xEE} ** 32);
     try w.finalize(file);
 
-    // Crash window: only the counter write hit the disk.
-    var counter_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &counter_buf, 11, .little);
-    try file.writePositionalAll(io, &counter_buf, 8);
+    // Crash window: only the 16-byte stamp write hit the disk.
+    var stamp_buf: [16]u8 = undefined;
+    std.mem.writeInt(u64, stamp_buf[0..8], 11, .little);
+    std.mem.writeInt(u64, stamp_buf[8..16], 200, .little);
+    try file.writePositionalAll(io, &stamp_buf, 8);
 
     try std.testing.expectError(error.ChecksumMismatch, loadFile(std.testing.allocator, &file, "GSTEST1\x00"));
     try std.testing.expectError(error.ChecksumMismatch, loadHeader(&file, "GSTEST1\x00", 8));
 }
 
-test "restampCounter: skips empty files and foreign magic; preserves an existing corruption mismatch" {
+test "restampStamps: skips empty files and foreign magic; preserves an existing corruption mismatch" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var empty = try tmp.dir.createFile(io, "empty.bin", .{ .read = true, .truncate = true });
     defer empty.close(io);
-    try std.testing.expect(!(try restampCounter(&empty, "GSTEST1\x00", 5)));
+    try std.testing.expect(!(try restampStamps(&empty, "GSTEST1\x00", 5, 50)));
 
     var foreign = try tmp.dir.createFile(io, "foreign.bin", .{ .read = true, .truncate = true });
     defer foreign.close(io);
     var w = SnapshotWriter.init(std.testing.allocator);
     defer w.deinit();
-    try w.writeHeader("GSOTHER\x00", 1, 1);
+    try w.writeHeader("GSOTHER\x00", 1, 10, 1);
     try w.writeBytes(&[_]u8{1} ** 8);
     try w.finalize(foreign);
-    try std.testing.expect(!(try restampCounter(&foreign, "GSTEST1\x00", 5)));
+    try std.testing.expect(!(try restampStamps(&foreign, "GSTEST1\x00", 5, 50)));
 
     // Pre-corrupted file: restamp must not mask the corruption.
     var corrupt = try tmp.dir.createFile(io, "corrupt.bin", .{ .read = true, .truncate = true });
     defer corrupt.close(io);
     var w2 = SnapshotWriter.init(std.testing.allocator);
     defer w2.deinit();
-    try w2.writeHeader("GSTEST1\x00", 1, 1);
+    try w2.writeHeader("GSTEST1\x00", 1, 10, 1);
     try w2.writeBytes(&[_]u8{2} ** 16);
     try w2.finalize(corrupt);
     var flip: [1]u8 = .{0xFF};
     try corrupt.writePositionalAll(io, &flip, 8 + HEADER_FIELDS_SIZE + 3); // payload byte
-    try std.testing.expect(try restampCounter(&corrupt, "GSTEST1\x00", 5));
+    try std.testing.expect(try restampStamps(&corrupt, "GSTEST1\x00", 5, 50));
     try std.testing.expectError(error.ChecksumMismatch, loadFile(std.testing.allocator, &corrupt, "GSTEST1\x00"));
 }
 
@@ -731,7 +782,7 @@ test "PERF-0052: loadPayload rejects a corrupted payload byte (SEC-0051)" {
 
     var w = SnapshotWriter.init(std.testing.allocator);
     defer w.deinit();
-    try w.writeHeader("GSTEST1\x00", 5, 1);
+    try w.writeHeader("GSTEST1\x00", 5, 0, 1);
     try w.writeBytes(&[_]u8{0xAB} ** 8);
     try w.finalize(file);
 

@@ -822,8 +822,8 @@ pub const GraphEngine = struct {
         return engine_index.tryLoadDerivedIndexes(self);
     }
 
-    fn saveDerivedIndexes(self: *GraphEngine) !void {
-        return engine_index.saveDerivedIndexes(self);
+    fn saveDerivedIndexes(self: *GraphEngine, covered_lsn: u64) !void {
+        return engine_index.saveDerivedIndexes(self, covered_lsn);
     }
 
     fn saveLabelDictionary(self: *GraphEngine) !void {
@@ -957,7 +957,10 @@ pub const GraphEngine = struct {
             // would have hydrated first, so a dirtied derived index is always
             // hydrated here.
             if (close_err == null and self.derived_hydrated.load(.acquire)) {
-                self.saveDerivedIndexes() catch |err| {
+                // doCheckpoint above set manifest.last_checkpoint_lsn to the LSN
+                // this checkpoint covered; stamp the snapshots with it as
+                // covered_lsn (paired with the advanced checkpoint_epoch).
+                self.saveDerivedIndexes(self.manifest.last_checkpoint_lsn) catch |err| {
                     if (close_err == null) close_err = err;
                 };
             }

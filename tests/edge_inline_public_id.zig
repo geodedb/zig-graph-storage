@@ -1086,16 +1086,16 @@ test "P2 crash: plain v2 appends (multi-block chain) replay with exact public_id
 // ============================================================================
 
 const OLD_EDGE_SNAPSHOT_MAGIC = "GSEIDX2\x00"; // pre-P3 (32 B records)
-// GAP warm-reopen P1: the edge snapshots moved to the SORTED mmap container
-// (sorted_index_snapshot.zig) under bumped magics — same record FIELDS as
-// GSEIDX3/GSXIDX1, sorted, with a per-block CRC directory.
-const NEW_EDGE_SNAPSHOT_MAGIC = "GSEIDX4\x00"; // P1 (sorted 40 B records)
-const NEW_EXIST_SNAPSHOT_MAGIC = "GSXIDX2\x00"; // P1 (sorted 28 B records)
+// The edge snapshots use the SORTED mmap container (sorted_index_snapshot.zig)
+// under bumped magics. WAL-aware durability grew the header a second stamp
+// field, bumping GSEIDX4 -> GSEIDX5 / GSXIDX2 -> GSXIDX3.
+const NEW_EDGE_SNAPSHOT_MAGIC = "GSEIDX5\x00"; // sorted 40 B records
+const NEW_EXIST_SNAPSHOT_MAGIC = "GSXIDX3\x00"; // sorted 28 B records
 const SNAPSHOT_CRC = std.hash.crc.Crc32Iscsi;
 /// LEGACY container header: magic(8) + checkpoint_counter(8) + item_count(8).
 const SNAPSHOT_HEADER = 24;
-/// Sorted-container header: magic(8) + counter(8) + record_count(8) +
-/// record_size(4) + block_size(4).
+/// Sorted-container header: magic(8) + checkpoint_epoch(8) + covered_lsn(8) +
+/// record_count(8) + record_size(4) + block_size(4).
 const SORTED_HEADER = gs.sorted_index_snapshot.HEADER_SIZE;
 
 /// Total on-disk size of a sorted-container snapshot with `n` records of
@@ -1143,15 +1143,22 @@ fn downgradeEdgeSnapshotToV2(allocator: Allocator, path: []const u8) !void {
 
     try testing.expect(data.len >= SORTED_HEADER + 4);
     try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
-    const item_count = std.mem.readInt(u64, data[16..24], .little);
-    try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[24..28], .little));
+    // New sorted layout: epoch@8, covered_lsn@16, record_count@24, size@32.
+    const item_count = std.mem.readInt(u64, data[24..32], .little);
+    try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[32..36], .little));
     try testing.expectEqual(sortedSnapshotSize(@intCast(item_count), 40), data.len);
     const payload = data[SORTED_HEADER..][0 .. item_count * 40];
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
+    // Legacy (pre-P3) container header: magic(8) | counter(8) | item_count(8).
+    // The value bytes are irrelevant to the test (the loader rejects on the old
+    // magic before parsing), but write a well-formed old header anyway.
     try out.appendSlice(allocator, OLD_EDGE_SNAPSHOT_MAGIC);
-    try out.appendSlice(allocator, data[8..24]); // counter + item_count verbatim
+    try out.appendSlice(allocator, data[8..16]); // reuse epoch bytes as legacy counter
+    var ic_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ic_buf, item_count, .little);
+    try out.appendSlice(allocator, &ic_buf);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
         const rec = payload[i * 40 ..][0..40];
@@ -1279,8 +1286,9 @@ test "P3 snapshot round-trip: clean reopen LOADS the 40 B-record snapshot (no re
         const data = try readFileBytes(testing.allocator, idx_path);
         defer testing.allocator.free(data);
         try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
-        try testing.expectEqual(@as(u64, P3_N), std.mem.readInt(u64, data[16..24], .little));
-        try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[24..28], .little));
+        // record_count@24, record_size@32 under the two-stamp sorted header.
+        try testing.expectEqual(@as(u64, P3_N), std.mem.readInt(u64, data[24..32], .little));
+        try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[32..36], .little));
         try testing.expectEqual(sortedSnapshotSize(P3_N, 40), data.len);
         // Records are sorted by edge_id (the binary-search invariant).
         var prev: u64 = 0;
@@ -1481,14 +1489,15 @@ test "P3 existence index untouched: MERGE dedup (probeEdge) works on v2 edges, 2
     defer testing.allocator.free(exist_path);
 
     // The existence snapshot record FIELDS are unchanged (28 B: from u64 +
-    // to u64 + rel u32 + edge_id u64 — no prop_head/public_id); P1 moved the
-    // container to the sorted mmap format under the GSXIDX2 magic.
+    // to u64 + rel u32 + edge_id u64 — no prop_head/public_id); the sorted mmap
+    // container carries them under the GSXIDX3 magic.
     {
         const data = try readFileBytes(testing.allocator, exist_path);
         defer testing.allocator.free(data);
         try testing.expectEqualStrings(NEW_EXIST_SNAPSHOT_MAGIC, data[0..8]);
-        try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, data[16..24], .little));
-        try testing.expectEqual(@as(u32, 28), std.mem.readInt(u32, data[24..28], .little));
+        // record_count@24, record_size@32 under the two-stamp sorted header.
+        try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, data[24..32], .little));
+        try testing.expectEqual(@as(u32, 28), std.mem.readInt(u32, data[32..36], .little));
         try testing.expectEqual(sortedSnapshotSize(1, 28), data.len);
     }
 

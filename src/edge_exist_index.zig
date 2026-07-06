@@ -488,7 +488,7 @@ fn writeExistBase(tmp: *std.testing.TmpDir, name: []const u8, recs: []const Exis
         encodeRecord(payload[i * RECORD_SIZE ..][0..RECORD_SIZE], r);
     }
     snapshot.sortRecords(payload, RECORD_SIZE, recordLess);
-    try snapshot.write(std.testing.allocator, file, TEST_BASE_MAGIC, 3, RECORD_SIZE, payload);
+    try snapshot.write(std.testing.allocator, file, TEST_BASE_MAGIC, 3, 0, RECORD_SIZE, payload);
     return file;
 }
 

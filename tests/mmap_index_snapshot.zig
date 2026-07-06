@@ -560,7 +560,7 @@ test "BENCH 1M-edge snapshot load: legacy read+build vs mmap-adopt" {
         }
         const f = try tmp.dir.createFile(io, "sorted.idx", .{ .read = true });
         defer f.close(io);
-        try sorted.write(a, f, "GSEIDX4\x00", 42, 40, payload);
+        try sorted.write(a, f, "GSEIDX4\x00", 42, 0, 40, payload);
     }
 
     // --- Legacy path: read whole file, CRC-verify, build the hashmap.

@@ -21,10 +21,13 @@ const NodeId = types.NodeId;
 // that need ordered output (tests, snapshot round-trips) continue to work.
 const NodeSet = std.AutoHashMapUnmanaged(NodeId, void);
 
-// SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
-/// GAP warm-reopen P2: pub so engine_index.restampCleanDerivedSnapshots can
-/// validate the file before an in-place counter restamp.
-pub const SNAPSHOT_MAGIC = "GSLIDX2\x00";
+// WAL-aware derived-index durability: the header now carries
+// (checkpoint_epoch, covered_lsn) instead of a bare counter. The magic IS the
+// format version, so the bump GSLIDX2 -> GSLIDX3 makes an old (v2, counter-only)
+// snapshot cleanly rejected by the loader's magic check (never misparsed).
+/// pub so engine_index.restampCleanDerivedSnapshots can validate the file
+/// before an in-place stamp restamp.
+pub const SNAPSHOT_MAGIC = "GSLIDX3\x00";
 
 // SEC-0044/SEC-0048: smallest bytes a single label record consumes on disk
 // (label_id u32 + node_count u64, with zero nodes).
@@ -220,10 +223,10 @@ pub const LabelIndex = struct {
 
     /// Persist the in-memory posting lists to labels.idx.
     /// Format:
-    ///   [8 bytes magic][u64 checkpoint_counter][u64 label_count]
+    ///   [8 bytes magic][u64 checkpoint_epoch][u64 covered_lsn][u64 label_count]
     ///   repeated label_count times:
     ///     [u32 label_id][u64 node_count][node_count * u64 node_id]
-    pub fn saveToFile(self: *LabelIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
+    pub fn saveToFile(self: *LabelIndex, file: *std.Io.File, checkpoint_epoch: u64, covered_lsn: u64) !void {
         // Take rwlock SHARED for the whole snapshot: a concurrent addNode could
         // otherwise rehash the index or a posting set mid-serialization and the
         // entry/key iterators below would read freed backing.
@@ -236,7 +239,7 @@ pub const LabelIndex = struct {
         var w = index_snapshot_mod.SnapshotWriter.init(self.allocator);
         defer w.deinit();
 
-        try w.writeHeader(SNAPSHOT_MAGIC, checkpoint_counter, self.index.count());
+        try w.writeHeader(SNAPSHOT_MAGIC, checkpoint_epoch, covered_lsn, self.index.count());
 
         var it = self.index.iterator();
         while (it.next()) |entry| {
@@ -260,9 +263,9 @@ pub const LabelIndex = struct {
     }
 
     /// Load a previously persisted labels.idx snapshot.
-    /// Returns the checkpoint counter embedded in the snapshot, or null when
-    /// the file is empty.
-    pub fn loadFromFile(self: *LabelIndex, file: *std.Io.File) !?u64 {
+    /// Returns the (checkpoint_epoch, covered_lsn) stamp embedded in the
+    /// snapshot, or null when the file is empty.
+    pub fn loadFromFile(self: *LabelIndex, file: *std.Io.File) !?index_snapshot_mod.Stamp {
         // PERF-0052: read + validate the whole snapshot once (CRC32 per SEC-0051,
         // label_count bounded vs payload per SEC-0044/0048), then walk the
         // resident payload instead of one positional read per node id.
@@ -304,7 +307,7 @@ pub const LabelIndex = struct {
         }
 
         if (r.remaining() != 0) return error.InvalidFormat;
-        return snapshot.checkpoint_counter;
+        return .{ .epoch = snapshot.checkpoint_epoch, .covered_lsn = snapshot.covered_lsn };
     }
 
     fn rebuildCallback(_: *LabelIndex, _: NodeId, _: node_mod.NodeRec) void {
@@ -548,14 +551,15 @@ test "PERF-0054: snapshot round-trip with large posting list" {
     var file = try env.tmp_dir.dir.createFile(io, "labels_perf.idx", .{ .read = true, .truncate = true });
     defer file.close(io);
 
-    try idx.saveToFile(&file, 99);
+    try idx.saveToFile(&file, 99, 0x5150);
 
     var loaded = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
     defer loaded.deinit();
 
     const ctr = try loaded.loadFromFile(&file);
     try testing.expect(ctr != null);
-    try testing.expectEqual(@as(u64, 99), ctr.?);
+    try testing.expectEqual(@as(u64, 99), ctr.?.epoch);
+    try testing.expectEqual(@as(u64, 0x5150), ctr.?.covered_lsn);
 
     try testing.expectEqual(@as(u64, N), loaded.count(label));
 
@@ -582,14 +586,15 @@ test "saveToFile + loadFromFile round-trip preserves posting lists" {
     var file = try env.tmp_dir.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "labels.idx", .{ .read = true, .truncate = true });
     defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    try idx.saveToFile(&file, 42);
+    try idx.saveToFile(&file, 42, 7);
 
     var loaded = LabelIndex.init(testing.allocator, &env.pool, &env.fsm, 4096);
     defer loaded.deinit();
 
-    const checkpoint_counter = try loaded.loadFromFile(&file);
-    try testing.expect(checkpoint_counter != null);
-    try testing.expectEqual(@as(u64, 42), checkpoint_counter.?);
+    const stamp = try loaded.loadFromFile(&file);
+    try testing.expect(stamp != null);
+    try testing.expectEqual(@as(u64, 42), stamp.?.epoch);
+    try testing.expectEqual(@as(u64, 7), stamp.?.covered_lsn);
 
     const label_one = try loaded.scan(1, testing.allocator);
     defer testing.allocator.free(label_one);
@@ -612,7 +617,7 @@ test "loadFromFile rejects an oversized label_count (SEC-0044/0048)" {
     defer file.close(io);
 
     var write_offset: u64 = 0;
-    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, std.math.maxInt(u64));
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 0, std.math.maxInt(u64));
     try file.writePositionalAll(io, &[_]u8{0}, write_offset);
     write_offset += 1;
     try index_snapshot_mod.finalizeChecksum(testing.allocator, file, write_offset);
@@ -635,7 +640,7 @@ test "loadFromFile rejects an oversized node_count (SEC-0044/0048)" {
     defer file.close(io);
 
     var write_offset: u64 = 0;
-    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 1);
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 0, 1);
     // One label: label_id=1, node_count=maxInt(u64) but no node bytes follow.
     var buf: [12]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], 1, .little);
@@ -667,7 +672,7 @@ test "loadFromFile rejects a flipped payload byte (SEC-0051)" {
     var file = try env.tmp_dir.dir.createFile(io, "labels.idx", .{ .read = true, .truncate = true });
     defer file.close(io);
 
-    try idx.saveToFile(&file, 42);
+    try idx.saveToFile(&file, 42, 0);
 
     const payload_off: u64 = SNAPSHOT_MAGIC.len + index_snapshot_mod.HEADER_FIELDS_SIZE;
     var orig: [1]u8 = undefined;

@@ -28,7 +28,11 @@
 //! checkpoint, the trees are not trusted across a crash.
 //!
 //! On-disk framing (one file `ordered_propidx.snap` under the graph dir) reuses
-//! `index_snapshot` (magic | counter | item_count | payload | CRC32):
+//! `index_snapshot` (magic | stamp0 | stamp1 | item_count | payload | CRC32).
+//! The ordered index is NOT part of the WAL-tail epoch contract that the 4
+//! engine derived indexes use: it keeps its own `manifest.counter` gate, so it
+//! stamps `counter` into the header's first stamp slot (`checkpoint_epoch`) and
+//! leaves the second (`covered_lsn`) == 0.
 //!   item_count = number of registered indexes
 //!   per index: [u32 label_id][u32 key_len][key bytes][u64 blob_len][tree blob]
 //! where the tree blob is `OrderedBTree.serialize` output.
@@ -50,9 +54,11 @@ const OrderedBTree = ordered_btree.OrderedBTree;
 pub const SNAPSHOT_FILE_NAME = "ordered_propidx.snap";
 /// 8-byte snapshot magic (index_snapshot requires exactly 8 bytes). Bumped
 /// 1 -> 2 when the per-index framing gained the eligibility flag + value-order
-/// class (an old GSORDIX1 snapshot is then cleanly rejected by the magic check
-/// and rebuilt from a live scan rather than silently misparsed).
-pub const SNAPSHOT_MAGIC = "GSORDIX2";
+/// class; bumped 2 -> 3 when the shared `index_snapshot` header grew a second
+/// stamp field (checkpoint_epoch + covered_lsn) for the WAL-aware derived
+/// indexes. An old GSORDIX2 snapshot is cleanly rejected by the magic check and
+/// rebuilt from a live scan rather than silently misparsed under the new header.
+pub const SNAPSHOT_MAGIC = "GSORDIX3";
 const owner_only_file_mode = 0o600;
 
 fn io() std.Io {
@@ -322,7 +328,9 @@ pub const OrderedPropertyIndex = struct {
         var w = index_snapshot.SnapshotWriter.init(self.allocator);
         defer w.deinit();
 
-        try w.writeHeader(SNAPSHOT_MAGIC, counter, self.entries.items.len);
+        // Counter-gated (not WAL-tail epoch-gated): stamp `counter` into the
+        // first stamp slot, leave covered_lsn == 0. See the module header.
+        try w.writeHeader(SNAPSHOT_MAGIC, counter, 0, self.entries.items.len);
         for (self.entries.items) |*e| {
             try w.writeU32(e.label_id);
             try w.writeU32(@intCast(e.property_key.len));
@@ -400,7 +408,8 @@ pub const OrderedPropertyIndex = struct {
             });
         }
 
-        return loaded.checkpoint_counter;
+        // The ordered index stamps its manifest.counter into the epoch slot.
+        return loaded.checkpoint_epoch;
     }
 };
 
