@@ -165,6 +165,85 @@ test "Phase 3: clean-shutdown tail reconcile == full rebuild (insert/update/DELE
     }
 }
 
+// GHOST_LABEL only ever appears on an UNCOMMITTED write — after a crash it must
+// be absent from every reconciled index (recovery discards uncommitted txns).
+const GHOST_LABEL: u32 = 77;
+
+test "Phase 3: crash tail reconcile excludes uncommitted txns AND == full rebuild (committed/uncommitted discipline)" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x33} ** 16;
+    const cfg = test_support.testConfig();
+
+    var s: S0 = undefined;
+    var xinfo: XInfo = undefined;
+    var far: u64 = 0;
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        s = try buildS0(eng);
+        // A committed "far" node on its OWN node page (page 1) plus filler so the
+        // committed tail's new node lands on page 3 — the far node's page is
+        // therefore NEVER imaged by a committed tail txn. Physical page-image WAL
+        // makes a committed txn's page image also carry any UNCOMMITTED sibling
+        // write on the SAME page (a recovery property, not a reconcile bug), so
+        // isolating the uncommitted write on its own page is how the existing
+        // recovery discipline is exercised cleanly.
+        const npp = eng.node_store.nodes_per_page;
+        far = npp + 5; // page 1, slot 5
+        while (eng.manifest.next_node_id < 3 * npp) {
+            const id = try eng.allocNode();
+            try eng.putNode(id, emptyNode()); // no label/prop/edge → no index contribution
+        }
+        try eng.checkpoint(); // snapshots @ (epoch E, covered_lsn L)
+
+        // UNCOMMITTED transaction U (NEVER committed): add GHOST_LABEL to the
+        // far node. This writes ONLY the far node's page (page 1) + a var page —
+        // pages no committed tail txn images below — so recovery observes U's
+        // records (M's commits fsync the shared WAL) and DISCARDS them. A wrong
+        // reconcile that applied U would leak GHOST_LABEL into the label index.
+        const txn_u = try eng.beginTxn();
+        try eng.addLabelTxn(far, GHOST_LABEL, txn_u);
+        // ... no commitTxn(txn_u) — U is abandoned by the crash.
+
+        // COMMITTED tail M (auto-commit → fsyncs the WAL, flushing U's records).
+        // Its new node lands on page 3; deletes/edits stay on page 0 / props /
+        // adj — none touch page 1 (the far node's page).
+        xinfo = try applyTailM(eng, s);
+
+        // SIMULATED CRASH (deinit): no checkpoint, no close. The fsynced WAL
+        // carries committed M AND uncommitted U; recovery replays M and discards
+        // U; the snapshots stay at S0. This is the recovery suite's committed/
+        // uncommitted discipline, now proven at the reconcile layer.
+        eng.deinit();
+    }
+
+    // Reconcile over the CRASH-recovered store == full rebuild over the same
+    // (durable committed) store — uncommitted U excluded by construction.
+    try assertReconcileEqualsRebuild(td.path, uuid);
+
+    // Concrete: committed state present/absent correctly, uncommitted GHOST gone.
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // UNCOMMITTED excluded: the far node exists (committed in S0) but carries
+        // NO GHOST_LABEL — its uncommitted label add was discarded by recovery.
+        try testing.expect((try eng.getNode(far)) != null);
+        const ghosts = try eng.scanLabel(GHOST_LABEL, testing.allocator);
+        defer testing.allocator.free(ghosts);
+        try testing.expectEqual(@as(usize, 0), ghosts.len);
+
+        // COMMITTED state (durable frontier) reflected exactly.
+        const ids = try eng.scanLabel(LABEL, testing.allocator);
+        defer testing.allocator.free(ids);
+        try testing.expectEqual(@as(usize, 6), ids.len); // +X, -nodes[2]
+        for (ids) |id| try testing.expect(id != s.nodes[2]);
+        try testing.expect((try eng.getEdge(xinfo.x_edge)) != null);
+        try testing.expect((try eng.getEdge(s.edges[3])) == null); // removeEdge
+        try testing.expect((try eng.getEdge(s.edges[2])) == null); // node2 deleted
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
