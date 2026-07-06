@@ -508,6 +508,20 @@ fn addIntegrationTests(
     const run_prop_store_slab = b.addRunArtifact(prop_store_slab_tests);
     prop_store_slab_step.dependOn(&run_prop_store_slab.step);
 
+    // GAP var-store slab packing P2 — WRITE-path acceptance gates: bytes/node
+    // re-measure, slab-vs-legacy parity, on-disk reopen, WAL imaging
+    // (logVarChain slab-aware), the crash gate (committed slab labels/strings
+    // survive a deinit-crash; uncommitted is invisible; every var_head live),
+    // clean-shutdown, and graduation-across-crash.
+    const var_store_slab_step = b.step("test-var-store-slab", "Run var-store slab-packing P2: bytes/node, parity, reopen, WAL imaging, and crash/graduation gates");
+    const var_store_slab_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/var_store_slab.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_var_store_slab = b.addRunArtifact(var_store_slab_tests);
+    var_store_slab_step.dependOn(&run_var_store_slab.step);
+
     // GAP edge-inline-public-id P0/P1 — baseline oracle for the per-edge
     // `__geode_internal_edge_id` LEGACY property cost (one ≥8 KB props page
     // per edge) + parity oracle over full edge enumeration, and the v1/v2
@@ -538,6 +552,33 @@ fn addIntegrationTests(
     });
     const run_adjacency_slab = b.addRunArtifact(adjacency_slab_tests);
     adjacency_slab_step.dependOn(&run_adjacency_slab.step);
+
+    // GAP adjacency-slab-packing P3 — consumer sweep: every path that READS
+    // adjacency stays slab-transparent. Backup/restore byte-copy round-trip,
+    // derived edge-index rebuild from a slab adj_out, FanIn-source
+    // (adj_in_remote) rebuild, and the integrity walk over slab chains.
+    const adjacency_slab_consumers_step = b.step("test-adjacency-slab-consumers", "Run adjacency slab-packing P3 consumer sweep: backup/restore round-trip, derived edge-index rebuild, FanIn-source rebuild, integrity walk over slab chains");
+    const adjacency_slab_consumers_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab_consumers.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab_consumers = b.addRunArtifact(adjacency_slab_consumers_tests);
+    adjacency_slab_consumers_step.dependOn(&run_adjacency_slab_consumers.step);
+
+    // GAP adjacency-slab-packing P4 — crash/WAL matrix for the hottest
+    // structure: relocation, graduation, slab remove/update (tombstone),
+    // deferred-WAL tail + harvest, and a mixed legacy+slab store. Each builds,
+    // crashes (deinit without checkpoint — only the fsynced WAL survives),
+    // reopens, and asserts full parity with no dangling head / no lost edge.
+    const adjacency_slab_crash_step = b.step("test-adjacency-slab-crash", "Run adjacency slab-packing P4 crash matrix: relocation/graduation/tombstone/deferred-tail/mixed — kill+reopen parity, no dangling head");
+    const adjacency_slab_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab_crash = b.addRunArtifact(adjacency_slab_crash_tests);
+    adjacency_slab_crash_step.dependOn(&run_adjacency_slab_crash.step);
 
     // GAP-ENT-0011 — free-space map vs WAL-tail allocations. Crash-restart
     // tests proving pages allocated after the last checkpoint and recovered
@@ -700,11 +741,17 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_checkpoint_epoch.step);
     // Label WAL-imaging crash guards likewise.
     integration_step.dependOn(&run_label_crash_replay.step);
+    integration_step.dependOn(&run_var_store_slab.step);
     // Edge-prop-head under-logging crash guards likewise.
     integration_step.dependOn(&run_edge_prop_crash.step);
     // Adjacency-slab read-both + harvest coverage (silent-counter-staleness
     // class once slab writers land) likewise.
     integration_step.dependOn(&run_adjacency_slab.step);
+    // P3 consumer sweep (backup/rebuild/integrity over slab chains) and P4
+    // crash matrix (relocation/graduation/tombstone/deferred-tail/mixed) are
+    // the release gate for the slab writer — gate both under the umbrella.
+    integration_step.dependOn(&run_adjacency_slab_consumers.step);
+    integration_step.dependOn(&run_adjacency_slab_crash.step);
 }
 
 fn addExample(

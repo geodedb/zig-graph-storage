@@ -72,6 +72,19 @@ pub fn encodeSlabHead(page_id: PageId, slot: u32) u64 {
     return SLAB_HEAD_TAG_BIT | (page_id << SLAB_HEAD_SLOT_BITS) | (@as(u64, slot) & SLAB_HEAD_SLOT_MASK);
 }
 
+/// P2 entry requirement 4: the WRITER's fallible encoder. A slab head packs
+/// the page id into 39 bits; a slab fill page allocated at/above 2^39 cannot
+/// be addressed by a slab head, so the writer must FALL BACK to a legacy
+/// block chain rather than corrupt the head — NEVER a release assert (which
+/// `encodeSlabHead` uses, as its callers already hold in-range ids). Returns
+/// null when the page id (or slot) overflows its field; the caller uses the
+/// legacy layout instead.
+pub fn tryEncodeSlabHead(page_id: PageId, slot: u32) ?u64 {
+    if (page_id >= SLAB_HEAD_MAX_PAGE_ID) return null;
+    if (@as(u64, slot) > SLAB_HEAD_SLOT_MASK) return null;
+    return encodeSlabHead(page_id, slot);
+}
+
 /// Decode the slab block page id from a slab head ref.
 pub fn slabHeadPageId(head: u64) PageId {
     return (head & ~SLAB_HEAD_TAG_BIT) >> SLAB_HEAD_SLOT_BITS;
@@ -110,6 +123,47 @@ pub const AdjStore = struct {
     /// and under-counts v1 blocks (339 vs 254 @ 8 KB).
     writer_entries_per_block: u32,
 
+    /// GAP adjacency slab packing (P2): when true, a NEW small chain's edges
+    /// are packed as a slot run in a shared slab fill block instead of a whole
+    /// dedicated block; a chain that outgrows the slab GRADUATES to a legacy
+    /// block chain. Default OFF — every write stays byte-identical to the
+    /// pre-P2 legacy layout (read-both keeps parsing any slab blocks a
+    /// slab-enabled store wrote). The engine flips it on per adjacency store.
+    slab_packing: bool = false,
+
+    /// The shared "current fill block" new slab runs append to. In-memory
+    /// only: after a reopen the first slab write starts a fresh fill block (a
+    /// partially-filled predecessor keeps its data and is read normally). The
+    /// append state (slot count, next free offset) is always re-derived from
+    /// the block itself, never cached, so a stale value cannot corrupt a page.
+    current_fill_page: ?PageId = null,
+
+    /// P2 (WAL slab-awareness, prop-store P4 discipline): page ids DIRTIED by
+    /// the CURRENT mutating op (`addEdge` / `removeEdge` / `updateEdgePropHead`),
+    /// deduplicated, in first-touch order. The ENGINE WAL-images every entry
+    /// after the op returns. A chain head is no longer always a page id (slab
+    /// heads encode tag|page|slot) and one op can dirty SEVERAL pages (a slab
+    /// relocation tombstones the old block and appends to the fill block; a
+    /// graduation additionally writes the fresh legacy chain), so logging just
+    /// "the head" would image a bogus page id (slab) or under-log (multi-page).
+    /// Worst case (graduation of a full slab run) dirties ≤ ~3 distinct pages;
+    /// 16 leaves slack and `recordTouched` fails loudly rather than drop a page.
+    touched_pages: [MAX_TOUCHED_PAGES]PageId = undefined,
+    touched_len: u8 = 0,
+
+    /// GAP-ENT-0022(b) discipline: undo record for the slab-slot tombstone
+    /// written by the CURRENT op (at most one — a graduation/relocation
+    /// tombstones exactly once, as its LAST mutation). Lets the ENGINE roll
+    /// the tombstone back (`undoLastSlabTombstone`) when it fails AFTER the
+    /// op returned (WAL imaging, index maintenance, commit) — its caller then
+    /// never stores the new head and the old head would reference a dead slot
+    /// forever. Cleared by `beginOp` at the top of every mutating op.
+    last_slab_tombstone: ?SlabTombstoneUndo = null,
+
+    pub const MAX_TOUCHED_PAGES: usize = 16;
+
+    const SlabTombstoneUndo = struct { page_id: PageId, slot: u32, offset: u32, entry_count: u32 };
+
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, file_id: FileId, page_size: u32) AdjStore {
         return .{
             .buffer_pool = buffer_pool,
@@ -118,6 +172,60 @@ pub const AdjStore = struct {
             .page_size = page_size,
             .writer_entries_per_block = edge_mod.entriesPerBlock(page_size, edge_mod.ENTRY_FORMAT_V2),
         };
+    }
+
+    /// P2: forget the previous op's dirtied-page set + tombstone undo. Called
+    /// at the top of every public mutating entry point.
+    fn beginOp(self: *AdjStore) void {
+        self.touched_len = 0;
+        self.last_slab_tombstone = null;
+    }
+
+    /// P2: record a page dirtied by the current mutating op (deduplicated).
+    /// Over-recording is harmless (a redundant page image is still correct);
+    /// UNDER-recording is silent data loss on crash — so overflow fails the
+    /// op loudly instead of dropping a page.
+    fn recordTouched(self: *AdjStore, page_id: PageId) !void {
+        for (self.touched_pages[0..self.touched_len]) |p| {
+            if (p == page_id) return;
+        }
+        if (self.touched_len >= MAX_TOUCHED_PAGES) return error.TooManyDirtyAdjPages;
+        self.touched_pages[self.touched_len] = page_id;
+        self.touched_len += 1;
+    }
+
+    /// P2: the pages dirtied by the most recent mutating call on this store.
+    /// Valid until the next mutating call. The engine WAL-images each entry.
+    pub fn touchedPages(self: *const AdjStore) []const PageId {
+        return self.touched_pages[0..self.touched_len];
+    }
+
+    /// GAP-ENT-0022(b): best-effort rollback of the slab-slot tombstone
+    /// written by the MOST RECENT mutating op. The engine's write paths call
+    /// this from an errdefer when they fail AFTER AdjStore relocated/graduated
+    /// a slab run and tombstoned the old slot: the engine's caller then never
+    /// stores the returned new head, so without the rollback the node record /
+    /// in-dir would reference a dead slot — permanent corruption for that
+    /// chain. Restores the old slot's entry_count; the run bytes are still
+    /// intact (a tombstone only rewrites the slot directory, never the run
+    /// data, within the same op), so the old head reads correctly again. The
+    /// already-placed new run is leaked until a future compaction — benign.
+    /// No-op when the current op wrote no tombstone. Allocation-free (resident
+    /// pin + one slot write) so it can succeed under the OOM that failed the op.
+    pub fn undoLastSlabTombstone(self: *AdjStore) !void {
+        const undo = self.last_slab_tombstone orelse return;
+        self.last_slab_tombstone = null;
+        const frame = try self.buffer_pool.pin(self.file_id, undo.page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        const cur = edge_mod.readSlabSlot(data, self.tail_reserve, undo.slot);
+        if (cur.offset != edge_mod.SLAB_SLOT_TOMBSTONE) {
+            // Defensive: not the tombstone this op wrote — leave it alone.
+            self.buffer_pool.unpin(frame_idx, false);
+            return;
+        }
+        edge_mod.writeSlabSlot(data, self.tail_reserve, undo.slot, .{ .offset = undo.offset, .entry_count = undo.entry_count });
+        self.buffer_pool.unpin(frame_idx, true);
     }
 
     /// Per-block entry capacity for a (validated) entry format.
@@ -144,9 +252,20 @@ pub const AdjStore = struct {
     ///     the old one. v1 blocks stay read-only-FORMAT forever (in-place
     ///     field mutation of EXISTING v1 entries remains allowed elsewhere).
     pub fn addEdge(self: *AdjStore, head_page: PageId, entry: EdgeEntry) !PageId {
-        // P1: nothing writes slab chains yet — reject a tagged head loudly
-        // rather than misparse the (block, slot) ref as a block page id.
-        // The P2 writer teaches this path slab appends + graduation.
+        self.beginOp();
+        // Slab writes (new-chain packing + growth + graduation) land in the
+        // slab path when packing is enabled; a tagged head always routes there.
+        if (self.slab_packing or isSlabHead(head_page)) {
+            return self.addEdgeSlab(head_page, entry);
+        }
+        return self.addEdgeLegacy(head_page, entry);
+    }
+
+    /// Legacy block-chain head-insert (the pre-P2 layout, verbatim). Records
+    /// the single page it mutated/allocated into the touched set so the engine
+    /// WAL-images exactly it — for a legacy chain that page always equals the
+    /// returned head, so imaging is unchanged from pre-P2.
+    fn addEdgeLegacy(self: *AdjStore, head_page: PageId, entry: EdgeEntry) !PageId {
         if (isSlabHead(head_page)) return error.SlabChainWriteNotSupported;
         if (head_page != 0) {
             const frame = try self.buffer_pool.pin(self.file_id, head_page);
@@ -159,6 +278,11 @@ pub const AdjStore = struct {
             const would_drop_public_id =
                 bh.entry_format == edge_mod.ENTRY_FORMAT_V1 and entry.public_id != 0;
             if (has_space and !would_drop_public_id) {
+                // Record the WAL touch BEFORE the first byte is mutated.
+                self.recordTouched(head_page) catch |err| {
+                    self.buffer_pool.unpin(frame_idx, false);
+                    return err;
+                };
                 // In-place append at the BLOCK's stride/format.
                 self.writeEntry(data, bh.count, entry, bh.entry_format);
                 bh.count += 1;
@@ -175,6 +299,13 @@ pub const AdjStore = struct {
         // Single block-construction site: a fresh v2 block as the new head;
         // the old head (0 for a new chain) becomes its overflow.
         const new_page = try self.free_space.allocPage();
+        // Record the WAL touch BEFORE any byte is written; on failure release
+        // the page (a recorded-but-freed page is harmless — the engine never
+        // images a FAILED op's touched set).
+        self.recordTouched(new_page) catch |err| {
+            self.free_space.freePage(new_page) catch {};
+            return err;
+        };
         const new_frame = try self.buffer_pool.pinNew(self.file_id, new_page);
         const new_frame_idx = self.buffer_pool.frameIndex(new_frame);
 
@@ -193,6 +324,315 @@ pub const AdjStore = struct {
         return new_page;
     }
 
+    // ------------------------------------------------------------------
+    // Slab WRITE path (P2). Mirrors the reviewed prop-store slab writer:
+    // new small chains pack into a shared fill block as slot runs; a chain
+    // grows in place at the block's frontier, else relocates to a new slot,
+    // else GRADUATES to a legacy block chain. Every touched page is recorded
+    // for the engine to WAL-image; a relocation/graduation tombstones the old
+    // slot LAST (the live-head invariant) and arms `undoLastSlabTombstone`.
+    // ------------------------------------------------------------------
+
+    const SlabState = struct { slot_count: u32, next_off: u32 };
+
+    /// Re-derive a slab block's write state from the page (never cached):
+    /// slot count (from the header) and the free-run frontier (max live run
+    /// end). Tombstoned slots do not extend the frontier. Fails DataCorruption
+    /// on a non-slab / chained / malformed block.
+    fn slabBlockState(self: *const AdjStore, data: []const u8) error{DataCorruption}!SlabState {
+        const bh = try self.readSlabBlockHeader(data);
+        const slot_count: u32 = bh.count;
+        const dir_start = edge_mod.slabDirStart(data.len, self.tail_reserve, slot_count);
+        var next_off: u32 = edge_mod.SLAB_RUNS_OFFSET;
+        var i: u32 = 0;
+        while (i < slot_count) : (i += 1) {
+            const s = edge_mod.readSlabSlot(data, self.tail_reserve, i);
+            if (s.offset == edge_mod.SLAB_SLOT_TOMBSTONE) continue;
+            if (s.offset < edge_mod.SLAB_RUNS_OFFSET) return error.DataCorruption;
+            const end = @as(u64, s.offset) + @as(u64, s.entry_count) * edge_mod.ENTRY_SIZE_V2;
+            if (end > dir_start) return error.DataCorruption;
+            if (end > next_off) next_off = @intCast(end);
+        }
+        return .{ .slot_count = slot_count, .next_off = next_off };
+    }
+
+    /// Max run bytes that can ever fit a FRESH single-slot slab block.
+    fn slabFreshRunCap(self: *const AdjStore) u64 {
+        return @as(u64, self.page_size) - self.tail_reserve - edge_mod.SLAB_RUNS_OFFSET - edge_mod.SLAB_DIR_ENTRY_SIZE;
+    }
+
+    fn writeSlabRunEntryInto(data: []u8, run_offset: u32, idx: u32, entry: EdgeEntry) void {
+        const off = @as(usize, run_offset) + @as(usize, idx) * edge_mod.ENTRY_SIZE_V2;
+        @memcpy(data[off..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&entry)[0..edge_mod.ENTRY_SIZE_V2]);
+    }
+
+    /// Write a contiguous run of v2 entries at `run_off` and its slot-dir entry
+    /// (offset, count). Does NOT touch the header slot_count — the caller makes
+    /// the new slot visible (fresh block: header count preset; fill block:
+    /// bumpSlabSlotCount after).
+    fn writeSlabRun(self: *const AdjStore, data: []u8, run_off: u32, slot: u32, entries: []const EdgeEntry) void {
+        for (entries, 0..) |e, k| writeSlabRunEntryInto(data, run_off, @intCast(k), e);
+        edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = run_off, .entry_count = @intCast(entries.len) });
+    }
+
+    fn bumpSlabSlotCount(self: *const AdjStore, data: []u8, new_count: u32, added_bytes: u32) void {
+        const off = self.blockHeaderOffset();
+        var bh: EdgeBlockHeader = @bitCast(data[off..][0..BLOCK_HEADER_SIZE].*);
+        bh.count = @intCast(new_count);
+        bh.payload_size = bh.payload_size +% @as(u16, @truncate(added_bytes));
+        self.writeBlockHeader(data, bh);
+    }
+
+    fn bumpSlabPayload(self: *const AdjStore, data: []u8, added: u16) void {
+        const off = self.blockHeaderOffset();
+        var bh: EdgeBlockHeader = @bitCast(data[off..][0..BLOCK_HEADER_SIZE].*);
+        bh.payload_size = bh.payload_size +% added;
+        self.writeBlockHeader(data, bh);
+    }
+
+    /// Append `entries` (≥1) as a NEW slot run on the current fill block, or a
+    /// fresh slab block when there is none / it is full. Returns the encoded
+    /// slab head, or null when the run cannot fit even a fresh slab block, or
+    /// the fresh block's page id overflows the slab-head field — the caller
+    /// then GRADUATES to a legacy chain. Records the WAL touch BEFORE any byte
+    /// is mutated; the new slot becomes visible only via the last write.
+    fn appendSlabRun(self: *AdjStore, entries: []const EdgeEntry) !?u64 {
+        std.debug.assert(entries.len >= 1);
+        const run_bytes: u32 = @intCast(entries.len * edge_mod.ENTRY_SIZE_V2);
+        if (run_bytes > self.slabFreshRunCap()) return null;
+
+        // Try the current fill block first.
+        if (self.current_fill_page) |fill_page| {
+            const frame = try self.buffer_pool.pin(self.file_id, fill_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+            const state = self.slabBlockState(data) catch |err| {
+                self.buffer_pool.unpin(frame_idx, false);
+                return err;
+            };
+            if (state.slot_count <= SLAB_HEAD_SLOT_MASK) {
+                const slot: u32 = state.slot_count;
+                const dir_needed: u64 = (@as(u64, slot) + 1) * edge_mod.SLAB_DIR_ENTRY_SIZE;
+                const avail_end: u64 = @as(u64, self.page_size) - self.tail_reserve - dir_needed;
+                if (@as(u64, state.next_off) + run_bytes <= avail_end) {
+                    self.recordTouched(fill_page) catch |err| {
+                        self.buffer_pool.unpin(frame_idx, false);
+                        return err;
+                    };
+                    self.writeSlabRun(data, state.next_off, slot, entries);
+                    self.bumpSlabSlotCount(data, slot + 1, run_bytes);
+                    self.buffer_pool.unpin(frame_idx, true);
+                    return encodeSlabHead(fill_page, slot); // fill_page already in range
+                }
+            }
+            // Full (or slot indices exhausted): retire it as the fill block.
+            self.buffer_pool.unpin(frame_idx, false);
+            self.current_fill_page = null;
+        }
+
+        // Start a fresh slab fill block.
+        const new_page = try self.free_space.allocPage();
+        const head = tryEncodeSlabHead(new_page, 0) orelse {
+            // page id overflows the 39-bit field — release and graduate.
+            self.free_space.freePage(new_page) catch {};
+            return null;
+        };
+        self.recordTouched(new_page) catch |err| {
+            self.free_space.freePage(new_page) catch {};
+            return err;
+        };
+        const frame = self.buffer_pool.pinNew(self.file_id, new_page) catch |err| { // zeroed
+            self.free_space.freePage(new_page) catch {};
+            return err;
+        };
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        self.writeBlockHeader(data, .{
+            .next_block = 0,
+            .count = 1,
+            .kind = 0,
+            .entry_format = edge_mod.ENTRY_FORMAT_SLAB,
+            .payload_size = @truncate(run_bytes),
+            .checksum = 0,
+        });
+        self.writeSlabRun(data, edge_mod.SLAB_RUNS_OFFSET, 0, entries);
+        self.buffer_pool.unpin(frame_idx, true);
+        self.current_fill_page = new_page;
+        return head;
+    }
+
+    /// Tombstone slot `slot` on `page` — records the WAL touch FIRST, then the
+    /// single directory write (NO error exit after it, so a failed op leaves
+    /// the old slot LIVE and the caller's old head valid). Arms the engine
+    /// rollback with the pre-tombstone (offset, count) so it can be restored.
+    fn tombstoneSlabSlot(self: *AdjStore, page: PageId, slot: u32, offset: u32, entry_count: u32) !void {
+        try self.recordTouched(page);
+        const frame = try self.buffer_pool.pin(self.file_id, page);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = edge_mod.SLAB_SLOT_TOMBSTONE, .entry_count = 0 });
+        self.buffer_pool.unpin(frame_idx, true);
+        self.last_slab_tombstone = .{ .page_id = page, .slot = slot, .offset = offset, .entry_count = entry_count };
+    }
+
+    /// Graduation: write every entry of `entries` into a fresh LEGACY block
+    /// chain (the pre-slab layout). Inserts in REVERSE so head-insert leaves
+    /// the run's original order under enumeration. Records each new legacy
+    /// page in the touched set (via addEdgeLegacy).
+    fn migrateRunToLegacy(self: *AdjStore, entries: []const EdgeEntry) !PageId {
+        std.debug.assert(entries.len >= 1);
+        var head: PageId = 0;
+        var i: usize = entries.len;
+        while (i > 0) {
+            i -= 1;
+            head = try self.addEdgeLegacy(head, entries[i]);
+        }
+        std.debug.assert(head != 0);
+        return head;
+    }
+
+    /// Slab write dispatcher (packing on, or a tagged head). A new chain packs
+    /// a single-entry run; an existing slab chain grows; an existing legacy
+    /// chain keeps growing as legacy (existing block chains are never
+    /// retro-packed).
+    fn addEdgeSlab(self: *AdjStore, head_page: PageId, entry: EdgeEntry) !PageId {
+        if (isSlabHead(head_page)) return self.growSlabChain(head_page, entry);
+        if (head_page == 0) {
+            const one = [_]EdgeEntry{entry};
+            if (try self.appendSlabRun(&one)) |h| return h;
+            return self.addEdgeLegacy(0, entry); // page-id overflow fallback
+        }
+        return self.addEdgeLegacy(head_page, entry);
+    }
+
+    /// Append `entry` to an existing slab-packed chain. In-place tail-grow when
+    /// the run is at the block frontier and fits; else relocate the whole
+    /// (run + entry) to a new slot and tombstone the old slot LAST; else
+    /// graduate to a legacy chain and tombstone the old slot LAST.
+    fn growSlabChain(self: *AdjStore, head: u64, entry: EdgeEntry) !PageId {
+        const page = slabHeadPageId(head);
+        const slot = slabHeadSlot(head);
+        if (page == 0) return error.DataCorruption; // F1: corrupt head
+
+        const frame = try self.buffer_pool.pin(self.file_id, page);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        const state = self.slabBlockState(data) catch |err| {
+            self.buffer_pool.unpin(frame_idx, false);
+            return err;
+        };
+        if (slot >= state.slot_count) {
+            self.buffer_pool.unpin(frame_idx, false);
+            return error.DataCorruption;
+        }
+        const s = edge_mod.readSlabSlot(data, self.tail_reserve, slot);
+        if (s.offset == edge_mod.SLAB_SLOT_TOMBSTONE or s.offset < edge_mod.SLAB_RUNS_OFFSET) {
+            self.buffer_pool.unpin(frame_idx, false);
+            return error.DataCorruption; // live-head invariant: head → live run
+        }
+        const run_end: u64 = @as(u64, s.offset) + @as(u64, s.entry_count) * edge_mod.ENTRY_SIZE_V2;
+        const dir_start = edge_mod.slabDirStart(data.len, self.tail_reserve, state.slot_count);
+        if (run_end > dir_start) {
+            self.buffer_pool.unpin(frame_idx, false);
+            return error.DataCorruption;
+        }
+
+        // (A) In-place tail-grow: run ends at the block frontier, one more fits.
+        if (run_end == state.next_off and run_end + edge_mod.ENTRY_SIZE_V2 <= dir_start) {
+            self.recordTouched(page) catch |err| {
+                self.buffer_pool.unpin(frame_idx, false);
+                return err;
+            };
+            @memcpy(data[@intCast(run_end)..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&entry)[0..edge_mod.ENTRY_SIZE_V2]);
+            edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = s.offset, .entry_count = s.entry_count + 1 });
+            self.bumpSlabPayload(data, edge_mod.ENTRY_SIZE_V2);
+            self.buffer_pool.unpin(frame_idx, true);
+            return head; // head unchanged
+        }
+
+        // (B) Copy the run out (no mutation yet), then relocate or graduate.
+        const alloc = self.buffer_pool.allocator;
+        const n: usize = s.entry_count;
+        const new_run = alloc.alloc(EdgeEntry, n + 1) catch |err| {
+            self.buffer_pool.unpin(frame_idx, false);
+            return err;
+        };
+        defer alloc.free(new_run);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const eoff: usize = @as(usize, s.offset) + i * edge_mod.ENTRY_SIZE_V2;
+            new_run[i] = @bitCast(data[eoff..][0..edge_mod.ENTRY_SIZE_V2].*);
+        }
+        new_run[n] = entry;
+        self.buffer_pool.unpin(frame_idx, false);
+
+        // (C) Relocate to a new slot; tombstone the old slot LAST.
+        if (try self.appendSlabRun(new_run)) |new_head| {
+            try self.tombstoneSlabSlot(page, slot, s.offset, s.entry_count);
+            return new_head;
+        }
+        // (D) Graduate to a legacy chain; tombstone the old slot LAST.
+        const legacy_head = try self.migrateRunToLegacy(new_run);
+        try self.tombstoneSlabSlot(page, slot, s.offset, s.entry_count);
+        return legacy_head;
+    }
+
+    /// Remove an edge from a slab-packed chain: swap-with-last within the run,
+    /// shrink the slot's entry_count. Head unchanged; returns the DECODED slab
+    /// block page for the engine to WAL-image (or null when absent).
+    fn removeEdgeSlab(self: *AdjStore, head: u64, edge_id: EdgeId) !?PageId {
+        const page = slabHeadPageId(head);
+        if (page == 0) return error.DataCorruption;
+        const slot = slabHeadSlot(head);
+        const frame = try self.buffer_pool.pin(self.file_id, page);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        var dirty = false;
+        defer self.buffer_pool.unpin(frame_idx, dirty);
+        const data = frame.dataSlice();
+        const run = try self.resolveSlabRun(data, slot);
+        var i: u32 = 0;
+        while (i < run.entry_count) : (i += 1) {
+            const e = readSlabRunEntry(data, run.offset, i);
+            if (e.edge_id == edge_id) {
+                try self.recordTouched(page);
+                if (i < run.entry_count - 1) {
+                    const last = readSlabRunEntry(data, run.offset, run.entry_count - 1);
+                    writeSlabRunEntryInto(data, run.offset, i, last);
+                }
+                edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = run.offset, .entry_count = run.entry_count - 1 });
+                dirty = true;
+                return page;
+            }
+        }
+        return null;
+    }
+
+    /// Update an edge's prop_head in a slab-packed chain (in-place rewrite).
+    /// Head unchanged; returns the DECODED slab block page (or null when absent).
+    fn updateEdgePropHeadSlab(self: *AdjStore, head: u64, edge_id: EdgeId, new_prop_head: u32) !?PageId {
+        const page = slabHeadPageId(head);
+        if (page == 0) return error.DataCorruption;
+        const slot = slabHeadSlot(head);
+        const frame = try self.buffer_pool.pin(self.file_id, page);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        var dirty = false;
+        defer self.buffer_pool.unpin(frame_idx, dirty);
+        const data = frame.dataSlice();
+        const run = try self.resolveSlabRun(data, slot);
+        var i: u32 = 0;
+        while (i < run.entry_count) : (i += 1) {
+            var e = readSlabRunEntry(data, run.offset, i);
+            if (e.edge_id == edge_id) {
+                try self.recordTouched(page);
+                e.prop_head = new_prop_head;
+                writeSlabRunEntryInto(data, run.offset, i, e);
+                dirty = true;
+                return page;
+            }
+        }
+        return null;
+    }
+
     /// Remove an edge entry from a node's adjacency list.
     /// Scans all blocks for the matching edge_id and removes it by swapping with the last entry.
     ///
@@ -203,8 +643,10 @@ pub const AdjStore = struct {
     /// exactly this page — imaging only the chain head lets older WAL images of
     /// a non-head block resurrect a committed delete on crash recovery.
     pub fn removeEdge(self: *AdjStore, head_page: PageId, edge_id: EdgeId) !?PageId {
-        // P1: slab chains are read-only — see addEdge.
-        if (isSlabHead(head_page)) return error.SlabChainWriteNotSupported;
+        self.beginOp();
+        // A tagged head is a slab-packed chain (regardless of the packing flag):
+        // remove in place within the run, return the decoded block page.
+        if (isSlabHead(head_page)) return self.removeEdgeSlab(head_page, edge_id);
         if (head_page == 0) return null;
 
         var current_page = head_page;
@@ -258,6 +700,13 @@ pub const AdjStore = struct {
         /// iterators, FanInEdgeIterator, index rebuild scans — inherits slab
         /// support with no signature change.
         slab_slot: ?u32 = null,
+        /// F1 guard (P2 entry requirement 1): set when `expand` was handed a
+        /// slab-tagged head whose page bits decode to 0 (page 0 is reserved) —
+        /// a corrupt head. `next()` surfaces DataCorruption instead of the
+        /// silently-empty run a page-0 slab mode would otherwise produce
+        /// (the slab loop terminates on current_page == 0). Never set for a
+        /// live slab head (its page id is ≥ 2).
+        slab_corrupt: bool = false,
 
         pub fn deinit(self: *AdjEdgeIterator) void {
             if (self.current_frame_idx) |idx| {
@@ -267,6 +716,7 @@ pub const AdjStore = struct {
         }
 
         pub fn next(self: *AdjEdgeIterator) anyerror!?EdgeEntry {
+            if (self.slab_corrupt) return error.DataCorruption;
             if (self.slab_slot) |slot| return self.nextSlab(slot);
             while (self.current_page != 0) {
                 if (self.current_frame_idx == null) {
@@ -346,11 +796,14 @@ pub const AdjStore = struct {
     /// slab read). Read-both is permanent.
     pub fn expand(self: *AdjStore, head_page: PageId, rel_type_filter: ?u32) AdjEdgeIterator {
         if (isSlabHead(head_page)) {
+            const page = slabHeadPageId(head_page);
             return .{
                 .store = self,
-                .current_page = slabHeadPageId(head_page),
+                .current_page = page,
                 .slab_slot = slabHeadSlot(head_page),
                 .rel_type = rel_type_filter,
+                // F1 guard: a tagged head that decodes to page 0 is corruption.
+                .slab_corrupt = (page == 0),
             };
         }
         return .{
@@ -369,8 +822,8 @@ pub const AdjStore = struct {
     /// contract as `removeEdge` (edge-remove non-head imaging fix). Returns
     /// null when the edge was not found (no page touched, nothing to log).
     pub fn updateEdgePropHead(self: *AdjStore, head_page: PageId, edge_id: EdgeId, new_prop_head: u32) !?PageId {
-        // P1: slab chains are read-only — see addEdge.
-        if (isSlabHead(head_page)) return error.SlabChainWriteNotSupported;
+        self.beginOp();
+        if (isSlabHead(head_page)) return self.updateEdgePropHeadSlab(head_page, edge_id, new_prop_head);
         if (head_page == 0) return null;
 
         var current_page = head_page;
@@ -412,6 +865,9 @@ pub const AdjStore = struct {
         if (head_page == 0) return 0;
 
         if (isSlabHead(head_page)) {
+            // F1 guard: a tagged head that decodes to reserved page 0 is
+            // corruption — reject before pinning page 0.
+            if (slabHeadPageId(head_page) == 0) return error.DataCorruption;
             const frame = try self.buffer_pool.pin(self.file_id, slabHeadPageId(head_page));
             const frame_idx = self.buffer_pool.frameIndex(frame);
             defer self.buffer_pool.unpin(frame_idx, false);
@@ -520,7 +976,7 @@ pub const AdjStore = struct {
     }
 
     /// Read entry `idx` of a validated slab run (always the v2 32 B stride).
-    fn readSlabRunEntry(data: []const u8, run_offset: u32, idx: u16) EdgeEntry {
+    fn readSlabRunEntry(data: []const u8, run_offset: u32, idx: u32) EdgeEntry {
         const off = @as(usize, run_offset) + @as(usize, idx) * edge_mod.ENTRY_SIZE_V2;
         const bytes = data[off..][0..edge_mod.ENTRY_SIZE_V2];
         return @bitCast(bytes.*);
@@ -1066,19 +1522,288 @@ test "slab read path rejects tombstoned, out-of-range, and out-of-bounds slots a
     }
 }
 
-test "P1 mutators reject slab heads loudly (slab writes land in P2)" {
+test "P2: a tagged slab head is always writable (append/remove/update) even with packing off" {
     var env = try TestEnv.init();
     env.fixup();
     defer env.deinit();
     var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    // Packing OFF: a NEW chain would be legacy, but a tagged head is a slab
+    // chain regardless (bit-63 tag discipline) — the writer must service it.
+    try testing.expect(!store.slab_packing);
 
     const run = [_]EdgeEntry{v2Edge(10, 701, 5, 0xF1)};
     const page = try writeRawSlabBlock(&store, &.{&run});
     const head = encodeSlabHead(page, 0);
 
-    try testing.expectError(error.SlabChainWriteNotSupported, store.addEdge(head, makeEdge(20, 702, 5)));
-    try testing.expectError(error.SlabChainWriteNotSupported, store.removeEdge(head, 701));
-    try testing.expectError(error.SlabChainWriteNotSupported, store.updateEdgePropHead(head, 701, 42));
+    // Append grows the slab run in place (single-run tail).
+    const grown = try store.addEdge(head, v2Edge(20, 702, 5, 0xF2));
+    try testing.expectEqual(head, grown); // tail-grow keeps the head
+    try testing.expectEqual(@as(u64, 2), try store.edgeCount(grown));
+    // Update + remove operate within the run.
+    try testing.expectEqual(@as(?PageId, page), try store.updateEdgePropHead(grown, 702, 9));
+    try testing.expectEqual(@as(?PageId, page), try store.removeEdge(grown, 701));
+    try testing.expectEqual(@as(u64, 1), try store.edgeCount(grown));
+}
+
+// ============================================================================
+// GAP adjacency slab packing — P2 ENTRY REQUIREMENT 1 (F1 guard).
+// A tagged slab head whose page bits decode to 0 (page 0 is reserved) is a
+// CORRUPT head. It must fail DataCorruption on both read entry points, never
+// silently enumerate an empty run (that would violate the live-head invariant
+// — a stored head must always reference a live run).
+// ============================================================================
+
+test "F1: slab head whose page bits decode to page 0 is corruption, never silently empty" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    // A slab-tagged head whose 39-bit page field is 0. page 0 is reserved, so
+    // this can only arise from corruption, never from a live slab write.
+    const bad = encodeSlabHead(0, 5);
+    try testing.expect(isSlabHead(bad));
+    try testing.expectEqual(@as(PageId, 0), slabHeadPageId(bad));
+
+    // expand() cannot return an error (it returns a plain iterator), so the
+    // corruption must surface on the FIRST next() — not as a silent empty run.
+    var it = store.expand(bad, null);
+    defer it.deinit();
+    try testing.expectError(error.DataCorruption, it.next());
+
+    // edgeCount() rejects it up front rather than pinning the reserved page 0.
+    try testing.expectError(error.DataCorruption, store.edgeCount(bad));
+}
+
+// ============================================================================
+// GAP adjacency slab packing — P2 ENTRY REQUIREMENT 4 (WAL-imaging plumbing +
+// fallback encoder). The engine must WAL-image the exact page(s) an addEdge
+// mutated — not the returned head, which becomes a tagged (block, slot) ref
+// once slab writes land. AdjStore exposes `touchedPages()` (the prop-store P4
+// discipline). With slab packing OFF (default), a legacy addEdge touches
+// exactly the block it mutated, which always equals the returned head — so
+// the engine's imaging is byte-identical whether it logs the head or the
+// touched set.
+// ============================================================================
+
+test "P2 plumbing: legacy addEdge records exactly the mutated page (== returned head)" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    // Default: slab packing OFF — legacy block chains, byte-identical to pre-P2.
+    try testing.expect(!store.slab_packing);
+
+    // New chain: touched == [new head block].
+    var head: PageId = 0;
+    head = try store.addEdge(head, makeEdge(10, 1, 5));
+    try testing.expectEqualSlices(PageId, &.{head}, store.touchedPages());
+
+    // In-place append to the same block: head unchanged, touched == [head].
+    const prev = head;
+    head = try store.addEdge(head, makeEdge(20, 2, 5));
+    try testing.expectEqual(prev, head);
+    try testing.expectEqualSlices(PageId, &.{head}, store.touchedPages());
+
+    // Overflow into a fresh block: touched == [new head], distinct from old.
+    const epb = store.writer_entries_per_block;
+    var i: u32 = 2;
+    while (i < epb) : (i += 1) head = try store.addEdge(head, makeEdge(i, i + 1, 5));
+    const before_overflow = head;
+    head = try store.addEdge(head, makeEdge(999, 9999, 5));
+    try testing.expect(head != before_overflow);
+    try testing.expectEqualSlices(PageId, &.{head}, store.touchedPages());
+}
+
+test "P2: tryEncodeSlabHead falls back (null) for a page id that overflows the 39-bit field" {
+    // 2^39 is the first page id that cannot be addressed by a slab head.
+    try testing.expectEqual(@as(?u64, null), tryEncodeSlabHead(@as(u64, 1) << 39, 0));
+    const ok = tryEncodeSlabHead((@as(u64, 1) << 39) - 1, 3).?;
+    try testing.expect(isSlabHead(ok));
+    try testing.expectEqual((@as(u64, 1) << 39) - 1, slabHeadPageId(ok));
+    try testing.expectEqual(@as(u32, 3), slabHeadSlot(ok));
+}
+
+// ============================================================================
+// GAP adjacency slab packing — P2 slab WRITE path (writer contract tests).
+// ============================================================================
+
+/// Drain an iterator into a caller list of neighbors (order preserved).
+fn collectNeighbors(store: *AdjStore, head: PageId, out: *std.ArrayList(u64)) !void {
+    var it = store.expand(head, null);
+    defer it.deinit();
+    while (try it.next()) |e| try out.append(testing.allocator, e.neighbor);
+}
+
+/// The first edge of a chain (helper: expand returns an iterator by value, so
+/// its `next()` needs a bound mutable var).
+fn firstEdge(store: *AdjStore, head: PageId) !EdgeEntry {
+    var it = store.expand(head, null);
+    defer it.deinit();
+    return (try it.next()).?;
+}
+
+test "P2 writer: a NEW chain slab-packs (tagged head, single-block, exact read-back)" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+
+    const head = try store.addEdge(0, v2Edge(10, 101, 5, 0xA1));
+    try testing.expect(isSlabHead(head)); // packed, not a whole block
+    try testing.expectEqual(@as(u64, 1), try store.edgeCount(head));
+    // touched set is exactly the slab block (decoded), never the tagged head.
+    try testing.expectEqualSlices(PageId, &.{slabHeadPageId(head)}, store.touchedPages());
+
+    var it = store.expand(head, null);
+    defer it.deinit();
+    const e = (try it.next()).?;
+    try testing.expectEqual(@as(u64, 10), e.neighbor);
+    try testing.expectEqual(@as(u64, 101), e.edge_id);
+    try testing.expectEqual(@as(u64, 0xA1), e.public_id);
+    try testing.expectEqual(@as(?EdgeEntry, null), try it.next());
+}
+
+test "P2 writer: many small NEW chains share ONE slab block (distinct slots)" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+
+    var heads: [8]PageId = undefined;
+    for (&heads, 0..) |*h, i| {
+        h.* = try store.addEdge(0, v2Edge(@intCast(100 + i), @intCast(1000 + i), 5, @intCast(0xB0 + i)));
+        try testing.expect(isSlabHead(h.*));
+    }
+    // All packed into the same fill block, on distinct slots.
+    const page0 = slabHeadPageId(heads[0]);
+    for (heads, 0..) |h, i| {
+        try testing.expectEqual(page0, slabHeadPageId(h));
+        try testing.expectEqual(@as(u32, @intCast(i)), slabHeadSlot(h));
+        const e = try firstEdge(&store, h);
+        try testing.expectEqual(@as(u64, @intCast(100 + i)), e.neighbor);
+    }
+}
+
+test "P2 writer: growing a slab chain keeps every edge (in-place tail-grow + relocate)" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+
+    // Chain A then chain B: A is no longer the tail run once B is packed.
+    var a = try store.addEdge(0, v2Edge(10, 101, 5, 0xA1));
+    const b = try store.addEdge(0, v2Edge(20, 201, 5, 0xB1));
+
+    // Grow A (a middle run) — must relocate, tombstone the old slot, stay slab.
+    a = try store.addEdge(a, v2Edge(11, 102, 5, 0xA2));
+    try testing.expect(isSlabHead(a));
+    // Grow A again — now A is the tail run, may grow in place.
+    a = try store.addEdge(a, v2Edge(12, 103, 5, 0xA3));
+
+    var na: std.ArrayList(u64) = .empty;
+    defer na.deinit(testing.allocator);
+    try collectNeighbors(&store, a, &na);
+    try testing.expectEqual(@as(usize, 3), na.items.len);
+    // exact set {10,11,12}
+    var seen_a: [3]bool = .{ false, false, false };
+    for (na.items) |n| {
+        if (n == 10) seen_a[0] = true else if (n == 11) seen_a[1] = true else if (n == 12) seen_a[2] = true else return error.Unexpected;
+    }
+    try testing.expect(seen_a[0] and seen_a[1] and seen_a[2]);
+
+    // B untouched by A's relocation.
+    try testing.expectEqual(@as(u64, 1), try store.edgeCount(b));
+    const be = try firstEdge(&store, b);
+    try testing.expectEqual(@as(u64, 20), be.neighbor);
+}
+
+test "P2 writer: a chain that outgrows the slab GRADUATES to a legacy block chain" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+
+    // Keep appending to one chain until it graduates (head stops being a slab
+    // head) — the run outgrew a slab block. Every edge must survive.
+    var head = try store.addEdge(0, v2Edge(0, 1, 5, 0xC0));
+    var n: u64 = 1;
+    var graduated = false;
+    while (n < 400) : (n += 1) {
+        head = try store.addEdge(head, v2Edge(n, n + 1, 5, 0xC000 + n));
+        if (!isSlabHead(head)) {
+            graduated = true;
+            break;
+        }
+    }
+    try testing.expect(graduated); // must have left the slab at some point
+    // Enumerate every edge 0..=n exactly once.
+    const total = n + 1;
+    var list: std.ArrayList(u64) = .empty;
+    defer list.deinit(testing.allocator);
+    try collectNeighbors(&store, head, &list);
+    try testing.expectEqual(@as(usize, @intCast(total)), list.items.len);
+    try testing.expectEqual(total, try store.edgeCount(head));
+}
+
+test "P2 writer: removeEdge + updateEdgePropHead work on a slab-packed chain" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+
+    var head = try store.addEdge(0, v2Edge(10, 101, 5, 0xA1));
+    head = try store.addEdge(head, v2Edge(20, 102, 5, 0xA2));
+    head = try store.addEdge(head, v2Edge(30, 103, 5, 0xA3));
+    try testing.expect(isSlabHead(head));
+    try testing.expectEqual(@as(u64, 3), try store.edgeCount(head));
+
+    // update prop_head of the middle edge.
+    const up = try store.updateEdgePropHead(head, 102, 77);
+    try testing.expectEqual(@as(?PageId, slabHeadPageId(head)), up);
+    {
+        var it = store.expand(head, null);
+        defer it.deinit();
+        while (try it.next()) |e| {
+            if (e.edge_id == 102) try testing.expectEqual(@as(u32, 77), e.prop_head) else try testing.expectEqual(@as(u32, 0), e.prop_head);
+        }
+    }
+
+    // remove the middle edge; the other two survive; returned page is decoded.
+    const rm = try store.removeEdge(head, 102);
+    try testing.expectEqual(@as(?PageId, slabHeadPageId(head)), rm);
+    try testing.expectEqual(@as(u64, 2), try store.edgeCount(head));
+    var it = store.expand(head, null);
+    defer it.deinit();
+    while (try it.next()) |e| try testing.expect(e.edge_id != 102);
+}
+
+test "P2 writer: relocate then undoLastSlabTombstone brings the old head back to life" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+
+    const a = try store.addEdge(0, v2Edge(10, 101, 5, 0xA1));
+    _ = try store.addEdge(0, v2Edge(20, 201, 5, 0xB1)); // makes A a middle run
+
+    // Grow A: relocates, tombstones A's old slot, arms the undo.
+    const a2 = try store.addEdge(a, v2Edge(11, 102, 5, 0xA2));
+    try testing.expect(a2 != a); // head moved (relocation)
+    // The old head A now points at a tombstoned slot — reading it is corruption.
+    try testing.expectError(error.DataCorruption, store.edgeCount(a));
+
+    // Engine-style rollback: restore the old slot. The OLD head must read again.
+    try store.undoLastSlabTombstone();
+    try testing.expectEqual(@as(u64, 1), try store.edgeCount(a));
+    const e = try firstEdge(&store, a);
+    try testing.expectEqual(@as(u64, 10), e.neighbor);
 }
 
 test {

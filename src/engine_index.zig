@@ -280,6 +280,10 @@ pub fn migrateColocateInEdges(engine: *GraphEngine) !void {
     //     overwritten in-place by the deterministic rebuild (slot-addressed,
     //     count-authoritative), so they need no explicit zeroing.
     resetFreeSpaceEmpty(&engine.free_space_in_idx);
+    // GAP adjacency slab packing (P2): the in_idx free space just reset to
+    // empty, so any in-memory slab fill-block pointer is stale — drop it so the
+    // rebuild's first slab append starts a fresh fill block from reset space.
+    engine.adj_in_remote.current_fill_page = null;
 
     // 2. Stream the out-adjacency and rebuild adj_in_remote keyed by `to`.
     const commit_batch: u32 = 4096;
@@ -335,10 +339,16 @@ pub fn migrateColocateInEdges(engine: *GraphEngine) !void {
                     self.err = e;
                     return;
                 };
-                self.engine.logPagePublic(self.txn, .in_idx, new_head) catch |e| {
-                    self.err = e;
-                    return;
-                };
+                // Image every in_idx page the addEdge dirtied. `new_head` may be
+                // a slab (block,slot) ref (not a page id) and a slab relocation
+                // dirties several pages — the store records the exact set (with
+                // slab packing off this is exactly [new_head], unchanged).
+                for (self.engine.adj_in_remote.touchedPages()) |p| {
+                    self.engine.logPagePublic(self.txn, .in_idx, p) catch |e| {
+                        self.err = e;
+                        return;
+                    };
+                }
                 self.engine.logPagePublic(self.txn, .in_dir, dir_page) catch |e| {
                     self.err = e;
                     return;

@@ -334,6 +334,278 @@ test "Phase 3 CRITICAL: two crashes, NO checkpoint between → REBUILD (not part
     }
 }
 
+// COMPOSED (adjacency slab packing × WAL-aware derived-index reconcile) — the
+// on-path proof that this release's two feature sets compose. With adjacency
+// slab packing ON (opt-in; ships default OFF), a committed clean-shutdown WAL
+// tail that PACKS a brand-new slab chain, GROWS a chain past GRADUATION (slab →
+// legacy migration in the tail), and TOMBSTONES a pre-checkpoint slab edge must
+// reconcile into the epoch-matched loaded snapshots KEY-FOR-KEY EQUAL to a full
+// rebuild. This holds because every adjacency write logs the owning node's
+// `.nodes` page in the same commit, and the reconcile's node-page pass
+// re-derives each affected node via the slab-aware `expand` (read-both) — so
+// slab relocation/graduation/tombstone in the tail can never strand or
+// mis-derive an edge. The two dedicated release gates (adjacency crash matrix,
+// Path-B tail reconcile) each run with the OTHER feature quiescent; this test is
+// the combined-path coverage that neither exercised.
+test "COMPOSED: slab-packed tail (pack + graduate + tombstone) reconcile == full rebuild" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x5b} ** 16;
+
+    var cfg = test_support.testConfig();
+    cfg.adjacency_slab_packing = true; // opt-in adjacency slab packing ON
+
+    const N_POOL = 600;
+    var pool: [N_POOL]u64 = undefined;
+    var hub: u64 = 0;
+    var x: u64 = 0;
+    var x_edge: u64 = 0;
+    var removed_edge: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+
+        // S0: a hub + a pool of targets, plus a few low-fanout slab chains that
+        // must survive the hub's graduation and the tail reconcile. No labels/
+        // props: keeps the tail free of non-slab `.props` pages (which would
+        // force the safe fallback rebuild) so the SLAB adjacency path is what
+        // the reconcile is proven against.
+        hub = try eng.allocNode();
+        try eng.putNode(hub, emptyNode());
+        for (&pool) |*n| {
+            n.* = try eng.allocNode();
+            try eng.putNode(n.*, emptyNode());
+        }
+        {
+            var i: usize = 1;
+            while (i + 1 < 20) : (i += 2) {
+                _ = try eng.addEdge(pool[i], pool[i + 1], REL);
+            }
+        }
+        // A pre-checkpoint slab edge hub -> pool[0], tombstoned in the tail.
+        removed_edge = try eng.addEdge(hub, pool[0], REL);
+
+        try eng.checkpoint(); // snapshots @ (epoch E, covered_lsn L); slab-packed adjacency on disk
+
+        // --- committed tail M (deferred; NO checkpoint) ---
+        // (1) PACK a brand-new slab chain: node X.
+        x = try eng.allocNode();
+        try eng.putNode(x, emptyNode());
+        x_edge = try eng.addEdge(x, pool[0], REL);
+        _ = try eng.addEdge(x, pool[1], REL);
+
+        // (2) GROW the hub until it GRADUATES (out_head stops being a slab head)
+        //     — a slab → legacy migration entirely inside the WAL tail.
+        var graduated = false;
+        var k: usize = 20;
+        while (k < N_POOL) : (k += 1) {
+            _ = try eng.addEdge(hub, pool[k], REL);
+            if (!gs.adj_store.isSlabHead((try eng.getNode(hub)).?.out_head)) {
+                graduated = true;
+                if (k > 40) break; // grow a little past graduation, then stop
+            }
+        }
+        try testing.expect(graduated);
+
+        // (3) TOMBSTONE the pre-checkpoint slab edge hub -> pool[0].
+        try eng.removeEdge(hub, pool[0], removed_edge);
+
+        // Clean-shutdown tail: deinit skips the checkpoint, so the snapshots stay
+        // @ (E, L) and only the fsynced WAL tail carries M.
+        eng.deinit();
+    }
+
+    // Reopen: LOAD (epoch match) + RECONCILE the slab-packed tail.
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        const reconciled = try eng.debugDerivedDigests();
+
+        // Reconcile-path metric shape: loaded + reconciled, did NOT rebuild —
+        // proves the slab (graduation/relocation/tombstone) tail pages stayed on
+        // the bounded reconcile path, not the O(graph) fallback rebuild.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_tail_deferred);
+
+        // Ground truth: a full rebuild over the SAME on-disk (S0 + M) store.
+        try eng.rebuildDerivedForTest();
+        const rebuilt = try eng.debugDerivedDigests();
+
+        // KEY-FOR-KEY EQUAL — the correctness bar.
+        try testing.expect(reconciled.eql(rebuilt));
+
+        // Concrete spot-checks on the composed result.
+        try testing.expect(!gs.adj_store.isSlabHead((try eng.getNode(hub)).?.out_head)); // hub graduated to legacy
+        try testing.expect((try eng.getEdge(x_edge)) != null); // new slab-packed chain edge present
+        try testing.expect((try eng.getEdge(removed_edge)) == null); // tombstoned edge absent
+
+        var buf: [8]u64 = undefined;
+        try testing.expectEqual(@as(usize, 0), (try eng.probeEdge(hub, REL, pool[0], &buf)).len); // removed
+        try testing.expectEqual(@as(usize, 1), (try eng.probeEdge(x, REL, pool[0], &buf)).len); // packed chain
+    }
+}
+
+fn containsNode(ids: []const u64, target: u64) bool {
+    for (ids) |id| {
+        if (id == target) return true;
+    }
+    return false;
+}
+
+// COMPOSED (var-slab leg): the var-slab analogue of the adjacency COMPOSED test
+// above. A committed WAL tail that PACKS a brand-new var-slab label slot, GROWS
+// a slab-resident label set past the graduation threshold (slab -> legacy
+// migration inside the tail), and TOMBSTONES a pre-checkpoint slab label slot
+// must reconcile into the epoch-matched loaded snapshots KEY-FOR-KEY EQUAL to a
+// full rebuild. This holds because every label mutation logs the owning node's
+// `.nodes` page in the same commit (and, for a slab tombstone, images the OLD
+// slab block too — the GAP-ENT-0030-class dangling-head/lost-slot guard), so the
+// reconcile's node-page pass (Pass 2) re-derives each affected node's label
+// memberships through the slab-aware `label_store.getLabels` -> `var_store`
+// read-both path. var-slab label ops emit only `.var_store` + `.nodes` tail
+// pages (never `.props`), so the Pass-1 props fallback never fires and the tail
+// stays on the bounded reconcile path — proven below via the reconcile metrics,
+// not just the digest. The var crash matrix and the Path-B tail reconcile
+// release gates each run with the OTHER feature quiescent; this is the
+// combined-path (var slab x Path-B reconcile) coverage neither exercised.
+test "COMPOSED: var-slab label tail (pack + graduate + tombstone) reconcile == full rebuild" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x5c} ** 16;
+
+    var cfg = test_support.testConfig();
+    cfg.buffer_pool_pages = 1024; // room for the graduated (legacy) label chain + churn
+
+    // A shared L_COMMON on every slab node + per-node discriminators so a
+    // scanLabel spot-check can prove exact membership after the reconcile.
+    const L_COMMON: u32 = 100;
+    const L_TOMB: u32 = 200; // removed from tomb_node in the tail
+    const L_SIB: u32 = 201; // sibling's discriminator, untouched in the tail
+    const L_PACK: u32 = 500; // brand-new slot packed in the tail
+    const BIG: u32 = 300; // > ~255 ids => > VAR_SLAB_MAX_RUN (1 KB) => graduates
+
+    var grad_node: u64 = 0;
+    var tomb_node: u64 = 0;
+    var sib_node: u64 = 0;
+    var pack_node: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true; // opt-in var-slab writer ON
+
+        // S0: three small (slab-resident) label sets. grad_node grows past
+        // graduation in the tail; tomb_node loses a label in the tail; sib_node
+        // is the same-era slab sibling that must stay intact across the tombstone.
+        grad_node = try eng.allocNode();
+        try eng.putNode(grad_node, emptyNode());
+        try eng.addLabel(grad_node, L_COMMON);
+        try eng.addLabel(grad_node, 101);
+
+        tomb_node = try eng.allocNode();
+        try eng.putNode(tomb_node, emptyNode());
+        try eng.addLabel(tomb_node, L_COMMON);
+        try eng.addLabel(tomb_node, L_TOMB);
+
+        sib_node = try eng.allocNode();
+        try eng.putNode(sib_node, emptyNode());
+        try eng.addLabel(sib_node, L_COMMON);
+        try eng.addLabel(sib_node, L_SIB);
+
+        // Pre-checkpoint: all three are slab-resident (small runs).
+        try testing.expect(gs.var_store.isSlabHead((try eng.getNode(grad_node)).?.label_head));
+        try testing.expect(gs.var_store.isSlabHead((try eng.getNode(tomb_node)).?.label_head));
+        try testing.expect(gs.var_store.isSlabHead((try eng.getNode(sib_node)).?.label_head));
+
+        try eng.checkpoint(); // snapshots @ (epoch E, covered_lsn L); slab-packed var on disk
+
+        // --- committed tail M (deferred; NO checkpoint) ---
+        // (1) PACK a brand-new slab slot: node pack_node.
+        pack_node = try eng.allocNode();
+        try eng.putNode(pack_node, emptyNode());
+        try eng.addLabel(pack_node, L_PACK);
+        try eng.addLabel(pack_node, L_COMMON);
+        try testing.expect(gs.var_store.isSlabHead((try eng.getNode(pack_node)).?.label_head));
+
+        // (2) GROW grad_node past VAR_SLAB_MAX_RUN so its label_head stops being
+        //     a slab head — a slab -> legacy migration entirely inside the tail.
+        var l: u32 = 1000;
+        while (l < 1000 + BIG) : (l += 1) try eng.addLabel(grad_node, l);
+        try testing.expect(!gs.var_store.isSlabHead((try eng.getNode(grad_node)).?.label_head));
+
+        // (3) TOMBSTONE a pre-checkpoint slab slot: remove L_TOMB from tomb_node.
+        //     The label store writes tomb_node's new block, then tombstones its
+        //     OLD slab slot; the engine images that OLD block in the same commit
+        //     so the tombstone is durable and the slot never resurrects on replay.
+        try eng.removeLabel(tomb_node, L_TOMB);
+
+        // Clean-shutdown tail: deinit skips the checkpoint, so the snapshots stay
+        // @ (E, L) and only the fsynced WAL tail carries M.
+        eng.deinit();
+    }
+
+    // Reopen: LOAD (epoch match) + RECONCILE the var-slab label tail.
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+
+        const reconciled = try eng.debugDerivedDigests();
+
+        // Reconcile-path metric shape: loaded + reconciled, did NOT rebuild —
+        // proves the var-slab (pack/graduate/tombstone) tail pages stayed on the
+        // bounded reconcile path, not the O(graph) fallback rebuild.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_tail_deferred);
+
+        // Ground truth: a full rebuild over the SAME on-disk (S0 + M) store.
+        try eng.rebuildDerivedForTest();
+        const rebuilt = try eng.debugDerivedDigests();
+
+        // KEY-FOR-KEY EQUAL — the correctness bar.
+        try testing.expect(reconciled.eql(rebuilt));
+
+        // Concrete spot-checks on the composed result.
+        // grad_node graduated to a LEGACY head.
+        try testing.expect(!gs.var_store.isSlabHead((try eng.getNode(grad_node)).?.label_head));
+
+        // pack_node's brand-new slot is visible in the reconciled label index.
+        {
+            const with_pack = try eng.scanLabel(L_PACK, alloc);
+            defer alloc.free(with_pack);
+            try testing.expect(containsNode(with_pack, pack_node));
+        }
+        // tomb_node's tombstoned membership is GONE, its sibling's is intact.
+        {
+            const with_tomb = try eng.scanLabel(L_TOMB, alloc);
+            defer alloc.free(with_tomb);
+            try testing.expect(!containsNode(with_tomb, tomb_node));
+        }
+        {
+            const with_sib = try eng.scanLabel(L_SIB, alloc);
+            defer alloc.free(with_sib);
+            try testing.expect(containsNode(with_sib, sib_node));
+        }
+        // The shared L_COMMON still resolves all four live nodes (incl. the
+        // graduated legacy chain and the tombstoned node's surviving membership).
+        {
+            const with_common = try eng.scanLabel(L_COMMON, alloc);
+            defer alloc.free(with_common);
+            try testing.expect(containsNode(with_common, grad_node));
+            try testing.expect(containsNode(with_common, tomb_node));
+            try testing.expect(containsNode(with_common, sib_node));
+            try testing.expect(containsNode(with_common, pack_node));
+        }
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
