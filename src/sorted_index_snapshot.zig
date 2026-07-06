@@ -20,13 +20,14 @@
 //! no alignment is assumed):
 //!
 //!   0   magic[8]            (per-index format version — bump on ANY change)
-//!   8   checkpoint_counter  u64   (caller's staleness gate)
-//!   16  record_count        u64
-//!   24  record_size         u32   (must equal the caller's expected size)
-//!   28  block_size          u32
-//!   32  payload             record_count * record_size bytes, SORTED
+//!   8   checkpoint_epoch    u64   (WAL-aware staleness gate; see manifest.zig)
+//!   16  covered_lsn         u64   (WAL LSN this snapshot reflects)
+//!   24  record_count        u64
+//!   32  record_size         u32   (must equal the caller's expected size)
+//!   36  block_size          u32
+//!   40  payload             record_count * record_size bytes, SORTED
 //!   ..  block_crcs          u32[ceil(payload_len / block_size)]
-//!   ..  meta_crc            u32 over bytes [8..32) ++ block_crcs region
+//!   ..  meta_crc            u32 over bytes [8..40) ++ block_crcs region
 //!
 //! CRASH-SAFETY / FAILURE MODEL (precise):
 //!
@@ -46,9 +47,9 @@
 //!      manifest are the OLD consistent state → counter gate accepts the old
 //!      snapshot, which is correct (nothing newer was durable).
 //!   3. Stale snapshot (light checkpoints, crash after manifest write). The
-//!      caller compares `checkpoint_counter` against manifest.counter exactly
-//!      as before → mismatch → rebuild. The counter is covered by the eagerly
-//!      verified meta-CRC, so a corrupt counter cannot skip the gate.
+//!      caller compares `checkpoint_epoch` against manifest.checkpoint_epoch
+//!      exactly as before → mismatch → rebuild. The epoch is covered by the
+//!      eagerly verified meta-CRC, so a corrupt epoch cannot skip the gate.
 //!   4. Post-write media corruption (bit-rot). Header/directory corruption is
 //!      caught EAGERLY at load (meta-CRC → error.ChecksumMismatch → rebuild).
 //!      Payload corruption is caught LAZILY at first access of the affected
@@ -72,8 +73,8 @@
 //! CRC re-check = silent garbage). Snapshot REPLACEMENT therefore goes
 //! through `writeAtomicReplace` (new inode + rename; the mapping keeps the
 //! old inode alive and semantically valid). The ONLY in-place writes ever
-//! performed on a possibly-mapped snapshot inode are `restampCounter` (bytes
-//! [8,16) + the 4-byte meta-CRC trailer) and `Loaded.invalidateOnce` (bytes
+//! performed on a possibly-mapped snapshot inode are `restampStamps` (bytes
+//! [8,24) + the 4-byte meta-CRC trailer) and `Loaded.invalidateOnce` (bytes
 //! [0,8), the magic): both are size-preserving and touch exclusively bytes
 //! that `load` consumed once and no reader ever re-reads through the mapping
 //! (recordAt reads payload bytes, dirEntry reads directory bytes).
@@ -86,7 +87,9 @@ const Allocator = std.mem.Allocator;
 // fips-exempt: non-security — CRC32C corruption detection for on-disk format.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 
-pub const HEADER_SIZE: usize = 32;
+/// magic(8) + checkpoint_epoch(8) + covered_lsn(8) + record_count(8) +
+/// record_size(4) + block_size(4).
+pub const HEADER_SIZE: usize = 40;
 pub const META_CRC_SIZE: usize = 4;
 pub const BLOCK_CRC_SIZE: usize = 4;
 
@@ -111,7 +114,8 @@ pub fn write(
     allocator: Allocator,
     file: std.Io.File,
     magic: []const u8,
-    checkpoint_counter: u64,
+    checkpoint_epoch: u64,
+    covered_lsn: u64,
     record_size: u32,
     payload: []const u8,
 ) !void {
@@ -126,10 +130,11 @@ pub fn write(
     // Header with the magic ZEROED — it is published last, after the body is
     // durable, so a valid magic implies a complete file.
     var hdr = [_]u8{0} ** HEADER_SIZE;
-    std.mem.writeInt(u64, hdr[8..16], checkpoint_counter, .little);
-    std.mem.writeInt(u64, hdr[16..24], record_count, .little);
-    std.mem.writeInt(u32, hdr[24..28], record_size, .little);
-    std.mem.writeInt(u32, hdr[28..32], DEFAULT_BLOCK_SIZE, .little);
+    std.mem.writeInt(u64, hdr[8..16], checkpoint_epoch, .little);
+    std.mem.writeInt(u64, hdr[16..24], covered_lsn, .little);
+    std.mem.writeInt(u64, hdr[24..32], record_count, .little);
+    std.mem.writeInt(u32, hdr[32..36], record_size, .little);
+    std.mem.writeInt(u32, hdr[36..40], DEFAULT_BLOCK_SIZE, .little);
 
     // Per-block payload CRC directory + trailing meta-CRC over
     // (header-after-magic ++ directory).
@@ -177,7 +182,8 @@ pub fn writeAtomicReplace(
     dir_path: []const u8,
     file_name: []const u8,
     magic: []const u8,
-    checkpoint_counter: u64,
+    checkpoint_epoch: u64,
+    covered_lsn: u64,
     record_size: u32,
     payload: []const u8,
 ) !void {
@@ -197,7 +203,7 @@ pub fn writeAtomicReplace(
         defer tmp_file.close(io);
         // `write` fsyncs the body and the magic before returning, so the tmp
         // file is fully durable before the rename below publishes it.
-        try write(allocator, tmp_file, magic, checkpoint_counter, record_size, payload);
+        try write(allocator, tmp_file, magic, checkpoint_epoch, covered_lsn, record_size, payload);
     }
 
     try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
@@ -212,26 +218,28 @@ pub fn writeAtomicReplace(
     try gdir_file.sync(io);
 }
 
-/// GAP warm-reopen P2: re-stamp `checkpoint_counter` of an existing sorted
-/// snapshot IN PLACE — 8 counter bytes + the 4-byte meta-CRC trailer; the
-/// payload and the per-block CRC directory are untouched. O(directory), i.e.
-/// 4 bytes read per 64 KiB of payload, plus two small writes.
+/// WAL-aware durability: re-stamp `(checkpoint_epoch, covered_lsn)` of an
+/// existing sorted snapshot IN PLACE — 16 stamp bytes + the 4-byte meta-CRC
+/// trailer; the payload and the per-block CRC directory are untouched.
+/// O(directory), i.e. 4 bytes read per 64 KiB of payload, plus two small writes.
 ///
 /// Used by the full checkpoint to keep a CLEAN (not re-serialized) index's
-/// snapshot counter-current when only OTHER indexes were dirty, so the next
-/// open still takes the O(mmap) load path instead of an O(graph) rebuild.
+/// snapshot epoch-current when only OTHER indexes were dirty, so the next
+/// open still takes the O(mmap) load path instead of an O(graph) rebuild. A
+/// clean index is unchanged, so it is valid as of the new checkpoint's LSN —
+/// both stamps advance to (manifest.checkpoint_epoch, checkpoint_lsn).
 ///
 /// MAPPED-INODE SAFETY: this may write the very inode a live adopted base
 /// has mmap'd. That is safe by construction (see the MAPPED-INODE RULE in
 /// the file header): the write is size-preserving and changes only bytes
-/// [8,16) and the meta-CRC trailer — both consumed exactly once by `load`
+/// [8,24) and the meta-CRC trailer — both consumed exactly once by `load`
 /// and never re-read through the mapping.
 ///
-/// CRASH SAFETY (torn restamp): counter and meta-CRC are two separate small
-/// writes. A crash that lands any strict subset (or a torn fraction of
-/// either) leaves counter/meta inconsistent → `load`'s EAGER meta-CRC check
+/// CRASH SAFETY (torn restamp): the stamp region and meta-CRC are two separate
+/// small writes. A crash that lands any strict subset (or a torn fraction of
+/// either) leaves stamps/meta inconsistent → `load`'s EAGER meta-CRC check
 /// fails (error.ChecksumMismatch) → the caller's rebuild path runs. Both
-/// landed = valid new stamp; neither = old stamp (counter-stale → rebuild).
+/// landed = valid new stamp; neither = old stamp (epoch-stale → rebuild).
 /// An accepted-but-corrupt outcome is impossible.
 ///
 /// The existing meta-CRC is VERIFIED before writing (the directory has to be
@@ -239,14 +247,15 @@ pub fn writeAtomicReplace(
 /// (returns false) so the loader keeps rejecting it. Returns false — file
 /// untouched — when there is nothing safe to restamp: empty/short file,
 /// foreign or old-format magic, wrong record_size, or a layout mismatch.
-/// Returns true when the file now carries `new_counter` (including the
+/// Returns true when the file now carries the new stamps (including the
 /// already-stamped no-op case).
-pub fn restampCounter(
+pub fn restampStamps(
     allocator: Allocator,
     file: *std.Io.File,
     expected_magic: []const u8,
     expected_record_size: u32,
-    new_counter: u64,
+    new_epoch: u64,
+    new_covered_lsn: u64,
 ) !bool {
     if (expected_magic.len != 8) return error.InvalidMagicLength;
     const io = ioT();
@@ -261,10 +270,11 @@ pub fn restampCounter(
     if (hn != hdr.len) return false;
     if (!std.mem.eql(u8, hdr[0..8], expected_magic)) return false;
 
-    const old_counter = std.mem.readInt(u64, hdr[8..16], .little);
-    const record_count = std.mem.readInt(u64, hdr[16..24], .little);
-    const record_size = std.mem.readInt(u32, hdr[24..28], .little);
-    const block_size = std.mem.readInt(u32, hdr[28..32], .little);
+    const old_epoch = std.mem.readInt(u64, hdr[8..16], .little);
+    const old_covered = std.mem.readInt(u64, hdr[16..24], .little);
+    const record_count = std.mem.readInt(u64, hdr[24..32], .little);
+    const record_size = std.mem.readInt(u32, hdr[32..36], .little);
+    const block_size = std.mem.readInt(u32, hdr[36..40], .little);
 
     if (record_size != expected_record_size) return false;
     if (block_size < MIN_BLOCK_SIZE or block_size > MAX_BLOCK_SIZE) return false;
@@ -280,7 +290,7 @@ pub fn restampCounter(
     const total = m.add(usize, meta_off, META_CRC_SIZE) catch return false;
     if (total != size) return false;
 
-    if (old_counter == new_counter) return true;
+    if (old_epoch == new_epoch and old_covered == new_covered_lsn) return true;
 
     // Read directory + stored meta-CRC, verify the OLD stamp is intact.
     const dir_and_meta = try allocator.alloc(u8, dir_len + META_CRC_SIZE);
@@ -292,17 +302,18 @@ pub fn restampCounter(
     old_meta.update(hdr[8..HEADER_SIZE]);
     old_meta.update(dir_and_meta[0..dir_len]);
     if (std.mem.readInt(u32, dir_and_meta[dir_len..][0..4], .little) != old_meta.final()) {
-        return false; // already corrupt — never bless it with a fresh counter
+        return false; // already corrupt — never bless it with fresh stamps
     }
 
-    std.mem.writeInt(u64, hdr[8..16], new_counter, .little);
+    std.mem.writeInt(u64, hdr[8..16], new_epoch, .little);
+    std.mem.writeInt(u64, hdr[16..24], new_covered_lsn, .little);
     var new_meta = Crc32.init();
     new_meta.update(hdr[8..HEADER_SIZE]);
     new_meta.update(dir_and_meta[0..dir_len]);
     var meta_buf: [META_CRC_SIZE]u8 = undefined;
     std.mem.writeInt(u32, &meta_buf, new_meta.final(), .little);
 
-    try file.writePositionalAll(io, hdr[8..16], 8);
+    try file.writePositionalAll(io, hdr[8..24], 8);
     try file.writePositionalAll(io, &meta_buf, meta_off);
     try file.sync(io);
     return true;
@@ -316,7 +327,8 @@ pub fn restampCounter(
 pub const Loaded = struct {
     allocator: Allocator,
     mapping: []align(std.heap.page_size_min) u8,
-    checkpoint_counter: u64,
+    checkpoint_epoch: u64,
+    covered_lsn: u64,
     record_count: u64,
     record_size: u32,
     block_size: u32,
@@ -461,10 +473,11 @@ pub fn load(
 
     if (!std.mem.eql(u8, mapping[0..8], expected_magic)) return error.InvalidFormat;
 
-    const counter = std.mem.readInt(u64, mapping[8..16], .little);
-    const record_count = std.mem.readInt(u64, mapping[16..24], .little);
-    const record_size = std.mem.readInt(u32, mapping[24..28], .little);
-    const block_size = std.mem.readInt(u32, mapping[28..32], .little);
+    const checkpoint_epoch = std.mem.readInt(u64, mapping[8..16], .little);
+    const covered_lsn = std.mem.readInt(u64, mapping[16..24], .little);
+    const record_count = std.mem.readInt(u64, mapping[24..32], .little);
+    const record_size = std.mem.readInt(u32, mapping[32..36], .little);
+    const block_size = std.mem.readInt(u32, mapping[36..40], .little);
 
     if (record_size != expected_record_size) return error.InvalidFormat;
     if (block_size < MIN_BLOCK_SIZE or block_size > MAX_BLOCK_SIZE) return error.InvalidFormat;
@@ -495,7 +508,8 @@ pub fn load(
     return .{
         .allocator = allocator,
         .mapping = mapping,
-        .checkpoint_counter = counter,
+        .checkpoint_epoch = checkpoint_epoch,
+        .covered_lsn = covered_lsn,
         .record_count = record_count,
         .record_size = record_size,
         .block_size = block_size,
@@ -568,11 +582,12 @@ test "sorted snapshot round-trip: header fields + every record readable" {
 
     const payload = try makePayload(t.allocator, 1000);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 77, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 77, 0xC0DE, 16, payload);
 
     var loaded = (try load(t.allocator, &file, TEST_MAGIC, 16)).?;
     defer loaded.deinit();
-    try t.expectEqual(@as(u64, 77), loaded.checkpoint_counter);
+    try t.expectEqual(@as(u64, 77), loaded.checkpoint_epoch);
+    try t.expectEqual(@as(u64, 0xC0DE), loaded.covered_lsn);
     try t.expectEqual(@as(u64, 1000), loaded.record_count);
     var i: u64 = 0;
     while (i < 1000) : (i += 1) {
@@ -598,7 +613,7 @@ test "wrong magic (old snapshot format) is version-rejected, never misparsed" {
 
     const payload = try makePayload(t.allocator, 8);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, "GSTSORT0", 1, 16, payload);
+    try write(t.allocator, file, "GSTSORT0", 1, 0, 16, payload);
     try t.expectError(error.InvalidFormat, load(t.allocator, &file, TEST_MAGIC, 16));
 }
 
@@ -610,7 +625,7 @@ test "zeroed magic (crash before magic publish) is rejected → rebuild path" {
 
     const payload = try makePayload(t.allocator, 8);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 1, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 1, 0, 16, payload);
     // Simulate the crash window: body durable, magic never published.
     const zeros = [_]u8{0} ** 8;
     try file.writePositionalAll(ioT(), &zeros, 0);
@@ -625,7 +640,7 @@ test "truncated file is rejected (layout/size mismatch)" {
 
     const payload = try makePayload(t.allocator, 64);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 1, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 1, 0, 16, payload);
     const stat = try file.stat(ioT());
     try file.setLength(ioT(), stat.size - 5);
     try t.expectError(error.InvalidFormat, load(t.allocator, &file, TEST_MAGIC, 16));
@@ -639,7 +654,7 @@ test "record_size mismatch is rejected" {
 
     const payload = try makePayload(t.allocator, 8);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 1, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 1, 0, 16, payload);
     try t.expectError(error.InvalidFormat, load(t.allocator, &file, TEST_MAGIC, 40));
 }
 
@@ -651,7 +666,7 @@ test "corrupt directory / header byte is caught EAGERLY at load (meta-CRC)" {
 
     const payload = try makePayload(t.allocator, 8);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 123, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 123, 0, 16, payload);
     // Flip a bit in the checkpoint counter — the staleness gate's input MUST
     // be integrity-covered or a corrupt counter could skip the rebuild.
     var b: [1]u8 = undefined;
@@ -671,7 +686,7 @@ test "corrupt payload byte: load succeeds, touched block fails LAZILY, others fi
     const n: usize = 5000;
     const payload = try makePayload(t.allocator, n);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 9, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 9, 0, 16, payload);
 
     // Corrupt a byte in block 0's payload.
     var b: [1]u8 = undefined;
@@ -695,14 +710,14 @@ test "zero records round-trips (empty index keeps its counter)" {
     var file = try openTmpSnapshot(&tmp, "snap.bin");
     defer file.close(ioT());
 
-    try write(t.allocator, file, TEST_MAGIC, 55, 16, &.{});
+    try write(t.allocator, file, TEST_MAGIC, 55, 0, 16, &.{});
     var loaded = (try load(t.allocator, &file, TEST_MAGIC, 16)).?;
     defer loaded.deinit();
-    try t.expectEqual(@as(u64, 55), loaded.checkpoint_counter);
+    try t.expectEqual(@as(u64, 55), loaded.checkpoint_epoch);
     try t.expectEqual(@as(u64, 0), loaded.record_count);
 }
 
-test "restampCounter: counter + meta-CRC updated in place; payload/dir bytes untouched; records readable" {
+test "restampStamps: epoch+covered_lsn + meta-CRC updated in place; payload/dir bytes untouched; records readable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try openTmpSnapshot(&tmp, "snap.bin");
@@ -710,7 +725,7 @@ test "restampCounter: counter + meta-CRC updated in place; payload/dir bytes unt
 
     const payload = try makePayload(t.allocator, 5000); // > 1 block
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 41, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 41, 100, 16, payload);
 
     const stat = try file.stat(ioT());
     const size: usize = @intCast(stat.size);
@@ -718,21 +733,22 @@ test "restampCounter: counter + meta-CRC updated in place; payload/dir bytes unt
     defer t.allocator.free(before);
     _ = try file.readPositionalAll(ioT(), before, 0);
 
-    try t.expect(try restampCounter(t.allocator, &file, TEST_MAGIC, 16, 42));
+    try t.expect(try restampStamps(t.allocator, &file, TEST_MAGIC, 16, 42, 200));
 
     const after = try t.allocator.alloc(u8, size);
     defer t.allocator.free(after);
     _ = try file.readPositionalAll(ioT(), after, 0);
 
-    // The CHEAP-restamp property: same length, and only bytes [8,16) (the
-    // counter) and the trailing 4 meta-CRC bytes may differ.
+    // The CHEAP-restamp property: same length, and only bytes [8,24) (the
+    // epoch + covered_lsn stamps) and the trailing 4 meta-CRC bytes may differ.
     try t.expectEqualSlices(u8, before[0..8], after[0..8]);
-    try t.expectEqualSlices(u8, before[16 .. size - META_CRC_SIZE], after[16 .. size - META_CRC_SIZE]);
-    try t.expect(!std.mem.eql(u8, before[8..16], after[8..16]));
+    try t.expectEqualSlices(u8, before[24 .. size - META_CRC_SIZE], after[24 .. size - META_CRC_SIZE]);
+    try t.expect(!std.mem.eql(u8, before[8..24], after[8..24]));
 
     var loaded = (try load(t.allocator, &file, TEST_MAGIC, 16)).?;
     defer loaded.deinit();
-    try t.expectEqual(@as(u64, 42), loaded.checkpoint_counter);
+    try t.expectEqual(@as(u64, 42), loaded.checkpoint_epoch);
+    try t.expectEqual(@as(u64, 200), loaded.covered_lsn);
     var i: u64 = 0;
     while (i < 5000) : (i += 100) {
         const rec = try loaded.recordAt(i);
@@ -740,42 +756,42 @@ test "restampCounter: counter + meta-CRC updated in place; payload/dir bytes unt
     }
 
     // Idempotent no-op when already stamped.
-    try t.expect(try restampCounter(t.allocator, &file, TEST_MAGIC, 16, 42));
+    try t.expect(try restampStamps(t.allocator, &file, TEST_MAGIC, 16, 42, 200));
 }
 
-test "restampCounter skips (returns false, no write) on empty file, wrong magic, wrong record_size, truncation" {
+test "restampStamps skips (returns false, no write) on empty file, wrong magic, wrong record_size, truncation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // Empty (never written).
     var empty = try openTmpSnapshot(&tmp, "empty.bin");
     defer empty.close(ioT());
-    try t.expect(!(try restampCounter(t.allocator, &empty, TEST_MAGIC, 16, 9)));
+    try t.expect(!(try restampStamps(t.allocator, &empty, TEST_MAGIC, 16, 9, 90)));
 
     // Wrong magic (old format).
     var wrong = try openTmpSnapshot(&tmp, "wrong.bin");
     defer wrong.close(ioT());
     const payload = try makePayload(t.allocator, 8);
     defer t.allocator.free(payload);
-    try write(t.allocator, wrong, "GSTSORT0", 1, 16, payload);
-    try t.expect(!(try restampCounter(t.allocator, &wrong, TEST_MAGIC, 16, 9)));
+    try write(t.allocator, wrong, "GSTSORT0", 1, 0, 16, payload);
+    try t.expect(!(try restampStamps(t.allocator, &wrong, TEST_MAGIC, 16, 9, 90)));
 
     // Wrong record size.
     var rs = try openTmpSnapshot(&tmp, "rs.bin");
     defer rs.close(ioT());
-    try write(t.allocator, rs, TEST_MAGIC, 1, 16, payload);
-    try t.expect(!(try restampCounter(t.allocator, &rs, TEST_MAGIC, 40, 9)));
+    try write(t.allocator, rs, TEST_MAGIC, 1, 0, 16, payload);
+    try t.expect(!(try restampStamps(t.allocator, &rs, TEST_MAGIC, 40, 9, 90)));
 
     // Truncated (layout mismatch).
     var trunc = try openTmpSnapshot(&tmp, "trunc.bin");
     defer trunc.close(ioT());
-    try write(t.allocator, trunc, TEST_MAGIC, 1, 16, payload);
+    try write(t.allocator, trunc, TEST_MAGIC, 1, 0, 16, payload);
     const st = try trunc.stat(ioT());
     try trunc.setLength(ioT(), st.size - 3);
-    try t.expect(!(try restampCounter(t.allocator, &trunc, TEST_MAGIC, 16, 9)));
+    try t.expect(!(try restampStamps(t.allocator, &trunc, TEST_MAGIC, 16, 9, 90)));
 }
 
-test "restampCounter refuses to bless a corrupt header/directory (meta-CRC pre-check)" {
+test "restampStamps refuses to bless a corrupt header/directory (meta-CRC pre-check)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try openTmpSnapshot(&tmp, "snap.bin");
@@ -783,7 +799,7 @@ test "restampCounter refuses to bless a corrupt header/directory (meta-CRC pre-c
 
     const payload = try makePayload(t.allocator, 8);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 5, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 5, 0, 16, payload);
 
     // Corrupt the record_count → meta-CRC mismatch... but that also breaks
     // the layout equation. Corrupt a DIRECTORY byte instead: layout holds,
@@ -794,12 +810,12 @@ test "restampCounter refuses to bless a corrupt header/directory (meta-CRC pre-c
     b[0] ^= 0x40;
     try file.writePositionalAll(ioT(), &b, dir_off);
 
-    try t.expect(!(try restampCounter(t.allocator, &file, TEST_MAGIC, 16, 9)));
+    try t.expect(!(try restampStamps(t.allocator, &file, TEST_MAGIC, 16, 9, 90)));
     // Still rejected by the loader (never blessed).
     try t.expectError(error.ChecksumMismatch, load(t.allocator, &file, TEST_MAGIC, 16));
 }
 
-test "torn restamp (counter landed, meta-CRC did not) → eager ChecksumMismatch at load → rebuild path" {
+test "torn restamp (stamps landed, meta-CRC did not) → eager ChecksumMismatch at load → rebuild path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try openTmpSnapshot(&tmp, "snap.bin");
@@ -807,9 +823,9 @@ test "torn restamp (counter landed, meta-CRC did not) → eager ChecksumMismatch
 
     const payload = try makePayload(t.allocator, 64);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 7, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 7, 70, 16, payload);
 
-    // Simulate the crash window inside restampCounter: the 8 counter bytes
+    // Simulate the crash window inside restampStamps: the 16 stamp bytes
     // hit disk, the meta-CRC trailer write did not.
     var counter_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &counter_buf, 8, .little);
@@ -827,7 +843,7 @@ test "writeAtomicReplace: replaces via rename; old mapping keeps serving old rec
 
     const payload1 = try makePayload(t.allocator, 100);
     defer t.allocator.free(payload1);
-    try writeAtomicReplace(t.allocator, dir_path, "snap.bin", TEST_MAGIC, 1, 16, payload1);
+    try writeAtomicReplace(t.allocator, dir_path, "snap.bin", TEST_MAGIC, 1, 10, 16, payload1);
 
     var f1 = try tmp.dir.openFile(io, "snap.bin", .{ .mode = .read_write });
     var loaded_old = (try load(t.allocator, &f1, TEST_MAGIC, 16)).?;
@@ -840,7 +856,7 @@ test "writeAtomicReplace: replaces via rename; old mapping keeps serving old rec
     for (0..100) |i| {
         std.mem.writeInt(u64, payload2[i * 16 + 8 ..][0..8], @as(u64, i) + 7000, .little);
     }
-    try writeAtomicReplace(t.allocator, dir_path, "snap.bin", TEST_MAGIC, 2, 16, payload2);
+    try writeAtomicReplace(t.allocator, dir_path, "snap.bin", TEST_MAGIC, 2, 20, 16, payload2);
 
     // Old mapping: OLD values, every block still CRC-valid (old inode intact).
     var i: u64 = 0;
@@ -854,7 +870,8 @@ test "writeAtomicReplace: replaces via rename; old mapping keeps serving old rec
     defer f2.close(io);
     var loaded_new = (try load(t.allocator, &f2, TEST_MAGIC, 16)).?;
     defer loaded_new.deinit();
-    try t.expectEqual(@as(u64, 2), loaded_new.checkpoint_counter);
+    try t.expectEqual(@as(u64, 2), loaded_new.checkpoint_epoch);
+    try t.expectEqual(@as(u64, 20), loaded_new.covered_lsn);
     const rec0 = try loaded_new.recordAt(0);
     try t.expectEqual(@as(u64, 7000), std.mem.readInt(u64, rec0[8..16], .little));
 }
@@ -873,7 +890,7 @@ test "I1: lazy payload ChecksumMismatch zeroes the magic (one-shot) so the next 
     defer t.allocator.free(payload);
     var file = try openTmpSnapshot(&tmp, "snap.bin");
     defer file.close(io);
-    try write(t.allocator, file, TEST_MAGIC, 3, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 3, 30, 16, payload);
 
     // Bit-rot in block 0.
     var b: [1]u8 = undefined;
@@ -906,7 +923,7 @@ test "M6: recordAt out-of-range index is a hard error, not UB" {
 
     const payload = try makePayload(t.allocator, 4);
     defer t.allocator.free(payload);
-    try write(t.allocator, file, TEST_MAGIC, 1, 16, payload);
+    try write(t.allocator, file, TEST_MAGIC, 1, 0, 16, payload);
     var loaded = (try load(t.allocator, &file, TEST_MAGIC, 16)).?;
     defer loaded.deinit();
     try t.expectError(error.InvalidRecordIndex, loaded.recordAt(4));

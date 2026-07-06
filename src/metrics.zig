@@ -51,6 +51,24 @@ pub const Metrics = struct {
     derived_index_loads: u64 = 0,
     derived_index_rebuilds: u64 = 0,
 
+    // WAL-aware durability (Path B): counts opens where the derived-index
+    // snapshots matched the manifest checkpoint_epoch (so the epoch gate would
+    // have accepted them) BUT a committed WAL tail existed beyond their
+    // covered_lsn. In Phase 2 this case is routed to a full rebuild for
+    // correctness (never serve stale); Phase 3 replaces the rebuild with a
+    // bounded tail reconcile. A non-zero value here on a crash reopen proves
+    // the epoch gate no longer wrongly rejects on the recovery-bumped counter —
+    // it accepted the epoch and deferred solely because of the tail.
+    derived_index_tail_deferred: u64 = 0,
+
+    // WAL-aware durability (Path B) Phase 3: counts opens where the epoch gate
+    // ACCEPTED the snapshots AND a committed WAL tail existed, and the engine
+    // RECONCILED only the bounded tail-affected pages into the loaded snapshot
+    // (O(tail)) instead of rebuilding O(graph). On the tail path this is 1 and
+    // derived_index_loads is 1 (the snapshot was loaded, then reconciled),
+    // while derived_index_rebuilds stays 0.
+    derived_index_reconciles: u64 = 0,
+
     // GAP warm-reopen P2: number of CLEAN derived-index snapshots whose
     // persisted checkpoint_counter was cheaply re-stamped (header-only
     // update, payload untouched) to the new manifest.counter by a FULL

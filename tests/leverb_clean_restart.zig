@@ -157,7 +157,7 @@ test "Lever B Test A: clean restart LOADS derived indexes (no O(graph) rebuild)"
     }
 }
 
-test "Lever B Test B: crash restart REBUILDS (stale snapshot invalidated by counter bump)" {
+test "Lever B Test B: crash restart LOADS the epoch-matched snapshot + RECONCILES the WAL tail (never stale)" {
     var td = try TestDataDir.init(testing.allocator);
     defer td.deinit();
 
@@ -203,8 +203,9 @@ test "Lever B Test B: crash restart REBUILDS (stale snapshot invalidated by coun
     }
 
     // Reopen. Recovery replays the committed WAL tail (the post-snapshot
-    // mutation) and bumps manifest.counter, so the saved snapshot is now
-    // stale-by-counter. The load gate MUST reject it and force a rebuild — this
+    // mutation) and bumps manifest.counter, but checkpoint_epoch is UNCHANGED.
+    // WAL-aware durability Phase 3 LOADS the epoch-matched snapshot and
+    // RECONCILES the bounded tail into it — never serving a stale index. This
     // is the crash-safety invariant Lever B must not weaken.
     {
         const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
@@ -225,13 +226,16 @@ test "Lever B Test B: crash restart REBUILDS (stale snapshot invalidated by coun
         try testing.expectEqual((N + 1) / 2, b_nodes.len);
 
         // CRASH-SAFETY PROOF (the Lever B invariant), now asserted at first-
-        // access: the rebuild was FORCED and the stale snapshot was NOT loaded.
-        // derived_index_rebuilds can only be 1 here if recovery saw the
-        // post-snapshot WAL tail and bumped manifest.counter past the snapshot's
-        // stamp. Had the tail not been seen, the snapshot would still be current
-        // and the first access would have LOADED it (loads==1) — the bug.
-        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_rebuilds);
-        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_loads);
+        // access under WAL-aware durability Phase 3: the epoch-matched snapshot
+        // is LOADED and the committed WAL tail is RECONCILED into it (never
+        // served stale). derived_index_tail_deferred==1 proves recovery saw the
+        // post-snapshot tail (the epoch matched but covered_lsn trailed the
+        // replayed frontier); the scanLabel counts above prove the reconciled
+        // result is correct. A full rebuild is NOT taken (rebuilds==0).
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_tail_deferred);
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
 
         // NOTE: the durability of the single post-checkpoint WAL-tail write
         // itself (getNode survival of the crash-tail mutation) is a recovery/

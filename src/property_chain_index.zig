@@ -5,10 +5,13 @@ const std = @import("std");
 const index_snapshot_mod = @import("index_snapshot.zig");
 
 const Allocator = std.mem.Allocator;
-// SEC-0051: v2 snapshot format appends a trailing CRC32 over the payload.
-/// GAP warm-reopen P2: pub so engine_index.restampCleanDerivedSnapshots can
-/// validate the file before an in-place counter restamp.
-pub const SNAPSHOT_MAGIC = "GSPIDX2\x00";
+// WAL-aware derived-index durability: the header now carries
+// (checkpoint_epoch, covered_lsn) instead of a bare counter. The magic bump
+// GSPIDX2 -> GSPIDX3 makes an old (v2, counter-only) snapshot cleanly rejected
+// by the loader's magic check (never misparsed).
+/// pub so engine_index.restampCleanDerivedSnapshots can validate the file
+/// before an in-place stamp restamp.
+pub const SNAPSHOT_MAGIC = "GSPIDX3\x00";
 
 // SEC-0044/SEC-0048: smallest bytes a single chain record consumes on disk
 // (prop_head u64 + entry_count u32, with zero entries).
@@ -179,19 +182,19 @@ pub const PropertyChainIndex = struct {
 
     /// Persist the property-chain digest map to props.idx.
     /// Format:
-    ///   [8 bytes magic][u64 checkpoint_counter][u64 chain_count]
+    ///   [8 bytes magic][u64 checkpoint_epoch][u64 covered_lsn][u64 chain_count]
     ///   repeated chain_count times:
     ///     [u64 prop_head][u32 entry_count]
     ///     repeated entry_count times:
     ///       [u16 key_len][key bytes][u64 value_hash]
-    pub fn saveToFile(self: *const PropertyChainIndex, file: *std.Io.File, checkpoint_counter: u64) !void {
+    pub fn saveToFile(self: *const PropertyChainIndex, file: *std.Io.File, checkpoint_epoch: u64, covered_lsn: u64) !void {
         // PERF-0052: serialize the whole snapshot into one in-memory buffer and
         // flush it with a single positional write instead of ~3 syscalls per
         // chain entry. Byte layout and trailing CRC32 (SEC-0051) are unchanged.
         var w = index_snapshot_mod.SnapshotWriter.init(self.allocator);
         defer w.deinit();
 
-        try w.writeHeader(SNAPSHOT_MAGIC, checkpoint_counter, self.chains.count());
+        try w.writeHeader(SNAPSHOT_MAGIC, checkpoint_epoch, covered_lsn, self.chains.count());
 
         var it = self.chains.iterator();
         while (it.next()) |entry| {
@@ -209,9 +212,9 @@ pub const PropertyChainIndex = struct {
     }
 
     /// Load a previously persisted props.idx snapshot.
-    /// Returns the checkpoint counter embedded in the snapshot, or null when
-    /// the file is empty.
-    pub fn loadFromFile(self: *PropertyChainIndex, file: *std.Io.File) !?u64 {
+    /// Returns the (checkpoint_epoch, covered_lsn) stamp embedded in the
+    /// snapshot, or null when the file is empty.
+    pub fn loadFromFile(self: *PropertyChainIndex, file: *std.Io.File) !?index_snapshot_mod.Stamp {
         // PERF-0052: read + validate the whole snapshot once (CRC32 per SEC-0051,
         // chain_count bounded vs payload per SEC-0044/0048), then walk the
         // resident payload instead of ~3 positional reads per chain entry.
@@ -260,7 +263,7 @@ pub const PropertyChainIndex = struct {
         }
 
         if (r.remaining() != 0) return error.InvalidFormat;
-        return snapshot.checkpoint_counter;
+        return .{ .epoch = snapshot.checkpoint_epoch, .covered_lsn = snapshot.covered_lsn };
     }
 };
 
@@ -319,14 +322,15 @@ test "saveToFile + loadFromFile round-trip preserves chain metadata" {
     var file = try tmp.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "props.idx", .{ .read = true, .truncate = true });
     defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    try idx.saveToFile(&file, 123);
+    try idx.saveToFile(&file, 123, 456);
 
     var loaded = PropertyChainIndex.init(testing.allocator);
     defer loaded.deinit();
 
-    const checkpoint_counter = try loaded.loadFromFile(&file);
-    try testing.expect(checkpoint_counter != null);
-    try testing.expectEqual(@as(u64, 123), checkpoint_counter.?);
+    const stamp = try loaded.loadFromFile(&file);
+    try testing.expect(stamp != null);
+    try testing.expectEqual(@as(u64, 123), stamp.?.epoch);
+    try testing.expectEqual(@as(u64, 456), stamp.?.covered_lsn);
     try testing.expect(loaded.containsChain(7));
     try testing.expect(loaded.hasKey(7, "name"));
     try testing.expect(loaded.hasKey(7, "active"));
@@ -346,7 +350,7 @@ test "loadFromFile rejects an oversized chain_count (SEC-0044/0048)" {
 
     // Header declares maxInt(u64) chains but writes only a 1-byte payload.
     var write_offset: u64 = 0;
-    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, std.math.maxInt(u64));
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 0, std.math.maxInt(u64));
     try file.writePositionalAll(io, &[_]u8{0}, write_offset);
     write_offset += 1;
     try index_snapshot_mod.finalizeChecksum(testing.allocator, file, write_offset);
@@ -368,7 +372,7 @@ test "loadFromFile rejects an oversized entry_count (SEC-0044/0048)" {
     defer file.close(io);
 
     var write_offset: u64 = 0;
-    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 1);
+    try index_snapshot_mod.writeHeader(file, &write_offset, SNAPSHOT_MAGIC, 1, 0, 1);
     // One chain: prop_head=7, entry_count=maxInt(u32) but no entry bytes follow.
     var buf: [12]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], 7, .little);
@@ -403,9 +407,9 @@ test "loadFromFile rejects a flipped payload byte (SEC-0051)" {
     var file = try tmp.dir.createFile(io, "props.idx", .{ .read = true, .truncate = true });
     defer file.close(io);
 
-    try idx.saveToFile(&file, 123);
+    try idx.saveToFile(&file, 123, 0);
 
-    // Flip the first payload byte (just past magic + 16-byte header).
+    // Flip the first payload byte (just past magic + header).
     const payload_off: u64 = SNAPSHOT_MAGIC.len + index_snapshot_mod.HEADER_FIELDS_SIZE;
     var orig: [1]u8 = undefined;
     _ = try file.readPositionalAll(io, &orig, payload_off);

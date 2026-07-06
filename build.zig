@@ -610,6 +610,20 @@ fn addIntegrationTests(
     const run_wal_recovery_counters = b.addRunArtifact(wal_recovery_counters_tests);
     wal_recovery_counters_step.dependOn(&run_wal_recovery_counters.step);
 
+    // checkpoint_epoch invariant — the durable derived-index freshness token
+    // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
+    // recovery (unlike manifest.counter, which recovery bumps for A/B
+    // freshness). This is the core invariant the WAL-aware derived-index
+    // durability contract rests on.
+    const checkpoint_epoch_step = b.step("test-checkpoint-epoch", "Run checkpoint_epoch invariant test: epoch advances only at checkpoint, never across WAL-tail recovery");
+    const checkpoint_epoch_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/test_checkpoint_epoch.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_checkpoint_epoch = b.addRunArtifact(checkpoint_epoch_tests);
+    checkpoint_epoch_step.dependOn(&run_checkpoint_epoch.step);
+
     // Label WAL imaging — regression guards for the raw-ref vs page-id
     // confusion on the label var-chain write paths (addLabelTxn /
     // removeLabelTxn image the FULL chain via logVarChain + the node page).
@@ -665,6 +679,32 @@ fn addIntegrationTests(
     const run_derived_restamp = b.addRunArtifact(derived_restamp_tests);
     derived_restamp_step.dependOn(&run_derived_restamp.step);
 
+    // WAL-aware derived-index durability (Path B) Phase 2 — the epoch-gate
+    // acceptance proofs: a no-tail clean reopen LOADS via the epoch (rebuild==0),
+    // and a crash-tail reopen whose epoch MATCHES (not counter-rejected) is
+    // counted as a tail-deferral and routed to a CORRECT rebuild (never stale).
+    const epoch_gate_step = b.step("test-derived-epoch-gate", "Run WAL-aware derived-index epoch-gate tests: no-tail reload via epoch, tail-present epoch-match routed to a correct rebuild");
+    const epoch_gate_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/derived_index_epoch_gate.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_epoch_gate = b.addRunArtifact(epoch_gate_tests);
+    epoch_gate_step.dependOn(&run_epoch_gate.step);
+
+    // WAL-aware derived-index durability (Path B) Phase 3 — the RELEASE GATE:
+    // rebuild-equivalence of the bounded WAL-tail reconcile (insert / in-place
+    // property VALUE change / DELETED node / removed edge) for a clean-shutdown
+    // tail AND a kill-9 crash tail.
+    const tail_reconcile_step = b.step("test-index-tail-reconcile", "Run WAL-aware derived-index tail-reconcile == full-rebuild property tests (clean + crash tail)");
+    const tail_reconcile_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/test_index_tail_reconcile.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_tail_reconcile = b.addRunArtifact(tail_reconcile_tests);
+    tail_reconcile_step.dependOn(&run_tail_reconcile.step);
+
     // Review F-5 (GAP-ENT-0011): CI runs `zig build test`, `test-integration`
     // and `test-fuzz-regression` only — standalone named steps never run
     // there. Silent-corruption crash-recovery regression guards must be gated,
@@ -672,13 +712,19 @@ fn addIntegrationTests(
     // remain individually invokable via their named steps).
     integration_step.dependOn(&run_free_space_wal_tail.step);
     integration_step.dependOn(&run_edge_remove_crash.step);
+    integration_step.dependOn(&run_tail_reconcile.step);
     // P1: the mmap-snapshot crash/corruption guards are the same class — gate
     // them under the integration umbrella too.
     integration_step.dependOn(&run_mmap_index.step);
     // P2: the restamp crash/staleness guards likewise.
     integration_step.dependOn(&run_derived_restamp.step);
+    // Phase 2 epoch-gate acceptance (no-tail reload + tail-present correct rebuild).
+    integration_step.dependOn(&run_epoch_gate.step);
     // WAL-recovery counter healing is the same silent-corruption class.
     integration_step.dependOn(&run_wal_recovery_counters.step);
+    // checkpoint_epoch recovery-invariance is the durability foundation the
+    // WAL-aware derived-index contract rests on — gate it under integration.
+    integration_step.dependOn(&run_checkpoint_epoch.step);
     // Label WAL-imaging crash guards likewise.
     integration_step.dependOn(&run_label_crash_replay.step);
     // Edge-prop-head under-logging crash guards likewise.
