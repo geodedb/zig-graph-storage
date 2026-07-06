@@ -26,16 +26,141 @@ const PAGE_HEADER_SIZE = page_mod.PAGE_HEADER_SIZE;
 /// - [PAGE_HEADER_SIZE+12..): data bytes
 const VAR_META_SIZE: u32 = 12; // next_page(8) + data_len(4)
 
+// ============================================================================
+// GAP var-store slab packing — tagged slab head refs + slab block layout
+// (READ path since P1; the P2 writer packs NEW small chains + graduates).
+//
+// LAYOUT DISCRIMINATION mirrors the adjacency slab (adj_store.zig) and the
+// prop-store slab verbatim: a TAG BIT in the var head ref itself.
+//   * Legacy var-chain head: `first_page << 16` (a var REF, NOT a raw page id —
+//     the low 16 bits are the historical offset field, always 0). Bit 63 is
+//     CLEAR (page ids are allocated sequentially and never approach 2^47, so
+//     `first_page << 16` never sets bit 63). Reads via the existing page-chain
+//     walk, unchanged, forever.
+//   * Slab head: bit 63 is SET. The remaining bits pack (block, slot):
+//     bits [24..63) = slab block page id (39 bits), bits [0..24) = slot index
+//     (24 bits) — the SAME packing as adj_store's encodeSlabHead. Many small
+//     var-chains share one slab block; the slot directory maps each slot to a
+//     contiguous BYTE run.
+//
+// WHY the tag lives in the head ref and not only the block header: to read a
+// block you must first know its page id, but a legacy head packs
+// `first_page << 16` while a slab head packs (page, slot) into the same u64 —
+// so the discriminator must be in the head. Defense-in-depth: a slab block's
+// header stamps VAR_SLAB_MARKER in the exact u32 slot the LEGACY reader parses
+// as `data_len`, and the marker is > any page's dataCapacity — so a legacy
+// chain walk that lands on a slab block trips the existing `data_len >
+// dataCapacity` DataCorruption guard, and a slab read that lands on a legacy
+// page finds marker != VAR_SLAB_MARKER. A slab block is NEVER chained.
+//
+// The stored var_head u64 (NodeRec.label_head, prop string refs) is unchanged
+// in width and opaque to every layer above VarStore.
+// ============================================================================
+
+/// Tag bit marking a slab-packed var head (vs a legacy `first_page << 16` ref).
+pub const SLAB_HEAD_TAG_BIT: u64 = @as(u64, 1) << 63;
+/// Number of low bits of a slab head used for the slot index (mirrors adj).
+const SLAB_HEAD_SLOT_BITS: u6 = 24;
+const SLAB_HEAD_SLOT_MASK: u64 = (@as(u64, 1) << SLAB_HEAD_SLOT_BITS) - 1;
+/// Maximum page id encodable in a slab head (64 - 1 tag - 24 slot = 39 bits).
+const SLAB_HEAD_MAX_PAGE_ID: u64 = @as(u64, 1) << (64 - 1 - SLAB_HEAD_SLOT_BITS);
+
+/// Slab block layout (page-relative), mirroring edge.zig's SLAB geometry:
+///   [page header 32 B][VarSlab header 16 B][byte runs → ...gap... ← slot dir][tail_reserve]
+/// The VarSlab header is 16 B so runs begin at the same offset (48) as the
+/// adjacency slab, and the slot directory grows BACKWARD from
+/// `page end - tail_reserve` exactly as edge.zig does.
+///
+/// VarSlab header:
+///   [0..8)   next_page (u64) = 0 — slab blocks are never chained.
+///   [8..12)  marker (u32) = VAR_SLAB_MARKER — aliases the legacy `data_len`
+///            field; > any dataCapacity so a legacy misread self-rejects.
+///   [12..16) slot_count (u32) — live + tombstoned slots.
+const VAR_SLAB_HEADER_SIZE: u32 = 16;
+/// Byte offset of the first run byte (after page header + VarSlab header).
+const VAR_SLAB_RUNS_OFFSET: u32 = PAGE_HEADER_SIZE + VAR_SLAB_HEADER_SIZE;
+/// Slot-directory entry: run byte-offset (u32 LE) + run byte-length (u32 LE).
+const VAR_SLAB_DIR_ENTRY_SIZE: u32 = 8;
+/// Tombstone marker in a slot's offset field (dead slot: chain graduated to a
+/// dedicated page chain, or was removed). A live head never points at one.
+const VAR_SLAB_SLOT_TOMBSTONE: u32 = 0xFFFF_FFFF;
+/// Marker stamped in the VarSlab header's [8..12) window. Distinct magic that
+/// is > any real dataCapacity (page sizes are <= 64 KB), so it can never equal
+/// a legacy `data_len` (which is always <= dataCapacity). "VARS" tag.
+const VAR_SLAB_MARKER: u32 = 0x5641_5253;
+
+/// True when a var head ref is a slab-packed (block, slot) pointer (bit 63 set)
+/// rather than a legacy `first_page << 16` ref. Head 0 (= empty / no chain) is
+/// untagged and stays the universal "no chain" sentinel.
+pub fn isSlabHead(head: u64) bool {
+    return (head & SLAB_HEAD_TAG_BIT) != 0;
+}
+
+/// Encode a slab var head from (slab block page id, slot index).
+pub fn encodeSlabHead(page_id: PageId, slot: u32) u64 {
+    std.debug.assert(page_id < SLAB_HEAD_MAX_PAGE_ID);
+    std.debug.assert(@as(u64, slot) <= SLAB_HEAD_SLOT_MASK);
+    return SLAB_HEAD_TAG_BIT | (page_id << SLAB_HEAD_SLOT_BITS) | (@as(u64, slot) & SLAB_HEAD_SLOT_MASK);
+}
+
+/// Decode the slab block page id from a slab var head.
+pub fn slabHeadPageId(head: u64) PageId {
+    return (head & ~SLAB_HEAD_TAG_BIT) >> SLAB_HEAD_SLOT_BITS;
+}
+
+/// Decode the slot index from a slab var head.
+pub fn slabHeadSlot(head: u64) u32 {
+    return @intCast(head & SLAB_HEAD_SLOT_MASK);
+}
+
+/// One slab slot: byte offset of the run in the page, and the run's byte length.
+const VarSlabSlot = struct { offset: u32, byte_len: u32 };
+
+/// First byte of the slot directory (== one-past-the-end of usable run space).
+fn varSlabDirStart(data_len: usize, tail_reserve: u32, slot_count: u32) usize {
+    return data_len - tail_reserve - @as(usize, slot_count) * VAR_SLAB_DIR_ENTRY_SIZE;
+}
+
+fn varSlabSlotBase(data_len: usize, tail_reserve: u32, idx: u32) usize {
+    return data_len - tail_reserve - (@as(usize, idx) + 1) * VAR_SLAB_DIR_ENTRY_SIZE;
+}
+
+/// Read slot `idx`'s (offset, byte_len) from the slot directory. Caller must
+/// have validated `idx` against the block header's slot_count.
+fn readVarSlabSlot(data: []const u8, tail_reserve: u32, idx: u32) VarSlabSlot {
+    const base = varSlabSlotBase(data.len, tail_reserve, idx);
+    return .{
+        .offset = std.mem.readInt(u32, data[base..][0..4], .little),
+        .byte_len = std.mem.readInt(u32, data[base + 4 ..][0..4], .little),
+    };
+}
+
+/// Write slot `idx`'s directory entry (tests / the future P2 writer).
+fn writeVarSlabSlot(data: []u8, tail_reserve: u32, idx: u32, slot: VarSlabSlot) void {
+    const base = varSlabSlotBase(data.len, tail_reserve, idx);
+    std.mem.writeInt(u32, data[base..][0..4], slot.offset, .little);
+    std.mem.writeInt(u32, data[base + 4 ..][0..4], slot.byte_len, .little);
+}
+
 pub const VarStore = struct {
     buffer_pool: *BufferPool,
     free_space: *FreeSpaceManager,
     page_size: u32,
+    /// Bytes reserved at the tail of every page for the page-level AES-GCM
+    /// authentication tag when at-rest encryption is enabled. The slab slot
+    /// directory grows backward from `page_size - tail_reserve`, so it never
+    /// collides with the tag — the same reservation the adjacency and prop
+    /// slabs make. Legacy var-chain pages grow forward only and are
+    /// unaffected. Set by the engine to the tag size when a key is configured
+    /// (the P2 writer path); 0 otherwise, including all P1 read-both fixtures.
+    tail_reserve: u32 = 0,
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, page_size: u32) VarStore {
         return .{
             .buffer_pool = buffer_pool,
             .free_space = free_space,
             .page_size = page_size,
+            .tail_reserve = 0,
         };
     }
 
@@ -114,9 +239,13 @@ pub const VarStore = struct {
         return next;
     }
 
-    /// Read variable-length data by reference.
-    /// Caller owns the returned slice and must free it.
+    /// Read variable-length data by reference (read-both, permanent).
+    /// `ref` is a var head: a legacy `first_page << 16` page-chain ref (the
+    /// walk below, unchanged) or a bit-63-tagged slab (block, slot) ref (single
+    /// contiguous byte run). Caller owns the returned slice and must free it.
     pub fn read(self: *VarStore, ref: u64, allocator: Allocator) ![]u8 {
+        if (isSlabHead(ref)) return self.readSlab(ref, allocator);
+
         const start_page: PageId = ref >> 16;
         if (start_page == 0) return error.InvalidPageId;
 
@@ -154,9 +283,70 @@ pub const VarStore = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    /// Read a slab-packed var head: resolve the (block, slot) to its single
+    /// contiguous byte run and return a copy. F1-style guard: a slab-tagged
+    /// head whose page bits decode to 0 (page 0 is reserved) is corruption,
+    /// never silently-empty. Caller owns the returned slice.
+    fn readSlab(self: *VarStore, ref: u64, allocator: Allocator) ![]u8 {
+        const page_id = slabHeadPageId(ref);
+        if (page_id == 0) return error.DataCorruption; // page 0 reserved (F1)
+        const slot = slabHeadSlot(ref);
+
+        const frame = try self.buffer_pool.pin(.var_store, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        defer self.buffer_pool.unpin(frame_idx, false);
+        const page_data = frame.dataSlice();
+
+        const run = try self.resolveSlabRun(page_data, slot);
+        const out = try allocator.alloc(u8, run.byte_len);
+        errdefer allocator.free(out);
+        if (run.byte_len > 0) {
+            @memcpy(out, page_data[run.offset..][0..run.byte_len]);
+        }
+        return out;
+    }
+
+    /// Parse + validate the header of a SLAB block reached via a tagged head.
+    /// Rejects loudly (mirrors adj_store.readSlabBlockHeader): wrong marker (a
+    /// tagged head must land on a slab block, and a legacy chain walk that
+    /// lands here already self-rejects via the `data_len > dataCapacity`
+    /// guard), a chained slab block (slab blocks are never linked), or a slot
+    /// directory that cannot fit the page.
+    fn readSlabBlockHeader(self: *const VarStore, data: []const u8) error{DataCorruption}!u32 {
+        const off = PAGE_HEADER_SIZE;
+        const next_page = std.mem.readInt(u64, data[off..][0..8], .little);
+        const marker = std.mem.readInt(u32, data[off + 8 ..][0..4], .little);
+        const slot_count = std.mem.readInt(u32, data[off + 12 ..][0..4], .little);
+        if (marker != VAR_SLAB_MARKER) return error.DataCorruption;
+        if (next_page != 0) return error.DataCorruption;
+        const dir_bytes = @as(u64, slot_count) * VAR_SLAB_DIR_ENTRY_SIZE;
+        if (VAR_SLAB_RUNS_OFFSET + dir_bytes + self.tail_reserve > data.len) return error.DataCorruption;
+        return slot_count;
+    }
+
+    /// Resolve a slab (block, slot) to its validated byte run. The live-head
+    /// invariant makes a tombstoned or out-of-range slot reached via a stored
+    /// head ref corruption — never silently empty (mirrors adj_store).
+    fn resolveSlabRun(self: *const VarStore, data: []const u8, slot: u32) error{DataCorruption}!VarSlabSlot {
+        const slot_count = try self.readSlabBlockHeader(data);
+        if (slot >= slot_count) return error.DataCorruption;
+        const run = readVarSlabSlot(data, self.tail_reserve, slot);
+        if (run.offset == VAR_SLAB_SLOT_TOMBSTONE) return error.DataCorruption;
+        if (run.offset < VAR_SLAB_RUNS_OFFSET) return error.DataCorruption;
+        const run_end = @as(u64, run.offset) + @as(u64, run.byte_len);
+        if (run_end > varSlabDirStart(data.len, self.tail_reserve, slot_count)) return error.DataCorruption;
+        return run;
+    }
+
     /// Free variable-length data by reference.
     /// Walks the page chain and frees each page.
     pub fn free(self: *VarStore, ref: u64) !void {
+        // P1: nothing writes slab chains yet, and a slab head packs (block,
+        // slot) — NOT a page id — so a chain-style free would free the SHARED
+        // slab block out from under its other slots. Reject loudly rather than
+        // corrupt; the P2 writer teaches free() slab-slot tombstoning.
+        if (isSlabHead(ref)) return error.SlabChainFreeNotSupported;
+
         const start_page: PageId = ref >> 16;
         if (start_page == 0) return;
 
@@ -392,6 +582,204 @@ test "P0 parity: short strings + label blocks round-trip byte-identical (legacy,
     }
 
     try expectVarRoundTripParity(&store, &env.pool, records.items);
+}
+
+// ============================================================================
+// GAP var-store slab packing — P1 slab READ path (read-both), NO writer.
+//
+// The production write path stays legacy in this phase; slab blocks are
+// hand-built by the raw fixture below (the on-disk-format oracle) and proven to
+// read byte-identical to the legacy page-chain encoding of the same data. The
+// P2 writer packs NEW small chains + graduates overflowing ones.
+// ============================================================================
+
+const LabelStore = @import("label_store.zig").LabelStore;
+
+/// Hand-build one SLAB block page: VarSlab header (marker + slot_count = number
+/// of slots), byte runs packed FORWARD from VAR_SLAB_RUNS_OFFSET, slot
+/// directory grown BACKWARD from the page tail. `runs[i].len == 0` writes slot
+/// i as a TOMBSTONE. Raw bytes — deliberately NOT the (future P2) production
+/// writer; the read-path oracle mirroring adj_store's writeRawSlabBlock.
+fn writeRawSlabVarBlock(store: *VarStore, runs: []const []const u8) !PageId {
+    const page_id = try store.free_space.allocPage();
+    const frame = try store.buffer_pool.pinNew(.var_store, page_id);
+    const frame_idx = store.buffer_pool.frameIndex(frame);
+    const data = frame.dataSlice();
+
+    const off: usize = PAGE_HEADER_SIZE;
+    std.mem.writeInt(u64, data[off..][0..8], 0, .little); // next_page: never chained
+    std.mem.writeInt(u32, data[off + 8 ..][0..4], VAR_SLAB_MARKER, .little);
+    std.mem.writeInt(u32, data[off + 12 ..][0..4], @intCast(runs.len), .little); // slot_count
+
+    var run_off: u32 = VAR_SLAB_RUNS_OFFSET;
+    for (runs, 0..) |run, i| {
+        if (run.len == 0) {
+            writeVarSlabSlot(data, 0, @intCast(i), .{ .offset = VAR_SLAB_SLOT_TOMBSTONE, .byte_len = 0 });
+            continue;
+        }
+        writeVarSlabSlot(data, 0, @intCast(i), .{ .offset = run_off, .byte_len = @intCast(run.len) });
+        @memcpy(data[run_off..][0..run.len], run);
+        run_off += @intCast(run.len);
+    }
+
+    store.buffer_pool.unpin(frame_idx, true);
+    return page_id;
+}
+
+/// Encode a label set the way LabelStore does ([u16 count][u32 ids...]).
+fn encodeLabelBlock(allocator: Allocator, ids: []const u32) ![]u8 {
+    const buf = try allocator.alloc(u8, 2 + ids.len * 4);
+    std.mem.writeInt(u16, buf[0..2], @intCast(ids.len), .little);
+    for (ids, 0..) |id, i| std.mem.writeInt(u32, buf[2 + i * 4 ..][0..4], id, .little);
+    return buf;
+}
+
+test "P1 slab var heads: bit-63 tag encode/decode round-trip; legacy heads untagged" {
+    // Legacy refs (incl. 0 = no chain and a `first_page << 16` ref) are never
+    // slab heads.
+    try testing.expect(!isSlabHead(0));
+    try testing.expect(!isSlabHead(@as(u64, 1) << 16));
+    try testing.expect(!isSlabHead(0x7FFF_FFFF_FFFF_FFFF));
+
+    const head = encodeSlabHead(12345, 678);
+    try testing.expect(isSlabHead(head));
+    try testing.expectEqual(@as(PageId, 12345), slabHeadPageId(head));
+    try testing.expectEqual(@as(u32, 678), slabHeadSlot(head));
+
+    // Extremes of both fields survive the round trip.
+    const big = encodeSlabHead((@as(u64, 1) << 39) - 1, (1 << 24) - 1);
+    try testing.expect(isSlabHead(big));
+    try testing.expectEqual((@as(u64, 1) << 39) - 1, slabHeadPageId(big));
+    try testing.expectEqual(@as(u32, (1 << 24) - 1), slabHeadSlot(big));
+}
+
+test "P1 slab read path: each (block, slot) head reads byte-identical to the legacy chain" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    // The SAME payloads, written two ways — a legacy page-chain per payload and
+    // all payloads packed into ONE shared slab block. Every read must match the
+    // source bytes AND match across the two encodings (the read-both invariant).
+    const payloads = [_][]const u8{
+        "Acanthurus leucosternon",
+        "Chromis viridis (Cuvier, 1830)",
+        "remarks: reef-associated; depth 2-40 m; IUCN LC",
+    };
+
+    var legacy_refs: [payloads.len]u64 = undefined;
+    for (payloads, 0..) |p, i| legacy_refs[i] = try store.write(p);
+
+    const page = try writeRawSlabVarBlock(&store, &payloads);
+
+    for (payloads, 0..) |p, i| {
+        const via_legacy = try store.read(legacy_refs[i], testing.allocator);
+        defer testing.allocator.free(via_legacy);
+        const via_slab = try store.read(encodeSlabHead(page, @intCast(i)), testing.allocator);
+        defer testing.allocator.free(via_slab);
+        try testing.expectEqualSlices(u8, p, via_legacy);
+        try testing.expectEqualSlices(u8, p, via_slab);
+        try testing.expectEqualSlices(u8, via_legacy, via_slab);
+    }
+}
+
+test "P1 slab read path: LabelStore decodes label blocks packed in a slab block" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    // Labels live in var_store; pack two label blocks as slab runs and read
+    // them back through the REAL LabelStore (which funnels via var_store.read).
+    const ids_a = [_]u32{ 10, 20, 30 };
+    const ids_b = [_]u32{ 7, 42 };
+    const block_a = try encodeLabelBlock(testing.allocator, &ids_a);
+    defer testing.allocator.free(block_a);
+    const block_b = try encodeLabelBlock(testing.allocator, &ids_b);
+    defer testing.allocator.free(block_b);
+
+    const runs = [_][]const u8{ block_a, block_b };
+    const page = try writeRawSlabVarBlock(&store, &runs);
+
+    var ls = LabelStore.init(&store);
+
+    const got_a = try ls.getLabels(encodeSlabHead(page, 0), testing.allocator);
+    defer testing.allocator.free(got_a);
+    try testing.expectEqualSlices(u32, &ids_a, got_a);
+
+    const got_b = try ls.getLabels(encodeSlabHead(page, 1), testing.allocator);
+    defer testing.allocator.free(got_b);
+    try testing.expectEqualSlices(u32, &ids_b, got_b);
+}
+
+test "P1: slab + legacy var chains coexist; an untagged head into a slab block is corruption" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    const legacy = try store.write("legacy payload");
+    const runs = [_][]const u8{"slabbed payload"};
+    const slab_page = try writeRawSlabVarBlock(&store, &runs);
+
+    const via_legacy = try store.read(legacy, testing.allocator);
+    defer testing.allocator.free(via_legacy);
+    try testing.expectEqualStrings("legacy payload", via_legacy);
+
+    const via_slab = try store.read(encodeSlabHead(slab_page, 0), testing.allocator);
+    defer testing.allocator.free(via_slab);
+    try testing.expectEqualStrings("slabbed payload", via_slab);
+
+    // An UNTAGGED head pointing at the slab block is a legacy chain walk into a
+    // slab block: the marker sits in the `data_len` window and exceeds
+    // dataCapacity, so the existing legacy guard rejects it — never parsed.
+    const untagged: u64 = @as(u64, slab_page) << 16;
+    try testing.expectError(error.DataCorruption, store.read(untagged, testing.allocator));
+}
+
+test "P1 slab read path rejects tombstoned, out-of-range, out-of-bounds, and page-0 heads" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    const runs = [_][]const u8{ "live", "" }; // slot 1 empty => tombstone
+    const page = try writeRawSlabVarBlock(&store, &runs);
+
+    // Sanity: slot 0 still reads.
+    {
+        const ok = try store.read(encodeSlabHead(page, 0), testing.allocator);
+        defer testing.allocator.free(ok);
+        try testing.expectEqualStrings("live", ok);
+    }
+    // Tombstoned slot behind a stored head ref violates the live-head invariant.
+    try testing.expectError(error.DataCorruption, store.read(encodeSlabHead(page, 1), testing.allocator));
+    // Slot index beyond the directory.
+    try testing.expectError(error.DataCorruption, store.read(encodeSlabHead(page, 9), testing.allocator));
+    // F1: a slab-tagged head whose page bits decode to 0 (page 0 reserved) is
+    // corruption, never silently-empty.
+    try testing.expectError(error.DataCorruption, store.read(encodeSlabHead(0, 0), testing.allocator));
+
+    // Corrupt slot 0's run bounds so it overruns the slot directory.
+    {
+        const frame = try store.buffer_pool.pin(.var_store, page);
+        const idx = store.buffer_pool.frameIndex(frame);
+        writeVarSlabSlot(frame.dataSlice(), 0, 0, .{ .offset = VAR_SLAB_RUNS_OFFSET, .byte_len = 5000 });
+        store.buffer_pool.unpin(idx, true);
+        try testing.expectError(error.DataCorruption, store.read(encodeSlabHead(page, 0), testing.allocator));
+    }
+}
+
+test "P1: free() rejects slab heads loudly (slab-slot tombstoning lands in P2)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    const runs = [_][]const u8{"x"};
+    const page = try writeRawSlabVarBlock(&store, &runs);
+    try testing.expectError(error.SlabChainFreeNotSupported, store.free(encodeSlabHead(page, 0)));
 }
 
 test {
