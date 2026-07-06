@@ -552,6 +552,20 @@ fn addIntegrationTests(
     const run_adjacency_slab_consumers = b.addRunArtifact(adjacency_slab_consumers_tests);
     adjacency_slab_consumers_step.dependOn(&run_adjacency_slab_consumers.step);
 
+    // GAP adjacency-slab-packing P4 — crash/WAL matrix for the hottest
+    // structure: relocation, graduation, slab remove/update (tombstone),
+    // deferred-WAL tail + harvest, and a mixed legacy+slab store. Each builds,
+    // crashes (deinit without checkpoint — only the fsynced WAL survives),
+    // reopens, and asserts full parity with no dangling head / no lost edge.
+    const adjacency_slab_crash_step = b.step("test-adjacency-slab-crash", "Run adjacency slab-packing P4 crash matrix: relocation/graduation/tombstone/deferred-tail/mixed — kill+reopen parity, no dangling head");
+    const adjacency_slab_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab_crash = b.addRunArtifact(adjacency_slab_crash_tests);
+    adjacency_slab_crash_step.dependOn(&run_adjacency_slab_crash.step);
+
     // GAP-ENT-0011 — free-space map vs WAL-tail allocations. Crash-restart
     // tests proving pages allocated after the last checkpoint and recovered
     // from the WAL tail are marked ALLOCATED in the restored free-space map
@@ -672,9 +686,11 @@ fn addIntegrationTests(
     // Adjacency-slab read-both + harvest coverage (silent-counter-staleness
     // class once slab writers land) likewise.
     integration_step.dependOn(&run_adjacency_slab.step);
-    // P3 consumer sweep (backup/rebuild/integrity over slab chains) is part of
-    // the slab writer's release gate — gate it under the umbrella.
+    // P3 consumer sweep (backup/rebuild/integrity over slab chains) and P4
+    // crash matrix (relocation/graduation/tombstone/deferred-tail/mixed) are
+    // the release gate for the slab writer — gate both under the umbrella.
     integration_step.dependOn(&run_adjacency_slab_consumers.step);
+    integration_step.dependOn(&run_adjacency_slab_crash.step);
 }
 
 fn addExample(
