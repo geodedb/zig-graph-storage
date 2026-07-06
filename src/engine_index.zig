@@ -439,8 +439,37 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !LoadOutcome {
         @min(label_stamp.covered_lsn, prop_stamp.covered_lsn),
         @min(edge_stamp.covered_lsn, edge_exist_stamp.covered_lsn),
     );
+
+    // 3. MULTI-RECOVERY GUARD (the reconcile-completeness precondition). The
+    //    captured tail-affected page set is only THIS session's recovery slice
+    //    (start_lsn..currentLsn). It is a COMPLETE account of the committed
+    //    records past the snapshot ONLY when the snapshot's covered_lsn equals
+    //    the durable frontier as it stood BEFORE this recovery ran
+    //    (`tail_pre_recovery_lsn` = start_lsn-1). If covered_lsn < that, a PRIOR
+    //    recovery already advanced the frontier past the snapshot WITHOUT
+    //    re-persisting it (two crashes, no checkpoint between) — reconciling
+    //    only the latest slice would SILENTLY DROP the earlier tail's committed
+    //    mutations from the derived indexes (they remain durable in the primary
+    //    stores → the indexes would serve wrong answers). Force a FULL REBUILD.
+    //    (An epoch match already rules out a post-snapshot checkpoint, so the
+    //    only frontier-advancing events since the snapshot are recoveries; thus
+    //    covered == pre_recovery ⟺ THIS is the first recovery since the
+    //    snapshot ⟺ the captured slice is complete. covered > pre_recovery is a
+    //    defensive impossibility — the manifest frontier only advances — and is
+    //    also routed to rebuild.)
+    if (covered != engine.tail_pre_recovery_lsn) {
+        engine.metrics.derived_index_tail_deferred += 1;
+        engine.label_index.clear();
+        engine.property_index.clear();
+        engine.edge_index.clearAndFree();
+        engine.edge_exist_index.clear();
+        return .rebuild;
+    }
+
     if (covered < durable_lsn) {
-        // epoch-match-but-tail-present. Phase 3 KEEPS the adopted bases and
+        // epoch-match, covered == the pre-recovery frontier, AND this session's
+        // recovery applied a committed tail (durable advanced past covered).
+        // The captured set is COMPLETE → Phase 3 KEEPS the adopted bases and
         // reconciles ONLY the bounded tail-affected pages into them (O(tail)),
         // instead of the Phase-2 full rebuild. Counted for observability; the
         // caller runs reconcileDerivedIndexesFromTail and records

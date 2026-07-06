@@ -244,6 +244,96 @@ test "Phase 3: crash tail reconcile excludes uncommitted txns AND == full rebuil
     }
 }
 
+test "Phase 3 CRITICAL: two crashes, NO checkpoint between → REBUILD (not partial reconcile); both tails present" {
+    // Regression for the multi-recovery gap: the captured tail-affected page set
+    // is only THIS session's recovery slice. When a PRIOR recovery advanced the
+    // durable frontier past the snapshot's covered_lsn WITHOUT persisting the
+    // snapshot (two crashes, no checkpoint between), reconciling only the latest
+    // slice would SILENTLY DROP the earlier tail's committed mutations from the
+    // derived indexes (they stay durable in the primary stores). The gate must
+    // detect covered_lsn < the PRE-RECOVERY frontier and FORCE a full rebuild.
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x34} ** 16;
+    const cfg = test_support.testConfig();
+
+    var hub: u64 = 0;
+    var na: u64 = 0; // mutation A's labelled node (tail 1)
+    var nb: u64 = 0; // mutation B's labelled node (tail 2)
+    var a_edge: u64 = 0;
+    var b_edge: u64 = 0;
+
+    // Session 1: baseline D0 + checkpoint (snapshot @ covered_lsn L0), then the
+    // committed tail A (NO checkpoint), then crash.
+    {
+        const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        hub = try eng.allocNode();
+        try eng.putNode(hub, emptyNode());
+        try eng.addLabel(hub, LABEL);
+        try eng.checkpoint(); // snapshots @ (epoch 1, covered_lsn L0)
+
+        na = try eng.allocNode();
+        try eng.putNode(na, emptyNode());
+        try eng.addLabel(na, LABEL);
+        a_edge = try eng.addEdge(na, hub, REL);
+        eng.deinit(); // CRASH — A is a committed tail (L0+1..L1), no checkpoint
+    }
+
+    // Session 2: recovery replays A (heals last_checkpoint_lsn = L1, epoch stays
+    // 1, snapshot NOT re-saved). Commit tail B (NO checkpoint), then crash. Any
+    // in-memory reconcile of A here is never persisted (no doCheckpoint).
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        nb = try eng.allocNode();
+        try eng.putNode(nb, emptyNode());
+        try eng.addLabel(nb, LABEL);
+        b_edge = try eng.addEdge(nb, hub, REL);
+        eng.deinit(); // CRASH — B is a committed tail (L1+1..L2), no checkpoint
+    }
+
+    // Session 3: recovery replays ONLY B (start_lsn = L1+1), capturing B's pages
+    // ONLY. The snapshot is still @ covered_lsn L0 (epoch 1). covered_lsn(L0) <
+    // pre-recovery frontier(L1) ⇒ FORCE FULL REBUILD, never a partial reconcile.
+    {
+        const eng = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // The reconciled/rebuilt indexes == a full rebuild over the 2-crash-
+        // recovered store (both A and B durable in the primary stores).
+        const reconciled = try eng.debugDerivedDigests();
+
+        // THE FIX: this is a REBUILD (not a partial reconcile) — the captured
+        // tail set (B only) is incomplete relative to the snapshot.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_loads);
+
+        try eng.rebuildDerivedForTest();
+        const rebuilt = try eng.debugDerivedDigests();
+        try testing.expect(reconciled.eql(rebuilt));
+
+        // BOTH tails present: the label set is {hub, na (A), nb (B)} = 3, and
+        // BOTH edges resolve. Before the fix, A (na + its label + a_edge) was
+        // silently ABSENT — reconcile applied only B's pages onto the L0 snapshot.
+        const ids = try eng.scanLabel(LABEL, testing.allocator);
+        defer testing.allocator.free(ids);
+        try testing.expectEqual(@as(usize, 3), ids.len);
+        var saw_hub = false;
+        var saw_a = false;
+        var saw_b = false;
+        for (ids) |id| {
+            if (id == hub) saw_hub = true;
+            if (id == na) saw_a = true;
+            if (id == nb) saw_b = true;
+        }
+        try testing.expect(saw_hub);
+        try testing.expect(saw_a); // A present — the CRITICAL fix
+        try testing.expect(saw_b);
+        try testing.expect((try eng.getEdge(a_edge)) != null); // A's edge present
+        try testing.expect((try eng.getEdge(b_edge)) != null); // B's edge present
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

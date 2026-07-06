@@ -131,6 +131,20 @@ pub const Recovery = struct {
     /// falls back to a full rebuild (a partial set would reconcile incorrectly).
     affected_pages: std.AutoHashMapUnmanaged(u128, void) = .empty,
     affected_pages_overflow: bool = false,
+    /// The DURABLE committed frontier (`manifest.last_checkpoint_lsn`) as it
+    /// stood in the selected manifest BEFORE this recovery replayed anything —
+    /// i.e. the LSN this Recovery instance STARTED replaying from (start_lsn-1).
+    /// The tail reconcile is only valid when the on-disk derived-index
+    /// snapshot's `covered_lsn` EQUALS this: then the ONLY committed records
+    /// past the snapshot are THIS session's recovery slice, which
+    /// `affected_pages` captured completely. If a PRIOR recovery advanced the
+    /// frontier past the snapshot WITHOUT re-persisting it (multi-crash, no
+    /// checkpoint between), the snapshot's covered_lsn is < this and the
+    /// captured set is only the LATEST slice → the engine must full-rebuild, not
+    /// partial-reconcile (else the earlier tail's committed mutations are
+    /// silently dropped from the derived indexes though they are durable in the
+    /// primary stores).
+    pre_recovery_last_checkpoint_lsn: u64 = 0,
     /// Opt-in: only the standalone engine open path (which reconciles the tail
     /// into its loaded derived-index snapshot) sets this true and `deinit()`s
     /// the map. Every other recover() caller (unit tests, sharded/other paths
@@ -225,6 +239,13 @@ pub const Recovery = struct {
         if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
             return error.UuidMismatch;
         }
+
+        // Tail-reconcile validity: record the durable committed frontier BEFORE
+        // this recovery advances it (line ~572). The reconcile is only correct
+        // when the snapshot's covered_lsn == this value (see the field doc); a
+        // prior un-checkpointed recovery would leave covered_lsn strictly below
+        // it, and our captured affected-page set would be only the latest slice.
+        self.pre_recovery_last_checkpoint_lsn = m.last_checkpoint_lsn;
 
         // Validate manifest format version compatibility
         var upgraded_from_v2 = false;

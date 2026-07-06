@@ -275,6 +275,16 @@ pub const GraphEngine = struct {
     /// (or in cleanupResources on an un-hydrated teardown).
     tail_affected_pages: ?[]TailPage = null,
 
+    /// WAL-aware derived-index durability Phase 3 (multi-recovery guard): the
+    /// durable committed frontier as it stood BEFORE this session's recovery ran
+    /// (recovery's `pre_recovery_last_checkpoint_lsn`). The first-access tail
+    /// reconcile is valid ONLY when a snapshot's `covered_lsn` == this value —
+    /// otherwise a PRIOR un-checkpointed recovery advanced the frontier past the
+    /// snapshot and `tail_affected_pages` is only the latest recovery slice, so
+    /// the gate forces a full rebuild instead of a (silently-incomplete) partial
+    /// reconcile. 0 on a freshly created graph (no recovery, never gated).
+    tail_pre_recovery_lsn: u64 = 0,
+
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
         const self = try allocator.create(GraphEngine);
@@ -302,6 +312,7 @@ pub const GraphEngine = struct {
         // holds vacuously (see the field doc).
         self.derived_snapshots_trusted = true;
         self.tail_affected_pages = null; // fresh graph: no WAL tail to reconcile
+        self.tail_pre_recovery_lsn = 0;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -447,6 +458,7 @@ pub const GraphEngine = struct {
         // forbidden until materializeDerivedIndexes establishes the invariant.
         self.derived_snapshots_trusted = false;
         self.tail_affected_pages = null; // set from recovery's captured set below
+        self.tail_pre_recovery_lsn = 0; // set from recovery below
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -593,6 +605,13 @@ pub const GraphEngine = struct {
         // last_checkpoint_lsn past the replayed tail, so a second crash
         // before the next checkpoint would otherwise take the clean path on
         // the NEXT open and trust the stale checkpoint-era file.
+        // WAL-aware derived-index durability Phase 3 (multi-recovery guard):
+        // record the durable frontier as it stood BEFORE this recovery ran. The
+        // first-access reconcile gate compares each snapshot's covered_lsn to
+        // this: covered < this ⇒ a prior un-checkpointed recovery advanced the
+        // frontier and the captured set below is only the latest slice ⇒ rebuild.
+        self.tail_pre_recovery_lsn = recovery.pre_recovery_last_checkpoint_lsn;
+
         // WAL-aware derived-index durability Phase 3: copy the tail-affected
         // page set out of `recovery` (about to deinit) for the DEFERRED
         // first-access reconcile. Only when a committed tail was applied and the
