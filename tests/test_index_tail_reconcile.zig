@@ -334,6 +334,121 @@ test "Phase 3 CRITICAL: two crashes, NO checkpoint between → REBUILD (not part
     }
 }
 
+// COMPOSED (adjacency slab packing × WAL-aware derived-index reconcile) — the
+// on-path proof that this release's two feature sets compose. With adjacency
+// slab packing ON (opt-in; ships default OFF), a committed clean-shutdown WAL
+// tail that PACKS a brand-new slab chain, GROWS a chain past GRADUATION (slab →
+// legacy migration in the tail), and TOMBSTONES a pre-checkpoint slab edge must
+// reconcile into the epoch-matched loaded snapshots KEY-FOR-KEY EQUAL to a full
+// rebuild. This holds because every adjacency write logs the owning node's
+// `.nodes` page in the same commit, and the reconcile's node-page pass
+// re-derives each affected node via the slab-aware `expand` (read-both) — so
+// slab relocation/graduation/tombstone in the tail can never strand or
+// mis-derive an edge. The two dedicated release gates (adjacency crash matrix,
+// Path-B tail reconcile) each run with the OTHER feature quiescent; this test is
+// the combined-path coverage that neither exercised.
+test "COMPOSED: slab-packed tail (pack + graduate + tombstone) reconcile == full rebuild" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x5b} ** 16;
+
+    var cfg = test_support.testConfig();
+    cfg.adjacency_slab_packing = true; // opt-in adjacency slab packing ON
+
+    const N_POOL = 600;
+    var pool: [N_POOL]u64 = undefined;
+    var hub: u64 = 0;
+    var x: u64 = 0;
+    var x_edge: u64 = 0;
+    var removed_edge: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+
+        // S0: a hub + a pool of targets, plus a few low-fanout slab chains that
+        // must survive the hub's graduation and the tail reconcile. No labels/
+        // props: keeps the tail free of non-slab `.props` pages (which would
+        // force the safe fallback rebuild) so the SLAB adjacency path is what
+        // the reconcile is proven against.
+        hub = try eng.allocNode();
+        try eng.putNode(hub, emptyNode());
+        for (&pool) |*n| {
+            n.* = try eng.allocNode();
+            try eng.putNode(n.*, emptyNode());
+        }
+        {
+            var i: usize = 1;
+            while (i + 1 < 20) : (i += 2) {
+                _ = try eng.addEdge(pool[i], pool[i + 1], REL);
+            }
+        }
+        // A pre-checkpoint slab edge hub -> pool[0], tombstoned in the tail.
+        removed_edge = try eng.addEdge(hub, pool[0], REL);
+
+        try eng.checkpoint(); // snapshots @ (epoch E, covered_lsn L); slab-packed adjacency on disk
+
+        // --- committed tail M (deferred; NO checkpoint) ---
+        // (1) PACK a brand-new slab chain: node X.
+        x = try eng.allocNode();
+        try eng.putNode(x, emptyNode());
+        x_edge = try eng.addEdge(x, pool[0], REL);
+        _ = try eng.addEdge(x, pool[1], REL);
+
+        // (2) GROW the hub until it GRADUATES (out_head stops being a slab head)
+        //     — a slab → legacy migration entirely inside the WAL tail.
+        var graduated = false;
+        var k: usize = 20;
+        while (k < N_POOL) : (k += 1) {
+            _ = try eng.addEdge(hub, pool[k], REL);
+            if (!gs.adj_store.isSlabHead((try eng.getNode(hub)).?.out_head)) {
+                graduated = true;
+                if (k > 40) break; // grow a little past graduation, then stop
+            }
+        }
+        try testing.expect(graduated);
+
+        // (3) TOMBSTONE the pre-checkpoint slab edge hub -> pool[0].
+        try eng.removeEdge(hub, pool[0], removed_edge);
+
+        // Clean-shutdown tail: deinit skips the checkpoint, so the snapshots stay
+        // @ (E, L) and only the fsynced WAL tail carries M.
+        eng.deinit();
+    }
+
+    // Reopen: LOAD (epoch match) + RECONCILE the slab-packed tail.
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        const reconciled = try eng.debugDerivedDigests();
+
+        // Reconcile-path metric shape: loaded + reconciled, did NOT rebuild —
+        // proves the slab (graduation/relocation/tombstone) tail pages stayed on
+        // the bounded reconcile path, not the O(graph) fallback rebuild.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_tail_deferred);
+
+        // Ground truth: a full rebuild over the SAME on-disk (S0 + M) store.
+        try eng.rebuildDerivedForTest();
+        const rebuilt = try eng.debugDerivedDigests();
+
+        // KEY-FOR-KEY EQUAL — the correctness bar.
+        try testing.expect(reconciled.eql(rebuilt));
+
+        // Concrete spot-checks on the composed result.
+        try testing.expect(!gs.adj_store.isSlabHead((try eng.getNode(hub)).?.out_head)); // hub graduated to legacy
+        try testing.expect((try eng.getEdge(x_edge)) != null); // new slab-packed chain edge present
+        try testing.expect((try eng.getEdge(removed_edge)) == null); // tombstoned edge absent
+
+        var buf: [8]u64 = undefined;
+        try testing.expectEqual(@as(usize, 0), (try eng.probeEdge(hub, REL, pool[0], &buf)).len); // removed
+        try testing.expectEqual(@as(usize, 1), (try eng.probeEdge(x, REL, pool[0], &buf)).len); // packed chain
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
