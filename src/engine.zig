@@ -1107,6 +1107,19 @@ pub const GraphEngine = struct {
         _ = try self.txn_manager.logPageUpdate(txn_id, @intFromEnum(file_id), page_id, frame.dataSlice());
     }
 
+    /// GAP adjacency slab packing (P2): WAL-image every page an AdjStore
+    /// mutation dirtied. An addEdge return value is a chain HEAD, which is no
+    /// longer always a page id (slab heads encode tag|block|slot) and one
+    /// mutation can dirty several pages (a slab relocation tombstones the old
+    /// block and appends to the fill block; a graduation additionally writes
+    /// the fresh legacy chain). Logging the raw head would image a bogus page
+    /// (slab) or under-log (multi-page). The store records the exact dirtied
+    /// set; with slab packing off it is exactly the one block a legacy
+    /// head-insert touched (== the returned head), so imaging is unchanged.
+    fn logTouchedAdj(self: *GraphEngine, txn_id: u64, file_id: FileId, store: *const AdjStore) anyerror!void {
+        for (store.touchedPages()) |p| try self.logPage(txn_id, file_id, p);
+    }
+
     /// WAL-image every page of a var-store chain (labels live there).
     ///
     /// Found by the GAP-ENT-0011 acceptance test: a var-store `ref` is
@@ -1403,6 +1416,11 @@ pub const GraphEngine = struct {
         // Update source node's out adjacency list
         var from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         const new_out_head = try self.adj_out.addEdge(from_rec.out_head, entry);
+        // GAP-ENT-0022(b): a slab relocation/graduation inside addEdge already
+        // tombstoned the old slot; if anything below errors the caller keeps
+        // the old head, so roll the tombstone back to keep it referencing a
+        // live run (no-op for legacy/in-slab writes).
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
         from_rec.out_head = new_out_head;
         try self.node_store.putNode(from, from_rec);
 
@@ -1416,12 +1434,15 @@ pub const GraphEngine = struct {
         };
         var to_rec = try self.node_store.getNode(to) orelse return error.NodeNotFound;
         const new_in_head = try self.adj_in.addEdge(to_rec.in_head, in_entry);
+        errdefer self.adj_in.undoLastSlabTombstone() catch {};
         to_rec.in_head = new_in_head;
         try self.node_store.putNode(to, to_rec);
 
-        // Log all dirty pages: adj_out page, adj_in page, from-node page, to-node page
-        try self.logPage(txn, .adj_out, new_out_head);
-        try self.logPage(txn, .adj_in, new_in_head);
+        // Log all dirty pages: adj_out page(s), adj_in page(s), from-node page,
+        // to-node page. Adjacency heads are imaged via the store's touched set
+        // (a head may be a slab (block,slot) ref; one write may dirty several).
+        try self.logTouchedAdj(txn, .adj_out, &self.adj_out);
+        try self.logTouchedAdj(txn, .adj_in, &self.adj_in);
         try self.logPage(txn, .nodes, self.nodePageId(from));
         // Avoid duplicate log if from and to share the same node page
         const to_page = self.nodePageId(to);
@@ -1464,6 +1485,13 @@ pub const GraphEngine = struct {
         errdefer self.txn_manager.abort(txn) catch {};
 
         const edge_id = try self.addEdgeTxn(from, to, rel_type, txn);
+
+        // GAP-ENT-0022(b): a COMMIT failure is the last window in which this op
+        // errors after a slab relocation/graduation tombstoned an old slot
+        // while the caller keeps the old head — roll both stores' tombstones
+        // back (no-op for legacy writes). The aborted txn's images never replay.
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
+        errdefer self.adj_in.undoLastSlabTombstone() catch {};
 
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");
@@ -1554,6 +1582,9 @@ pub const GraphEngine = struct {
         };
         var from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         const new_out_head = try self.adj_out.addEdge(from_rec.out_head, out_entry);
+        // GAP-ENT-0022(b): roll back a slab tombstone if anything below errors
+        // (no-op for legacy/in-slab writes) — the caller keeps the old head.
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
         from_rec.out_head = new_out_head;
         try self.node_store.putNode(from, from_rec);
 
@@ -1568,14 +1599,17 @@ pub const GraphEngine = struct {
         };
         const old_in_head = try self.in_head_dir.getHead(to);
         const new_in_head = try self.adj_in_remote.addEdge(old_in_head, in_entry);
+        errdefer self.adj_in_remote.undoLastSlabTombstone() catch {};
         const dir_page = try self.in_head_dir.setHead(to, new_in_head);
 
         // 3. Log every dirty page under the ONE txn: out-adj, from-node, in-adj
         //    body, in-dir page. No remote pages, no `to`-node page — strictly
-        //    fewer pages than addEdgeTxn's two-node write.
-        try self.logPage(txn, .adj_out, new_out_head);
+        //    fewer pages than addEdgeTxn's two-node write. Adjacency heads are
+        //    imaged via each store's touched set (a head may be a slab
+        //    (block,slot) ref; one write may dirty several pages).
+        try self.logTouchedAdj(txn, .adj_out, &self.adj_out);
         try self.logPage(txn, .nodes, self.nodePageId(from));
-        try self.logPage(txn, .in_idx, new_in_head);
+        try self.logTouchedAdj(txn, .in_idx, &self.adj_in_remote);
         try self.logPage(txn, .in_dir, dir_page);
 
         // 4. Derived in-memory indexes (same as addEdgeTxn — already source-shard).
@@ -1621,6 +1655,11 @@ pub const GraphEngine = struct {
         errdefer self.txn_manager.abort(txn) catch {};
 
         const edge_id = try self.addEdgeColocatedTxnWithPublicId(from, to, rel_type, txn, public_id);
+
+        // GAP-ENT-0022(b): roll back a slab tombstone on commit failure (the
+        // last error window; no-op for legacy/in-slab writes).
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
+        errdefer self.adj_in_remote.undoLastSlabTombstone() catch {};
 
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");

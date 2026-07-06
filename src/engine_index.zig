@@ -297,10 +297,16 @@ pub fn migrateColocateInEdges(engine: *GraphEngine) !void {
                     self.err = e;
                     return;
                 };
-                self.engine.logPagePublic(self.txn, .in_idx, new_head) catch |e| {
-                    self.err = e;
-                    return;
-                };
+                // Image every in_idx page the addEdge dirtied. `new_head` may be
+                // a slab (block,slot) ref (not a page id) and a slab relocation
+                // dirties several pages — the store records the exact set (with
+                // slab packing off this is exactly [new_head], unchanged).
+                for (self.engine.adj_in_remote.touchedPages()) |p| {
+                    self.engine.logPagePublic(self.txn, .in_idx, p) catch |e| {
+                        self.err = e;
+                        return;
+                    };
+                }
                 self.engine.logPagePublic(self.txn, .in_dir, dir_page) catch |e| {
                     self.err = e;
                     return;
