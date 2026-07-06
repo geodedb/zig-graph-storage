@@ -2028,3 +2028,44 @@ test "PHASE G G1: an in-place property value change (props-only tail) forces reb
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, 0), got.len);
 }
+
+// ============================================================================
+// PHASE G reverse map (prop_head -> node_id) — build/persist/reload wiring.
+// ============================================================================
+
+test "PHASE G reverse-map: fresh-graph build + checkpoint + reopen LOADS prop_head->node (not rebuilt)" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x5A} ** 16;
+    const cfg = testConfig();
+    var head1: u64 = undefined;
+    var head2: u64 = undefined;
+    {
+        // A fresh graph is hydrated from creation, so putNode maintains the
+        // reverse map live (no scan).
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id1 = try engine.allocNode();
+        var r1 = test_support.emptyNode(1);
+        r1.prop_head = try engine.putProperty(0, "k", .{ .int = 1 });
+        try engine.putNode(id1, r1);
+        head1 = r1.prop_head;
+        const id2 = try engine.allocNode();
+        var r2 = test_support.emptyNode(1);
+        r2.prop_head = try engine.putProperty(0, "k", .{ .int = 2 });
+        try engine.putNode(id2, r2);
+        head2 = r2.prop_head;
+        try testing.expectEqual(@as(?NodeId, id1), engine.prop_rev_index.get(head1));
+        try testing.expectEqual(@as(?NodeId, id2), engine.prop_rev_index.get(head2));
+        try engine.checkpoint();
+        try engine.close();
+    }
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try engine.ensureDerivedHydrated();
+    // Epoch matched → derived indexes LOADED clean (not rebuilt); the reverse
+    // map loaded from its snapshot in the same path (no O(nodes) scan).
+    try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_loads);
+    try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
+    try testing.expectEqual(@as(?NodeId, 1), engine.prop_rev_index.get(head1));
+    try testing.expectEqual(@as(?NodeId, 2), engine.prop_rev_index.get(head2));
+}

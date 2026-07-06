@@ -317,6 +317,12 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     errdefer self.label_index.deinit();
     self.property_index = PropertyChainIndex.init(allocator);
     errdefer self.property_index.deinit();
+    // PHASE G reverse map (prop_head -> node_id). Starts empty: create() leaves
+    // it empty (fresh graph, maintained live from the first putNode since a
+    // fresh graph is hydrated); open() loads its snapshot or rebuilds it during
+    // hydration.
+    self.prop_rev_index = @import("prop_rev_index.zig").PropRevIndex.init(allocator);
+    errdefer self.prop_rev_index.deinit();
     self.edge_index = @import("edge_index_map.zig").EdgeIndexMap.init(allocator);
     errdefer self.edge_index.deinit();
     // PHASE 3: edge-existence index. Starts empty; open() loads its snapshot or
@@ -398,7 +404,7 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     const derived_pending = save_derived and
         (engine.label_index_dirty or engine.property_index_dirty or
             engine.edge_index_dirty or engine.edge_exist_index_dirty or
-            engine.ordered_index_dirty);
+            engine.prop_rev_index_dirty or engine.ordered_index_dirty);
     if (!engine.persistence_dirty and !derived_pending) {
         return;
     }
@@ -436,11 +442,13 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     var property_was_dirty = false;
     var edge_was_dirty = false;
     var edge_exist_was_dirty = false;
+    var prop_rev_was_dirty = false;
     if (save_derived) {
         label_was_dirty = engine.label_index_dirty;
         property_was_dirty = engine.property_index_dirty;
         edge_was_dirty = engine.edge_index_dirty;
         edge_exist_was_dirty = engine.edge_exist_index_dirty;
+        prop_rev_was_dirty = engine.prop_rev_index_dirty;
         // WAL-aware durability: doCheckpoint (above) set
         // manifest.last_checkpoint_lsn to the LSN this checkpoint covered;
         // stamp the derived-index snapshots with it (paired with the advanced
@@ -453,10 +461,21 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
             edge_exist_was_dirty,
             engine.manifest.last_checkpoint_lsn,
         );
+        // PHASE G reverse map: persist it when dirty, stamped with the same
+        // (epoch, covered_lsn) as the other derived snapshots so they load/gate
+        // together. A clean map is restamped below (not re-saved).
+        if (prop_rev_was_dirty) {
+            try engine.prop_rev_index.saveToFile(
+                engine.graph_dir.path,
+                engine.manifest.checkpoint_epoch,
+                engine.manifest.last_checkpoint_lsn,
+            );
+        }
         engine.label_index_dirty = false;
         engine.property_index_dirty = false;
         engine.edge_index_dirty = false;
         engine.edge_exist_index_dirty = false;
+        engine.prop_rev_index_dirty = false;
         engine.metrics.derived_index_saves += 1;
     }
     // Label dictionary is O(labels) and is NOT rebuildable from pages (it maps
@@ -527,6 +546,16 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
                 !edge_exist_was_dirty,
                 engine.manifest.last_checkpoint_lsn,
             );
+            // PHASE G: restamp a CLEAN reverse map to the advanced epoch so a
+            // partial checkpoint does not epoch-invalidate it (→ needless scan
+            // rebuild on the next open). A dirty map was saved above.
+            if (!prop_rev_was_dirty) {
+                _ = try engine.prop_rev_index.restampFile(
+                    engine.graph_dir.path,
+                    engine.manifest.checkpoint_epoch,
+                    engine.manifest.last_checkpoint_lsn,
+                );
+            }
         } else if (label_was_dirty and property_was_dirty and edge_was_dirty and edge_exist_was_dirty) {
             engine.derived_snapshots_trusted = true;
         }

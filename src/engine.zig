@@ -66,6 +66,7 @@ const Checkpointer = checkpoint_mod.Checkpointer;
 const Recovery = recovery_mod.Recovery;
 const LabelIndex = label_index_mod.LabelIndex;
 const PropertyChainIndex = property_chain_index_mod.PropertyChainIndex;
+const PropRevIndex = @import("prop_rev_index.zig").PropRevIndex;
 const LabelStore = label_store_mod.LabelStore;
 const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
@@ -146,6 +147,13 @@ pub const GraphEngine = struct {
     label_store: LabelStore,
     label_index: LabelIndex,
     property_index: PropertyChainIndex,
+    /// PHASE G reverse map: prop_head -> node_id, so a crash-reopen exact-index
+    /// reconcile resolves a tail PROPS-page slab slot to its owning node. Built
+    /// by the hydration scan, kept current on the record-write path
+    /// (putNode/deleteNode, when hydrated), persisted with the other derived
+    /// snapshots (epoch + covered_lsn stamped), reconciled from the nodes-page
+    /// tail. See prop_rev_index.zig.
+    prop_rev_index: PropRevIndex,
     /// GAP warm-reopen P1: overlay hashmap + optional immutable mmap base
     /// (see edge_index_map.zig). Resident mode (no base) behaves exactly like
     /// the previous `std.AutoHashMap(EdgeId, EdgeIndexEntry)`.
@@ -188,6 +196,10 @@ pub const GraphEngine = struct {
     persistence_dirty: bool = false,
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
+    /// PHASE G reverse map: set when a record write moved/added/removed a
+    /// prop_head->node mapping since the last persist, so the next checkpoint
+    /// re-saves the reverse-map snapshot (and a clean one is restamped).
+    prop_rev_index_dirty: bool = false,
     edge_index_dirty: bool = true,
     /// PHASE 3: set when the edge-existence index changed since the last persist,
     /// so the next checkpoint/close writes its snapshot. Tracked in lock-step
@@ -881,6 +893,9 @@ pub const GraphEngine = struct {
             },
             .loaded_clean => {
                 // Snapshot covers the durable frontier — served directly, no tail.
+                // PHASE G: load the reverse-map snapshot (or scan-rebuild it if
+                // its stamp lags, e.g. a light checkpoint left it un-restamped).
+                try self.hydratePropRevIndex();
                 self.metrics.derived_index_loads = 1;
             },
             .loaded_needs_reconcile => {
@@ -889,6 +904,10 @@ pub const GraphEngine = struct {
                 // recovery at OPEN) into the loaded snapshot — O(tail), not
                 // O(graph). If the captured set is unavailable (overflow / a
                 // path that did not capture), rebuild (safe).
+                // PHASE G: load the reverse-map BASE (as of covered_lsn) BEFORE
+                // the tail reconcile — reconcileOneNode updates it for the
+                // nodes-page tail set (adds inserts/relocations, drops deletes).
+                try self.hydratePropRevIndex();
                 try self.reconcileOrRebuildTail();
             },
         }
@@ -946,6 +965,22 @@ pub const GraphEngine = struct {
         self.property_index_dirty = true;
         self.edge_index_dirty = true;
         self.edge_exist_index_dirty = true;
+        // PHASE G: a rebuild/reconcile also changed the reverse map vs the
+        // on-disk snapshot → persist it on the next checkpoint.
+        self.prop_rev_index_dirty = true;
+    }
+
+    /// PHASE G: bring the reverse map (prop_head -> node_id) in-memory to its
+    /// covered_lsn BASE for the load/reconcile hydration branches. Loads the
+    /// epoch-stamped snapshot when it is current; if it is absent or its stamp
+    /// lags the manifest epoch (e.g. a light checkpoint did not restamp it),
+    /// rebuild it from a live node scan (O(nodes), safe). On the reconcile
+    /// branch the caller then applies the nodes-page tail on top of this base.
+    fn hydratePropRevIndex(self: *GraphEngine) !void {
+        if (self.prop_rev_index.loadFromFile(self.graph_dir.path) catch null) |stamp| {
+            if (stamp.epoch == self.manifest.checkpoint_epoch) return;
+        }
+        try engine_index.buildPropRevIndexFromScan(self);
     }
 
     fn rebuildEdgeIndex(self: *GraphEngine) !void {
@@ -1125,6 +1160,7 @@ pub const GraphEngine = struct {
         self.label_dict.deinit();
         self.label_index.deinit();
         self.property_index.deinit();
+        self.prop_rev_index.deinit();
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -1280,6 +1316,7 @@ pub const GraphEngine = struct {
         self.label_dict.deinit();
         self.label_index.deinit();
         self.property_index.deinit();
+        self.prop_rev_index.deinit();
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -1547,6 +1584,16 @@ pub const GraphEngine = struct {
         try self.ensureWritable();
         try self.node_store.putNode(id, rec);
         try self.logPage(txn, .nodes, self.nodePageId(id));
+        // PHASE G reverse map: record this node's current prop_head -> id when the
+        // derived indexes are hydrated (a fresh graph is hydrated from creation;
+        // a reopened graph's pre-hydration writes are captured by the hydration
+        // scan instead — so this never forces a hydration on the write path).
+        // put() no-ops for prop_head==0; overwriting is exactly the rebuild
+        // result for slab-slot reuse. In-memory only — no write amplification.
+        if (rec.prop_head != 0 and self.derived_hydrated.load(.acquire)) {
+            try self.prop_rev_index.put(rec.prop_head, id);
+            self.prop_rev_index_dirty = true;
+        }
         self.markDirty();
     }
 
@@ -1597,6 +1644,17 @@ pub const GraphEngine = struct {
             // H3-P4: a delete changes index membership; the trees are stale
             // until the next rebuild at the durability boundary.
             self.ordered_index_stale = true;
+        }
+        // PHASE G reverse map: drop this node's prop_head -> id before the record
+        // is tombstoned (deleteNode keeps prop_head, but read it now to be
+        // explicit). Only when hydrated (see putNodeTxn). In-memory only.
+        if (self.derived_hydrated.load(.acquire)) {
+            if (try self.node_store.getRawSlot(id)) |rec| {
+                if (rec.prop_head != 0) {
+                    self.prop_rev_index.remove(rec.prop_head);
+                    self.prop_rev_index_dirty = true;
+                }
+            }
         }
         try self.node_store.deleteNode(id);
         try self.logPage(txn, .nodes, self.nodePageId(id));

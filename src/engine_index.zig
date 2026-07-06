@@ -125,16 +125,47 @@ pub fn rebuildLabelIndex(engine: *GraphEngine) !void {
 
 /// Rebuild the property chain index from all live nodes and their edges.
 /// PERF-0030: Uses scanNodes batch API instead of per-ID getNode.
+/// PHASE G: rebuilds the reverse map (prop_head -> node_id) in the SAME scan.
 pub fn rebuildPropertyIndex(engine: *GraphEngine) !void {
     engine.property_index.clear();
+    engine.prop_rev_index.clear();
 
     const Ctx = struct {
         engine: *GraphEngine,
         err: ?anyerror = null,
 
-        fn callback(self: *@This(), _: NodeId, rec: NodeRec) void {
+        fn callback(self: *@This(), node_id: NodeId, rec: NodeRec) void {
             if (self.err != null) return;
             indexNodeProperties(self.engine, rec) catch |e| {
+                self.err = e;
+                return;
+            };
+            // PHASE G reverse map: this node's chain -> its id (no-op for head 0).
+            self.engine.prop_rev_index.put(rec.prop_head, node_id) catch |e| {
+                self.err = e;
+            };
+        }
+    };
+
+    var ctx = Ctx{ .engine = engine };
+    try engine.node_store.scanNodes(engine.manifest.next_node_id, &ctx, Ctx.callback);
+    if (ctx.err) |e| return e;
+}
+
+/// PHASE G: rebuild ONLY the reverse map (prop_head -> node_id) from a live node
+/// scan. Used when the derived-index snapshots load clean but the reverse-map
+/// snapshot is absent or its stamp lags (so a separate O(nodes) pass is paid for
+/// the reverse map alone, not a full derived-index rebuild).
+pub fn buildPropRevIndexFromScan(engine: *GraphEngine) !void {
+    engine.prop_rev_index.clear();
+
+    const Ctx = struct {
+        engine: *GraphEngine,
+        err: ?anyerror = null,
+
+        fn callback(self: *@This(), node_id: NodeId, rec: NodeRec) void {
+            if (self.err != null) return;
+            self.engine.prop_rev_index.put(rec.prop_head, node_id) catch |e| {
                 self.err = e;
             };
         }
@@ -576,12 +607,20 @@ fn reconcileOneNode(engine: *GraphEngine, node_id: NodeId, rec: NodeRec) !void {
         // dropped in step 1; a full rebuild's scanNodes skips it entirely, so
         // the reconciled state (no labels, no chain, no out-edges) matches.
         engine.property_index.removeChain(rec.prop_head);
+        // PHASE G reverse map: drop the deleted node's head (tombstone keeps
+        // prop_head) so the reconciled map == a full rebuild over live nodes.
+        engine.prop_rev_index.remove(rec.prop_head);
     } else {
         // Live node: re-derive its FULL current contribution — identical to the
         // shared rebuild derivation for this node.
         try indexNodeLabels(engine, node_id, rec);
         try indexNodeProperties(engine, rec);
         try indexNodeEdges(engine, node_id, rec);
+        // PHASE G reverse map: record the node's CURRENT head (insert/relocation).
+        // A relocation's OLD head lingers (tombstoned slot, never a live slot) —
+        // harmless for resolution and overwritten on slab-slot reuse; see
+        // prop_rev_index.zig.
+        try engine.prop_rev_index.put(rec.prop_head, node_id);
     }
 }
 
@@ -617,6 +656,8 @@ pub fn saveDerivedIndexes(engine: *GraphEngine, covered_lsn: u64) !void {
     try engine.property_index.saveToFile(prop_file, epoch, covered_lsn);
     try saveEdgeIndex(engine, covered_lsn);
     try saveEdgeExistIndex(engine, covered_lsn);
+    // PHASE G reverse map (by-path snapshot, like the ordered index).
+    try engine.prop_rev_index.saveToFile(engine.graph_dir.path, epoch, covered_lsn);
 }
 
 /// Save only the derived index snapshots whose dirty flag is set, stamped with
