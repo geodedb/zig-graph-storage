@@ -1319,11 +1319,46 @@ test "GAP-ENT-0024 F1: version-2 manifest opens fine and is upgraded to version 
     try testing.expect(on_disk_a.counter > v2_manifest.counter);
 }
 
-test "GAP-ENT-0024 F1: freshly written manifests carry version 3" {
+test "downgrade gate: recovery rejects a v3-format manifest (v4 required)" {
+    // The checkpoint_epoch field bumped MANIFEST_VERSION 3 -> 4. A store whose
+    // manifest still declares format_version 3 (a pre-v0.2.29 binary's output)
+    // is NOT a v4 store and must be refused at the version gate — the same
+    // read-only-or-IncompatibleVersion policy the v2/v1 branches use.
     const allocator = testing.allocator;
-    // The constant itself is the downgrade gate: v0.2.23 rejects any value
-    // other than 2 (and the V1 legacy path), so 3 fails loudly there.
-    try testing.expectEqual(@as(u32, 3), manifest_mod.MANIFEST_VERSION);
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    var v3_manifest = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    v3_manifest.format_version = manifest_mod.MANIFEST_VERSION_V3;
+
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try v3_manifest.writeToFile(allocator, path_a);
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    const result = recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectError(error.IncompatibleVersion, result);
+}
+
+test "GAP-ENT-0024 F1: freshly written manifests carry version 4" {
+    const allocator = testing.allocator;
+    // The constant itself is the downgrade gate: a pre-v0.2.29 binary rejects
+    // any value other than 3 (and the V2/V1 legacy paths), so 4 fails loudly
+    // there.
+    try testing.expectEqual(@as(u32, 4), manifest_mod.MANIFEST_VERSION);
 
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1332,11 +1367,11 @@ test "GAP-ENT-0024 F1: freshly written manifests carry version 3" {
     const file_path = try std.fmt.allocPrint(allocator, "{s}/manifest_v3_roundtrip", .{dir_path});
     defer allocator.free(file_path);
 
-    // A default-constructed manifest (what create() persists) round-trips as 3.
+    // A default-constructed manifest (what create() persists) round-trips as 4.
     const fresh = Manifest{ .graph_uuid = [_]u8{0xCC} ** 16 };
     try fresh.writeToFile(allocator, file_path);
     const on_disk = (try Manifest.readFromFile(allocator, file_path)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u32, 3), on_disk.format_version);
+    try testing.expectEqual(@as(u32, 4), on_disk.format_version);
 }
 
 test "GAP-0005a: torn/truncated WAL record fails recovery closed" {

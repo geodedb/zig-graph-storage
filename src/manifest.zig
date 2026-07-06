@@ -15,15 +15,21 @@ const timing_safe = std.crypto.timing_safe;
 const owner_only_file_mode = 0o600;
 
 pub const MANIFEST_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'M', 'N', 'F', '0', '1' };
+/// V4 (v0.2.29): appends the durable `checkpoint_epoch` field (8 B) at the END
+/// of the field block so persisted derived-index snapshots survive a WAL-tail
+/// recovery. This is an ADDITIVE, positional change (mirrors the in_idx/in_dir
+/// append precedent). The byte layout is 8 bytes LONGER than V3, so the bump
+/// doubles as a downgrade gate: a pre-v0.2.29 (V3) binary opening a V4 manifest
+/// fails closed at open — its CRC boundary (SERIALIZED_SIZE-4 at the shorter
+/// V3 size) lands inside the appended field, so the CRC check mismatches and
+/// both slots read null (recovery aborts) rather than silently misparsing.
+///
 /// V3 (v0.2.24, GAP-ENT-0024): store-level downgrade gate for inline edge
-/// public ids. The manifest's own byte layout is UNCHANGED from V2 — the bump
-/// exists so a pre-v0.2.24 binary (which loudly rejects any unknown
-/// format_version at open, recovery.zig) fails with IncompatibleVersion on a
-/// store this version has touched, instead of silently misparsing 32 B v2
-/// adjacency entries at the legacy 24 B stride (and durably corrupting them on
-/// its first write). V3 readers ACCEPT V2 stores and silently upgrade them at
-/// open (recovery rewrites both manifest slots at the end of `recover`).
-pub const MANIFEST_VERSION: u32 = 3;
+/// public ids. The manifest's own byte layout is UNCHANGED from V2 — that bump
+/// existed so a pre-v0.2.24 binary fails on a store this version has touched.
+/// A V4 reader treats a V3 (or lower) format_version per the version gate's
+/// existing read-only-or-IncompatibleVersion policy (recovery.zig).
+pub const MANIFEST_VERSION: u32 = 4;
 
 /// SEC-0043: When Transparent Data Encryption is enabled (an encryption key is
 /// configured), the manifest carries a keyed HMAC-SHA256 trailer in addition to
@@ -49,14 +55,23 @@ pub const MANIFEST_VERSION_V1: u32 = 1;
 /// stores are accepted and upgraded in place at open.
 pub const MANIFEST_VERSION_V2: u32 = 2;
 
+/// V3 (v0.2.24 .. v0.2.28): the inline-edge-public-id byte layout PLUS the two
+/// edge-co-location page counts. V4 (this build) is a strictly additive
+/// extension — it appends `checkpoint_epoch` (8 B) at the END of the field
+/// block, so a V3 manifest is 8 bytes shorter and a V4 manifest opened by a
+/// pre-v0.2.29 (V3) binary fails closed at open (its CRC boundary lands inside
+/// the appended field). Recovery's version gate requires V4; a V3 (or lower)
+/// format_version follows the existing read-only-or-IncompatibleVersion policy.
+pub const MANIFEST_VERSION_V3: u32 = 3;
+
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields (see below) + CRC32(4)
 /// Edge co-location (Phase A) appends in_idx_pages + in_dir_pages (two u64) to
-/// the field block; the format is otherwise unchanged. (Migrating a legacy,
-/// shorter manifest is Phase B; fresh graphs created by this build are
-/// self-consistent.)
-const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 164
-/// Size of the CRC-only (plaintext) serialized manifest: magic + fields + crc = 160.
+/// the field block; V4 appends checkpoint_epoch (one u64). The format is
+/// otherwise unchanged. (Migrating a legacy, shorter manifest is Phase B;
+/// fresh graphs created by this build are self-consistent.)
+const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 172
+/// Size of the CRC-only (plaintext) serialized manifest: magic + fields + crc = 184.
 pub const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4;
 /// Authenticated (TDE) size: CRC-only body + HMAC-SHA256 trailer = 192.
 pub const SERIALIZED_SIZE_HMAC: usize = SERIALIZED_SIZE + MANIFEST_HMAC_SIZE;
@@ -86,6 +101,15 @@ pub const Manifest = struct {
     /// (`in_dir`). Serialized at the END of the field block (additive).
     in_idx_pages: u64 = 0,
     in_dir_pages: u64 = 0,
+    /// Durable derived-index freshness epoch. Advanced ONLY by
+    /// `checkpoint.zig:doCheckpoint`, NEVER by `recovery.zig:recover` (unlike
+    /// `counter`, which recovery bumps for A/B freshness, and
+    /// `last_checkpoint_lsn`, which recovery overwrites when it replays a tail).
+    /// Derived-index snapshots stamp this so a snapshot taken at epoch E stays
+    /// valid across a pure WAL-tail recovery (counter advances, epoch does not).
+    /// Serialized LAST in the field block (additive, mirrors the in_idx/in_dir
+    /// append precedent).
+    checkpoint_epoch: u64 = 0,
 
     /// Serialize to bytes: magic(8) + all fields in little-endian + CRC32(4).
     /// Plaintext (no-key) form. Identical to `serializeWithKey(allocator, null)`.
@@ -133,6 +157,7 @@ pub const Manifest = struct {
         writeU64(buf, &pos, self.edge_count);
         writeU64(buf, &pos, self.in_idx_pages);
         writeU64(buf, &pos, self.in_dir_pages);
+        writeU64(buf, &pos, self.checkpoint_epoch);
 
         // CRC32 over everything before the checksum
         const crc = Crc32.hash(buf[0..pos]);
@@ -231,6 +256,8 @@ pub const Manifest = struct {
         m.in_idx_pages = readU64(data, pos);
         pos += 8;
         m.in_dir_pages = readU64(data, pos);
+        pos += 8;
+        m.checkpoint_epoch = readU64(data, pos);
 
         return m;
     }
@@ -372,6 +399,50 @@ test "serialize/deserialize round-trip" {
     try std.testing.expectEqual(m.free_pages, m2.free_pages);
     try std.testing.expectEqual(m.node_count, m2.node_count);
     try std.testing.expectEqual(m.edge_count, m2.edge_count);
+}
+
+test "checkpoint_epoch round-trips through serialize/deserialize" {
+    const allocator = std.testing.allocator;
+    const m = Manifest{
+        .graph_uuid = [_]u8{0x5E} ** 16,
+        .counter = 7,
+        .checkpoint_epoch = 0xDEAD_BEEF_1234,
+    };
+
+    const data = try m.serialize(allocator);
+    defer allocator.free(data);
+
+    const m2 = try Manifest.deserialize(allocator, data);
+    try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF_1234), m2.checkpoint_epoch);
+    // The pre-existing tail field must still survive alongside the new one.
+    try std.testing.expectEqual(m.counter, m2.counter);
+}
+
+test "A/B selection preserves checkpoint_epoch through serialize/deserialize" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+    const path_a = try std.fmt.allocPrint(allocator, "{s}/manifest.a", .{tmp_path});
+    defer allocator.free(path_a);
+    const path_b = try std.fmt.allocPrint(allocator, "{s}/manifest.b", .{tmp_path});
+    defer allocator.free(path_b);
+
+    // The stale slot (lower counter) carries a stale epoch; the fresh slot
+    // (higher counter) carries the epoch selection must ride along.
+    const older = Manifest{ .counter = 5, .checkpoint_epoch = 2 };
+    const newer = Manifest{ .counter = 9, .checkpoint_epoch = 3 };
+    try older.writeToFile(allocator, path_a);
+    try newer.writeToFile(allocator, path_b);
+
+    const a_read = try Manifest.readFromFile(allocator, path_a);
+    const b_read = try Manifest.readFromFile(allocator, path_b);
+    const sel = try Manifest.selectManifest(a_read, b_read);
+
+    try std.testing.expectEqual(@as(u64, 9), sel.counter);
+    try std.testing.expectEqual(@as(u64, 3), sel.checkpoint_epoch);
 }
 
 test "corrupt data detected (bad CRC)" {

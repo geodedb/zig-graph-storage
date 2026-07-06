@@ -1011,7 +1011,7 @@ test "getStorageStats returns correct counters" {
     const stats0 = engine.getStorageStats();
     try testing.expectEqual(@as(u64, 0), stats0.node_count);
     try testing.expectEqual(@as(u64, 0), stats0.edge_count);
-    try testing.expectEqual(@as(u32, 3), stats0.format_version); // V3 (v0.2.24 downgrade gate)
+    try testing.expectEqual(@as(u32, 4), stats0.format_version); // V4 (v0.2.29 checkpoint_epoch downgrade gate)
     try testing.expectEqual(@as(u32, 4096), stats0.page_size);
 
     // Add a node and check stats update
