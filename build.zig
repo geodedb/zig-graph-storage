@@ -539,6 +539,19 @@ fn addIntegrationTests(
     const run_adjacency_slab = b.addRunArtifact(adjacency_slab_tests);
     adjacency_slab_step.dependOn(&run_adjacency_slab.step);
 
+    // GAP adjacency-slab-packing P3 — consumer sweep: every path that READS
+    // adjacency stays slab-transparent. Backup/restore byte-copy round-trip,
+    // derived edge-index rebuild from a slab adj_out, FanIn-source
+    // (adj_in_remote) rebuild, and the integrity walk over slab chains.
+    const adjacency_slab_consumers_step = b.step("test-adjacency-slab-consumers", "Run adjacency slab-packing P3 consumer sweep: backup/restore round-trip, derived edge-index rebuild, FanIn-source rebuild, integrity walk over slab chains");
+    const adjacency_slab_consumers_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab_consumers.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab_consumers = b.addRunArtifact(adjacency_slab_consumers_tests);
+    adjacency_slab_consumers_step.dependOn(&run_adjacency_slab_consumers.step);
+
     // GAP-ENT-0011 — free-space map vs WAL-tail allocations. Crash-restart
     // tests proving pages allocated after the last checkpoint and recovered
     // from the WAL tail are marked ALLOCATED in the restored free-space map
@@ -659,6 +672,9 @@ fn addIntegrationTests(
     // Adjacency-slab read-both + harvest coverage (silent-counter-staleness
     // class once slab writers land) likewise.
     integration_step.dependOn(&run_adjacency_slab.step);
+    // P3 consumer sweep (backup/rebuild/integrity over slab chains) is part of
+    // the slab writer's release gate — gate it under the umbrella.
+    integration_step.dependOn(&run_adjacency_slab_consumers.step);
 }
 
 fn addExample(
