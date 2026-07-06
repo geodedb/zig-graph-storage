@@ -61,8 +61,12 @@ pub const LabelStore = struct {
         defer allocator.free(new_list);
         @memcpy(new_list[0..existing.len], existing);
         new_list[existing.len] = label_id;
-        if (label_head != 0) try self.var_store.free(label_head);
+        // GAP-ENT-0022(b) live-head invariant: write the NEW block FIRST, then
+        // free/tombstone the OLD one LAST. If putLabels fails, `label_head`
+        // still references a live run (slab slot or legacy chain); freeing
+        // first would leave a dangling head on failure.
         const new_head = try self.putLabels(new_list, allocator);
+        if (label_head != 0 and label_head != new_head) try self.var_store.free(label_head);
         return .{ .head = new_head, .count = @intCast(new_list.len) };
     }
 
@@ -75,9 +79,12 @@ pub const LabelStore = struct {
         for (existing) |id| {
             if (id != label_id) try new_list.append(allocator, id);
         }
-        if (label_head != 0) try self.var_store.free(label_head);
-        if (new_list.items.len == 0) return .{ .head = 0, .count = 0 };
-        const new_head = try self.putLabels(new_list.items, allocator);
+        // GAP-ENT-0022(b) live-head invariant: write the NEW block FIRST (an
+        // empty result writes nothing, head 0), then free/tombstone the OLD one
+        // LAST — so a putLabels failure leaves `label_head` referencing a live
+        // run rather than a dangling one.
+        const new_head: u64 = if (new_list.items.len == 0) 0 else try self.putLabels(new_list.items, allocator);
+        if (label_head != 0 and label_head != new_head) try self.var_store.free(label_head);
         return .{ .head = new_head, .count = @intCast(new_list.items.len) };
     }
 };

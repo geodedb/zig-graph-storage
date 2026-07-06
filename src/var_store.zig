@@ -88,6 +88,14 @@ const VAR_SLAB_SLOT_TOMBSTONE: u32 = 0xFFFF_FFFF;
 /// is > any real dataCapacity (page sizes are <= 64 KB), so it can never equal
 /// a legacy `data_len` (which is always <= dataCapacity). "VARS" tag.
 const VAR_SLAB_MARKER: u32 = 0x5641_5253;
+/// Graduation threshold: the largest byte run the slab writer packs into a
+/// shared block. Runs above this migrate to a dedicated legacy page-chain, so a
+/// shared block always holds MANY small records (packing — not one ~page-sized
+/// run that would defeat the whole point). ~1 KB sits at the top of the plan's
+/// ~512 B–1 KB band; taxa var strings (scientific_name/authorship ~40–500 B)
+/// and label blocks (2 + 4·n B) pack comfortably below it. Physically capped by
+/// the block's own capacity in `slabMaxRunLen`.
+const VAR_SLAB_MAX_RUN: u32 = 1024;
 
 /// True when a var head ref is a slab-packed (block, slot) pointer (bit 63 set)
 /// rather than a legacy `first_page << 16` ref. Head 0 (= empty / no chain) is
@@ -225,9 +233,115 @@ pub const VarStore = struct {
         return self.page_size - PAGE_HEADER_SIZE - VAR_META_SIZE;
     }
 
-    /// Write variable-length data. Returns a reference (page_id << 16 | 0).
-    /// For multi-page data, pages are chained via next_page pointers.
+    /// Bytes on a slab block available for byte runs + slot-directory entries
+    /// (page minus header/VarSlab-header and the AES-GCM tail reservation).
+    fn slabCapacity(self: *const VarStore) u32 {
+        return self.page_size - self.tail_reserve - VAR_SLAB_RUNS_OFFSET;
+    }
+
+    /// Largest single run the writer packs into a slab block: the graduation
+    /// threshold, physically capped so even a fresh block (one dir entry) holds
+    /// it. Runs above this graduate to a legacy chain.
+    fn slabMaxRunLen(self: *const VarStore) u32 {
+        const physical = self.slabCapacity() - VAR_SLAB_DIR_ENTRY_SIZE;
+        return @min(VAR_SLAB_MAX_RUN, physical);
+    }
+
+    const VarSlabState = struct { slot_count: u32, next_off: u32 };
+
+    /// Re-derive a slab block's append state from the page itself (never cached
+    /// — a stale VarStore value can't corrupt a page): the slot count (from the
+    /// validated header) and the first free run byte (max over LIVE slots of
+    /// offset+byte_len; tombstoned slots keep their dir entry but free no run
+    /// space until compaction). O(slot_count), bounded by page_size.
+    fn slabBlockState(self: *const VarStore, data: []const u8) error{DataCorruption}!VarSlabState {
+        const slot_count = try self.readSlabBlockHeader(data);
+        const dir_start = varSlabDirStart(data.len, self.tail_reserve, slot_count);
+        var next_off: u32 = VAR_SLAB_RUNS_OFFSET;
+        var i: u32 = 0;
+        while (i < slot_count) : (i += 1) {
+            const s = readVarSlabSlot(data, self.tail_reserve, i);
+            if (s.offset == VAR_SLAB_SLOT_TOMBSTONE) continue;
+            if (s.offset < VAR_SLAB_RUNS_OFFSET) return error.DataCorruption;
+            const end = @as(u64, s.offset) + @as(u64, s.byte_len);
+            if (end > dir_start) return error.DataCorruption;
+            if (end > next_off) next_off = @intCast(end);
+        }
+        return .{ .slot_count = slot_count, .next_off = next_off };
+    }
+
+    /// Pack `data` as a NEW slot on the current fill block, or on a fresh slab
+    /// block when there is no fill block / it is full. Returns the bit-63 tagged
+    /// (block, slot) head, or null when the run can never fit a slab block
+    /// (> graduation threshold) or the page-id encode guard trips — the caller
+    /// then uses the legacy layout. Never partially writes: the slot becomes
+    /// visible only via the slot_count bump AFTER the run bytes + directory
+    /// entry are written.
+    fn appendSlabRun(self: *VarStore, data: []const u8) !?u64 {
+        if (data.len > self.slabMaxRunLen()) return null; // graduate to legacy
+        const run_len: u32 = @intCast(data.len);
+
+        // Try the current fill block first.
+        if (self.current_fill_page) |fill_page| {
+            const frame = try self.buffer_pool.pin(.var_store, fill_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const page_data = frame.dataSlice();
+            const state = self.slabBlockState(page_data) catch |err| {
+                self.buffer_pool.unpin(frame_idx, false);
+                return err;
+            };
+            if (@as(u64, state.slot_count) <= SLAB_HEAD_SLOT_MASK) {
+                const slot: u32 = state.slot_count;
+                // Space for the run AND one more directory entry (the new slot).
+                const dir_end = varSlabDirStart(page_data.len, self.tail_reserve, slot + 1);
+                if (@as(u64, state.next_off) + run_len <= dir_end) {
+                    if (run_len > 0) @memcpy(page_data[state.next_off..][0..run_len], data);
+                    writeVarSlabSlot(page_data, self.tail_reserve, slot, .{ .offset = state.next_off, .byte_len = run_len });
+                    writeVarSlabSlotCount(page_data, slot + 1);
+                    self.buffer_pool.unpin(frame_idx, true);
+                    return encodeSlabHead(fill_page, slot);
+                }
+            }
+            // Full (or slot indices exhausted): retire it — no mutation.
+            self.buffer_pool.unpin(frame_idx, false);
+            self.current_fill_page = null;
+        }
+
+        // Start a fresh slab fill block.
+        const new_page = try self.free_space.allocPage();
+        // The page id must fit the 39-bit slab-head field with the tag clear;
+        // never encode an out-of-range id (that would corrupt the head) —
+        // release the page and use the legacy layout.
+        if (new_page >= SLAB_HEAD_MAX_PAGE_ID) {
+            self.free_space.freePage(new_page) catch {};
+            return null;
+        }
+        const frame = self.buffer_pool.pinNew(.var_store, new_page) catch |err| { // zeroed
+            self.free_space.freePage(new_page) catch {};
+            return err;
+        };
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const page_data = frame.dataSlice();
+        writeVarSlabHeader(page_data, 1);
+        if (run_len > 0) @memcpy(page_data[VAR_SLAB_RUNS_OFFSET..][0..run_len], data);
+        writeVarSlabSlot(page_data, self.tail_reserve, 0, .{ .offset = VAR_SLAB_RUNS_OFFSET, .byte_len = run_len });
+        self.buffer_pool.unpin(frame_idx, true);
+        self.current_fill_page = new_page;
+        return encodeSlabHead(new_page, 0);
+    }
+
+    /// Write variable-length data. Returns a var head: a bit-63 tagged slab
+    /// (block, slot) ref when slab packing is on and the run fits the
+    /// graduation threshold, else a legacy `page_id << 16` page-chain ref.
+    /// For multi-page (legacy) data, pages are chained via next_page pointers.
     pub fn write(self: *VarStore, data: []const u8) !u64 {
+        // GAP var-store slab packing (P2): pack a NEW small run into the shared
+        // fill block. A null result means "graduate to legacy" (run over the
+        // threshold, or the page-id encode limit tripped) — fall through.
+        if (self.slab_packing) {
+            if (try self.appendSlabRun(data)) |head| return head;
+        }
+
         const cap = self.dataCapacity();
         var remaining = data;
         var first_page: PageId = 0;
@@ -650,6 +764,10 @@ test "P0 oracle: legacy var.store costs one full 8 KB page per small chain (the 
     defer env.deinit();
 
     var store = VarStore.init(&env.pool, &env.fsm, page_size);
+    // This LOCKS the legacy one-page-per-chain baseline the slab writer must
+    // beat — force legacy explicitly so the oracle stays valid regardless of
+    // the default.
+    store.slab_packing = false;
 
     // Short taxa var strings — scientific_name + authorship sized (~40-90 B),
     // far below one page.
@@ -971,6 +1089,154 @@ test "P2: free() on an already-tombstoned slab slot errors (live-head invariant)
     try store.free(encodeSlabHead(page, 0));
     // Double-free of a dead slot is corruption, not a silent no-op.
     try testing.expectError(error.DataCorruption, store.free(encodeSlabHead(page, 0)));
+}
+
+// ============================================================================
+// GAP var-store slab packing — P2 slab WRITE path (the REAL writer, not the
+// hand-built fixture): NEW small runs pack into shared blocks; oversized runs
+// graduate to legacy; the empty-string encoding is distinct from a tombstone;
+// LabelStore add/remove funnels through the writer/tombstone.
+// ============================================================================
+
+test "P2 writer: many small var runs pack into shared slab blocks and read byte-identical" {
+    const page_size: u32 = 8192;
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", page_size, 64);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, page_size);
+    store.slab_packing = true;
+
+    const n: u32 = 200;
+    var refs: [n]u64 = undefined;
+    var bufs: [n][96]u8 = undefined;
+    var lens: [n]usize = undefined;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const s = try std.fmt.bufPrint(&bufs[i], "Acanthurus leucosternon {d} (Bennett, 1833)", .{i});
+        lens[i] = s.len;
+        refs[i] = try store.write(s);
+        try testing.expect(isSlabHead(refs[i])); // packed, not a legacy chain
+    }
+
+    // Packing: 200 short runs share a handful of pages, NOT 200 (the legacy
+    // baseline). bytes/node collapses from 8,192 to the acceptance target.
+    const pages = env.fsm.allocatedCount();
+    try testing.expect(pages < 10);
+    const bytes_per_node = pages * page_size / n;
+    try testing.expect(bytes_per_node <= 256);
+
+    // Every packed run reads byte-identical — no cross-slot bleed.
+    i = 0;
+    while (i < n) : (i += 1) {
+        const got = try store.read(refs[i], testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(bufs[i][0..lens[i]], got);
+    }
+}
+
+test "P2 writer: an empty var string packs as a LIVE empty run, distinct from a tombstone" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+    store.slab_packing = true;
+
+    const empty_ref = try store.write("");
+    try testing.expect(isSlabHead(empty_ref));
+    const nonempty_ref = try store.write("x");
+
+    // The empty run reads back as an EMPTY slice — NOT a DataCorruption
+    // tombstone. This is the explicit empty-string-vs-tombstone encoding: a
+    // live run keeps a real offset (byte_len 0); only offset == TOMBSTONE is
+    // dead.
+    {
+        const got = try store.read(empty_ref, testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqual(@as(usize, 0), got.len);
+    }
+
+    // Tombstoning it flips it to DataCorruption, proving the two encodings are
+    // distinct.
+    try store.free(empty_ref);
+    try testing.expectError(error.DataCorruption, store.read(empty_ref, testing.allocator));
+
+    // Sibling non-empty run untouched.
+    const x = try store.read(nonempty_ref, testing.allocator);
+    defer testing.allocator.free(x);
+    try testing.expectEqualStrings("x", x);
+}
+
+test "P2 writer: a run over the graduation threshold falls back to a legacy chain (byte-identical)" {
+    const page_size: u32 = 8192;
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", page_size, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, page_size);
+    store.slab_packing = true;
+
+    // A small run slabs …
+    const small = try store.write("small run");
+    try testing.expect(isSlabHead(small));
+
+    // … a 4 KB run (>> VAR_SLAB_MAX_RUN = 1 KB) graduates to a legacy page
+    // chain, read-both correct.
+    const big = try testing.allocator.alloc(u8, 4096);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast(i % 256);
+    const big_ref = try store.write(big);
+    try testing.expect(!isSlabHead(big_ref)); // legacy
+
+    const got_small = try store.read(small, testing.allocator);
+    defer testing.allocator.free(got_small);
+    try testing.expectEqualStrings("small run", got_small);
+    const got_big = try store.read(big_ref, testing.allocator);
+    defer testing.allocator.free(got_big);
+    try testing.expectEqualSlices(u8, big, got_big);
+}
+
+test "P2 writer: LabelStore add/remove funnels through slab writer/tombstone (update + delete + sibling)" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+    store.slab_packing = true;
+    var ls = LabelStore.init(&store);
+
+    // Node A: each add rewrites the block (new slab slot, old slot tombstoned).
+    var a_head: u64 = 0;
+    {
+        const r = try ls.addLabel(a_head, 10, testing.allocator);
+        a_head = r.head;
+        try testing.expect(isSlabHead(a_head));
+    }
+    a_head = (try ls.addLabel(a_head, 20, testing.allocator)).head;
+    a_head = (try ls.addLabel(a_head, 30, testing.allocator)).head;
+
+    // Node B shares the same block — must be undisturbed by A's churn.
+    const b = try ls.putLabels(&[_]u32{ 7, 8 }, testing.allocator);
+    try testing.expect(isSlabHead(b));
+
+    // Delete a middle label from A (rewrite + tombstone the old slot).
+    a_head = (try ls.removeLabel(a_head, 20, testing.allocator)).head;
+    {
+        const got = try ls.getLabels(a_head, testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u32, &[_]u32{ 10, 30 }, got);
+    }
+    {
+        const got = try ls.getLabels(b, testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u32, &[_]u32{ 7, 8 }, got);
+    }
+
+    // Remove the rest of A → head 0; B still intact after all the tombstoning.
+    a_head = (try ls.removeLabel(a_head, 10, testing.allocator)).head;
+    const last = try ls.removeLabel(a_head, 30, testing.allocator);
+    try testing.expectEqual(@as(u64, 0), last.head);
+    try testing.expectEqual(@as(u16, 0), last.count);
+    const got_b2 = try ls.getLabels(b, testing.allocator);
+    defer testing.allocator.free(got_b2);
+    try testing.expectEqualSlices(u32, &[_]u32{ 7, 8 }, got_b2);
 }
 
 test {
