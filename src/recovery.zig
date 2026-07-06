@@ -1488,6 +1488,87 @@ test "downgrade gate: recovery rejects a v3-format manifest (v4 required)" {
     try testing.expectError(error.IncompatibleVersion, result);
 }
 
+test "GAP-0053 v3-upgrade integration: a real 176-byte V3 store opens and migrates to V4 on checkpoint" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // A store EXACTLY as a pre-v0.2.29 (V3) binary left it: a 176-byte manifest
+    // with no checkpoint_epoch. graph_uuid MUST match the graph dir or recovery
+    // rejects it with UuidMismatch before the version gate is reached.
+    var v3 = Manifest{
+        .graph_uuid = setup.graph_dir.graph_uuid,
+        .page_size = 4096,
+        .counter = 5,
+        .next_node_id = 4242,
+        .node_count = 77,
+    };
+    v3.format_version = manifest_mod.MANIFEST_VERSION_V3;
+
+    // Write the RAW V3 bytes (writeToFile would emit the 184-byte V4 layout —
+    // we need the real on-disk V3 format the old binary produced).
+    const v3_bytes = try manifest_mod.serializeV3Legacy(allocator, v3, null);
+    defer allocator.free(v3_bytes);
+    try testing.expectEqual(@as(usize, 176), v3_bytes.len);
+
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = try std.Io.Dir.cwd().createFile(io, path_a, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, v3_bytes);
+        try f.sync(io);
+        try testing.expectEqual(@as(u64, 176), try f.length(io));
+    }
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    // 1) The graph OPENS (the brick is fixed) and the V3 manifest is upgraded:
+    //    version bumped to V4, every field preserved, checkpoint_epoch = 0.
+    var recovery = Recovery.init(allocator, null);
+    var recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectEqual(manifest_mod.MANIFEST_VERSION, recovered.format_version);
+    try testing.expectEqual(@as(u64, 4242), recovered.next_node_id);
+    try testing.expectEqual(@as(u64, 77), recovered.node_count);
+    try testing.expectEqual(@as(u64, 0), recovered.checkpoint_epoch);
+
+    // 2) A checkpoint MIGRATES the store to V4 on disk. Drive TWO checkpoints so
+    //    BOTH A/B slots flip (each checkpoint writes the alternate slot).
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
+    var wal = try WalManager.init(allocator, wal_dir, setup.graph_dir.graph_uuid, 0, .{});
+    defer wal.deinit();
+
+    var cp = Checkpointer.init(allocator, &pool, &wal, &recovered, &fm, &setup.graph_dir);
+    try cp.doCheckpoint(); // writes slot .b as V4 (last_slot starts at .a)
+    try cp.doCheckpoint(); // writes slot .a as V4
+
+    // BOTH slots are now valid 184-byte V4 manifests with the fields preserved.
+    for ([_]GraphDir.ManifestSlot{ .a, .b }) |slot| {
+        const p = try setup.graph_dir.manifestPath(allocator, slot);
+        defer allocator.free(p);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = try std.Io.Dir.cwd().openFile(io, p, .{});
+        defer f.close(io);
+        try testing.expectEqual(@as(u64, 184), try f.length(io));
+        const on_disk = (try Manifest.readFromFile(allocator, p)) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(manifest_mod.MANIFEST_VERSION, on_disk.format_version);
+        try testing.expectEqual(@as(u64, 4242), on_disk.next_node_id);
+    }
+    // Epoch advanced 0 -> 1 -> 2 across the two checkpoints (never false-matches
+    // a pre-upgrade derived snapshot, which had no epoch stamp at all).
+    try testing.expectEqual(@as(u64, 2), recovered.checkpoint_epoch);
+}
+
 test "GAP-ENT-0024 F1: freshly written manifests carry version 4" {
     const allocator = testing.allocator;
     // The constant itself is the downgrade gate: a pre-v0.2.29 binary rejects
