@@ -292,6 +292,108 @@ test "read rejects data_len exceeding dataCapacity (0xFFFFFFFF)" {
     try testing.expectError(error.DataCorruption, store.read(ref, testing.allocator));
 }
 
+// ============================================================================
+// GAP var-store slab packing — P0 oracle: bytes/node baseline + round-trip
+// parity harness.
+//
+// The var.store is the biggest un-slabbed store: measured at the 14.27M scale
+// it costs exactly 8,192 B/node = ONE 8 KB page per node's var-chain, because
+// `write` allocates a fresh page (chain) per call even for a ~40-90 B string.
+// These tests LOCK that baseline as a regression oracle (the "before" number
+// the slab initiative is judged against) and provide the round-trip parity
+// harness reused by P1 (a slab-format block must read byte-identical to the
+// legacy page-chain encoding) and the future writer.
+// ============================================================================
+
+/// Round-trip parity oracle. Writes every opaque var record through the legacy
+/// funnel, forces the pages to disk (`flushAll` + a buffer pool small enough
+/// that natural eviction re-reads from the persisted image), then reads each
+/// back and asserts byte-identical. A node's label block and a property string
+/// are both just bytes to VarStore, so one harness covers "every var string AND
+/// every label reads back byte-identical after write + reopen".
+fn expectVarRoundTripParity(store: *VarStore, pool: *buffer_pool_mod.BufferPool, records: []const []const u8) !void {
+    const refs = try testing.allocator.alloc(u64, records.len);
+    defer testing.allocator.free(refs);
+    for (records, 0..) |rec, i| refs[i] = try store.write(rec);
+
+    // Persist the whole store; with a small pool the earlier chains have
+    // already been evicted to disk, so the read-back exercises the on-disk
+    // image, not just the write cache.
+    try pool.flushAll();
+
+    for (records, 0..) |rec, i| {
+        const got = try store.read(refs[i], testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, rec, got);
+    }
+}
+
+test "P0 oracle: legacy var.store costs one full 8 KB page per small chain (the bloat baseline)" {
+    const page_size: u32 = 8192;
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", page_size, 64);
+    env.register();
+    defer env.deinit();
+
+    var store = VarStore.init(&env.pool, &env.fsm, page_size);
+
+    // Short taxa var strings — scientific_name + authorship sized (~40-90 B),
+    // far below one page.
+    const n: u32 = 200;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        var buf: [96]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "Acanthurus leucosternon {d} (Bennett, 1833)", .{i});
+        _ = try store.write(s);
+    }
+
+    // One page allocated per chain — the un-slabbed layout, verbatim.
+    const pages = env.fsm.allocatedCount();
+    try testing.expectEqual(@as(u64, n), pages);
+
+    // The number the whole initiative is judged against: 8,192 B/node.
+    // P2's slab writer flips this assertion toward O(actual bytes); until then
+    // this LOCKS the baseline so a regression that reinflates it fails loudly.
+    const bytes_per_node = pages * page_size / n;
+    try testing.expectEqual(@as(u64, 8192), bytes_per_node);
+}
+
+test "P0 parity: short strings + label blocks round-trip byte-identical (legacy, after flush)" {
+    // Small pool (8 pages) vs many chains ⇒ eviction forces disk round-trips.
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 8);
+    env.register();
+    defer env.deinit();
+
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+
+    var records: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (records.items) |r| testing.allocator.free(r);
+        records.deinit(testing.allocator);
+    }
+
+    // Interleave variable-length taxa strings with encoded label blocks — the
+    // exact on-disk LabelStore encoding ([u16 count][u32 ids...]) so "labels
+    // read back byte-identical" is covered at the byte level.
+    var i: u32 = 0;
+    while (i < 40) : (i += 1) {
+        if (i % 2 == 0) {
+            const s = try std.fmt.allocPrint(testing.allocator, "Chromis viridis {d} authorship remark payload", .{i});
+            try records.append(testing.allocator, s);
+        } else {
+            const nlabels: u32 = 1 + (i % 5);
+            const buf = try testing.allocator.alloc(u8, 2 + nlabels * 4);
+            std.mem.writeInt(u16, buf[0..2], @intCast(nlabels), .little);
+            var k: u32 = 0;
+            while (k < nlabels) : (k += 1) {
+                std.mem.writeInt(u32, buf[2 + k * 4 ..][0..4], i * 100 + k, .little);
+            }
+            try records.append(testing.allocator, buf);
+        }
+    }
+
+    try expectVarRoundTripParity(&store, &env.pool, records.items);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
