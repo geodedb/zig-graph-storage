@@ -1095,7 +1095,13 @@ test "checkIntegrity propagates adjacency-scan I/O errors" {
     defer td.deinit();
 
     const uuid = [_]u8{0x73} ** 16;
-    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    // This test corrupts a LEGACY EdgeBlockHeader (block-per-chain layout) to
+    // force a circular chain. Adjacency slab packing defaults ON since P7, which
+    // makes a low-fanout out_head a slab head instead of a raw block page — so
+    // opt the legacy adjacency writer back in to keep exercising this path.
+    var cfg = testConfig();
+    cfg.adjacency_slab_packing = false;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
     defer engine.close() catch {};
 
     // Two nodes with a single edge so node n1 has a non-empty out_head chain.

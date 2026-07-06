@@ -59,6 +59,11 @@ fn baselineConfig() gs.GraphConfig {
         .page_size = PAGE_SIZE,
         .buffer_pool_pages = 256,
         .data_dir = "data",
+        // LEGACY block-per-chain baseline: adjacency slab packing defaults ON
+        // since P7, so pin the legacy writer here to keep measuring (and
+        // asserting green) the pre-slab bloat this baseline documents. The
+        // read-both path keeps this legacy layout readable forever.
+        .adjacency_slab_packing = false,
     };
 }
 

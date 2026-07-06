@@ -665,6 +665,11 @@ test "free releases pages" {
     defer env.deinit();
 
     var store = VarStore.init(&env.pool, &env.fsm, 4096);
+    // Legacy one-page-per-chain writer: this test asserts that freeing a
+    // var-chain releases its WHOLE page back to free space. Slab packing
+    // (default ON since P7) tombstones the slot but keeps the shared fill page,
+    // so opt the legacy writer back in to keep exercising the page-release path.
+    store.slab_packing = false;
 
     const free_before = env.fsm.freeCount();
     const ref = try store.write("some data");
