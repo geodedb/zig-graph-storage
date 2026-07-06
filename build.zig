@@ -652,6 +652,19 @@ fn addIntegrationTests(
     const run_derived_restamp = b.addRunArtifact(derived_restamp_tests);
     derived_restamp_step.dependOn(&run_derived_restamp.step);
 
+    // WAL-aware derived-index durability (Path B) Phase 2 — the epoch-gate
+    // acceptance proofs: a no-tail clean reopen LOADS via the epoch (rebuild==0),
+    // and a crash-tail reopen whose epoch MATCHES (not counter-rejected) is
+    // counted as a tail-deferral and routed to a CORRECT rebuild (never stale).
+    const epoch_gate_step = b.step("test-derived-epoch-gate", "Run WAL-aware derived-index epoch-gate tests: no-tail reload via epoch, tail-present epoch-match routed to a correct rebuild");
+    const epoch_gate_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/derived_index_epoch_gate.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_epoch_gate = b.addRunArtifact(epoch_gate_tests);
+    epoch_gate_step.dependOn(&run_epoch_gate.step);
+
     // Review F-5 (GAP-ENT-0011): CI runs `zig build test`, `test-integration`
     // and `test-fuzz-regression` only — standalone named steps never run
     // there. Silent-corruption crash-recovery regression guards must be gated,
@@ -664,6 +677,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_mmap_index.step);
     // P2: the restamp crash/staleness guards likewise.
     integration_step.dependOn(&run_derived_restamp.step);
+    // Phase 2 epoch-gate acceptance (no-tail reload + tail-present correct rebuild).
+    integration_step.dependOn(&run_epoch_gate.step);
     // WAL-recovery counter healing is the same silent-corruption class.
     integration_step.dependOn(&run_wal_recovery_counters.step);
     // checkpoint_epoch recovery-invariance is the durability foundation the
