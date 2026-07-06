@@ -665,6 +665,19 @@ fn addIntegrationTests(
     const run_epoch_gate = b.addRunArtifact(epoch_gate_tests);
     epoch_gate_step.dependOn(&run_epoch_gate.step);
 
+    // WAL-aware derived-index durability (Path B) Phase 3 — the RELEASE GATE:
+    // rebuild-equivalence of the bounded WAL-tail reconcile (insert / in-place
+    // property VALUE change / DELETED node / removed edge) for a clean-shutdown
+    // tail AND a kill-9 crash tail.
+    const tail_reconcile_step = b.step("test-index-tail-reconcile", "Run WAL-aware derived-index tail-reconcile == full-rebuild property tests (clean + crash tail)");
+    const tail_reconcile_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/test_index_tail_reconcile.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_tail_reconcile = b.addRunArtifact(tail_reconcile_tests);
+    tail_reconcile_step.dependOn(&run_tail_reconcile.step);
+
     // Review F-5 (GAP-ENT-0011): CI runs `zig build test`, `test-integration`
     // and `test-fuzz-regression` only — standalone named steps never run
     // there. Silent-corruption crash-recovery regression guards must be gated,
@@ -672,6 +685,7 @@ fn addIntegrationTests(
     // remain individually invokable via their named steps).
     integration_step.dependOn(&run_free_space_wal_tail.step);
     integration_step.dependOn(&run_edge_remove_crash.step);
+    integration_step.dependOn(&run_tail_reconcile.step);
     // P1: the mmap-snapshot crash/corruption guards are the same class — gate
     // them under the integration umbrella too.
     integration_step.dependOn(&run_mmap_index.step);

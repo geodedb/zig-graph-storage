@@ -82,6 +82,22 @@ pub const EdgeIndexEntry = edge_index_map_mod.EdgeIndexEntry;
 /// captured by recovery and consumed by the first-access tail reconcile.
 pub const TailPage = struct { file_id: types.FileId, page_id: u64 };
 
+/// TEST/introspection: order-independent content digest of the four derived
+/// indexes. Two equal digests ⇒ the indexes are key-for-key equal (negligible
+/// collision probability). Used to assert a WAL-tail reconcile == a full
+/// rebuild over the same store.
+pub const DerivedDigests = struct {
+    label: u64,
+    property: u64,
+    edge: u64,
+    edge_exist: u64,
+
+    pub fn eql(a: DerivedDigests, b: DerivedDigests) bool {
+        return a.label == b.label and a.property == b.property and
+            a.edge == b.edge and a.edge_exist == b.edge_exist;
+    }
+};
+
 /// Default worker count for the owned (no-`external_thread_pool`) path.
 /// Sized for the only consumer — `BufferPool.flushAllParallel`, capped at
 /// `MAX_CHUNKS = 64` short-lived I/O tasks per checkpoint. Four workers
@@ -835,33 +851,167 @@ pub const GraphEngine = struct {
     /// `derived_hydrate_mutex`.
     fn materializeDerivedIndexes(self: *GraphEngine) !void {
         self.derived_materialize_runs += 1;
-        const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
-        if (!loaded_indexes) {
-            try engine_index.rebuildDerivedIndexes(self);
-            // Rebuilt indexes differ from the disk snapshots; mark dirty so the
-            // next checkpoint writes them.
-            self.label_index_dirty = true;
-            self.property_index_dirty = true;
-            self.edge_index_dirty = true;
-            self.edge_exist_index_dirty = true;
-            self.metrics.derived_index_rebuilds = 1;
-        } else {
-            self.metrics.derived_index_loads = 1;
+        // WAL-aware derived-index durability: the load gate returns one of three
+        // outcomes. On any load error, fall back to a rebuild (safe).
+        const outcome = self.tryLoadDerivedIndexes() catch engine_index.LoadOutcome.rebuild;
+        switch (outcome) {
+            .rebuild => {
+                try engine_index.rebuildDerivedIndexes(self);
+                self.markDerivedIndexesDirty();
+                self.metrics.derived_index_rebuilds = 1;
+            },
+            .loaded_clean => {
+                // Snapshot covers the durable frontier — served directly, no tail.
+                self.metrics.derived_index_loads = 1;
+            },
+            .loaded_needs_reconcile => {
+                // Epoch matched AND a committed tail exists beyond covered_lsn.
+                // Reconcile ONLY the bounded tail-affected pages (captured by
+                // recovery at OPEN) into the loaded snapshot — O(tail), not
+                // O(graph). If the captured set is unavailable (overflow / a
+                // path that did not capture), rebuild (safe).
+                try self.reconcileOrRebuildTail();
+            },
         }
         // P2: either branch establishes the clean-snapshot invariant — LOAD:
         // memory := snapshot with all dirty flags clean (holds materially);
-        // REBUILD: all four flags just went dirty (holds vacuously) and the
-        // next full checkpoint's save makes it material. From here on, a full
-        // checkpoint may restamp clean snapshots (see the field doc).
+        // REBUILD/RECONCILE: all four flags went dirty (a rebuild vacuously; a
+        // reconcile because the loaded snapshot no longer matches the tail-
+        // advanced store) and the next full checkpoint's save makes it material.
+        // From here on, a full checkpoint may restamp clean snapshots.
         self.derived_snapshots_trusted = true;
+    }
+
+    /// WAL-aware derived-index durability Phase 3: on the epoch-matched
+    /// tail-present path, reconcile the captured tail-affected pages into the
+    /// loaded snapshot; rebuild if the captured set is unavailable or the
+    /// reconcile cannot decode a page exactly. Consumes tail_affected_pages.
+    fn reconcileOrRebuildTail(self: *GraphEngine) !void {
+        if (self.tail_affected_pages) |pages| {
+            defer {
+                self.allocator.free(pages);
+                self.tail_affected_pages = null;
+            }
+            const result = engine_index.reconcileDerivedIndexesFromTail(self, pages) catch blk: {
+                // A reconcile error (unexpected decode/IO): the safe recovery is
+                // a full rebuild, which clears any partially reconciled state.
+                try engine_index.rebuildDerivedIndexes(self);
+                break :blk engine_index.ReconcileResult.rebuilt;
+            };
+            // The reconciled/rebuilt indexes differ from the on-disk (covered_lsn)
+            // snapshots → mark dirty so the next checkpoint persists them.
+            self.markDerivedIndexesDirty();
+            switch (result) {
+                .reconciled => {
+                    self.metrics.derived_index_loads = 1;
+                    self.metrics.derived_index_reconciles = 1;
+                },
+                .rebuilt => {
+                    self.metrics.derived_index_rebuilds = 1;
+                },
+            }
+        } else {
+            // No captured tail set (overflow / non-capturing path): rebuild. The
+            // loaded bases are released by rebuildDerivedIndexes' clears.
+            try engine_index.rebuildDerivedIndexes(self);
+            self.markDerivedIndexesDirty();
+            self.metrics.derived_index_rebuilds = 1;
+        }
+    }
+
+    /// Mark all four derived-index dirty flags so the next checkpoint persists
+    /// them (used after a rebuild or a tail reconcile — the resident indexes no
+    /// longer match the on-disk snapshots).
+    fn markDerivedIndexesDirty(self: *GraphEngine) void {
+        self.label_index_dirty = true;
+        self.property_index_dirty = true;
+        self.edge_index_dirty = true;
+        self.edge_exist_index_dirty = true;
     }
 
     fn rebuildEdgeIndex(self: *GraphEngine) !void {
         return engine_index.rebuildEdgeIndex(self);
     }
 
-    fn tryLoadDerivedIndexes(self: *GraphEngine) !bool {
+    fn tryLoadDerivedIndexes(self: *GraphEngine) !engine_index.LoadOutcome {
         return engine_index.tryLoadDerivedIndexes(self);
+    }
+
+    /// TEST/introspection: order-independent content digest of the four derived
+    /// indexes (label / property-chain / edge / edge-existence). Hydrates first.
+    /// Two engines over the same store with equal digests are key-for-key
+    /// identical — the assertion the WAL-tail reconcile == full-rebuild property
+    /// test rests on.
+    pub fn debugDerivedDigests(self: *GraphEngine) !DerivedDigests {
+        try self.ensureDerivedHydrated();
+        var d = DerivedDigests{ .label = 0, .property = 0, .edge = 0, .edge_exist = 0 };
+
+        // label: sum over every (label_id, node_id) posting.
+        var lit = self.label_index.index.iterator();
+        while (lit.next()) |e| {
+            var nit = e.value_ptr.keyIterator();
+            while (nit.next()) |n| {
+                var buf: [16]u8 = undefined;
+                std.mem.writeInt(u64, buf[0..8], e.key_ptr.*, .little);
+                std.mem.writeInt(u64, buf[8..16], n.*, .little);
+                d.label +%= std.hash.Wyhash.hash(0xA1, &buf);
+            }
+        }
+
+        // property: sum over every (prop_head, key, value_hash) chain entry.
+        var cit = self.property_index.chains.iterator();
+        while (cit.next()) |e| {
+            const ph = e.key_ptr.*;
+            for (e.value_ptr.entries.items) |entry| {
+                var h = std.hash.Wyhash.init(0xB2);
+                h.update(std.mem.asBytes(&ph));
+                h.update(entry.key);
+                h.update(std.mem.asBytes(&entry.value_hash));
+                d.property +%= h.final();
+            }
+        }
+
+        // edge: sum over every live edge_index record.
+        const EC = struct { total: *u64 };
+        var ec = EC{ .total = &d.edge };
+        try self.edge_index.forEachLive(&ec, struct {
+            fn f(c: *EC, edge_id: u64, e: EdgeIndexEntry) anyerror!void {
+                var h = std.hash.Wyhash.init(0xC3);
+                h.update(std.mem.asBytes(&edge_id));
+                h.update(std.mem.asBytes(&e.from));
+                h.update(std.mem.asBytes(&e.neighbor));
+                h.update(std.mem.asBytes(&e.rel_type));
+                h.update(std.mem.asBytes(&e.prop_head));
+                h.update(std.mem.asBytes(&e.public_id));
+                c.total.* +%= h.final();
+            }
+        }.f);
+
+        // edge_exist: sum over every live (from, rel, to, edge_id) record.
+        const XC = struct { total: *u64 };
+        var xc = XC{ .total = &d.edge_exist };
+        try self.edge_exist_index.forEachRecord(&xc, struct {
+            fn f(c: *XC, from: u64, rel_type: u32, to: u64, edge_id: u64) anyerror!void {
+                var buf: [28]u8 = undefined;
+                std.mem.writeInt(u64, buf[0..8], from, .little);
+                std.mem.writeInt(u32, buf[8..12], rel_type, .little);
+                std.mem.writeInt(u64, buf[12..20], to, .little);
+                std.mem.writeInt(u64, buf[20..28], edge_id, .little);
+                c.total.* +%= std.hash.Wyhash.hash(0xD4, &buf);
+            }
+        }.f);
+
+        return d;
+    }
+
+    /// TEST: force a full O(graph) rebuild of the derived indexes IN PLACE over
+    /// the current store (releases any adopted mmap bases). Lets a test compare
+    /// a tail-reconciled index against the ground-truth rebuild on the SAME
+    /// on-disk pages. Does not touch metrics (the reconcile-open counters stay
+    /// as observed).
+    pub fn rebuildDerivedForTest(self: *GraphEngine) !void {
+        try self.ensureDerivedHydrated();
+        try engine_index.rebuildDerivedIndexes(self);
     }
 
     fn saveDerivedIndexes(self: *GraphEngine, covered_lsn: u64) !void {
@@ -1722,6 +1872,18 @@ pub const GraphEngine = struct {
         // page and logs nothing.
         if (out_mutated) |p| try self.logPage(txn, .adj_out, p);
         if (in_mutated) |p| try self.logPage(txn, .in_idx, p);
+
+        // WAL-aware derived-index durability Phase 3: also log `from`'s node
+        // page. removeEdge leaves `from.out_head` unchanged, so this images an
+        // UNCHANGED node record (harmless on replay: same bytes, zero census /
+        // id-counter effect) — but it puts `from` in recovery's tail-affected
+        // NODE set, which is what the first-access tail reconcile scans to find
+        // the edges to re-derive. Without it, a crash right after a committed
+        // removeEdge would leave the removed edge stale in the reloaded
+        // edge_index/edge_exist snapshot (the adj_out page alone carries no
+        // back-pointer to its owning node). Skipped when the removal was a
+        // no-op (out_mutated == null): nothing changed, nothing to reconcile.
+        if (out_mutated != null) try self.logPage(txn, .nodes, self.nodePageId(from));
 
         // PHASE 3: drop the edge-existence entry BEFORE removing the edge_index
         // record (we need its rel_type to form the key). No-op if absent.

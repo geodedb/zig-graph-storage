@@ -208,7 +208,7 @@ test "P1: never-mutated mmap-backed index persists NOTHING (snapshot files byte-
     }
 }
 
-test "P1 crash: mutations after mmap-adopt, crash before checkpoint → counter gate → exact rebuild" {
+test "P1 crash: mutations after mmap-adopt, crash before checkpoint → epoch gate → exact tail reconcile" {
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xF3} ** 16;
@@ -230,8 +230,10 @@ test "P1 crash: mutations after mmap-adopt, crash before checkpoint → counter 
         try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
         try eng.removeEdge(fx.nodes[0], fx.nodes[1 + 1 % 5], fx.edges[1]);
         new_edge = try eng.addEdgeColocatedWithPublicId(fx.nodes[4], fx.nodes[5], REL, pid(777));
-        // SIMULATED CRASH: no checkpoint, no close. The on-disk snapshots are
-        // now stale (WAL replay will advance manifest.counter past them).
+        // SIMULATED CRASH: no checkpoint, no close. WAL replay advances
+        // manifest.counter past the snapshots, but checkpoint_epoch is
+        // UNCHANGED — so the next open LOADS the epoch-matched snapshots and
+        // RECONCILES the committed tail (removeEdge + addEdge) into them.
         eng.deinit();
     }
     {
@@ -243,9 +245,12 @@ test "P1 crash: mutations after mmap-adopt, crash before checkpoint → counter 
             if (i == 1) continue;
             try expectEdgePid(eng, e, pid(i));
         }
-        // Crash restart: REBUILT from WAL-recovered adjacency, not loaded.
-        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_loads);
-        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+        // Crash restart: LOADED the epoch-matched snapshot, then RECONCILED the
+        // committed tail (removeEdge + addEdge) into it — NOT a full rebuild.
+        // The exact-edge assertions above prove the reconcile is correct.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
         var buf: [8]u64 = undefined;
         const hits = try eng.probeEdge(fx.nodes[4], REL, fx.nodes[5], &buf);
         try testing.expectEqual(@as(usize, 1), hits.len);

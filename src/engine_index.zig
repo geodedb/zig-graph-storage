@@ -49,6 +49,57 @@ const EDGE_RECORD_SIZE: u32 = edge_index_map_mod.RECORD_SIZE; // 40
 const EDGE_EXIST_SNAPSHOT_MAGIC = "GSXIDX3\x00";
 const EDGE_EXIST_RECORD_SIZE: u32 = edge_exist_index_mod.RECORD_SIZE; // 28
 
+// ---------------------------------------------------------------------------
+// Shared per-node/per-edge DERIVATION helpers. Defined ONCE and called by BOTH
+// the full rebuild (below) and the WAL-tail reconcile (reconcileDerivedIndexes-
+// FromTail) so the derivation logic can never fork/drift between the two paths
+// (the plan's explicit constraint). Each takes the CURRENT node record and adds
+// that node's contribution to the derived indexes.
+// ---------------------------------------------------------------------------
+
+/// Derive one node's LABEL postings: (label -> node) for each of its labels.
+pub fn indexNodeLabels(engine: *GraphEngine, node_id: NodeId, rec: NodeRec) !void {
+    if (rec.label_head == 0) return;
+    const labels = try engine.label_store.getLabels(rec.label_head, engine.allocator);
+    defer engine.allocator.free(labels);
+    for (labels) |label_id| {
+        try engine.label_index.addNode(label_id, node_id);
+    }
+}
+
+/// Derive one node's PROPERTY-chain entries: the node's own chain plus each of
+/// its out-edges' chains (edge property chains are keyed by the edge's
+/// prop_head, exactly as the full rebuild's property pass derives them).
+pub fn indexNodeProperties(engine: *GraphEngine, rec: NodeRec) !void {
+    try engine.refreshPropertyChainIndex(rec.prop_head);
+    if (rec.out_head == 0) return;
+    var iter = engine.adj_out.expand(rec.out_head, null);
+    defer iter.deinit();
+    while (try iter.next()) |entry| {
+        try engine.refreshPropertyChainIndex(entry.prop_head);
+    }
+}
+
+/// Derive one node's EDGE entries: for each out-edge, the edge_index record
+/// (edge_id -> {from, neighbor, rel_type, prop_head, public_id}) and the
+/// edge-existence record ((from, rel_type, to) -> edge_id). `put` is idempotent
+/// per key, so re-deriving an unchanged node is a no-op.
+pub fn indexNodeEdges(engine: *GraphEngine, node_id: NodeId, rec: NodeRec) !void {
+    if (rec.out_head == 0) return;
+    var iter = engine.adj_out.expand(rec.out_head, null);
+    defer iter.deinit();
+    while (try iter.next()) |entry| {
+        try engine.edge_index.put(entry.edge_id, .{
+            .from = node_id,
+            .neighbor = entry.neighbor,
+            .rel_type = entry.rel_type,
+            .prop_head = entry.prop_head,
+            .public_id = entry.public_id,
+        });
+        try engine.edge_exist_index.put(node_id, entry.rel_type, entry.neighbor, entry.edge_id);
+    }
+}
+
 /// Rebuild the in-memory label index by reading each live node's labels
 /// from the LabelStore (var.store-backed).
 /// PERF-0030: Uses scanNodes batch API instead of per-ID getNode.
@@ -61,17 +112,9 @@ pub fn rebuildLabelIndex(engine: *GraphEngine) !void {
 
         fn callback(self: *@This(), node_id: NodeId, rec: NodeRec) void {
             if (self.err != null) return;
-            if (rec.label_head == 0) return;
-
-            const labels = self.engine.label_store.getLabels(rec.label_head, self.engine.allocator) catch return;
-            defer self.engine.allocator.free(labels);
-
-            for (labels) |label_id| {
-                self.engine.label_index.addNode(label_id, node_id) catch |e| {
-                    self.err = e;
-                    return;
-                };
-            }
+            indexNodeLabels(self.engine, node_id, rec) catch |e| {
+                self.err = e;
+            };
         }
     };
 
@@ -91,24 +134,9 @@ pub fn rebuildPropertyIndex(engine: *GraphEngine) !void {
 
         fn callback(self: *@This(), _: NodeId, rec: NodeRec) void {
             if (self.err != null) return;
-
-            self.engine.refreshPropertyChainIndex(rec.prop_head) catch |e| {
+            indexNodeProperties(self.engine, rec) catch |e| {
                 self.err = e;
-                return;
             };
-
-            if (rec.out_head == 0) return;
-            var iter = self.engine.adj_out.expand(rec.out_head, null);
-            defer iter.deinit();
-            while (iter.next() catch |e| {
-                self.err = e;
-                return;
-            }) |entry| {
-                self.engine.refreshPropertyChainIndex(entry.prop_head) catch |e| {
-                    self.err = e;
-                    return;
-                };
-            }
         }
     };
 
@@ -155,35 +183,12 @@ pub fn rebuildEdgeIndex(engine: *GraphEngine) !void {
 
         fn callback(self: *@This(), node_id: NodeId, rec: NodeRec) void {
             if (self.err != null) return;
-            if (rec.out_head == 0) return;
-
-            var iter = self.engine.adj_out.expand(rec.out_head, null);
-            defer iter.deinit();
-            while (iter.next() catch |e| {
+            // (from = node_id, rel_type, to = neighbor) -> edge_id plus the
+            // edge_index record; both `put`s are idempotent per key so a
+            // re-applied/duplicated adjacency entry never creates a phantom.
+            indexNodeEdges(self.engine, node_id, rec) catch |e| {
                 self.err = e;
-                return;
-            }) |entry| {
-                self.engine.edge_index.put(entry.edge_id, .{
-                    .from = node_id,
-                    .neighbor = entry.neighbor,
-                    .rel_type = entry.rel_type,
-                    .prop_head = entry.prop_head,
-                    // P3: carried straight from the adjacency scan — v2 blocks
-                    // yield the real inline id, v1 blocks yield 0 (readers fall
-                    // back to the legacy id property for those).
-                    .public_id = entry.public_id,
-                }) catch |e| {
-                    self.err = e;
-                    return;
-                };
-                // (from = node_id, rel_type, to = neighbor) -> edge_id. `put` is
-                // idempotent per edge_id, so re-applied/duplicated adjacency
-                // entries never create a phantom record.
-                self.engine.edge_exist_index.put(node_id, entry.rel_type, entry.neighbor, entry.edge_id) catch |e| {
-                    self.err = e;
-                    return;
-                };
-            }
+            };
         }
     };
 
@@ -335,8 +340,30 @@ fn resetFreeSpaceEmpty(fsm: *@import("free_space.zig").FreeSpaceManager) void {
     fsm.bitmap.set(0); // page 0 is always reserved (bitmap metadata page)
 }
 
-/// Try to load persisted derived index snapshots. Returns true when all four
-/// snapshots are loadable AND fresh enough to serve directly.
+/// Outcome of the derived-index load gate.
+pub const LoadOutcome = enum {
+    /// Snapshots missing/corrupt/epoch-mismatched → caller rebuilds O(graph).
+    rebuild,
+    /// Snapshots loaded AND cover the durable frontier (no tail) → serve as-is.
+    loaded_clean,
+    /// Snapshots loaded and epoch-matched, but a committed WAL tail exists
+    /// beyond their covered_lsn. The adopted bases are KEPT (not cleared); the
+    /// caller reconciles the bounded tail-affected pages into them.
+    loaded_needs_reconcile,
+};
+
+/// Result of a WAL-tail reconcile.
+pub const ReconcileResult = enum {
+    /// The bounded tail was reconciled into the loaded snapshot.
+    reconciled,
+    /// The reconcile hit a page it could not decode exactly (e.g. a non-slab
+    /// props page) and did a full rebuild instead — always correct, just slow.
+    rebuilt,
+};
+
+/// Try to load persisted derived index snapshots. Returns a LoadOutcome:
+/// `.loaded_clean` (serve directly), `.loaded_needs_reconcile` (bases kept;
+/// caller reconciles the tail), or `.rebuild` (rebuild O(graph)).
 ///
 /// WAL-aware durability (Path B) gate — TWO conditions, both required:
 ///   1. EPOCH MATCH. Each snapshot's durable `checkpoint_epoch` must equal
@@ -362,14 +389,14 @@ fn resetFreeSpaceEmpty(fsm: *@import("free_space.zig").FreeSpaceManager) void {
 ///      past covered_lsn and fake a tail on a clean reopen. `last_checkpoint_lsn`
 ///      only moves at checkpoint/recovery, so `covered_lsn < last_checkpoint_lsn`
 ///      cleanly means "recovery replayed committed records the snapshot predates".
-pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !bool {
-    const label_file = engine.file_manager.getFile(.label_idx) orelse return false;
-    const prop_file = engine.file_manager.getFile(.prop_idx) orelse return false;
-    const edge_file = engine.file_manager.getFile(.edge_idx) orelse return false;
+pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !LoadOutcome {
+    const label_file = engine.file_manager.getFile(.label_idx) orelse return .rebuild;
+    const prop_file = engine.file_manager.getFile(.prop_idx) orelse return .rebuild;
+    const edge_file = engine.file_manager.getFile(.edge_idx) orelse return .rebuild;
     // PHASE 3: the existence-index file is ADDITIVE. If it is missing entirely
-    // (pre-Phase-3 graph), return false so the caller rebuilds ALL derived
-    // indexes from durable adjacency — the existence index included.
-    const edge_exist_file = engine.file_manager.getFile(.edge_exist_idx) orelse return false;
+    // (pre-Phase-3 graph), rebuild ALL derived indexes from durable adjacency —
+    // the existence index included.
+    const edge_exist_file = engine.file_manager.getFile(.edge_exist_idx) orelse return .rebuild;
 
     engine.label_index.clear();
     engine.property_index.clear();
@@ -382,12 +409,12 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !bool {
         engine.edge_exist_index.clear();
     }
 
-    const label_stamp = try engine.label_index.loadFromFile(label_file) orelse return false;
-    const prop_stamp = try engine.property_index.loadFromFile(prop_file) orelse return false;
-    const edge_stamp = try loadEdgeIndex(engine, edge_file) orelse return false;
+    const label_stamp = try engine.label_index.loadFromFile(label_file) orelse return .rebuild;
+    const prop_stamp = try engine.property_index.loadFromFile(prop_file) orelse return .rebuild;
+    const edge_stamp = try loadEdgeIndex(engine, edge_file) orelse return .rebuild;
     // A pre-Phase-3 graph has an empty/absent existence snapshot → load returns
     // null → rebuild. A present-but-stale snapshot fails the epoch check below.
-    const edge_exist_stamp = try loadEdgeExistIndex(engine, edge_exist_file) orelse return false;
+    const edge_exist_stamp = try loadEdgeExistIndex(engine, edge_exist_file) orelse return .rebuild;
 
     const epoch = engine.manifest.checkpoint_epoch;
     if (label_stamp.epoch != epoch or
@@ -401,7 +428,7 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !bool {
         engine.property_index.clear();
         engine.edge_index.clearAndFree();
         engine.edge_exist_index.clear();
-        return false;
+        return .rebuild;
     }
 
     // Epoch matches. Detect a committed WAL tail beyond the covered LSN using
@@ -413,19 +440,140 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !bool {
         @min(edge_stamp.covered_lsn, edge_exist_stamp.covered_lsn),
     );
     if (covered < durable_lsn) {
-        // epoch-match-but-tail-present. Phase 3 will reconcile the bounded tail
-        // into the loaded index; Phase 2 rebuilds instead to preserve
-        // correctness (never serve stale). Counted for observability; the
-        // caller then rebuilds and records derived_index_rebuilds.
+        // epoch-match-but-tail-present. Phase 3 KEEPS the adopted bases and
+        // reconciles ONLY the bounded tail-affected pages into them (O(tail)),
+        // instead of the Phase-2 full rebuild. Counted for observability; the
+        // caller runs reconcileDerivedIndexesFromTail and records
+        // derived_index_reconciles.
         engine.metrics.derived_index_tail_deferred += 1;
-        engine.label_index.clear();
-        engine.property_index.clear();
-        engine.edge_index.clearAndFree();
-        engine.edge_exist_index.clear();
-        return false;
+        return .loaded_needs_reconcile;
     }
 
-    return true;
+    return .loaded_clean;
+}
+
+/// WAL-aware derived-index durability Phase 3 — the correctness core.
+///
+/// Reconcile a bounded WAL tail into the just-loaded derived-index snapshots so
+/// the result is IDENTICAL to a full rebuild over the current committed store,
+/// touching only O(tail-affected-pages) instead of O(graph). Precondition: the
+/// four snapshots were loaded (adopted as immutable bases) with EMPTY overlays
+/// (tryLoadDerivedIndexes returned `.loaded_needs_reconcile`), so each base
+/// holds exactly the derived state as of `covered_lsn`.
+///
+/// The tail touched only these primary files (others are irrelevant to the four
+/// out-derived indexes and are ignored): `.nodes` and `.props`. `.adj_out`
+/// changes always co-occur with a `.nodes` write of the owning node (addEdge
+/// putNodes `from`; removeEdge is made to log `from`'s node page too), so the
+/// node set drives the edge reconcile; label mutations always putNode; and a
+/// node-page delete is a tombstoned slot. IN-PLACE property mutations rewrite
+/// only the props page (never the node record), so they are reached via the
+/// props-page slab-slot pass.
+///
+/// Per affected node: remove its OLD out-edges (enumerated from the immutable
+/// edge-existence base by `from`) and its OLD label memberships, then EITHER
+/// re-derive it fully (live) or drop its own property chain (deleted). This is
+/// exactly the inverse-then-forward of the shared derivation helpers, so the
+/// reconciled indexes equal a rebuild key-for-key.
+///
+/// Any props page that is not an unambiguous slab page routes to a full rebuild
+/// (`.rebuilt`) — always correct, never a mis-decode.
+pub fn reconcileDerivedIndexesFromTail(engine: *GraphEngine, pages: []const engine_mod.TailPage) !ReconcileResult {
+    // Pass 1 — props pages: refresh (live slot) / drop (tombstoned slot) each
+    // slab chain, reaching IN-PLACE property mutations that never touched a
+    // node page. A non-slab props page → full rebuild.
+    for (pages) |p| {
+        if (p.file_id != .props) continue;
+        const PropCtx = struct { engine: *GraphEngine };
+        var pc = PropCtx{ .engine = engine };
+        engine.prop_store.forEachSlabSlotOnPage(p.page_id, &pc, struct {
+            fn f(c: *PropCtx, prop_head: u64, live: bool) anyerror!void {
+                if (live) {
+                    try c.engine.refreshPropertyChainIndex(prop_head);
+                } else {
+                    c.engine.property_index.removeChain(prop_head);
+                }
+            }
+        }.f) catch |e| switch (e) {
+            error.NotSlabPage => return fallbackRebuild(engine),
+            else => return e,
+        };
+    }
+
+    // Pass 2 — node pages: un-derive then re-derive each affected node.
+    const npp = engine.node_store.nodes_per_page;
+    const max_node = engine.manifest.next_node_id;
+    for (pages) |p| {
+        if (p.file_id != .nodes) continue;
+        var slot: u64 = 0;
+        while (slot < npp) : (slot += 1) {
+            const node_id = p.page_id * npp + slot;
+            if (node_id >= max_node) break;
+            const rec = (try engine.node_store.getRawSlot(node_id)) orelse continue;
+            try reconcileOneNode(engine, node_id, rec);
+        }
+    }
+
+    return .reconciled;
+}
+
+/// Clear the (partially reconciled) derived indexes and rebuild them fully.
+/// Always correct — the safe fallback whenever the reconcile cannot decode a
+/// page exactly. Releases the adopted mmap bases via clear/clearAndFree.
+fn fallbackRebuild(engine: *GraphEngine) !ReconcileResult {
+    engine.label_index.clear();
+    engine.property_index.clear();
+    engine.edge_index.clearAndFree();
+    engine.edge_exist_index.clear();
+    try rebuildDerivedIndexes(engine);
+    return .rebuilt;
+}
+
+/// Reconcile ONE tail-affected node into the loaded snapshot.
+fn reconcileOneNode(engine: *GraphEngine, node_id: NodeId, rec: NodeRec) !void {
+    // 1. Remove the node's OLD out-edges (edge_index + edge_exist + each such
+    //    edge's property chain). Enumerated from the immutable edge-existence
+    //    base keyed by `from` — these are the node's covered_lsn out-edges. A
+    //    persisted edge is removed then re-added below (net unchanged); a
+    //    deleted edge is removed and NOT re-added.
+    try removeNodeOldEdges(engine, node_id);
+
+    // 2. Remove the node from ALL label postings (its OLD label memberships).
+    engine.label_index.removeNodeFromAll(node_id);
+
+    if (node_mod.isDeleted(&rec)) {
+        // Deleted node: drop its own property chain (deleteNode never touches
+        // the props page, so pass 1 cannot). Its out-edges + their chains were
+        // dropped in step 1; a full rebuild's scanNodes skips it entirely, so
+        // the reconciled state (no labels, no chain, no out-edges) matches.
+        engine.property_index.removeChain(rec.prop_head);
+    } else {
+        // Live node: re-derive its FULL current contribution — identical to the
+        // shared rebuild derivation for this node.
+        try indexNodeLabels(engine, node_id, rec);
+        try indexNodeProperties(engine, rec);
+        try indexNodeEdges(engine, node_id, rec);
+    }
+}
+
+/// Remove every OLD (covered_lsn) out-edge of `node_id` from the edge_index and
+/// edge-existence index (and drop each edge's property chain). Uses the sorted
+/// edge-existence BASE range scan by `from` (overlay is empty at reconcile
+/// start, so the base holds all of the node's snapshot out-edges).
+fn removeNodeOldEdges(engine: *GraphEngine, node_id: NodeId) !void {
+    const Ctx = struct { engine: *GraphEngine, from: NodeId };
+    var c = Ctx{ .engine = engine, .from = node_id };
+    try engine.edge_exist_index.forEachBaseFrom(node_id, &c, struct {
+        fn f(cc: *Ctx, rel_type: u32, to: types.NodeId, edge_id: u64) anyerror!void {
+            // A removed edge's property chain must not survive (a rebuild would
+            // not index it). Look it up BEFORE removing the edge_index record.
+            if (try cc.engine.edge_index.get(edge_id)) |e| {
+                if (e.prop_head != 0) cc.engine.property_index.removeChain(e.prop_head);
+            }
+            try cc.engine.edge_exist_index.remove(cc.from, rel_type, to, edge_id);
+            try cc.engine.edge_index.remove(edge_id);
+        }
+    }.f);
 }
 
 /// Save derived index snapshots to disk, stamped with the current

@@ -1384,11 +1384,13 @@ test "P3 crash between edge writes and checkpoint → recovery → getEdge ids e
         for (ids, 0..) |id, i| {
             try expectEdgePid(eng, id, if (i < 3) 0 else p3Pid(i));
         }
-        // Crash restart: the pre-crash snapshot is stale (WAL replay advanced
-        // the manifest counter), so the edge_index was REBUILT from the
-        // WAL-recovered adjacency — ids exact.
-        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_loads);
-        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+        // Crash restart (WAL-aware durability Phase 3): the epoch-matched
+        // (empty) edge snapshot LOADS and the committed edge tail is RECONCILED
+        // into it from the WAL-recovered adjacency — ids exact (asserted above),
+        // NOT a full rebuild.
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
     }
 }
 
@@ -1437,9 +1439,10 @@ test "P3 mixed v1/v2 adjacency → rebuild → v1 edges surface id 0, v2 edges r
         // block onto the v1 block — a mixed chain on ONE node.
         new_edge = try eng.addEdgeColocatedWithPublicId(node_a, node_c, REL, pid);
 
-        // SIMULATED CRASH so the reopen is forced down the REBUILD path (the
-        // point under test: rebuildEdgeIndex carrying public_id across a
-        // mixed-format chain).
+        // SIMULATED CRASH: the reopen LOADS the epoch-matched snapshot and
+        // RECONCILES the committed tail (the new v2 edge) into it — the point
+        // under test is that the reconcile's shared edge derivation carries
+        // public_id across a mixed v1/v2 chain, exactly as rebuildEdgeIndex does.
         eng.deinit();
     }
 
@@ -1449,7 +1452,9 @@ test "P3 mixed v1/v2 adjacency → rebuild → v1 edges surface id 0, v2 edges r
 
         try expectEdgePid(eng, legacy_edge, 0); // v1 block → id 0 (fallback class)
         try expectEdgePid(eng, new_edge, pid); // v2 block → exact id
-        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
     }
 }
 

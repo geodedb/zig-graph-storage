@@ -148,6 +148,23 @@ pub const LabelIndex = struct {
         _ = set.remove(node_id);
     }
 
+    /// WAL-aware derived-index tail reconcile: remove `node_id` from EVERY
+    /// label's posting list. Used to drop a tail-touched node's OLD label
+    /// memberships before re-deriving its CURRENT labels (a live node whose
+    /// labels changed, or a deleted node whose labels must all go) — without
+    /// needing the node's old label set. O(distinct labels); the label
+    /// cardinality is small (node kinds), so this stays cheap per node. The
+    /// resident map holds all postings (this index has no mmap base), so
+    /// iterating it is complete.
+    pub fn removeNodeFromAll(self: *LabelIndex, node_id: NodeId) void {
+        self.rwlock.lockUncancelable(io());
+        defer self.rwlock.unlock(io());
+        var it = self.index.valueIterator();
+        while (it.next()) |set| {
+            _ = set.remove(node_id);
+        }
+    }
+
     /// Scan all node IDs for a label. Returns a sorted, owned slice (caller frees).
     /// Takes `rwlock` SHARED so concurrent scans run in parallel but no mutator
     /// can rehash/free the set mid-iteration.

@@ -16,11 +16,11 @@
 //   (B) TAIL-PRESENT CRASH REOPEN: recovery replays a committed WAL tail and
 //       bumps manifest.counter PAST the snapshot stamp — but the epoch is
 //       UNCHANGED, so the gate no longer wrongly rejects on the counter. It
-//       ACCEPTS the epoch (derived_index_tail_deferred is counted) and then,
-//       because the snapshot's covered_lsn is behind the replayed tail, Phase 2
-//       still routes to a full REBUILD for CORRECTNESS (Phase 3 will replace
-//       that rebuild with a bounded tail reconcile). The rebuilt index MUST
-//       reflect the tail — Phase 2 never serves a stale index.
+//       ACCEPTS the epoch (derived_index_tail_deferred is counted), LOADS the
+//       snapshot, and RECONCILES the bounded tail-affected pages into it
+//       (derived_index_reconciles; Phase 3) — NOT a full rebuild. The
+//       reconciled index MUST reflect the tail (the reconcile == a rebuild;
+//       proven exhaustively in test_index_tail_reconcile.zig).
 
 const std = @import("std");
 const gs = @import("graph_storage");
@@ -93,7 +93,7 @@ test "Phase 2 A: no-tail clean reopen LOADS via the epoch gate (rebuild==0)" {
     }
 }
 
-test "Phase 2 B: crash-tail reopen — epoch MATCHES (not counter-rejected) but tail-present routes to a correct rebuild" {
+test "Phase 3 B: crash-tail reopen — epoch MATCHES, snapshot LOADS, tail RECONCILES (not rebuild), never stale" {
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xB2} ** 16;
@@ -136,16 +136,19 @@ test "Phase 2 B: crash-tail reopen — epoch MATCHES (not counter-rejected) but 
         try testing.expect(eng.manifest.counter > counter_at_checkpoint);
         try testing.expectEqual(epoch_at_checkpoint, eng.manifest.checkpoint_epoch);
 
-        // First derived access hydrates. THE PHASE 2 ASSERTIONS:
+        // First derived access hydrates. THE PHASE 3 ASSERTIONS:
         //  - the epoch matched (else the mismatch branch would return before the
         //    tail check) → derived_index_tail_deferred == 1;
-        //  - but covered_lsn < the replayed durable frontier → routed to REBUILD.
+        //  - covered_lsn < the replayed durable frontier → the snapshot LOADED
+        //    and the bounded tail was RECONCILED into it (loads==1,
+        //    reconciles==1), NOT a full rebuild (rebuilds==0).
         const count = try labelCount(eng);
         try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_tail_deferred);
-        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_rebuilds);
-        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), eng.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.getMetrics().derived_index_rebuilds);
 
-        // CORRECTNESS (never serve stale): the rebuild reflects the committed
+        // CORRECTNESS (never serve stale): the reconcile reflects the committed
         // tail node — the label set is N+1 and includes tail_node.
         try testing.expectEqual(@as(usize, N + 1), count);
         const ids = try eng.scanLabel(LABEL, testing.allocator);

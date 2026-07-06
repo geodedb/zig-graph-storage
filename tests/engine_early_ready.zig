@@ -234,7 +234,7 @@ test "Phase A: concurrent first-accesses materialize exactly once" {
     }
 }
 
-test "Phase A: stale snapshot (crash) is REBUILT from scan at first access" {
+test "Phase A: crash-tail snapshot is LOADED + tail-RECONCILED at first access" {
     var td = try TestDataDir.init(testing.allocator);
     defer td.deinit();
 
@@ -268,18 +268,21 @@ test "Phase A: stale snapshot (crash) is REBUILT from scan at first access" {
         const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
         defer engine.close() catch {};
 
-        // Recovery replayed the WAL tail and bumped manifest.counter, so the
-        // persisted derived snapshot is now stale-by-counter — but open still
-        // builds NOTHING.
+        // Recovery replayed the WAL tail and bumped manifest.counter, but
+        // checkpoint_epoch is UNCHANGED — the persisted snapshot is still
+        // epoch-valid. Open still builds NOTHING (deferred).
         try testing.expectEqual(@as(u32, 0), engine.derived_materialize_runs);
 
-        // First access materializes once via the REBUILD path (counter mismatch).
+        // First access materializes once: WAL-aware durability Phase 3 LOADS the
+        // epoch-matched snapshot and RECONCILES the committed tail into it (not a
+        // full rebuild). The scanLabel count below verifies correctness.
         const a_nodes = try engine.scanLabel(label_a, testing.allocator);
         defer testing.allocator.free(a_nodes);
         try testing.expectEqual(N, a_nodes.len);
         try testing.expectEqual(@as(u32, 1), engine.derived_materialize_runs);
-        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_rebuilds);
-        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_loads);
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
 
         // The rebuilt indexes are correct over the durable (checkpointed) graph.
         // (Durability of the single WAL-tail write itself is a recovery concern

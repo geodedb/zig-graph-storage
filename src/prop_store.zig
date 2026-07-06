@@ -320,6 +320,51 @@ pub const PropStore = struct {
         return self.touched_pages[0..self.touched_len];
     }
 
+    /// WAL-aware derived-index tail reconcile: enumerate the slab slots on one
+    /// `.props` page, calling `f(ctx, prop_head, live)` for each — `live` true
+    /// for a slot with a blob, false for a TOMBSTONE (dead slot, len == 0). The
+    /// reconcile refreshes the property-chain index for live slots and drops it
+    /// for tombstoned ones — this is how an IN-PLACE property update (which
+    /// rewrites only the props page, never the owning node's record) reaches
+    /// the property index at first-access hydration.
+    ///
+    /// Returns error.NotSlabPage when the page is not an unambiguous, internally
+    /// consistent slab page (a legacy chain page, or bytes that don't parse as a
+    /// slab directory), so the caller falls back to a full rebuild rather than
+    /// ever mis-decoding a page into wrong index entries.
+    pub fn forEachSlabSlotOnPage(
+        self: *PropStore,
+        page_id: PageId,
+        ctx: anytype,
+        comptime f: fn (@TypeOf(ctx), prop_head: u64, live: bool) anyerror!void,
+    ) !void {
+        if (!self.free_space.isAllocated(page_id)) return;
+        const frame = try self.buffer_pool.pin(.props, page_id);
+        defer self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
+        const data = self.logical(frame.dataSlice());
+
+        if (data.len < SLAB_DATA_OFFSET + SLAB_SLOT_COUNT_SIZE) return error.NotSlabPage;
+        if (data[SLAB_META_OFFSET] != SLAB_LAYOUT_VERSION) return error.NotSlabPage;
+        const count = readSlabSlotCount(data);
+        const max_slots = (data.len - SLAB_DATA_OFFSET - SLAB_SLOT_COUNT_SIZE) / SLAB_SLOT_SIZE;
+        if (count > max_slots) return error.NotSlabPage;
+        const dir_bytes = @as(usize, count) * SLAB_SLOT_SIZE;
+        const dir_start = data.len - SLAB_SLOT_COUNT_SIZE - dir_bytes;
+
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const slot = readSlabSlot(data, i);
+            const live = slot.len >= 4; // tombstoneSlabSlot sets len = 0
+            if (live) {
+                // Bounds-check the blob so a mis-detected page fails loudly (→
+                // NotSlabPage → rebuild) rather than yielding a head onto garbage.
+                if (slot.offset < SLAB_DATA_OFFSET) return error.NotSlabPage;
+                if (@as(usize, slot.offset) + slot.len > dir_start) return error.NotSlabPage;
+            }
+            try f(ctx, encodeSlabHead(page_id, i), live);
+        }
+    }
+
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, var_store: *VarStore, page_size: u32) PropStore {
         return .{
             .buffer_pool = buffer_pool,
