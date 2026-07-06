@@ -112,9 +112,10 @@ pub const GraphConfig = struct {
     /// low-fanout graphs. A chain that outgrows its slab slot graduates to a
     /// legacy block chain. Reads are always slab-aware (read-both is permanent),
     /// so a slab-packed store opens on any build that has the P1 read path.
-    /// OPT-IN (default OFF) for this increment: production behaviour is
-    /// unchanged until the format is validated at scale.
-    adjacency_slab_packing: bool = false,
+    /// Default ON since P7: freshly-created stores pack new adjacency chains;
+    /// existing legacy chains keep reading via the read-both path (no migration).
+    /// Toggle retained for rollback/diagnostics (set false → pure legacy writer).
+    adjacency_slab_packing: bool = true,
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
     /// Policy for handling legacy (V1) graph formats during recovery.
     legacy_policy: LegacyPolicy = .reject,

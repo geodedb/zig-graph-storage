@@ -311,12 +311,12 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     // Same tail reservation for the var-store SLAB slot directory (GAP var-store
     // slab packing): a slab block's directory grows backward from the page end
     // exactly like the prop-store/adjacency directories. Legacy var chains grow
-    // forward only, so this is a no-op for them. The slab WRITER stays OFF by
-    // default this pass (the engine keeps minting legacy var heads until the
-    // crash gate is soaked and the default is flipped, per the plan's P6/P7);
-    // set it explicitly for clarity.
+    // forward only, so this is a no-op for them. The slab WRITER is ON by
+    // default since P7 (freshly-created stores pack new var-chains; existing
+    // legacy chains keep reading via the read-both path — no migration); set it
+    // explicitly for clarity / to keep the toggle discoverable for rollback.
     self.var_store.tail_reserve = self.prop_store.tail_reserve;
-    self.var_store.slab_packing = false;
+    self.var_store.slab_packing = true;
 
     // GAP adjacency slab packing (P2): opt-in per config. New small chains on
     // all three adjacency stores pack into shared slab blocks. Reads stay

@@ -185,11 +185,12 @@ pub const VarStore = struct {
     /// instead of allocating a whole >=page_size page per record — so many
     /// small strings/label blocks share one page. Runs that exceed the
     /// graduation threshold (or trip the page-id encode limit) fall back to the
-    /// legacy one-page-per-chain layout. Default OFF this pass: the engine
-    /// keeps producing legacy heads in production until the crash gate is
-    /// soaked and the engine default is flipped ON (the plan's P6/P7, mirroring
-    /// prop_store). Tests opt in with `slab_packing = true`.
-    slab_packing: bool = false,
+    /// legacy one-page-per-chain layout. Default ON since P7 (mirroring
+    /// prop_store): freshly-created stores pack new var-chains; existing legacy
+    /// chains keep reading via the read-both path (no migration). Tests that
+    /// exercise the legacy one-page-per-chain writer opt out with
+    /// `slab_packing = false`.
+    slab_packing: bool = true,
 
     /// The shared "current fill page" NEW slab runs append to. In-memory only:
     /// after a reopen the first slab write simply starts a fresh fill page
@@ -215,7 +216,7 @@ pub const VarStore = struct {
             .free_space = free_space,
             .page_size = page_size,
             .tail_reserve = 0,
-            .slab_packing = false,
+            .slab_packing = true,
             .current_fill_page = null,
             .last_slab_tombstone = null,
         };
