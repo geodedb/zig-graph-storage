@@ -258,6 +258,13 @@ pub const AdjStore = struct {
         /// iterators, FanInEdgeIterator, index rebuild scans — inherits slab
         /// support with no signature change.
         slab_slot: ?u32 = null,
+        /// F1 guard (P2 entry requirement 1): set when `expand` was handed a
+        /// slab-tagged head whose page bits decode to 0 (page 0 is reserved) —
+        /// a corrupt head. `next()` surfaces DataCorruption instead of the
+        /// silently-empty run a page-0 slab mode would otherwise produce
+        /// (the slab loop terminates on current_page == 0). Never set for a
+        /// live slab head (its page id is ≥ 2).
+        slab_corrupt: bool = false,
 
         pub fn deinit(self: *AdjEdgeIterator) void {
             if (self.current_frame_idx) |idx| {
@@ -267,6 +274,7 @@ pub const AdjStore = struct {
         }
 
         pub fn next(self: *AdjEdgeIterator) anyerror!?EdgeEntry {
+            if (self.slab_corrupt) return error.DataCorruption;
             if (self.slab_slot) |slot| return self.nextSlab(slot);
             while (self.current_page != 0) {
                 if (self.current_frame_idx == null) {
@@ -346,11 +354,14 @@ pub const AdjStore = struct {
     /// slab read). Read-both is permanent.
     pub fn expand(self: *AdjStore, head_page: PageId, rel_type_filter: ?u32) AdjEdgeIterator {
         if (isSlabHead(head_page)) {
+            const page = slabHeadPageId(head_page);
             return .{
                 .store = self,
-                .current_page = slabHeadPageId(head_page),
+                .current_page = page,
                 .slab_slot = slabHeadSlot(head_page),
                 .rel_type = rel_type_filter,
+                // F1 guard: a tagged head that decodes to page 0 is corruption.
+                .slab_corrupt = (page == 0),
             };
         }
         return .{
@@ -412,6 +423,9 @@ pub const AdjStore = struct {
         if (head_page == 0) return 0;
 
         if (isSlabHead(head_page)) {
+            // F1 guard: a tagged head that decodes to reserved page 0 is
+            // corruption — reject before pinning page 0.
+            if (slabHeadPageId(head_page) == 0) return error.DataCorruption;
             const frame = try self.buffer_pool.pin(self.file_id, slabHeadPageId(head_page));
             const frame_idx = self.buffer_pool.frameIndex(frame);
             defer self.buffer_pool.unpin(frame_idx, false);
@@ -1079,6 +1093,36 @@ test "P1 mutators reject slab heads loudly (slab writes land in P2)" {
     try testing.expectError(error.SlabChainWriteNotSupported, store.addEdge(head, makeEdge(20, 702, 5)));
     try testing.expectError(error.SlabChainWriteNotSupported, store.removeEdge(head, 701));
     try testing.expectError(error.SlabChainWriteNotSupported, store.updateEdgePropHead(head, 701, 42));
+}
+
+// ============================================================================
+// GAP adjacency slab packing — P2 ENTRY REQUIREMENT 1 (F1 guard).
+// A tagged slab head whose page bits decode to 0 (page 0 is reserved) is a
+// CORRUPT head. It must fail DataCorruption on both read entry points, never
+// silently enumerate an empty run (that would violate the live-head invariant
+// — a stored head must always reference a live run).
+// ============================================================================
+
+test "F1: slab head whose page bits decode to page 0 is corruption, never silently empty" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+
+    // A slab-tagged head whose 39-bit page field is 0. page 0 is reserved, so
+    // this can only arise from corruption, never from a live slab write.
+    const bad = encodeSlabHead(0, 5);
+    try testing.expect(isSlabHead(bad));
+    try testing.expectEqual(@as(PageId, 0), slabHeadPageId(bad));
+
+    // expand() cannot return an error (it returns a plain iterator), so the
+    // corruption must surface on the FIRST next() — not as a silent empty run.
+    var it = store.expand(bad, null);
+    defer it.deinit();
+    try testing.expectError(error.DataCorruption, it.next());
+
+    // edgeCount() rejects it up front rather than pinning the reserved page 0.
+    try testing.expectError(error.DataCorruption, store.edgeCount(bad));
 }
 
 test {
