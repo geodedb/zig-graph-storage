@@ -36,6 +36,9 @@ const Pager = gs.pager.Pager;
 const SingleStoreEnv = gs.test_support.SingleStoreEnv;
 const GraphEngine = gs.GraphEngine;
 const TestDataDir = gs.test_support.TestDataDir;
+const Backup = gs.backup.Backup;
+const GraphDir = gs.graph_dir.GraphDir;
+const VerifyTool = gs.verify.VerifyTool;
 
 // ============================================================================
 // (1) store-level: bytes/node re-measure + parity + on-disk reopen
@@ -448,6 +451,226 @@ test "var-slab P2 graduation crash: a graduated (legacy) label set and slab sibl
 
     try expectLabelSet(alloc, eng, big_nid, expected_big.items);
     try expectLabelSet(alloc, eng, small_nid, &.{ 42, 43, 44 });
+}
+
+// ============================================================================
+// (4) PHASE 3 — remaining consumers: backup/export/copy, integrity/verify,
+// migration/colocation. Each proves the var slab writer is TRANSPARENT to the
+// consumer: backup copies var.store FILE-granular (byte-for-byte), verify scans
+// PAGE checksums (never decodes a var chain), and the colocation edge path
+// treats label_head as an OPAQUE u64 it never dereferences. A label block IS a
+// var byte-run, so "the run survives byte-identical" == "the string survives".
+// ============================================================================
+
+/// Assert `getLabels` succeeds for every head (a DANGLING slab head errors
+/// DataCorruption). Proves no consumer left a var_head pointing at a dead slot.
+fn expectNoDanglingHeads(alloc: Allocator, eng: *GraphEngine, node_ids: []const u64) !void {
+    for (node_ids) |id| {
+        const rec = (try eng.getNode(id)) orelse return error.NodeInvisible;
+        const labels = try eng.label_store.getLabels(rec.label_head, alloc);
+        alloc.free(labels); // a dangling head would have errored above
+    }
+}
+
+test "var-slab P3 backup: slab-packed var.store round-trips byte-identical through backup+restore (labels + raw runs)" {
+    const alloc = testing.allocator;
+    var src = try TestDataDir.init(alloc);
+    defer src.deinit();
+    var dst = try TestDataDir.init(alloc);
+    defer dst.deinit();
+    const uuid = [_]u8{0x75} ** 16;
+    const cfg = gs.test_support.testConfig();
+
+    const N: usize = 40;
+    var nids: [N]u64 = undefined;
+    var heads: [N]u64 = undefined;
+    // The raw slab-run bytes per node BEFORE backup — a label block is a var
+    // byte-run, i.e. exactly the "string" the release gate must preserve.
+    var raw: [N][]u8 = undefined;
+    var raw_set: usize = 0;
+    defer for (raw[0..raw_set]) |r| alloc.free(r);
+
+    // ---- build a slab-packed graph, capture raw runs, CLEAN close ----
+    {
+        const eng = try GraphEngine.create(alloc, src.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+        for (0..N) |i| {
+            const nid = try eng.allocNode();
+            try eng.putNode(nid, gs.test_support.emptyNode(1));
+            nids[i] = nid;
+            try eng.addLabel(nid, @intCast(100 + i));
+            try eng.addLabel(nid, @intCast(200 + i));
+        }
+        for (0..N) |i| {
+            const rec = (try eng.getNode(nids[i])).?;
+            heads[i] = rec.label_head;
+            try testing.expect(gs.var_store.isSlabHead(rec.label_head)); // slab-resident
+            raw[i] = try eng.var_store.read(rec.label_head, alloc);
+            raw_set += 1;
+        }
+        try eng.close(); // checkpoint + flush: var.store file complete on disk
+    }
+
+    // ---- backup the graph dir (file-granular copy), restore to a fresh dir ----
+    const backup_path = try std.fmt.allocPrint(alloc, "{s}/varslab.geob", .{dst.path});
+    defer alloc.free(backup_path);
+    {
+        var gd = try GraphDir.open(alloc, src.path, uuid);
+        defer gd.deinit();
+        // Restore must land in the engine's canonical {data_dir}/graphs/<uuid>
+        // layout so GraphEngine.open(dst.path) resolves it (GraphDir.open
+        // appends graphs/<uuid_hex>).
+        const uuid_hex = std.fs.path.basename(gd.path);
+        const restore_graph_path = try std.fmt.allocPrint(alloc, "{s}/graphs/{s}", .{ dst.path, uuid_hex });
+        defer alloc.free(restore_graph_path);
+
+        var bk = Backup.init(alloc);
+        defer bk.deinit();
+        const res = try bk.createBackup(&gd, backup_path);
+        try testing.expect(res.files_backed_up > 0);
+        try testing.expect(try bk.validateBackup(backup_path));
+        bk.setExpectedGraphUuid(uuid);
+        bk.enableLegacyV1Restore();
+        try bk.restoreBackup(backup_path, restore_graph_path);
+    }
+
+    // ---- reopen the RESTORED graph: every label set + raw run byte-identical ----
+    {
+        const eng = try GraphEngine.open(alloc, dst.path, uuid, cfg);
+        defer eng.close() catch {};
+        for (0..N) |i| {
+            const rec = (try eng.getNode(nids[i])) orelse return error.NodeInvisible;
+            try testing.expectEqual(heads[i], rec.label_head); // opaque head preserved
+            try testing.expect(gs.var_store.isSlabHead(rec.label_head));
+            try expectLabelSet(alloc, eng, nids[i], &.{ @intCast(100 + i), @intCast(200 + i) });
+            const bytes = try eng.var_store.read(rec.label_head, alloc);
+            defer alloc.free(bytes);
+            try testing.expectEqualSlices(u8, raw[i], bytes); // BYTE-IDENTICAL var run
+        }
+        try expectNoDanglingHeads(alloc, eng, nids[0..N]);
+    }
+}
+
+test "var-slab P3 integrity: verifyGraph passes clean over a slab-packed var.store (page-checksum scan is slab-transparent)" {
+    const alloc = testing.allocator;
+    var td = try TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x76} ** 16;
+    const cfg = gs.test_support.testConfig();
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+        for (0..64) |i| {
+            const nid = try eng.allocNode();
+            try eng.putNode(nid, gs.test_support.emptyNode(1));
+            try eng.addLabel(nid, @intCast(1 + i));
+            try eng.addLabel(nid, @intCast(500 + (i % 7)));
+        }
+        // Engine-level integrity check (scanNodes + adjacency; var-transparent —
+        // it never decodes a var run, so slab blocks cannot trip it).
+        const report = try eng.checkIntegrity();
+        try testing.expectEqual(@as(u64, 0), report.total_errors);
+        try eng.close(); // flush stamps every slab page's header checksum
+    }
+
+    // Page-checksum verify over EVERY store file, incl. the slab-packed var.store.
+    // The VAR_SLAB_MARKER lives in the data region; verifyPage checks only the
+    // page-header CRC, so a slab block passes exactly like a legacy chain page.
+    var gd = try GraphDir.open(alloc, td.path, uuid);
+    defer gd.deinit();
+    var vt = VerifyTool.init(alloc);
+    var result = try vt.verifyGraph(&gd, cfg.page_size);
+    defer result.deinit();
+    // Scope the assertion to the VAR store. verifyGraph also scans free.store —
+    // a compact bitmap file that is intentionally NOT page-aligned (a
+    // pre-existing verify/free-store shape mismatch, unrelated to var slab), so
+    // isClean() over the whole graph is not the right gate here. What matters:
+    // NO paged page failed its checksum (corrupted_pages == 0 covers every
+    // var.store slab page) and the var.store artifact scanned OK.
+    try testing.expectEqual(@as(u64, 0), result.corrupted_pages);
+    var saw_var_ok = false;
+    for (result.artifacts.items) |art| {
+        if (std.mem.eql(u8, art.name, "var.store")) {
+            try testing.expect(art.status == .ok);
+            saw_var_ok = true;
+        }
+    }
+    try testing.expect(saw_var_ok);
+}
+
+test "var-slab P3 colocation: the colocation edge path leaves slab var heads + labels undisturbed (var-transparent)" {
+    // migration.zig is a stub (no var-ref harvest) and colocation moves only
+    // ADJACENCY blocks — a node's label_head is an opaque u64 the edge path
+    // never dereferences. Prove it: build slab-packed labels, drive the
+    // colocation edge path across those nodes, and confirm the heads + label
+    // sets are untouched, surviving a clean reopen.
+    const alloc = testing.allocator;
+    var td = try TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x7A} ** 16;
+    const cfg = gs.test_support.testConfig();
+    const REL: u32 = 7;
+
+    const M: usize = 24;
+    var nids: [M]u64 = undefined;
+    var heads: [M]u64 = undefined;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+
+        for (0..M) |i| {
+            const nid = try eng.allocNode();
+            try eng.putNode(nid, gs.test_support.emptyNode(1));
+            nids[i] = nid;
+            try eng.addLabel(nid, @intCast(10 + i));
+            try eng.addLabel(nid, @intCast(900 + i));
+        }
+        for (0..M) |i| {
+            const rec = (try eng.getNode(nids[i])).?;
+            heads[i] = rec.label_head;
+            try testing.expect(gs.var_store.isSlabHead(rec.label_head));
+        }
+
+        // Drive the colocation path (the only "migration/colocation" surface
+        // that exists) across the slab-label nodes.
+        for (0..M) |i| {
+            _ = try eng.addEdgeColocatedWithPublicId(
+                nids[i],
+                nids[(i + 1) % M],
+                REL,
+                0xC010_0000_0000_0000 | @as(u64, @intCast(i + 1)),
+            );
+        }
+
+        // Heads unchanged; labels intact; no head was rewritten by edge ops.
+        for (0..M) |i| {
+            const rec = (try eng.getNode(nids[i])).?;
+            try testing.expectEqual(heads[i], rec.label_head);
+            try expectLabelSet(alloc, eng, nids[i], &.{ @intCast(10 + i), @intCast(900 + i) });
+        }
+        try eng.close();
+    }
+
+    // Reopen: colocated edges + slab labels both survive, heads still valid.
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        for (0..M) |i| {
+            const rec = (try eng.getNode(nids[i])) orelse return error.NodeInvisible;
+            try testing.expectEqual(heads[i], rec.label_head);
+            try expectLabelSet(alloc, eng, nids[i], &.{ @intCast(10 + i), @intCast(900 + i) });
+            var it = try eng.expandOutIter(nids[i], null);
+            defer it.deinit();
+            const e = (try it.next()) orelse return error.ColocatedEdgeMissing;
+            try testing.expectEqual(nids[(i + 1) % M], e.neighbor);
+        }
+        try expectNoDanglingHeads(alloc, eng, nids[0..M]);
+    }
 }
 
 test {
