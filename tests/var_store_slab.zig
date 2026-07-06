@@ -673,6 +673,432 @@ test "var-slab P3 colocation: the colocation edge path leaves slab var heads + l
     }
 }
 
+// ============================================================================
+// (5) PHASE 4 — comprehensive crash/WAL matrix (the release gate; string/label
+// LOSS is the failure mode). Each case: build + deinit-crash (a big buffer pool
+// so NO dirty page is stolen — the fsynced WAL is the ONLY durability channel
+// across the crash) + reopen + assert the label sets AND the raw var byte-runs
+// ("strings") survive, with NO dangling var_head (getLabels on a dangling slab
+// head errors DataCorruption). A label block IS a var byte-run, so raw-run
+// survival == string survival.
+// ============================================================================
+
+test "var-slab P4 relocation crash: a label run that relocates to a NEW fill block survives; the old slot never resurrects" {
+    const alloc = testing.allocator;
+    var td = try TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x77} ** 16;
+    var cfg = gs.test_support.testConfig();
+    cfg.buffer_pool_pages = 1024; // big pool: only the fsynced WAL carries the crash window
+    const vs = gs.var_store;
+
+    const F: usize = 16;
+    var fillers: [F]u64 = undefined;
+    var x: u64 = 0;
+    var block_a: u64 = 0;
+    var block_b: u64 = 0;
+    var x_old_head: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+
+        // node X: first label -> a slot on block A.
+        x = try eng.allocNode();
+        try eng.putNode(x, gs.test_support.emptyNode(1));
+        try eng.addLabel(x, 10);
+        {
+            const rec = (try eng.getNode(x)).?;
+            try testing.expect(vs.isSlabHead(rec.label_head));
+            block_a = vs.slabHeadPageId(rec.label_head);
+            x_old_head = rec.label_head;
+        }
+        for (&fillers) |*f| {
+            f.* = try eng.allocNode();
+            try eng.putNode(f.*, gs.test_support.emptyNode(1));
+            try eng.addLabel(f.*, 1);
+        }
+
+        try eng.checkpoint(); // durable baseline: X = {10} on block A.
+
+        // ---- crash window ----
+        // Churn filler label sets until the shared fill block advances OFF
+        // block A, so X's coming grow lands on a DIFFERENT block (a true
+        // cross-block relocation, not an in-place append).
+        var next_label: u32 = 1000;
+        var iters: usize = 0;
+        while (iters < 8000) : (iters += 1) {
+            const f = fillers[iters % F];
+            next_label += 1;
+            try eng.addLabel(f, next_label);
+            const rec = (try eng.getNode(f)).?;
+            if (vs.isSlabHead(rec.label_head) and vs.slabHeadPageId(rec.label_head) != block_a) {
+                block_b = vs.slabHeadPageId(rec.label_head);
+                break;
+            }
+        }
+        try testing.expect(block_b != 0 and block_b != block_a);
+
+        // Grow X: new slot on block B (current fill), old slot on block A
+        // tombstoned — a committed cross-block relocation living in the WAL tail.
+        try eng.addLabel(x, 20);
+        {
+            const rec = (try eng.getNode(x)).?;
+            try testing.expect(vs.isSlabHead(rec.label_head));
+            try testing.expectEqual(block_b, vs.slabHeadPageId(rec.label_head));
+            try testing.expect(rec.label_head != x_old_head);
+        }
+
+        eng.deinit(); // CRASH
+    }
+
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // X's head -> the LIVE grown run on block B, byte-consistent.
+        const rec = (try eng.getNode(x)) orelse return error.NodeInvisible;
+        try testing.expect(vs.isSlabHead(rec.label_head));
+        try testing.expectEqual(block_b, vs.slabHeadPageId(rec.label_head));
+        try expectLabelSet(alloc, eng, x, &.{ 10, 20 });
+        const bytes = try eng.var_store.read(rec.label_head, alloc);
+        defer alloc.free(bytes);
+        try testing.expectEqual(@as(usize, 2 + 2 * 4), bytes.len); // [u16 count][2×u32]
+
+        // The tombstoned OLD slot on block A must NOT resurrect: reading X's
+        // pre-relocation head errors DataCorruption (the tombstone replayed).
+        try testing.expectError(error.DataCorruption, eng.var_store.read(x_old_head, alloc));
+
+        // Derived label_index rebuilt from the replayed blocks: label 10 maps to
+        // X exactly once (via the grown set), not twice (no orphan resurrection).
+        const with10 = try eng.scanLabel(10, alloc);
+        defer alloc.free(with10);
+        try testing.expectEqualSlices(u64, &.{x}, with10);
+
+        // No dangling head on any filler either.
+        try expectNoDanglingHeads(alloc, eng, &fillers);
+    }
+}
+
+test "var-slab P4 tombstone crash: a committed free applies durably; an uncommitted free leaves siblings intact; no dangling head" {
+    const alloc = testing.allocator;
+    var td = try TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x78} ** 16;
+    var cfg = gs.test_support.testConfig();
+    cfg.buffer_pool_pages = 1024;
+    const vs = gs.var_store;
+
+    // X, Y, Z created first => all pack into the SAME shared slab block.
+    var x: u64 = 0;
+    var y: u64 = 0;
+    var z: u64 = 0;
+    var x_old_head: u64 = 0;
+    var z_head: u64 = 0;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+
+        x = try eng.allocNode();
+        try eng.putNode(x, gs.test_support.emptyNode(1));
+        try eng.addLabel(x, 11);
+        y = try eng.allocNode();
+        try eng.putNode(y, gs.test_support.emptyNode(1));
+        try eng.addLabel(y, 22);
+        try eng.addLabel(y, 23);
+        z = try eng.allocNode();
+        try eng.putNode(z, gs.test_support.emptyNode(1));
+        try eng.addLabel(z, 33);
+
+        {
+            const xr = (try eng.getNode(x)).?;
+            const yr = (try eng.getNode(y)).?;
+            const zr = (try eng.getNode(z)).?;
+            try testing.expect(vs.isSlabHead(xr.label_head));
+            try testing.expect(vs.isSlabHead(yr.label_head));
+            try testing.expect(vs.isSlabHead(zr.label_head));
+            // Shared block: X and Z live on the same slab page.
+            try testing.expectEqual(vs.slabHeadPageId(xr.label_head), vs.slabHeadPageId(zr.label_head));
+            x_old_head = xr.label_head;
+            z_head = zr.label_head;
+        }
+
+        try eng.checkpoint(); // durable baseline.
+
+        // ---- crash window ----
+        // (committed) remove X's only label -> X.label_head durably 0, X's slot
+        // tombstoned in the shared block (the tombstone is WAL-imaged).
+        try eng.removeLabel(x, 11);
+        try testing.expectEqual(@as(u64, 0), (try eng.getNode(x)).?.label_head);
+
+        // (uncommitted) begin a txn that tombstones Z's slot in the SAME block,
+        // then DO NOT commit. The aborted txn's images never land on replay, so
+        // Z must stay live — proving a mid-write free can't dangle a sibling.
+        {
+            const txn = try eng.beginTxn();
+            try eng.removeLabelTxn(z, 33, txn);
+        }
+
+        eng.deinit(); // CRASH
+    }
+
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // Committed tombstone APPLIED: X durably has no labels, head 0, not dangling.
+        {
+            const xr = (try eng.getNode(x)) orelse return error.NodeInvisible;
+            try testing.expectEqual(@as(u64, 0), xr.label_head);
+            try expectLabelSet(alloc, eng, x, &.{});
+            // X's old slab slot is durably tombstoned (never resurrects).
+            try testing.expectError(error.DataCorruption, eng.var_store.read(x_old_head, alloc));
+        }
+        // Uncommitted tombstone NOT applied: Z's slot is still LIVE and readable.
+        {
+            const zr = (try eng.getNode(z)) orelse return error.NodeInvisible;
+            try testing.expectEqual(z_head, zr.label_head);
+            try expectLabelSet(alloc, eng, z, &.{33});
+        }
+        // Sibling Y in the shared block untouched throughout.
+        try expectLabelSet(alloc, eng, y, &.{ 22, 23 });
+        try expectNoDanglingHeads(alloc, eng, &.{ x, y, z });
+    }
+}
+
+test "var-slab P4 deferred-WAL tail: a var slab write in the deferred WAL tail replays; labels+runs current, no dangling head" {
+    const alloc = testing.allocator;
+    var td = try TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x79} ** 16;
+    var cfg = gs.test_support.testConfig();
+    cfg.sync_mode = .deferred; // relaxed durability: the tail lives in the OS
+    // page cache until a barrier — a same-process reopen replays it (commit
+    // still write()s the batch + commit record, only the per-commit fsync is
+    // skipped). This is the same deferred-WAL tail Path B hardens for the index;
+    // here we prove strings/labels survive it.
+    cfg.buffer_pool_pages = 1024; // no steal: only the deferred WAL carries the tail
+
+    const N: usize = 24;
+    var nids: [N]u64 = undefined;
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+        for (0..N) |i| {
+            const nid = try eng.allocNode();
+            try eng.putNode(nid, gs.test_support.emptyNode(1));
+            nids[i] = nid;
+            try eng.addLabel(nid, @intCast(1 + i));
+        }
+        try eng.checkpoint(); // durable barrier: each node = {1+i}.
+
+        // Deferred WAL TAIL (un-fsynced commits): adds create new slab slots +
+        // tombstone old ones; a remove drops node 0 to a single label.
+        for (0..N) |i| {
+            try eng.addLabel(nids[i], @intCast(1000 + i));
+        }
+        try eng.removeLabel(nids[0], 1); // node 0: {1000} only
+
+        eng.deinit(); // CRASH: no checkpoint/close/flush — recovery replays the
+        // deferred tail from the WAL file.
+    }
+
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try expectLabelSet(alloc, eng, nids[0], &.{1000});
+        var i: usize = 1;
+        while (i < N) : (i += 1) {
+            try expectLabelSet(alloc, eng, nids[i], &.{ @intCast(1 + i), @intCast(1000 + i) });
+        }
+        // raw var run for a tail-mutated node is intact + readable (no dangling).
+        {
+            const rec = (try eng.getNode(nids[5])).?;
+            const bytes = try eng.var_store.read(rec.label_head, alloc);
+            defer alloc.free(bytes);
+            try testing.expectEqual(@as(usize, 2 + 2 * 4), bytes.len);
+        }
+        try expectNoDanglingHeads(alloc, eng, nids[0..N]);
+    }
+}
+
+test "var-slab P4 mixed legacy+slab crash: graduated-legacy sets and slab sets both recover byte-identical" {
+    const alloc = testing.allocator;
+    var td = try TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x7B} ** 16;
+    var cfg = gs.test_support.testConfig();
+    cfg.buffer_pool_pages = 2048; // room for two graduated legacy chains + slab churn
+    const vs = gs.var_store;
+
+    const BIG: u32 = 300; // >255 labels -> block >1 KB -> graduates to a legacy chain
+    var legacy_a: u64 = 0;
+    var legacy_b: u64 = 0;
+    const S: usize = 12;
+    var slab_nodes: [S]u64 = undefined;
+    var exp_a: std.ArrayList(u32) = .empty;
+    defer exp_a.deinit(alloc);
+    var exp_b: std.ArrayList(u32) = .empty;
+    defer exp_b.deinit(alloc);
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+
+        legacy_a = try eng.allocNode();
+        try eng.putNode(legacy_a, gs.test_support.emptyNode(1));
+        legacy_b = try eng.allocNode();
+        try eng.putNode(legacy_b, gs.test_support.emptyNode(1));
+        for (&slab_nodes, 0..) |*n, i| {
+            n.* = try eng.allocNode();
+            try eng.putNode(n.*, gs.test_support.emptyNode(1));
+            try eng.addLabel(n.*, @intCast(10 + i));
+        }
+        var l: u32 = 1;
+        while (l <= BIG) : (l += 1) {
+            try eng.addLabel(legacy_a, l);
+            try exp_a.append(alloc, l);
+            try eng.addLabel(legacy_b, 10000 + l);
+            try exp_b.append(alloc, 10000 + l);
+        }
+        // Both legacy nodes graduated; every slab node stayed slab.
+        try testing.expect(!vs.isSlabHead((try eng.getNode(legacy_a)).?.label_head));
+        try testing.expect(!vs.isSlabHead((try eng.getNode(legacy_b)).?.label_head));
+        for (slab_nodes) |n| try testing.expect(vs.isSlabHead((try eng.getNode(n)).?.label_head));
+
+        try eng.checkpoint();
+
+        // ---- crash window: mutate BOTH kinds ----
+        try eng.addLabel(legacy_a, 90001);
+        try exp_a.append(alloc, 90001);
+        try eng.removeLabel(legacy_b, 10001); // 10000+1
+        _ = exp_b.orderedRemove(0);
+        for (slab_nodes, 0..) |n, i| {
+            try eng.addLabel(n, @intCast(2000 + i));
+        }
+        try eng.removeLabel(slab_nodes[0], 10); // slab node 0: drop its first label
+
+        eng.deinit(); // CRASH
+    }
+
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try expectLabelSet(alloc, eng, legacy_a, exp_a.items);
+        try expectLabelSet(alloc, eng, legacy_b, exp_b.items);
+        // legacy heads stayed legacy, slab heads stayed slab after recovery.
+        try testing.expect(!vs.isSlabHead((try eng.getNode(legacy_a)).?.label_head));
+        try testing.expect(!vs.isSlabHead((try eng.getNode(legacy_b)).?.label_head));
+        for (slab_nodes, 0..) |n, i| {
+            if (i == 0) {
+                try expectLabelSet(alloc, eng, n, &.{2000}); // 10 removed, 2000 added
+            } else {
+                try expectLabelSet(alloc, eng, n, &.{ @intCast(10 + i), @intCast(2000 + i) });
+            }
+            try testing.expect(vs.isSlabHead((try eng.getNode(n)).?.label_head));
+        }
+        var all: [S + 2]u64 = undefined;
+        all[0] = legacy_a;
+        all[1] = legacy_b;
+        for (slab_nodes, 0..) |n, i| all[2 + i] = n;
+        try expectNoDanglingHeads(alloc, eng, &all);
+    }
+}
+
+test "var-slab P4 graduation crash mid-migration: committed graduation -> legacy chain; uncommitted graduation keeps the intact slab slot (never a half-migrated dangling head)" {
+    const alloc = testing.allocator;
+    var td = try TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{0x7C} ** 16;
+    var cfg = gs.test_support.testConfig();
+    cfg.buffer_pool_pages = 2048;
+    const vs = gs.var_store;
+
+    const BIG: u32 = 300;
+    var g: u64 = 0; // graduates (committed) mid-crash-window
+    var h: u64 = 0; // graduation attempted UNCOMMITTED -> must stay slab
+    var g_slab_head: u64 = 0;
+    var h_slab_head: u64 = 0;
+    var exp_g: std.ArrayList(u32) = .empty;
+    defer exp_g.deinit(alloc);
+
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        eng.var_store.slab_packing = true;
+
+        // G and H both start as SMALL slab sets (committed + checkpointed).
+        g = try eng.allocNode();
+        try eng.putNode(g, gs.test_support.emptyNode(1));
+        try eng.addLabel(g, 1);
+        try exp_g.append(alloc, 1);
+        h = try eng.allocNode();
+        try eng.putNode(h, gs.test_support.emptyNode(1));
+        try eng.addLabel(h, 7);
+        g_slab_head = (try eng.getNode(g)).?.label_head;
+        h_slab_head = (try eng.getNode(h)).?.label_head;
+        try testing.expect(vs.isSlabHead(g_slab_head));
+        try testing.expect(vs.isSlabHead(h_slab_head));
+
+        try eng.checkpoint(); // durable: G={1} slab, H={7} slab.
+
+        // ---- crash window ----
+        // (committed) grow G past the slab threshold: putLabels graduates to a
+        // LEGACY page-chain and the engine tombstones G's old slab slot — a full
+        // slab->legacy MIGRATION living in the WAL tail.
+        var l: u32 = 2;
+        while (l <= BIG) : (l += 1) {
+            try eng.addLabel(g, l);
+            try exp_g.append(alloc, l);
+        }
+        try testing.expect(!vs.isSlabHead((try eng.getNode(g)).?.label_head)); // graduated
+        try testing.expect((try eng.getNode(g)).?.label_head != g_slab_head);
+
+        // (uncommitted) attempt the SAME graduation on H inside a txn, then DO
+        // NOT commit. The half-migration (new legacy chain + old-slot tombstone)
+        // must roll back atomically: after replay H keeps its intact slab slot.
+        {
+            const txn = try eng.beginTxn();
+            var m: u32 = 100;
+            while (m < 100 + BIG) : (m += 1) {
+                try eng.addLabelTxn(h, m, txn);
+            }
+            // NO commit.
+        }
+
+        eng.deinit(); // CRASH
+    }
+
+    {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+
+        // G: the COMPLETE legacy chain replayed; full set intact; the old slab
+        // slot is durably tombstoned (never a live half-migrated remnant).
+        {
+            const gr = (try eng.getNode(g)) orelse return error.NodeInvisible;
+            try testing.expect(!vs.isSlabHead(gr.label_head)); // legacy chain
+            try expectLabelSet(alloc, eng, g, exp_g.items);
+            try testing.expectError(error.DataCorruption, eng.var_store.read(g_slab_head, alloc));
+        }
+        // H: uncommitted graduation rolled back — head is STILL the intact slab
+        // slot with the original set, readable (no dangling half-migrated head).
+        {
+            const hr = (try eng.getNode(h)) orelse return error.NodeInvisible;
+            try testing.expectEqual(h_slab_head, hr.label_head);
+            try testing.expect(vs.isSlabHead(hr.label_head));
+            try expectLabelSet(alloc, eng, h, &.{7});
+        }
+        try expectNoDanglingHeads(alloc, eng, &.{ g, h });
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
