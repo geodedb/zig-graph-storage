@@ -1332,6 +1332,117 @@ pub const GraphEngine = struct {
         return self.tail_pre_recovery_lsn;
     }
 
+    /// G1. Resolve the recovery tail-affected PAGE set captured by Path B
+    /// (`tail_affected_pages`) to the OWNING node ids, for an external derived
+    /// index that reconciles the bounded WAL tail after a crash reopen.
+    ///
+    /// Returns an owned, ascending, deduped slice (caller frees with
+    /// `allocator.free`). An EMPTY slice is the "no bounded reconcile" sentinel
+    /// — see `resolveTailAffectedNodeIds` for exactly when. The empty-on-doubt
+    /// discipline mirrors Path B: NEVER return a partial set that looks
+    /// complete (a missed node ⇒ a stale external index ⇒ silently-wrong query
+    /// results).
+    ///
+    /// LIFECYCLE: reads `tail_affected_pages` without consuming it, but gs's
+    /// own lazy derived hydration frees that set on first access — so the
+    /// external reconcile MUST call this after open() and BEFORE the first
+    /// accessor that triggers derived hydration.
+    pub fn tailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) ![]NodeId {
+        return (try self.resolveTailAffectedNodeIds(allocator)) orelse
+            try allocator.alloc(NodeId, 0);
+    }
+
+    /// G1 core (also the per-shard primitive the ShardedGraphEngine aggregate
+    /// consumes). Three outcomes:
+    ///   * `null`  — a full REBUILD is required: a committed tail advanced the
+    ///     durable frontier but the affected-page capture is unavailable
+    ///     (overflow / capture off → `tail_affected_pages` null while
+    ///     `had_tail`), OR the tail touched props pages this engine cannot
+    ///     soundly attribute to a node (props limitation below).
+    ///   * non-null EMPTY — nothing to reconcile (a clean reopen: no committed
+    ///     tail; or a tail that touched no node-owning pages).
+    ///   * non-null non-empty — the resolved (super)set of affected node ids.
+    /// The `null` vs empty distinction lets the sharded aggregate poison the
+    /// whole result on any single shard that needs a rebuild without confusing
+    /// it with a clean shard.
+    ///
+    /// SOUNDNESS. NODES-page entries decode directly to node ids by the SAME
+    /// page→node slot arithmetic reconcileOneNode uses
+    /// (`node_id = page_id*nodes_per_page + slot`); every allocated slot on an
+    /// affected nodes page is included (live AND tombstoned — a deleted node's
+    /// external postings must be evicted). A nodes page is shared by
+    /// nodes_per_page nodes and the WAL granularity is the whole page, so the
+    /// set is a harmless SUPERSET (re-deriving an unchanged page-mate is a
+    /// no-op for the caller).
+    ///
+    /// PROPS-page limitation (reported precisely). An IN-PLACE property value
+    /// mutation rewrites ONLY the props page (putPropertyTxnImpl logs `.props`,
+    /// never the node record) so the changed node is on NO tail nodes page. A
+    /// props page is a SLAB shared by many nodes; a slab blob stores no owner
+    /// back-reference and gs has no persisted prop_head→node reverse map, so a
+    /// props page cannot be attributed to its changed node in bounded time.
+    /// We therefore VERIFY, for every LIVE slab slot on every tail props page,
+    /// that its prop_head is already owned by a node in the nodes-page set
+    /// (heads are unique per node). If any live slot's head is unrecognised —
+    /// a pure in-place value change, a slab-shared co-resident outside the set,
+    /// or a non-slab legacy chain page — the tail is not soundly attributable
+    /// → `null` (rebuild). Bounded props reconcile (the ingest case) requires
+    /// a persisted prop_head→node reverse map, a follow-up beyond this API.
+    pub fn resolveTailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) !?[]NodeId {
+        const had_tail = self.manifest.last_checkpoint_lsn > self.tail_pre_recovery_lsn;
+        const pages = self.tail_affected_pages orelse {
+            // No captured set: a committed tail with no capture (overflow /
+            // off) → rebuild; a clean reopen (no tail) → nothing to reconcile.
+            if (had_tail) return null;
+            return try allocator.alloc(NodeId, 0);
+        };
+
+        // Pass 1 — nodes pages → node-id set N and the set of N's current
+        // prop_heads (used to attribute tail props pages in pass 2).
+        var node_set: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
+        defer node_set.deinit(allocator);
+        var head_set: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer head_set.deinit(allocator);
+        const npp = self.node_store.nodes_per_page;
+        const max_node = self.manifest.next_node_id;
+        for (pages) |p| {
+            if (p.file_id != .nodes) continue;
+            var slot: u64 = 0;
+            while (slot < npp) : (slot += 1) {
+                const node_id = p.page_id * npp + slot;
+                if (node_id >= max_node) break;
+                const rec = (try self.node_store.getRawSlot(node_id)) orelse continue;
+                try node_set.put(allocator, node_id, {});
+                if (rec.prop_head != 0) try head_set.put(allocator, rec.prop_head, {});
+            }
+        }
+
+        // Pass 2 — props pages: every LIVE slab slot must be owned by a node
+        // already in N, else the tail is not soundly attributable → rebuild.
+        for (pages) |p| {
+            if (p.file_id != .props) continue;
+            const Ctx = struct { heads: *std.AutoHashMapUnmanaged(u64, void), ok: bool };
+            var ctx = Ctx{ .heads = &head_set, .ok = true };
+            self.prop_store.forEachSlabSlotOnPage(p.page_id, &ctx, struct {
+                fn f(c: *Ctx, prop_head: u64, live: bool) anyerror!void {
+                    if (live and !c.heads.contains(prop_head)) c.ok = false;
+                }
+            }.f) catch |e| switch (e) {
+                error.NotSlabPage => return null, // legacy/undecodable page → rebuild
+                else => return e,
+            };
+            if (!ctx.ok) return null; // in-place / shared co-resident → rebuild
+        }
+
+        const out = try allocator.alloc(NodeId, node_set.count());
+        errdefer allocator.free(out);
+        var it = node_set.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) out[i] = k.*;
+        std.mem.sort(NodeId, out, {}, std.sort.asc(NodeId));
+        return out;
+    }
+
     /// Get a GraphStorage interface backed by this engine.
     pub fn storage(self: *GraphEngine) GraphStorage {
         return GraphStorage.init(GraphEngine, self);

@@ -436,6 +436,36 @@ pub const ShardedGraphEngine = struct {
         return self.shards[index];
     }
 
+    /// G1. Resolve the recovery tail-affected page set to the OWNING node ids
+    /// across ALL shards, deduped and ascending (caller frees). An EMPTY slice
+    /// is the "full rebuild" / "nothing to reconcile" sentinel.
+    ///
+    /// SOUNDNESS across shards: if ANY shard requires a rebuild (its capture
+    /// overflowed/was off, or its tail touched props pages it cannot attribute
+    /// — see `GraphEngine.resolveTailAffectedNodeIds`) the WHOLE result is
+    /// empty, because a partial cross-shard set would look complete and leave
+    /// the external index silently stale on the un-reconciled shard. Shards
+    /// with no committed tail contribute nothing (not a rebuild signal).
+    pub fn tailAffectedNodeIds(self: *ShardedGraphEngine, allocator: Allocator) ![]NodeId {
+        var set: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
+        defer set.deinit(allocator);
+        for (self.shards) |eng| {
+            const ids = (try eng.resolveTailAffectedNodeIds(allocator)) orelse
+                // A shard needs a full rebuild → the external index must
+                // rebuild wholesale; never return a partial cross-shard set.
+                return try allocator.alloc(NodeId, 0);
+            defer allocator.free(ids);
+            for (ids) |id| try set.put(allocator, id, {});
+        }
+        const out = try allocator.alloc(NodeId, set.count());
+        errdefer allocator.free(out);
+        var it = set.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) out[i] = k.*;
+        std.mem.sort(NodeId, out, {}, std.sort.asc(NodeId));
+        return out;
+    }
+
     pub fn getNode(self: *ShardedGraphEngine, id: NodeId) anyerror!?NodeRec {
         return self.shards[shard_count_mod.shardOfNode(id)].getNode(id);
     }

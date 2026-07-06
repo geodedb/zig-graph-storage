@@ -1893,3 +1893,138 @@ test "PHASE G G2: getters reflect manifest + recovery state across checkpoint an
     try testing.expectEqual(epoch_after_ckpt, engine.checkpointEpoch());
     try testing.expectEqual(durable_after_ckpt, engine.preRecoveryFrontierLsn());
 }
+
+// ============================================================================
+// PHASE G — crash-reopen exact-index reconcile: tailAffectedNodeIds (G1).
+// Resolve the Path-B tail-affected page set to owning node ids; empty is the
+// "full rebuild / nothing to reconcile" sentinel. ADDITIVE; pure reads.
+// ============================================================================
+
+test "PHASE G G1: tailAffectedNodeIds resolves a nodes-page tail to exactly the affected node ids" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x47} ** 16;
+    const cfg = testConfig();
+
+    var new_ids: [3]NodeId = undefined;
+    {
+        // Session 1: fill nodes page 0 exactly, checkpoint (durable), close —
+        // so page 0 is NOT in the crash tail and new nodes start a fresh page.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const npp = engine.node_store.nodes_per_page;
+        var created: u64 = 0;
+        while (created < npp - 1) : (created += 1) {
+            const id = try engine.allocNode();
+            try engine.putNode(id, test_support.emptyNode(1));
+        }
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2: create 3 NEW nodes on the fresh page (the tail), CRASH
+        // (deinit — no checkpoint).
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        for (&new_ids) |*nid| {
+            const id = try engine.allocNode();
+            try engine.putNode(id, test_support.emptyNode(2));
+            nid.* = id;
+        }
+        engine.deinit();
+    }
+    // Session 3: reopen (capture on) → the tail-affected node ids are exactly
+    // the 3 new nodes (their page holds only them).
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    defer testing.allocator.free(got);
+    std.mem.sort(NodeId, &new_ids, {}, std.sort.asc(NodeId));
+    try testing.expectEqualSlices(NodeId, &new_ids, got);
+}
+
+test "PHASE G G1: tailAffectedNodeIds is empty on a clean reopen (no tail)" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x48} ** 16;
+    const cfg = testConfig();
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(1));
+        try engine.checkpoint();
+        try engine.close();
+    }
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    // Clean reopen: pre-recovery frontier == durable frontier, no captured tail.
+    try testing.expectEqual(engine.durableFrontierLsn(), engine.preRecoveryFrontierLsn());
+    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "PHASE G G1: tailAffectedNodeIds is empty when the tail capture is unavailable (overflow)" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x49} ** 16;
+    const cfg = testConfig();
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(1));
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(2));
+        engine.deinit(); // crash with a committed tail
+    }
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    // A committed tail advanced the durable frontier past the pre-recovery one.
+    try testing.expect(engine.durableFrontierLsn() > engine.preRecoveryFrontierLsn());
+    try testing.expect(engine.tail_affected_pages != null);
+    // Simulate an overflowed / absent capture: drop the captured set while the
+    // frontier still shows a tail was applied → must fall back to full rebuild.
+    testing.allocator.free(engine.tail_affected_pages.?);
+    engine.tail_affected_pages = null;
+    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "PHASE G G1: an in-place property value change (props-only tail) forces rebuild (empty)" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4A} ** 16;
+    const cfg = testConfig();
+    {
+        // Session 1: node 1 with a fixed-size property; checkpoint; close.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        var rec = test_support.emptyNode(1);
+        rec.prop_head = try engine.putProperty(0, "k", .{ .int = 1 });
+        try engine.putNode(id, rec);
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2: IN-PLACE value change (same key, same-size i64) rewrites
+        // ONLY the props page, never node 1's record → node 1 is on NO tail
+        // nodes page. Crash.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const rec = (try engine.getNode(1)).?;
+        const new_head = try engine.putProperty(rec.prop_head, "k", .{ .int = 2 });
+        try testing.expectEqual(rec.prop_head, new_head); // in-place: head unchanged
+        engine.deinit();
+    }
+    // Session 3: the tail touched a props page whose changed node is on no
+    // nodes page → cannot be soundly attributed → empty (rebuild).
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try testing.expect(engine.tail_affected_pages != null);
+    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}

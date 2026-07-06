@@ -482,3 +482,62 @@ test "ShardedGraphEngine: 16 concurrent shard checkpoints complete on a 4-worker
         }
     }
 }
+
+// ============================================================================
+// PHASE G — crash-reopen exact-index reconcile: ShardedGraphEngine G1 aggregate.
+// ============================================================================
+
+test "PHASE G G1: ShardedGraphEngine tailAffectedNodeIds unions per-shard node ids and poisons on rebuild" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x51} ** 16;
+    const cfg = test_support.testConfig();
+
+    {
+        // Session 1: empty graph, close (durable baseline).
+        var eng = try sharded_engine_mod.ShardedGraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try eng.close();
+    }
+
+    const K = 6;
+    var tail_ids: [K]u64 = undefined;
+    {
+        // Session 2: create K bare nodes (round-robined across distinct shards)
+        // as the committed tail, then CRASH. Nothing pre-existed, so each
+        // touched shard page holds only its own tail node.
+        var eng = try sharded_engine_mod.ShardedGraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        for (&tail_ids) |*tid| {
+            const id = try eng.allocNode();
+            try eng.putNode(id, test_support.emptyNode(2));
+            tid.* = id;
+        }
+        eng.deinit();
+    }
+
+    // Session 3: reopen (per-shard capture on).
+    var eng = try sharded_engine_mod.ShardedGraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer eng.deinit();
+
+    // Aggregate G1: exactly the K tail ids, deduped + ascending across shards.
+    {
+        const got = try eng.tailAffectedNodeIds(testing.allocator);
+        defer testing.allocator.free(got);
+        std.mem.sort(u64, &tail_ids, {}, std.sort.asc(u64));
+        try testing.expectEqualSlices(u64, &tail_ids, got);
+    }
+
+    // G2 per-shard access: the shard owning a tail node advanced its durable
+    // frontier past its pre-recovery frontier (a tail replayed there).
+    try testing.expectEqual(shard_count_mod.SHARD_COUNT, eng.shardCount());
+    const owner = eng.shard(shard_count_mod.shardOfNode(tail_ids[0]));
+    try testing.expect(owner.durableFrontierLsn() > owner.preRecoveryFrontierLsn());
+
+    // Poison: if ANY shard needs a rebuild (its capture unavailable while a
+    // tail was applied), the WHOLE aggregate is empty — never a partial set.
+    try testing.expect(owner.tail_affected_pages != null);
+    testing.allocator.free(owner.tail_affected_pages.?);
+    owner.tail_affected_pages = null;
+    const poisoned = try eng.tailAffectedNodeIds(testing.allocator);
+    defer testing.allocator.free(poisoned);
+    try testing.expectEqual(@as(usize, 0), poisoned.len);
+}
