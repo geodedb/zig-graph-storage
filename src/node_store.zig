@@ -57,6 +57,25 @@ pub const NodeStore = struct {
         return rec;
     }
 
+    /// WAL-aware derived-index tail reconcile: read a node record INCLUDING a
+    /// DELETED one (unlike `getNode`, which returns null for deleted). Returns
+    /// null only for an unallocated page or a genuinely empty slot. The caller
+    /// classifies via `node_mod.isDeleted`. deleteNode never cascades (labels,
+    /// props, out-adjacency stay intact), so a deleted record's head pointers
+    /// are still safe to walk when un-deriving its stale index entries.
+    pub fn getRawSlot(self: *NodeStore, node_id: NodeId) !?NodeRec {
+        const page_id = self.pageForNode(node_id);
+        if (!self.free_space.isAllocated(page_id)) return null;
+
+        const frame = try self.buffer_pool.pin(.nodes, page_id);
+        defer self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
+
+        const data = frame.dataSlice();
+        const rec = std.mem.bytesToValue(NodeRec, data[self.slotOffset(node_id)..][0..@sizeOf(NodeRec)]);
+        if (node_mod.isEmpty(&rec)) return null;
+        return rec; // may be DELETED — caller checks node_mod.isDeleted
+    }
+
     /// Write a node record at the given ID.
     /// Allocates the page via free_space if needed.
     pub fn putNode(self: *NodeStore, node_id: NodeId, rec: NodeRec) !void {

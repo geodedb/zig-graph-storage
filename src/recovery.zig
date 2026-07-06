@@ -121,6 +121,36 @@ pub const Recovery = struct {
     replayed_node_delta: i64 = 0,
     replayed_edge_delta: i64 = 0,
 
+    /// WAL-aware derived-index durability Phase 3 (tail reconcile): the set of
+    /// (file_id, page_id) pairs this recovery APPLIED via committed page_update
+    /// records — the bounded tail-affected page set. The engine copies it out
+    /// at OPEN and, at first-access derived-index hydration, reconciles ONLY
+    /// these pages into the loaded snapshot instead of rebuilding O(graph).
+    /// Keyed `(file_id << 64) | page_id`; deduplicated; bounded by the tail LSN
+    /// range. `affected_pages_overflow` latches on an OOM insert so the engine
+    /// falls back to a full rebuild (a partial set would reconcile incorrectly).
+    affected_pages: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    affected_pages_overflow: bool = false,
+    /// The DURABLE committed frontier (`manifest.last_checkpoint_lsn`) as it
+    /// stood in the selected manifest BEFORE this recovery replayed anything —
+    /// i.e. the LSN this Recovery instance STARTED replaying from (start_lsn-1).
+    /// The tail reconcile is only valid when the on-disk derived-index
+    /// snapshot's `covered_lsn` EQUALS this: then the ONLY committed records
+    /// past the snapshot are THIS session's recovery slice, which
+    /// `affected_pages` captured completely. If a PRIOR recovery advanced the
+    /// frontier past the snapshot WITHOUT re-persisting it (multi-crash, no
+    /// checkpoint between), the snapshot's covered_lsn is < this and the
+    /// captured set is only the LATEST slice → the engine must full-rebuild, not
+    /// partial-reconcile (else the earlier tail's committed mutations are
+    /// silently dropped from the derived indexes though they are durable in the
+    /// primary stores).
+    pre_recovery_last_checkpoint_lsn: u64 = 0,
+    /// Opt-in: only the standalone engine open path (which reconciles the tail
+    /// into its loaded derived-index snapshot) sets this true and `deinit()`s
+    /// the map. Every other recover() caller (unit tests, sharded/other paths
+    /// that rebuild) leaves it false → no allocation, no ownership to free.
+    capture_affected_pages: bool = false,
+
     pub fn init(allocator: Allocator, encryption_key: ?[32]u8) Recovery {
         return .{
             .allocator = allocator,
@@ -139,6 +169,30 @@ pub const Recovery = struct {
             // teardown, not a cryptographic algorithm operation.
             std.crypto.secureZero(u8, key);
         }
+        self.affected_pages.deinit(self.allocator);
+    }
+
+    /// Phase 3 tail reconcile: record a (file_id, page_id) that replay applied
+    /// from a committed page_update. Best-effort — an OOM latches
+    /// `affected_pages_overflow` so the engine rebuilds instead of reconciling
+    /// from an incomplete set (an under-count would leave stale index entries).
+    fn recordAffectedPage(self: *Recovery, file_id: FileId, page_id: u64) void {
+        if (!self.capture_affected_pages) return;
+        const key: u128 = (@as(u128, @intFromEnum(file_id)) << 64) | page_id;
+        self.affected_pages.put(self.allocator, key, {}) catch {
+            self.affected_pages_overflow = true;
+        };
+    }
+
+    /// Number of distinct tail-affected pages (test/observability).
+    pub fn affectedPageCount(self: *const Recovery) usize {
+        return self.affected_pages.count();
+    }
+
+    /// True when (file_id, page_id) is in the tail-affected set (test helper).
+    pub fn hasAffectedPage(self: *const Recovery, file_id: FileId, page_id: u64) bool {
+        const key: u128 = (@as(u128, @intFromEnum(file_id)) << 64) | page_id;
+        return self.affected_pages.contains(key);
     }
 
     /// Recover a graph from its directory.
@@ -185,6 +239,13 @@ pub const Recovery = struct {
         if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
             return error.UuidMismatch;
         }
+
+        // Tail-reconcile validity: record the durable committed frontier BEFORE
+        // this recovery advances it (line ~572). The reconcile is only correct
+        // when the snapshot's covered_lsn == this value (see the field doc); a
+        // prior un-checkpointed recovery would leave covered_lsn strictly below
+        // it, and our captured affected-page set would be only the latest slice.
+        self.pre_recovery_last_checkpoint_lsn = m.last_checkpoint_lsn;
 
         // Validate manifest format version compatibility
         var upgraded_from_v2 = false;
@@ -353,6 +414,12 @@ pub const Recovery = struct {
                 ctx.applied_committed_pages.* = true;
 
                 const file_id: FileId = std.enums.fromInt(FileId, rec.file_id) orelse return error.InvalidFormat;
+
+                // Phase 3 tail reconcile: record the applied (file_id, page_id)
+                // so the engine can reconcile ONLY the tail-touched pages into
+                // the loaded derived-index snapshot at first-access hydration.
+                ctx.recovery.recordAffectedPage(file_id, rec.page_id);
+
                 const frame = try ctx.buffer_pool.pinNew(file_id, rec.page_id);
                 const frame_idx = ctx.buffer_pool.frameIndex(frame);
                 const data = frame.dataSlice();
@@ -984,6 +1051,74 @@ test "recovery with committed transaction: changes visible after recovery" {
     try testing.expect(all_match);
 }
 
+test "Phase 3 Task 3.1: replay records the tail-affected (file_id,page_id) set" {
+    // A committed 3-page tail → recovery's affected-page set == exactly those
+    // 3 pages (dedup, bounded by the tail). The engine copies this at OPEN and
+    // reconciles only these pages into the loaded derived-index snapshot at
+    // first access, instead of an O(graph) rebuild.
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+
+    var begin_rec = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&begin_rec);
+
+    var page_data: [4096]u8 = undefined;
+    @memset(&page_data, 0xAB);
+    // Three distinct pages on the nodes file: 1, 2, 3. Page 2 is written TWICE
+    // to prove dedup (the affected set counts distinct pages, not records).
+    const page_ids = [_]u64{ 1, 2, 2, 3 };
+    for (page_ids) |pid| {
+        var update_rec = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .page_update, .file_id = @intFromEnum(FileId.nodes), .page_id = pid, .payload = &page_data, .checksum = 0 };
+        _ = try wal.appendRecord(&update_rec);
+    }
+
+    var commit_rec = WalRecord{ .lsn = 0, .txn_id = 3, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &[_]u8{}, .checksum = 0 };
+    _ = try wal.appendRecord(&commit_rec);
+    try wal.sync();
+    wal.deinit();
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    defer recovery.deinit();
+    recovery.capture_affected_pages = true;
+    _ = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    // Exactly 3 DISTINCT pages, all on the nodes file, no overflow.
+    try testing.expect(!recovery.affected_pages_overflow);
+    try testing.expectEqual(@as(usize, 3), recovery.affectedPageCount());
+    try testing.expect(recovery.hasAffectedPage(.nodes, 1));
+    try testing.expect(recovery.hasAffectedPage(.nodes, 2));
+    try testing.expect(recovery.hasAffectedPage(.nodes, 3));
+    // A page NOT in the tail is absent.
+    try testing.expect(!recovery.hasAffectedPage(.nodes, 4));
+    try testing.expect(!recovery.hasAffectedPage(.props, 1));
+}
+
 test "GAP-0030: recovery replays a large committed WAL tail" {
     const allocator = testing.allocator;
     var setup = try setupTestGraph(allocator);
@@ -1351,6 +1486,87 @@ test "downgrade gate: recovery rejects a v3-format manifest (v4 required)" {
     var recovery = Recovery.init(allocator, null);
     const result = recovery.recover(&setup.graph_dir, &pool, &fm);
     try testing.expectError(error.IncompatibleVersion, result);
+}
+
+test "GAP-0053 v3-upgrade integration: a real 176-byte V3 store opens and migrates to V4 on checkpoint" {
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    // A store EXACTLY as a pre-v0.2.29 (V3) binary left it: a 176-byte manifest
+    // with no checkpoint_epoch. graph_uuid MUST match the graph dir or recovery
+    // rejects it with UuidMismatch before the version gate is reached.
+    var v3 = Manifest{
+        .graph_uuid = setup.graph_dir.graph_uuid,
+        .page_size = 4096,
+        .counter = 5,
+        .next_node_id = 4242,
+        .node_count = 77,
+    };
+    v3.format_version = manifest_mod.MANIFEST_VERSION_V3;
+
+    // Write the RAW V3 bytes (writeToFile would emit the 184-byte V4 layout —
+    // we need the real on-disk V3 format the old binary produced).
+    const v3_bytes = try manifest_mod.serializeV3Legacy(allocator, v3, null);
+    defer allocator.free(v3_bytes);
+    try testing.expectEqual(@as(usize, 176), v3_bytes.len);
+
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = try std.Io.Dir.cwd().createFile(io, path_a, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, v3_bytes);
+        try f.sync(io);
+        try testing.expectEqual(@as(u64, 176), try f.length(io));
+    }
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 16);
+    defer pool.deinit();
+
+    // 1) The graph OPENS (the brick is fixed) and the V3 manifest is upgraded:
+    //    version bumped to V4, every field preserved, checkpoint_epoch = 0.
+    var recovery = Recovery.init(allocator, null);
+    var recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
+    try testing.expectEqual(manifest_mod.MANIFEST_VERSION, recovered.format_version);
+    try testing.expectEqual(@as(u64, 4242), recovered.next_node_id);
+    try testing.expectEqual(@as(u64, 77), recovered.node_count);
+    try testing.expectEqual(@as(u64, 0), recovered.checkpoint_epoch);
+
+    // 2) A checkpoint MIGRATES the store to V4 on disk. Drive TWO checkpoints so
+    //    BOTH A/B slots flip (each checkpoint writes the alternate slot).
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
+    var wal = try WalManager.init(allocator, wal_dir, setup.graph_dir.graph_uuid, 0, .{});
+    defer wal.deinit();
+
+    var cp = Checkpointer.init(allocator, &pool, &wal, &recovered, &fm, &setup.graph_dir);
+    try cp.doCheckpoint(); // writes slot .b as V4 (last_slot starts at .a)
+    try cp.doCheckpoint(); // writes slot .a as V4
+
+    // BOTH slots are now valid 184-byte V4 manifests with the fields preserved.
+    for ([_]GraphDir.ManifestSlot{ .a, .b }) |slot| {
+        const p = try setup.graph_dir.manifestPath(allocator, slot);
+        defer allocator.free(p);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = try std.Io.Dir.cwd().openFile(io, p, .{});
+        defer f.close(io);
+        try testing.expectEqual(@as(u64, 184), try f.length(io));
+        const on_disk = (try Manifest.readFromFile(allocator, p)) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(manifest_mod.MANIFEST_VERSION, on_disk.format_version);
+        try testing.expectEqual(@as(u64, 4242), on_disk.next_node_id);
+    }
+    // Epoch advanced 0 -> 1 -> 2 across the two checkpoints (never false-matches
+    // a pre-upgrade derived snapshot, which had no epoch stamp at all).
+    try testing.expectEqual(@as(u64, 2), recovered.checkpoint_epoch);
 }
 
 test "GAP-ENT-0024 F1: freshly written manifests carry version 4" {

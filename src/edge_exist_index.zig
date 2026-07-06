@@ -371,6 +371,31 @@ pub const EdgeExistenceIndex = struct {
         return out[0..n];
     }
 
+    /// WAL-aware derived-index tail reconcile: visit every BASE (snapshot)
+    /// record whose `from == from` exactly once, via a range scan over the
+    /// sorted base (records are ordered by (from, to, rel_type, edge_id), so a
+    /// from-run is contiguous). Tombstoned base records are skipped. Overlay
+    /// records are NOT visited — at first-access reconcile the overlay is empty
+    /// (the snapshot was just adopted as the base with no writes yet), so the
+    /// base holds ALL of `from`'s snapshot out-edges. This lets the reconcile
+    /// enumerate a node's OLD out-edges (to remove the stale ones) without an
+    /// O(graph) scan. No-op when there is no base (resident-mode rebuild path).
+    pub fn forEachBaseFrom(
+        self: *EdgeExistenceIndex,
+        from: NodeId,
+        ctx: anytype,
+        comptime f: fn (@TypeOf(ctx), rel_type: u32, to: NodeId, edge_id: EdgeId) anyerror!void,
+    ) !void {
+        const b = if (self.base) |*ptr| ptr else return;
+        var i = try self.baseLowerBound(.{ .from = from, .to = 0, .rel_type = 0, .edge_id = 0 });
+        while (i < b.record_count) : (i += 1) {
+            const rec = decodeRecord(try b.recordAt(i));
+            if (rec.from != from) break;
+            if (self.tombstones.contains(rec)) continue;
+            try f(ctx, rec.rel_type, rec.to, rec.edge_id);
+        }
+    }
+
     /// Preallocate for an expected number of distinct keys (rebuild/load hint).
     pub fn ensureTotalCapacity(self: *EdgeExistenceIndex, n: u32) !void {
         try self.primary.ensureTotalCapacity(self.allocator, n);
@@ -488,7 +513,7 @@ fn writeExistBase(tmp: *std.testing.TmpDir, name: []const u8, recs: []const Exis
         encodeRecord(payload[i * RECORD_SIZE ..][0..RECORD_SIZE], r);
     }
     snapshot.sortRecords(payload, RECORD_SIZE, recordLess);
-    try snapshot.write(std.testing.allocator, file, TEST_BASE_MAGIC, 3, RECORD_SIZE, payload);
+    try snapshot.write(std.testing.allocator, file, TEST_BASE_MAGIC, 3, 0, RECORD_SIZE, payload);
     return file;
 }
 

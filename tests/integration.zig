@@ -167,18 +167,21 @@ test "integration: corrupt edges.idx snapshot triggers index rebuild (SEC-0051)"
         try eng.close();
     }
 
-    // Corrupt one payload byte of the persisted edge index snapshot, leaving the
-    // magic + checkpoint_counter header intact so staleness gating still passes.
+    // Corrupt the persisted edge index snapshot so the loader must reject it and
+    // rebuild. edges.idx is the SORTED mmap container; offset 24 is the
+    // record_count header field (magic(8) + checkpoint_epoch(8) + covered_lsn(8)
+    // = 24), which is covered by both the layout equation and the eager meta-CRC
+    // — corrupting it is rejected at load (InvalidFormat/ChecksumMismatch) →
+    // clean rebuild from durable adjacency.
     {
         const io = gs_io();
         const f = try std.Io.Dir.cwd().openFile(io, edges_idx_path, .{ .mode = .read_write });
         defer f.close(io);
-        // magic(8) + checkpoint_counter(8) + item_count(8) = first payload byte at 24.
-        const payload_off: u64 = 24;
+        const corrupt_off: u64 = 24;
         var orig: [1]u8 = undefined;
-        _ = try f.readPositionalAll(io, &orig, payload_off);
+        _ = try f.readPositionalAll(io, &orig, corrupt_off);
         const flipped: [1]u8 = .{orig[0] ^ 0xFF};
-        try f.writePositionalAll(io, &flipped, payload_off);
+        try f.writePositionalAll(io, &flipped, corrupt_off);
     }
 
     // Phase 2: reopen — corrupt snapshot must be rejected and rebuilt.

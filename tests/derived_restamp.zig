@@ -61,17 +61,18 @@ fn readFileBytes(allocator: Allocator, path: []const u8) ![]u8 {
     return buf;
 }
 
-/// Assert `path` changed ONLY in the counter bytes [8,16) and the trailing
-/// `trailer_len` bytes — the on-disk shape of a cheap header restamp.
-fn expectOnlyCounterAndTrailerChanged(before: []const u8, after: []const u8, trailer_len: usize) !void {
+/// Assert `path` changed ONLY in the 16 stamp bytes [8,24) (checkpoint_epoch ++
+/// covered_lsn) and the trailing `trailer_len` bytes — the on-disk shape of a
+/// cheap header restamp under the WAL-aware two-stamp header.
+fn expectOnlyStampsAndTrailerChanged(before: []const u8, after: []const u8, trailer_len: usize) !void {
     try testing.expectEqual(before.len, after.len);
     try testing.expectEqualSlices(u8, before[0..8], after[0..8]);
     try testing.expectEqualSlices(
         u8,
-        before[16 .. before.len - trailer_len],
-        after[16 .. after.len - trailer_len],
+        before[24 .. before.len - trailer_len],
+        after[24 .. after.len - trailer_len],
     );
-    try testing.expect(!std.mem.eql(u8, before[8..16], after[8..16]));
+    try testing.expect(!std.mem.eql(u8, before[8..24], after[8..24]));
 }
 
 const Fixture = struct {
@@ -171,7 +172,7 @@ test "P2: edges-only session restamps clean label/prop; next open LOADS derived 
     }
 }
 
-test "P2: dirty label SAVED (never restamped); clean edge snapshot restamped by exactly 12 bytes; live base keeps serving" {
+test "P2: dirty label SAVED (never restamped); clean edge snapshot restamped by only the stamp+trailer bytes; live base keeps serving" {
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xE2} ** 16;
@@ -226,7 +227,7 @@ test "P2: dirty label SAVED (never restamped); clean edge snapshot restamped by 
     }
 
     // On-disk shapes: label fully rewritten (content changed — it MUST NOT
-    // have been restamped); prop + edge changed by ONLY counter + trailer.
+    // have been restamped); prop + edge changed by ONLY the stamps + trailer.
     const label_after = try readFileBytes(testing.allocator, label_path);
     defer testing.allocator.free(label_after);
     const prop_after = try readFileBytes(testing.allocator, prop_path);
@@ -235,9 +236,9 @@ test "P2: dirty label SAVED (never restamped); clean edge snapshot restamped by 
     defer testing.allocator.free(edge_after);
 
     // Legacy container trailer = 4-byte whole-file CRC.
-    try expectOnlyCounterAndTrailerChanged(prop_before, prop_after, 4);
+    try expectOnlyStampsAndTrailerChanged(prop_before, prop_after, 4);
     // Sorted container trailer = 4-byte meta-CRC.
-    try expectOnlyCounterAndTrailerChanged(edge_before, edge_after, 4);
+    try expectOnlyStampsAndTrailerChanged(edge_before, edge_after, 4);
     // The dirty label snapshot was re-serialized: same-length-and-payload
     // would mean the new label never reached disk.
     try testing.expect(label_after.len != label_before.len or

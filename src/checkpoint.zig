@@ -84,6 +84,13 @@ pub const Checkpointer = struct {
         // 4. Update manifest
         self.manifest.last_checkpoint_lsn = checkpoint_lsn;
         self.manifest.counter += 1;
+        // Advance the durable derived-index freshness epoch. This is the ONLY
+        // site that touches checkpoint_epoch — recovery.zig:recover leaves it
+        // unchanged when it replays a WAL tail (it bumps `counter` for A/B
+        // freshness and overwrites `last_checkpoint_lsn`, but NOT the epoch), so
+        // a snapshot stamped at epoch E stays valid-as-of its covered LSN across
+        // a pure tail recovery.
+        self.manifest.checkpoint_epoch += 1;
 
         // 5. Write manifest to the alternate slot
         const next_slot: GraphDir.ManifestSlot = switch (self.last_slot) {

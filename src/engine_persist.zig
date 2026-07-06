@@ -318,6 +318,13 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.var_store.tail_reserve = self.prop_store.tail_reserve;
     self.var_store.slab_packing = false;
 
+    // GAP adjacency slab packing (P2): opt-in per config. New small chains on
+    // all three adjacency stores pack into shared slab blocks. Reads stay
+    // slab-aware regardless (read-both), so toggling this never strands data.
+    self.adj_out.slab_packing = cfg.adjacency_slab_packing;
+    self.adj_in.slab_packing = cfg.adjacency_slab_packing;
+    self.adj_in_remote.slab_packing = cfg.adjacency_slab_packing;
+
     // Label dictionary, label store, and label index
     self.label_dict = LabelDictionary.init(allocator);
     errdefer self.label_dict.deinit();
@@ -450,12 +457,17 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
         property_was_dirty = engine.property_index_dirty;
         edge_was_dirty = engine.edge_index_dirty;
         edge_exist_was_dirty = engine.edge_exist_index_dirty;
+        // WAL-aware durability: doCheckpoint (above) set
+        // manifest.last_checkpoint_lsn to the LSN this checkpoint covered;
+        // stamp the derived-index snapshots with it (paired with the advanced
+        // checkpoint_epoch) so the next open's epoch gate can detect a tail.
         try engine_index.saveDerivedIndexesConditional(
             engine,
             label_was_dirty,
             property_was_dirty,
             edge_was_dirty,
             edge_exist_was_dirty,
+            engine.manifest.last_checkpoint_lsn,
         );
         engine.label_index_dirty = false;
         engine.property_index_dirty = false;
@@ -511,7 +523,7 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     // anywhere before or during the restamps leaves each not-yet-restamped
     // file counter-stale (→ rebuild, safe) and a torn restamp is rejected by
     // the format's integrity check (→ rebuild, safe); see the per-format
-    // restampCounter docs for the exact torn-write analysis.
+    // restampStamps docs for the exact torn-write analysis.
     //
     // Gated on derived_snapshots_trusted: only when the clean snapshots are
     // KNOWN content-current for this session (established by create(), a
@@ -529,6 +541,7 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
                 !property_was_dirty,
                 !edge_was_dirty,
                 !edge_exist_was_dirty,
+                engine.manifest.last_checkpoint_lsn,
             );
         } else if (label_was_dirty and property_was_dirty and edge_was_dirty and edge_exist_was_dirty) {
             engine.derived_snapshots_trusted = true;

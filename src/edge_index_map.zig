@@ -274,7 +274,7 @@ fn writeBaseSnapshot(tmp: *std.testing.TmpDir, name: []const u8, ids: []const u6
         encodeRecord(payload[i * RECORD_SIZE ..][0..RECORD_SIZE], id, testEntry(id));
     }
     snapshot.sortRecords(payload, RECORD_SIZE, recordLess);
-    try snapshot.write(t.allocator, file, TEST_MAGIC, 7, RECORD_SIZE, payload);
+    try snapshot.write(t.allocator, file, TEST_MAGIC, 7, 0, RECORD_SIZE, payload);
     return file;
 }
 

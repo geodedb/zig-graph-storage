@@ -73,8 +73,19 @@ pub const MANIFEST_VERSION_V3: u32 = 3;
 const FIELD_SIZE: usize = 4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8; // = 172
 /// Size of the CRC-only (plaintext) serialized manifest: magic + fields + crc = 184.
 pub const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4;
-/// Authenticated (TDE) size: CRC-only body + HMAC-SHA256 trailer = 192.
+/// Authenticated (TDE) size: CRC-only body + HMAC-SHA256 trailer = 216.
 pub const SERIALIZED_SIZE_HMAC: usize = SERIALIZED_SIZE + MANIFEST_HMAC_SIZE;
+
+/// GAP-0053 v3→v4 upgrade path — the on-disk sizes of a pre-v0.2.29 (V3)
+/// manifest. V4 appends `checkpoint_epoch` (8 B) at the END of the field block,
+/// so a V3 manifest's field block is exactly 8 B shorter. These constants exist
+/// ONLY to recognise and validate a genuine V3 manifest so `deserialize` can
+/// upgrade it in-memory; SERIALIZE never emits them (it always writes V4).
+const FIELD_SIZE_V3: usize = FIELD_SIZE - 8; // = 164 (no checkpoint_epoch)
+/// V3 CRC-only serialized size: magic(8) + v3 fields(164) + crc(4) = 176.
+const SERIALIZED_SIZE_V3: usize = 8 + FIELD_SIZE_V3 + 4;
+/// V3 authenticated (TDE) size: v3 CRC-only body + HMAC-SHA256 trailer = 208.
+const SERIALIZED_SIZE_V3_HMAC: usize = SERIALIZED_SIZE_V3 + MANIFEST_HMAC_SIZE;
 
 pub const Manifest = struct {
     format_version: u32 = MANIFEST_VERSION,
@@ -190,6 +201,32 @@ pub const Manifest = struct {
     pub fn deserializeWithKey(allocator: Allocator, data: []const u8, key: ?[32]u8) !Manifest {
         _ = allocator;
 
+        // GAP-0053 v3→v4 UPGRADE PATH. A store written by v0.2.24..v0.2.28 has a
+        // V3 manifest: exactly SERIALIZED_SIZE_V3 (176) bytes, or
+        // SERIALIZED_SIZE_V3_HMAC (208) under TDE — 8 bytes SHORTER than V4
+        // because checkpoint_epoch is absent. Without this branch the V4 length
+        // gate below rejects it (176 < 184 → InvalidData → NoManifest), bricking
+        // every existing store.
+        //
+        // Discriminate on BOTH the exact V3 length AND the embedded
+        // format_version field (== 3). This is unambiguous:
+        //   * A V4 store is always 184/216 bytes, never 176/208 — never confused.
+        //   * A truncated/torn V4 keeps format_version==4 (offset 8, ahead of any
+        //     tail truncation), so it never matches even if it happens to land on
+        //     176/208 bytes; it falls through and fails closed.
+        //   * A matched candidate is then validated with the V3 CRC (and, under
+        //     TDE, the V3 HMAC) EXACTLY as v0.2.28 did — a corrupt or tampered V3
+        //     fails closed (ChecksumMismatch / ManifestAuthFailed). There is NO
+        //     heuristic acceptance.
+        // A VALID V3 is upgraded in-memory to V4 (checkpoint_epoch = 0); SERIALIZE
+        // always emits V4, so the store auto-migrates on the next manifest write.
+        if ((data.len == SERIALIZED_SIZE_V3 or data.len == SERIALIZED_SIZE_V3_HMAC) and
+            std.mem.eql(u8, data[0..8], &MANIFEST_MAGIC) and
+            readU32(data, 8) == MANIFEST_VERSION_V3)
+        {
+            return deserializeV3Upgrade(data, key);
+        }
+
         if (data.len < SERIALIZED_SIZE) return error.InvalidData;
 
         // Validate magic
@@ -258,6 +295,97 @@ pub const Manifest = struct {
         m.in_dir_pages = readU64(data, pos);
         pos += 8;
         m.checkpoint_epoch = readU64(data, pos);
+
+        return m;
+    }
+
+    /// GAP-0053: parse a V3-layout manifest (caller already confirmed the exact
+    /// V3 length, valid magic, and format_version == 3) and return it upgraded
+    /// in-memory to the V4 shape.
+    ///
+    /// The V3 CRC (over magic + the 164-byte V3 field block) and, under TDE, the
+    /// V3 HMAC trailer (over the V3 CRC-only body) are validated EXACTLY as
+    /// v0.2.28 did, so a corrupt or tampered V3 manifest fails closed
+    /// (ChecksumMismatch / ManifestAuthFailed) and is NEVER heuristically
+    /// upgraded. On success:
+    ///   * every persisted V3 field is preserved verbatim,
+    ///   * checkpoint_epoch is set to its upgrade default of 0 — a freshly
+    ///     upgraded store has no epoch-stamped derived snapshots (their old
+    ///     counter/magic forces a rebuild), and the first post-upgrade checkpoint
+    ///     bumps epoch 0 → 1, so no stale snapshot can false-match a later epoch,
+    ///   * format_version is bumped to the current MANIFEST_VERSION so the next
+    ///     SERIALIZE persists the store in V4 layout (auto-migration).
+    fn deserializeV3Upgrade(data: []const u8, key: ?[32]u8) !Manifest {
+        // V3 CRC covers magic + V3 field block: bytes 0 .. SERIALIZED_SIZE_V3-4.
+        const stored_crc = readU32(data, SERIALIZED_SIZE_V3 - 4);
+        const computed_crc = Crc32.hash(data[0 .. SERIALIZED_SIZE_V3 - 4]);
+        if (stored_crc != computed_crc) return error.ChecksumMismatch;
+
+        // SEC-0043 parity: under TDE the V3 HMAC trailer is mandatory and
+        // constant-time verified — an attacker cannot strip it to downgrade to
+        // CRC-only verification, and a forged body is rejected.
+        if (key) |k| {
+            if (data.len < SERIALIZED_SIZE_V3_HMAC) return error.ManifestAuthFailed;
+            var expected: [MANIFEST_HMAC_SIZE]u8 = undefined;
+            HmacSha256.create(&expected, data[0..SERIALIZED_SIZE_V3], &k);
+            var stored: [MANIFEST_HMAC_SIZE]u8 = undefined;
+            @memcpy(&stored, data[SERIALIZED_SIZE_V3..][0..MANIFEST_HMAC_SIZE]);
+            if (!timing_safe.eql([MANIFEST_HMAC_SIZE]u8, stored, expected)) {
+                return error.ManifestAuthFailed;
+            }
+        }
+
+        var pos: usize = 8;
+        var m = Manifest{};
+
+        // format_version is read to advance the cursor; it is authoritatively
+        // set to MANIFEST_VERSION at the end (this IS the upgrade).
+        m.format_version = readU32(data, pos);
+        pos += 4;
+        @memcpy(&m.graph_uuid, data[pos..][0..16]);
+        pos += 16;
+        m.page_size = readU32(data, pos);
+        pos += 4;
+        m.counter = readU64(data, pos);
+        pos += 8;
+        m.last_checkpoint_lsn = readU64(data, pos);
+        pos += 8;
+        m.node_high_water = readU64(data, pos);
+        pos += 8;
+        m.edge_high_water = readU64(data, pos);
+        pos += 8;
+        m.next_node_id = readU64(data, pos);
+        pos += 8;
+        m.next_edge_id = readU64(data, pos);
+        pos += 8;
+        m.next_txn_id = readU64(data, pos);
+        pos += 8;
+        m.label_count = readU32(data, pos);
+        pos += 4;
+        m.nodes_pages = readU64(data, pos);
+        pos += 8;
+        m.adj_out_pages = readU64(data, pos);
+        pos += 8;
+        m.adj_in_pages = readU64(data, pos);
+        pos += 8;
+        m.props_pages = readU64(data, pos);
+        pos += 8;
+        m.var_pages = readU64(data, pos);
+        pos += 8;
+        m.free_pages = readU64(data, pos);
+        pos += 8;
+        m.node_count = readU64(data, pos);
+        pos += 8;
+        m.edge_count = readU64(data, pos);
+        pos += 8;
+        m.in_idx_pages = readU64(data, pos);
+        pos += 8;
+        m.in_dir_pages = readU64(data, pos);
+        pos += 8;
+        // V3 has NO checkpoint_epoch here — pos now == SERIALIZED_SIZE_V3 - 4
+        // (the CRC we already validated). Apply the upgrade defaults.
+        m.checkpoint_epoch = 0;
+        m.format_version = MANIFEST_VERSION;
 
         return m;
     }
@@ -350,6 +478,62 @@ fn readU32(data: []const u8, offset: usize) u32 {
 
 fn readU64(data: []const u8, offset: usize) u64 {
     return std.mem.littleToNative(u64, @bitCast(data[offset..][0..8].*));
+}
+
+/// GAP-0053 TEST/FIXTURE ONLY — reproduce the exact pre-v0.2.29 (V3) on-disk
+/// byte layout: magic(8) + V3 field block(164, NO checkpoint_epoch) + V3 CRC(4),
+/// optionally followed by the V3 keyed HMAC-SHA256 trailer over the V3 CRC-only
+/// body. This is byte-for-byte what a v0.2.24..v0.2.28 binary's `serialize`
+/// produced, and is the authoritative fixture for the v3→v4 upgrade tests
+/// (manifest.zig unit tests and the recovery integration test). Production code
+/// NEVER emits V3 — SERIALIZE always writes V4. `m.format_version` is written
+/// verbatim so an adversarial fixture can also stamp a non-3 version.
+pub fn serializeV3Legacy(allocator: Allocator, m: Manifest, key: ?[32]u8) ![]u8 {
+    const out_len: usize = if (key != null) SERIALIZED_SIZE_V3_HMAC else SERIALIZED_SIZE_V3;
+    const buf = try allocator.alloc(u8, out_len);
+    errdefer allocator.free(buf);
+
+    var pos: usize = 0;
+    @memcpy(buf[pos..][0..8], &MANIFEST_MAGIC);
+    pos += 8;
+
+    // V3 field block: identical to V4 THROUGH in_dir_pages; checkpoint_epoch is
+    // absent in V3 (it is the appended field V4 introduced).
+    writeU32(buf, &pos, m.format_version);
+    @memcpy(buf[pos..][0..16], &m.graph_uuid);
+    pos += 16;
+    writeU32(buf, &pos, m.page_size);
+    writeU64(buf, &pos, m.counter);
+    writeU64(buf, &pos, m.last_checkpoint_lsn);
+    writeU64(buf, &pos, m.node_high_water);
+    writeU64(buf, &pos, m.edge_high_water);
+    writeU64(buf, &pos, m.next_node_id);
+    writeU64(buf, &pos, m.next_edge_id);
+    writeU64(buf, &pos, m.next_txn_id);
+    writeU32(buf, &pos, m.label_count);
+    writeU64(buf, &pos, m.nodes_pages);
+    writeU64(buf, &pos, m.adj_out_pages);
+    writeU64(buf, &pos, m.adj_in_pages);
+    writeU64(buf, &pos, m.props_pages);
+    writeU64(buf, &pos, m.var_pages);
+    writeU64(buf, &pos, m.free_pages);
+    writeU64(buf, &pos, m.node_count);
+    writeU64(buf, &pos, m.edge_count);
+    writeU64(buf, &pos, m.in_idx_pages);
+    writeU64(buf, &pos, m.in_dir_pages);
+    // (no checkpoint_epoch) — pos is now SERIALIZED_SIZE_V3 - 4.
+
+    const crc = Crc32.hash(buf[0..pos]);
+    writeU32(buf, &pos, crc);
+
+    if (key) |k| {
+        var tag: [MANIFEST_HMAC_SIZE]u8 = undefined;
+        HmacSha256.create(&tag, buf[0..SERIALIZED_SIZE_V3], &k);
+        @memcpy(buf[pos..][0..MANIFEST_HMAC_SIZE], &tag);
+        pos += MANIFEST_HMAC_SIZE;
+    }
+
+    return buf;
 }
 
 // ============================================================================
@@ -667,6 +851,210 @@ test "SEC-0043: writeToFileWithKey/readFromFileWithKey round-trip and tamper det
 
     const tampered = Manifest.readFromFileWithKey(allocator, file_path, key);
     try std.testing.expectError(error.ManifestAuthFailed, tampered);
+}
+
+// ============================================================================
+// GAP-0053: v3 → v4 manifest upgrade path
+// ----------------------------------------------------------------------------
+// A store written by v0.2.24..v0.2.28 has a V3 manifest — 176 bytes (208 under
+// TDE), 8 bytes SHORTER than V4 (no checkpoint_epoch). deserialize must UPGRADE
+// a VALID V3 in-memory (all fields preserved, checkpoint_epoch = 0) while a
+// corrupt/forged buffer of either version still fails closed.
+// ============================================================================
+
+// A V3 manifest with every field distinct and non-zero so preservation is
+// verifiable field-by-field (byte-for-byte through the parse).
+fn v3FixtureFields() Manifest {
+    return Manifest{
+        .format_version = MANIFEST_VERSION_V3,
+        .graph_uuid = [_]u8{0x3C} ** 16,
+        .page_size = 8192,
+        .counter = 7,
+        .last_checkpoint_lsn = 0xCAFE_BABE,
+        .node_high_water = 111,
+        .edge_high_water = 222,
+        .next_node_id = 333,
+        .next_edge_id = 444,
+        .next_txn_id = 555,
+        .label_count = 66,
+        .nodes_pages = 10,
+        .adj_out_pages = 20,
+        .adj_in_pages = 30,
+        .props_pages = 40,
+        .var_pages = 50,
+        .free_pages = 60,
+        .node_count = 70,
+        .edge_count = 80,
+        .in_idx_pages = 90,
+        .in_dir_pages = 100,
+        // checkpoint_epoch intentionally left default (0); V3 has no such field.
+    };
+}
+
+// Assert every V3 DATA field survived the upgrade byte-for-byte (format_version
+// is intentionally bumped 3 -> 4 by the upgrade; checkpoint_epoch defaults 0).
+fn expectV3FieldsPreserved(src: Manifest, got: Manifest) !void {
+    try std.testing.expectEqual(src.graph_uuid, got.graph_uuid);
+    try std.testing.expectEqual(src.page_size, got.page_size);
+    try std.testing.expectEqual(src.counter, got.counter);
+    try std.testing.expectEqual(src.last_checkpoint_lsn, got.last_checkpoint_lsn);
+    try std.testing.expectEqual(src.node_high_water, got.node_high_water);
+    try std.testing.expectEqual(src.edge_high_water, got.edge_high_water);
+    try std.testing.expectEqual(src.next_node_id, got.next_node_id);
+    try std.testing.expectEqual(src.next_edge_id, got.next_edge_id);
+    try std.testing.expectEqual(src.next_txn_id, got.next_txn_id);
+    try std.testing.expectEqual(src.label_count, got.label_count);
+    try std.testing.expectEqual(src.nodes_pages, got.nodes_pages);
+    try std.testing.expectEqual(src.adj_out_pages, got.adj_out_pages);
+    try std.testing.expectEqual(src.adj_in_pages, got.adj_in_pages);
+    try std.testing.expectEqual(src.props_pages, got.props_pages);
+    try std.testing.expectEqual(src.var_pages, got.var_pages);
+    try std.testing.expectEqual(src.free_pages, got.free_pages);
+    try std.testing.expectEqual(src.node_count, got.node_count);
+    try std.testing.expectEqual(src.edge_count, got.edge_count);
+    try std.testing.expectEqual(src.in_idx_pages, got.in_idx_pages);
+    try std.testing.expectEqual(src.in_dir_pages, got.in_dir_pages);
+}
+
+test "GAP-0053 v3-upgrade: valid 176-byte V3 manifest upgrades to V4 in-memory" {
+    const allocator = std.testing.allocator;
+    const src = v3FixtureFields();
+
+    const v3 = try serializeV3Legacy(allocator, src, null);
+    defer allocator.free(v3);
+    // Byte-exact V3 length (the current bug rejects this at the length gate).
+    try std.testing.expectEqual(SERIALIZED_SIZE_V3, v3.len);
+    try std.testing.expectEqual(@as(usize, 176), v3.len);
+
+    const got = try Manifest.deserialize(allocator, v3);
+
+    // UPGRADE: version bumped to V4, epoch defaulted to 0, all data preserved.
+    try std.testing.expectEqual(MANIFEST_VERSION, got.format_version);
+    try std.testing.expectEqual(@as(u32, 4), got.format_version);
+    try std.testing.expectEqual(@as(u64, 0), got.checkpoint_epoch);
+    try expectV3FieldsPreserved(src, got);
+
+    // Re-serialize: the upgraded manifest persists as a VALID V4 (184 bytes)
+    // that round-trips cleanly (auto-migration on the next manifest write).
+    const v4 = try got.serialize(allocator);
+    defer allocator.free(v4);
+    try std.testing.expectEqual(SERIALIZED_SIZE, v4.len);
+    try std.testing.expectEqual(@as(usize, 184), v4.len);
+
+    const rt = try Manifest.deserialize(allocator, v4);
+    try std.testing.expectEqual(@as(u32, 4), rt.format_version);
+    try std.testing.expectEqual(@as(u64, 0), rt.checkpoint_epoch);
+    try expectV3FieldsPreserved(src, rt);
+}
+
+test "GAP-0053 v3-upgrade: valid 208-byte V3 HMAC manifest upgrades under TDE" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x53} ** 32;
+    const src = v3FixtureFields();
+
+    const v3 = try serializeV3Legacy(allocator, src, key);
+    defer allocator.free(v3);
+    try std.testing.expectEqual(SERIALIZED_SIZE_V3_HMAC, v3.len);
+    try std.testing.expectEqual(@as(usize, 208), v3.len);
+
+    const got = try Manifest.deserializeWithKey(allocator, v3, key);
+    try std.testing.expectEqual(@as(u32, 4), got.format_version);
+    try std.testing.expectEqual(@as(u64, 0), got.checkpoint_epoch);
+    try expectV3FieldsPreserved(src, got);
+
+    // Auto-migrates to a valid V4 HMAC (216 bytes) that round-trips with key.
+    const v4 = try got.serializeWithKey(allocator, key);
+    defer allocator.free(v4);
+    try std.testing.expectEqual(SERIALIZED_SIZE_HMAC, v4.len);
+    const rt = try Manifest.deserializeWithKey(allocator, v4, key);
+    try std.testing.expectEqual(@as(u32, 4), rt.format_version);
+    try expectV3FieldsPreserved(src, rt);
+}
+
+test "GAP-0053 v3-upgrade: V3 HMAC with a bad trailer fails closed (no upgrade)" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x53} ** 32;
+    const src = v3FixtureFields();
+
+    const v3 = try serializeV3Legacy(allocator, src, key);
+    defer allocator.free(v3);
+    // Corrupt one byte of the HMAC trailer (after the V3 CRC-only body).
+    v3[SERIALIZED_SIZE_V3 + 4] ^= 0xFF;
+
+    const result = Manifest.deserializeWithKey(allocator, v3, key);
+    try std.testing.expectError(error.ManifestAuthFailed, result);
+}
+
+test "GAP-0053 v3-upgrade: V3 with a bad CRC fails closed (no heuristic upgrade)" {
+    const allocator = std.testing.allocator;
+    const src = v3FixtureFields();
+
+    const v3 = try serializeV3Legacy(allocator, src, null);
+    defer allocator.free(v3);
+    // Flip a field byte WITHOUT recomputing the V3 CRC -> checksum mismatch.
+    v3[40] ^= 0xFF;
+
+    const result = Manifest.deserialize(allocator, v3);
+    try std.testing.expectError(error.ChecksumMismatch, result);
+}
+
+test "GAP-0053 v3-upgrade: 176-byte buffer claiming format_version=4 fails closed" {
+    const allocator = std.testing.allocator;
+    // Adversarial: V3 LENGTH but the embedded version field says 4. This is
+    // impossible for a real store (a V4 binary always writes 184 bytes) and
+    // must NOT be treated as a V3 upgrade. The length-based V4 gate rejects it.
+    var src = v3FixtureFields();
+    src.format_version = MANIFEST_VERSION; // 4, in a 176-byte body
+    const buf = try serializeV3Legacy(allocator, src, null);
+    defer allocator.free(buf);
+    try std.testing.expectEqual(@as(usize, 176), buf.len);
+
+    const result = Manifest.deserialize(allocator, buf);
+    try std.testing.expectError(error.InvalidData, result);
+}
+
+test "GAP-0053 v3-upgrade: truncated (170-byte) buffer fails closed" {
+    const allocator = std.testing.allocator;
+    const src = v3FixtureFields();
+    const v3 = try serializeV3Legacy(allocator, src, null);
+    defer allocator.free(v3);
+
+    // A short read / torn write: neither a V3 (176) nor V4 (184) length.
+    const result = Manifest.deserialize(allocator, v3[0..170]);
+    try std.testing.expectError(error.InvalidData, result);
+}
+
+test "GAP-0053 v3-upgrade: V4-length manifest declaring version 3 is NOT upgraded" {
+    const allocator = std.testing.allocator;
+    // Downgrade-gate guard at the manifest layer: a 184-byte body whose version
+    // field is 3 (forged / impossible) must deserialize AS-IS (format_version
+    // stays 3) so recovery's version gate rejects it — it must NOT be silently
+    // upgraded to 4. The discriminator keys on LENGTH, not just the field.
+    var m = Manifest{ .graph_uuid = [_]u8{0xD0} ** 16, .counter = 3 };
+    m.format_version = MANIFEST_VERSION_V3;
+    const buf = try m.serialize(allocator); // 184-byte V4 layout, version field 3
+    defer allocator.free(buf);
+    try std.testing.expectEqual(@as(usize, 184), buf.len);
+
+    const got = try Manifest.deserialize(allocator, buf);
+    try std.testing.expectEqual(MANIFEST_VERSION_V3, got.format_version); // NOT bumped to 4
+}
+
+test "GAP-0053 v3-upgrade: V4-reads-V4 normal path is unchanged (epoch preserved)" {
+    const allocator = std.testing.allocator;
+    const m = Manifest{
+        .graph_uuid = [_]u8{0x44} ** 16,
+        .counter = 12,
+        .checkpoint_epoch = 9,
+    };
+    const buf = try m.serialize(allocator);
+    defer allocator.free(buf);
+    try std.testing.expectEqual(@as(usize, 184), buf.len);
+
+    const got = try Manifest.deserialize(allocator, buf);
+    try std.testing.expectEqual(@as(u32, 4), got.format_version);
+    try std.testing.expectEqual(@as(u64, 12), got.counter);
+    try std.testing.expectEqual(@as(u64, 9), got.checkpoint_epoch);
 }
 
 test {

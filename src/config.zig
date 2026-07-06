@@ -106,6 +106,15 @@ pub const GraphConfig = struct {
     checkpoint_time_threshold_ms: u64 = 60_000,
     encryption_key: ?[32]u8 = null,
     data_dir: []const u8 = "data",
+    /// GAP adjacency slab packing (P2): when true, NEW small adjacency chains
+    /// pack into shared slab blocks instead of a whole ≥8 KB block per (node,
+    /// direction) chain — killing the block-per-chain bloat that dominates
+    /// low-fanout graphs. A chain that outgrows its slab slot graduates to a
+    /// legacy block chain. Reads are always slab-aware (read-both is permanent),
+    /// so a slab-packed store opens on any build that has the P1 read path.
+    /// OPT-IN (default OFF) for this increment: production behaviour is
+    /// unchanged until the format is validated at scale.
+    adjacency_slab_packing: bool = false,
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
     /// Policy for handling legacy (V1) graph formats during recovery.
     legacy_policy: LegacyPolicy = .reject,
