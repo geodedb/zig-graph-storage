@@ -15,6 +15,7 @@ const page_mod = @import("page.zig");
 const edge_mod = @import("edge.zig");
 const test_support = @import("testing_support.zig");
 const engine_mod = @import("engine.zig");
+const engine_index = @import("engine_index.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -1994,13 +1995,14 @@ test "PHASE G G1: tailAffectedNodeIds is empty when the tail capture is unavaila
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
-test "PHASE G G1: an in-place property value change (props-only tail) forces rebuild (empty)" {
+test "PHASE G reverse-map: an in-place property value change (props-only tail) resolves the changed node" {
     var td = try testDataDir();
     defer td.deinit();
     const uuid = [_]u8{0x4A} ** 16;
     const cfg = testConfig();
     {
-        // Session 1: node 1 with a fixed-size property; checkpoint; close.
+        // Session 1: node 1 with a fixed-size property; checkpoint (persists the
+        // reverse map node1->head); close.
         const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
         const id = try engine.allocNode();
         var rec = test_support.emptyNode(1);
@@ -2019,14 +2021,53 @@ test "PHASE G G1: an in-place property value change (props-only tail) forces reb
         try testing.expectEqual(rec.prop_head, new_head); // in-place: head unchanged
         engine.deinit();
     }
-    // Session 3: the tail touched a props page whose changed node is on no
-    // nodes page → cannot be soundly attributed → empty (rebuild).
+    // Session 3: the tail props page's live slot resolves to node 1 via the
+    // reverse map (loaded on demand) — RED->GREEN: previously an empty rebuild.
     const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
     defer engine.deinit();
     try testing.expect(engine.tail_affected_pages != null);
     const got = try engine.tailAffectedNodeIds(testing.allocator);
     defer testing.allocator.free(got);
-    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expectEqualSlices(NodeId, &[_]NodeId{1}, got);
+}
+
+test "PHASE G reverse-map: fill-page co-tenant is resolved (not a rebuild) on an in-place change" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4C} ** 16;
+    const cfg = testConfig();
+    {
+        // Session 1: nodes 1 and 2 both get a small property → they share one
+        // slab fill page. Checkpoint persists the reverse map for BOTH; close.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id1 = try engine.allocNode();
+        var r1 = test_support.emptyNode(1);
+        r1.prop_head = try engine.putProperty(0, "k", .{ .int = 1 });
+        try engine.putNode(id1, r1);
+        const id2 = try engine.allocNode();
+        var r2 = test_support.emptyNode(1);
+        r2.prop_head = try engine.putProperty(0, "k", .{ .int = 2 });
+        try engine.putNode(id2, r2);
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2: IN-PLACE change to node 1 only → rewrites the shared fill
+        // page (node 2's live slot rides along, unchanged). No nodes page in the
+        // tail. Crash.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const rec = (try engine.getNode(1)).?;
+        _ = try engine.putProperty(rec.prop_head, "k", .{ .int = 9 });
+        engine.deinit();
+    }
+    // Session 3: the shared props page resolves BOTH the changed node 1 AND the
+    // co-tenant node 2 (harmless superset) via the reverse map — where the
+    // nodes-page pass alone would have force-rebuilt.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(NodeId, &[_]NodeId{ 1, 2 }, got);
 }
 
 // ============================================================================
@@ -2068,4 +2109,61 @@ test "PHASE G reverse-map: fresh-graph build + checkpoint + reopen LOADS prop_he
     try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
     try testing.expectEqual(@as(?NodeId, 1), engine.prop_rev_index.get(head1));
     try testing.expectEqual(@as(?NodeId, 2), engine.prop_rev_index.get(head2));
+}
+
+test "PHASE G reverse-map: tail reconcile (insert + delete) equals a full rebuild of the map" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4D} ** 16;
+    const cfg = testConfig();
+    {
+        // Session 1: nodes 1,2,3 each with a property; checkpoint; close.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        var n: u64 = 0;
+        while (n < 3) : (n += 1) {
+            const id = try engine.allocNode();
+            var r = test_support.emptyNode(1);
+            r.prop_head = try engine.putProperty(0, "k", .{ .int = @intCast(id) });
+            try engine.putNode(id, r);
+        }
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2 (committed tail): INSERT node 4 (with a prop) + DELETE node 1.
+        // Crash (deinit — no checkpoint) so session 3 must reconcile.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        var r = test_support.emptyNode(2);
+        r.prop_head = try engine.putProperty(0, "k", .{ .int = 99 });
+        try engine.putNode(id, r);
+        try engine.deleteNode(1);
+        engine.deinit();
+    }
+    // Session 3: hydrate → the bounded tail is RECONCILED into the loaded map.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try engine.ensureDerivedHydrated();
+    try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_reconciles);
+
+    // Snapshot the RECONCILED reverse map.
+    var snap: std.AutoHashMapUnmanaged(u64, NodeId) = .empty;
+    defer snap.deinit(testing.allocator);
+    {
+        var it = engine.prop_rev_index.map.iterator();
+        while (it.next()) |e| try snap.put(testing.allocator, e.key_ptr.*, e.value_ptr.*);
+    }
+
+    // Ground truth: a full rebuild from a live node scan (deleted node 1 is
+    // excluded by scanNodes; inserted node 4 is present).
+    try engine_index.buildPropRevIndexFromScan(engine);
+
+    try testing.expectEqual(engine.prop_rev_index.count(), snap.count());
+    var it = engine.prop_rev_index.map.iterator();
+    while (it.next()) |e| {
+        try testing.expectEqual(@as(?NodeId, e.value_ptr.*), snap.get(e.key_ptr.*));
+    }
+    // Node 1 was deleted → absent from both; node 4 present in both.
+    const rec4 = (try engine.getNode(4)).?;
+    try testing.expectEqual(@as(?NodeId, 4), snap.get(rec4.prop_head));
 }

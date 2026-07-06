@@ -1394,8 +1394,8 @@ pub const GraphEngine = struct {
     ///   * `null`  — a full REBUILD is required: a committed tail advanced the
     ///     durable frontier but the affected-page capture is unavailable
     ///     (overflow / capture off → `tail_affected_pages` null while
-    ///     `had_tail`), OR the tail touched props pages this engine cannot
-    ///     soundly attribute to a node (props limitation below).
+    ///     `had_tail`), OR a tail props slab slot cannot be attributed to a node
+    ///     (the reverse map was absent, or a non-slab legacy page — see below).
     ///   * non-null EMPTY — nothing to reconcile (a clean reopen: no committed
     ///     tail; or a tail that touched no node-owning pages).
     ///   * non-null non-empty — the resolved (super)set of affected node ids.
@@ -1412,19 +1412,20 @@ pub const GraphEngine = struct {
     /// set is a harmless SUPERSET (re-deriving an unchanged page-mate is a
     /// no-op for the caller).
     ///
-    /// PROPS-page limitation (reported precisely). An IN-PLACE property value
+    /// PROPS pages (resolved via the reverse map). An IN-PLACE property value
     /// mutation rewrites ONLY the props page (putPropertyTxnImpl logs `.props`,
-    /// never the node record) so the changed node is on NO tail nodes page. A
-    /// props page is a SLAB shared by many nodes; a slab blob stores no owner
-    /// back-reference and gs has no persisted prop_head→node reverse map, so a
-    /// props page cannot be attributed to its changed node in bounded time.
-    /// We therefore VERIFY, for every LIVE slab slot on every tail props page,
-    /// that its prop_head is already owned by a node in the nodes-page set
-    /// (heads are unique per node). If any live slot's head is unrecognised —
-    /// a pure in-place value change, a slab-shared co-resident outside the set,
-    /// or a non-slab legacy chain page — the tail is not soundly attributable
-    /// → `null` (rebuild). Bounded props reconcile (the ingest case) requires
-    /// a persisted prop_head→node reverse map, a follow-up beyond this API.
+    /// never the node record) so the changed node is on NO tail nodes page; a
+    /// slab props page is shared by many nodes and stores no owner. The
+    /// `prop_head→node` reverse map (prop_rev_index.zig) inverts this: for every
+    /// LIVE slab slot on a tail props page, if its head is already in N (a
+    /// tail-new / relocated node) it is covered, else the reverse map resolves it
+    /// to its EXISTING owner (the in-place-changed node, or a fill-page
+    /// co-tenant added as a harmless superset). A slot resolvable by NEITHER
+    /// (the reverse map was absent / not loaded) or a non-slab legacy chain page
+    /// → `null` (rebuild — the safe fallback). This closes the in-place
+    /// value-change and ingest checkpoint-boundary fill-page cases that the
+    /// nodes-page pass alone could not. The reverse map is loaded on demand from
+    /// its covered_lsn snapshot when this runs before hydration.
     pub fn resolveTailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) !?[]NodeId {
         const had_tail = self.manifest.last_checkpoint_lsn > self.tail_pre_recovery_lsn;
         const pages = self.tail_affected_pages orelse {
@@ -1454,21 +1455,59 @@ pub const GraphEngine = struct {
             }
         }
 
-        // Pass 2 — props pages: every LIVE slab slot must be owned by a node
-        // already in N, else the tail is not soundly attributable → rebuild.
+        // PHASE G resolution: a tail props-page slot resolves to its OWNING node
+        // via the reverse map. Load its covered_lsn snapshot on demand when this
+        // runs BEFORE hydration (the documented lifecycle); when already
+        // hydrated the in-memory map is current — use it as-is. Only paid when
+        // the tail actually touched a props page.
+        var has_props = false;
+        for (pages) |p| {
+            if (p.file_id == .props) {
+                has_props = true;
+                break;
+            }
+        }
+        if (has_props and !self.derived_hydrated.load(.acquire)) {
+            _ = self.prop_rev_index.loadFromFile(self.graph_dir.path) catch {};
+        }
+
+        // Pass 2 — props pages: attribute every LIVE slab slot to a node. It is
+        // already in N (tail-new / relocated → its head is in H_N), or the
+        // reverse map resolves it to its existing owner (an in-place value change
+        // or a fill-page co-tenant — added as a harmless superset; re-deriving an
+        // unchanged co-tenant is a caller no-op). A slot resolvable by NEITHER
+        // (reverse map absent / incomplete) or a non-slab legacy page → rebuild.
         for (pages) |p| {
             if (p.file_id != .props) continue;
-            const Ctx = struct { heads: *std.AutoHashMapUnmanaged(u64, void), ok: bool };
-            var ctx = Ctx{ .heads = &head_set, .ok = true };
+            const Ctx = struct {
+                heads: *std.AutoHashMapUnmanaged(u64, void),
+                rev: *PropRevIndex,
+                node_set: *std.AutoHashMapUnmanaged(NodeId, void),
+                allocator: Allocator,
+                ok: bool,
+            };
+            var ctx = Ctx{
+                .heads = &head_set,
+                .rev = &self.prop_rev_index,
+                .node_set = &node_set,
+                .allocator = allocator,
+                .ok = true,
+            };
             self.prop_store.forEachSlabSlotOnPage(p.page_id, &ctx, struct {
                 fn f(c: *Ctx, prop_head: u64, live: bool) anyerror!void {
-                    if (live and !c.heads.contains(prop_head)) c.ok = false;
+                    if (!live) return;
+                    if (c.heads.contains(prop_head)) return; // already in N (tail-new/relocated)
+                    if (c.rev.get(prop_head)) |owner| {
+                        try c.node_set.put(c.allocator, owner, {}); // existing owner
+                        return;
+                    }
+                    c.ok = false; // unresolvable → rebuild (safe fallback)
                 }
             }.f) catch |e| switch (e) {
                 error.NotSlabPage => return null, // legacy/undecodable page → rebuild
                 else => return e,
             };
-            if (!ctx.ok) return null; // in-place / shared co-resident → rebuild
+            if (!ctx.ok) return null;
         }
 
         const out = try allocator.alloc(NodeId, node_set.count());
