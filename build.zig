@@ -583,6 +583,20 @@ fn addIntegrationTests(
     const run_wal_recovery_counters = b.addRunArtifact(wal_recovery_counters_tests);
     wal_recovery_counters_step.dependOn(&run_wal_recovery_counters.step);
 
+    // checkpoint_epoch invariant — the durable derived-index freshness token
+    // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
+    // recovery (unlike manifest.counter, which recovery bumps for A/B
+    // freshness). This is the core invariant the WAL-aware derived-index
+    // durability contract rests on.
+    const checkpoint_epoch_step = b.step("test-checkpoint-epoch", "Run checkpoint_epoch invariant test: epoch advances only at checkpoint, never across WAL-tail recovery");
+    const checkpoint_epoch_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/test_checkpoint_epoch.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_checkpoint_epoch = b.addRunArtifact(checkpoint_epoch_tests);
+    checkpoint_epoch_step.dependOn(&run_checkpoint_epoch.step);
+
     // Label WAL imaging — regression guards for the raw-ref vs page-id
     // confusion on the label var-chain write paths (addLabelTxn /
     // removeLabelTxn image the FULL chain via logVarChain + the node page).
@@ -652,6 +666,9 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_derived_restamp.step);
     // WAL-recovery counter healing is the same silent-corruption class.
     integration_step.dependOn(&run_wal_recovery_counters.step);
+    // checkpoint_epoch recovery-invariance is the durability foundation the
+    // WAL-aware derived-index contract rests on — gate it under integration.
+    integration_step.dependOn(&run_checkpoint_epoch.step);
     // Label WAL-imaging crash guards likewise.
     integration_step.dependOn(&run_label_crash_replay.step);
     // Edge-prop-head under-logging crash guards likewise.
