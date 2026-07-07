@@ -203,8 +203,10 @@ fn rootImports(deps: Deps) [5]Import {
 
 fn addUnitTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: OptimizeMode, deps: Deps, test_step: *std.Build.Step) void {
     const root_imports = rootImports(deps);
+    const test_filter = b.option([]const u8, "test-filter", "Only run unit tests whose name contains this substring");
     const unit_tests = b.addTest(.{
         .root_module = createModule(b, "src/root.zig", target, optimize, &root_imports),
+        .filters = if (test_filter) |f| b.dupeStrings(&.{f}) else &.{},
     });
     if (deps.observability_init_mod) |m| unit_tests.root_module.addImport("observability_init", m);
     if (deps.otel_mod) |m| unit_tests.root_module.addImport("otel", m);

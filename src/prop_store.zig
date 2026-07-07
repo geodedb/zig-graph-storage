@@ -2653,6 +2653,123 @@ test "GAP-ENT-0022(b) W1: tombstone with exhausted touched-page budget leaves th
     try testing.expectEqualStrings("Panthera leo", val.?.string);
 }
 
+test "GAP-0060 oracle: taxon node ingest slab-packs props (bytes/node << one page)" {
+    // Regression oracle for the prop-store slab-packing gap. A fresh 14.27M store
+    // measured props at ~8305 "B/node", read as "NODE props are unslabbed". This
+    // oracle disproves that: taxon-shaped nodes driven through the exact
+    // multi-property NODE write path (putProperty: prop_head==0 first prop, then
+    // the returned head for each subsequent prop) slab-pack many nodes per page —
+    // the physical footprint is far below one page per node. (The real ~8305
+    // "B/node" bloat is EDGE property chains; see the companion test below.)
+    var env = try PropTestEnv.init();
+    defer env.deinit();
+    var store = PropStore.init(env.pool(), env.fsm(), &env.vs, 4096);
+    try testing.expect(store.slab_packing); // default ON since P7
+
+    const N: u64 = 200;
+    var n: u64 = 0;
+    while (n < N) : (n += 1) {
+        // Mirror the geode bulk-insert node path: internal id first (prop_head==0
+        // → slabFirstWrite), then the user taxon properties chained on the head.
+        var head: u64 = 0;
+        var id_buf: [16]u8 = undefined;
+        const id_text = std.fmt.bufPrint(&id_buf, "{x:0>16}", .{n}) catch unreachable;
+        head = try store.putProperty(head, "__geode_node_id", .{ .string = id_text });
+        head = try store.putProperty(head, "scientific_name", .{ .string = "Homo sapiens" });
+        head = try store.putProperty(head, "authorship", .{ .string = "Linnaeus, 1758" });
+        head = try store.putProperty(head, "rank", .{ .string = "species" });
+        head = try store.putProperty(head, "source", .{ .string = "GBIF" });
+        head = try store.putProperty(head, "source_id", .{ .string = "2436436" });
+        // The node's final head must be slab-resident (the whole taxon prop set
+        // fits a slab page many times over) — never migrated to a legacy chain.
+        try testing.expect(isSlabHead(head));
+    }
+
+    const pages = env.fsm().allocatedCount();
+    const bytes_per_node = pages * 4096 / N;
+    std.debug.print(
+        "\nGAP-0060 oracle: {d} nodes → {d} props pages = {d} B/node (page=4096)\n",
+        .{ N, pages, bytes_per_node },
+    );
+    // Legacy (one page per node) would be ≥4096 B/node. Slab packing must keep
+    // this well under a quarter page per node.
+    try testing.expect(bytes_per_node < 1024);
+}
+
+test "GAP-0060 finding: EDGE property chains are legacy one-page-per-edge (the real props.store bloat)" {
+    // ROOT-CAUSE characterization for GAP-0060. On the fresh 14.27M store props
+    // divided out to ~8305 "B/node" — but that number divides the WHOLE
+    // props.store (≈96% EDGE property pages) by the NODE count. On-disk decode of
+    // a shard: every NODE prop blob lives in a dense slab region (bytes
+    // 8KB..~316MB, ~24 blobs/page), and every EDGE prop chain lives in the legacy
+    // region beyond it (one 8KB page per edge). NODE props slab-pack correctly
+    // (oracle above). EDGE prop chains are LEGACY-only by design: an edge
+    // prop_head is packed as a u32 in the adjacency EdgeEntry AND the edge index
+    // (edge_index_map.zig:41, serialized at rec[28..32]) and cannot represent a
+    // slab head (bit63 | 39-bit page | 24-bit slot ⇒ 63 bits). So a fresh edge
+    // carrying ANY property (the seed adds run_id='edges-…') costs a whole page.
+    //
+    // This test pins that behavior and quantifies the gap side by side. It stays
+    // GREEN (asserts today's layout); TIGHTEN the edge_pages assertion once an
+    // edge-property slab / u64 edge-head lands.
+    //
+    // Uses a generous buffer pool (one legacy page per edge stays resident) so
+    // the measurement never depends on the eviction path.
+    var base = try DualStoreEnv.init(
+        testing.allocator,
+        .props,
+        .props,
+        "props.store",
+        .var_store,
+        "var.store",
+        4096,
+        512,
+    );
+    base.register();
+    defer base.deinit();
+    var vs = VarStore.init(&base.pool, &base.fsm, 4096);
+    var store = PropStore.init(&base.pool, &base.fsm, &vs, 4096);
+
+    const N: u64 = 200;
+
+    // (1) NODE path (putProperty, slab-enabled): one small property per node.
+    var node_head: u64 = 0;
+    var i: u64 = 0;
+    while (i < N) : (i += 1) {
+        node_head = try store.putProperty(0, "run_id", .{ .string = "edges-1783388992" });
+        try testing.expect(isSlabHead(node_head)); // node props → slab
+    }
+    const node_pages = base.fsm.allocatedCount();
+
+    // (2) EDGE path (putPropertyLegacyOnly): the SAME small property per edge.
+    var edge_head: u64 = 0;
+    i = 0;
+    while (i < N) : (i += 1) {
+        edge_head = try store.putPropertyLegacyOnly(0, "run_id", .{ .string = "edges-1783388992" });
+        try testing.expect(!isSlabHead(edge_head)); // edge props → legacy bare page id
+    }
+    const edge_pages = base.fsm.allocatedCount() - node_pages;
+
+    // read-both: a slab-head chain AND a legacy-head chain both read back.
+    const nv = (try store.getProperty(node_head, "run_id", testing.allocator)).?;
+    defer property_mod.freeDecoded(testing.allocator, nv);
+    try testing.expectEqualStrings("edges-1783388992", nv.string);
+    const ev = (try store.getProperty(edge_head, "run_id", testing.allocator)).?;
+    defer property_mod.freeDecoded(testing.allocator, ev);
+    try testing.expectEqualStrings("edges-1783388992", ev.string);
+
+    const node_bytes = node_pages * 4096 / N;
+    const edge_bytes = edge_pages * 4096 / N;
+    std.debug.print(
+        "\nGAP-0060 finding: {d} nodes → {d} pages ({d} B/node, SLAB)  |  {d} edges → {d} pages ({d} B/edge, LEGACY)\n",
+        .{ N, node_pages, node_bytes, N, edge_pages, edge_bytes },
+    );
+    // Node props pack many-per-page; edge props take exactly one page each — the
+    // real props.store bloat.
+    try testing.expect(node_bytes < 512);
+    try testing.expect(edge_pages == N);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
