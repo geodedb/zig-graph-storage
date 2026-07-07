@@ -645,18 +645,25 @@ pub const Recovery = struct {
                 const bh_size = @sizeOf(edge_mod.EdgeBlockHeader);
                 if (data.len < hdr_off + bh_size) return;
                 const bh = std.mem.bytesToValue(edge_mod.EdgeBlockHeader, data[hdr_off..][0..bh_size]);
-                if (bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB) {
+                // GAP-0060: slab-v2 AND slab-v3 blocks route to the slab harvest.
+                if (bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB or
+                    bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB_V3)
+                {
                     self.harvestSlabAdjImage(data, bh);
                     return;
                 }
-                if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return;
+                // Chain harvest handles v1/v2/v3; any other byte is not a chain
+                // layout we understand — skip (never misparse at a guessed stride).
+                if (bh.entry_format != edge_mod.ENTRY_FORMAT_V1 and
+                    bh.entry_format != edge_mod.ENTRY_FORMAT_V2 and
+                    bh.entry_format != edge_mod.ENTRY_FORMAT_V3) return;
                 const cap = edge_mod.entriesPerBlock(@intCast(data.len), bh.entry_format);
                 if (bh.count > cap) return;
                 const esz = edge_mod.entrySize(bh.entry_format);
                 const entries = data[hdr_off + bh_size ..];
                 var i: u32 = 0;
                 while (i < bh.count) : (i += 1) {
-                    // edge_id is at byte offset 8 of both v1 and v2 entries.
+                    // edge_id is at byte offset 8 of v1/v2/v3 entries.
                     const off: usize = @intCast(i * esz + 8);
                     const edge_id = std.mem.readInt(u64, entries[off..][0..8], .little);
                     // Residue guard (I1): legacy pre-co-location `.adj_in`
@@ -759,16 +766,21 @@ pub const Recovery = struct {
                 const bh_size = @sizeOf(edge_mod.EdgeBlockHeader);
                 if (data.len < hdr_off + bh_size) return 0;
                 const bh = std.mem.bytesToValue(edge_mod.EdgeBlockHeader, data[hdr_off..][0..bh_size]);
-                if (bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB) {
+                if (bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB or
+                    bh.entry_format == edge_mod.ENTRY_FORMAT_SLAB_V3)
+                {
                     // 0025 count heal × adjacency slab packing: slab out-runs
                     // ARE this page's out-entries, so the census counts them
                     // — through the SAME parse the id harvest uses (see
                     // `censusSlabAdjImage`). If slab images censused 0, every
                     // post-slab crash replay would diff 0-minus-before and
-                    // walk the healed edge_count BACKWARD.
+                    // walk the healed edge_count BACKWARD. GAP-0060: slab-v2 and
+                    // slab-v3 both route here.
                     return self.censusSlabAdjImage(data, bh);
                 }
-                if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return 0;
+                if (bh.entry_format != edge_mod.ENTRY_FORMAT_V1 and
+                    bh.entry_format != edge_mod.ENTRY_FORMAT_V2 and
+                    bh.entry_format != edge_mod.ENTRY_FORMAT_V3) return 0;
                 const cap = edge_mod.entriesPerBlock(@intCast(data.len), bh.entry_format);
                 if (bh.count > cap) return 0;
                 // Entry removal swap-compacts the block (AdjStore.removeEdge),
@@ -800,13 +812,15 @@ pub const Recovery = struct {
         if (edge_mod.SLAB_RUNS_OFFSET + dir_bytes + tail_reserve > data.len) return 0;
         const dir_start = edge_mod.slabDirStart(data.len, tail_reserve, bh.count);
 
+        // GAP-0060: stride at the block's own width (slab-v2 32B or slab-v3 40B).
+        const stride = edge_mod.slabEntrySize(bh.entry_format);
         var live: u64 = 0;
         var s: u32 = 0;
         while (s < bh.count) : (s += 1) {
             const slot = edge_mod.readSlabSlot(data, tail_reserve, s);
             if (slot.offset == edge_mod.SLAB_SLOT_TOMBSTONE) continue;
             if (slot.offset < edge_mod.SLAB_RUNS_OFFSET) continue;
-            const run_end = @as(u64, slot.offset) + @as(u64, slot.entry_count) * edge_mod.ENTRY_SIZE_V2;
+            const run_end = @as(u64, slot.offset) + @as(u64, slot.entry_count) * stride;
             if (run_end > dir_start) continue;
             live += slot.entry_count;
         }
@@ -815,7 +829,8 @@ pub const Recovery = struct {
 
     /// Harvest edge-id maxima from a SLAB adjacency image (GAP adjacency slab
     /// packing): iterate the slot directory, and for every LIVE, bounds-valid
-    /// slot walk its contiguous run of v2 (32 B) entries. Defensive per slot:
+    /// slot walk its contiguous run at the block's stride (slab-v2 32 B or
+    /// GAP-0060 slab-v3 40 B). Defensive per slot:
     /// tombstoned, truncated, or out-of-bounds slots contribute nothing and
     /// never abort the harvest of well-formed siblings. The layout (incl. the
     /// AES-GCM tail reservation mirrored from the slab writer) lives in
@@ -832,19 +847,21 @@ pub const Recovery = struct {
         const dir_bytes = @as(u64, bh.count) * edge_mod.SLAB_DIR_ENTRY_SIZE;
         if (edge_mod.SLAB_RUNS_OFFSET + dir_bytes + tail_reserve > data.len) return;
         const dir_start = edge_mod.slabDirStart(data.len, tail_reserve, bh.count);
+        // GAP-0060: stride at the block's own width (slab-v2 32B or slab-v3 40B).
+        const stride = edge_mod.slabEntrySize(bh.entry_format);
 
         var s: u32 = 0;
         while (s < bh.count) : (s += 1) {
             const slot = edge_mod.readSlabSlot(data, tail_reserve, s);
             if (slot.offset == edge_mod.SLAB_SLOT_TOMBSTONE) continue;
             if (slot.offset < edge_mod.SLAB_RUNS_OFFSET) continue;
-            const run_end = @as(u64, slot.offset) + @as(u64, slot.entry_count) * edge_mod.ENTRY_SIZE_V2;
+            const run_end = @as(u64, slot.offset) + @as(u64, slot.entry_count) * stride;
             if (run_end > dir_start) continue;
 
             var i: u32 = 0;
             while (i < slot.entry_count) : (i += 1) {
-                // edge_id is at byte offset 8 of every v2 run entry.
-                const off: usize = @intCast(@as(u64, slot.offset) + @as(u64, i) * edge_mod.ENTRY_SIZE_V2 + 8);
+                // edge_id is at byte offset 8 of every v2/v3 run entry.
+                const off: usize = @intCast(@as(u64, slot.offset) + @as(u64, i) * stride + 8);
                 const edge_id = std.mem.readInt(u64, data[off..][0..8], .little);
                 // Residue guard (I1): same rule as the block-chain harvest.
                 if (edge_id % self.id_stride != self.shard_residue) continue;
@@ -2628,6 +2645,57 @@ fn slabRunEntry(edge_id: u64) edge_mod.EdgeEntry {
     return .{ .neighbor = 1, .edge_id = edge_id, .rel_type = 7, .prop_head = 0, .public_id = 0 };
 }
 
+/// GAP-0060: a SLAB-V3 (40 B stride) adjacency image header.
+fn stampSlabHeaderV3(img: []u8, slot_count: u16) void {
+    const bh = edge_mod.EdgeBlockHeader{
+        .next_block = 0,
+        .count = slot_count,
+        .kind = 0,
+        .entry_format = edge_mod.ENTRY_FORMAT_SLAB_V3,
+        .payload_size = 0,
+        .checksum = 0,
+    };
+    @memcpy(img[page_mod.PAGE_HEADER_SIZE..][0..@sizeOf(edge_mod.EdgeBlockHeader)], std.mem.asBytes(&bh));
+}
+
+test "GAP-0060: recovery harvest + census parse slab-V3 (40B) runs; ids never escape the heal" {
+    // The silent-staleness landmine: a replayed slab-V3 edge run must be walked
+    // at the 40 B stride. Had the harvest kept the 32 B stride, entry 1's
+    // edge_id would be read from the middle of entry 0's record — NOT the true
+    // max — and the healed edge-id counter would re-issue a live id after a
+    // crash. This proves the stride + the slab-V3 dispatch are both correct.
+    var rec = Recovery.init(testing.allocator, null);
+    defer rec.deinit();
+    rec.id_stride = 16;
+    rec.shard_residue = 0;
+
+    const img = try testing.allocator.alloc(u8, 4096);
+    defer testing.allocator.free(img);
+    @memset(img, 0);
+    stampSlabHeaderV3(img, 2);
+
+    const V3: u32 = edge_mod.ENTRY_SIZE_V3;
+    const small: u64 = 16 * 3; // ≡ 0 (mod 16)
+    const max: u64 = 16 * 700; // ≡ 0 — the value the heal must learn
+
+    // Slot 0: a live 2-entry V3 run. Entry 0 carries a prop-store SLAB head
+    // (bit 63) — only representable in a V3 record — to exercise the wide bytes.
+    const run0: u32 = edge_mod.SLAB_RUNS_OFFSET;
+    var e0 = slabRunEntry(small);
+    e0.prop_head = (@as(u64, 1) << 63) | 0x1234;
+    edge_mod.encodeEntry(img[run0 .. run0 + V3], e0, edge_mod.ENTRY_FORMAT_SLAB_V3);
+    const e1 = slabRunEntry(max);
+    edge_mod.encodeEntry(img[run0 + V3 .. run0 + 2 * V3], e1, edge_mod.ENTRY_FORMAT_SLAB_V3);
+    edge_mod.writeSlabSlot(img, 0, 0, .{ .offset = run0, .entry_count = 2 });
+    // Slot 1: tombstone — contributes nothing.
+    edge_mod.writeSlabSlot(img, 0, 1, .{ .offset = edge_mod.SLAB_SLOT_TOMBSTONE, .entry_count = 0 });
+
+    rec.trackReplayedIdMaxima(.adj_out, 60, img);
+    try testing.expectEqual(max, rec.max_replayed_edge_id);
+    // Census counts the 2 live V3 entries at the 40 B stride.
+    try testing.expectEqual(@as(u64, 2), rec.liveRecordCensus(.adj_out, img));
+}
+
 test "adjacency slab: counter harvest learns slab-block WAL images (ids in slab runs never escape the heal)" {
     // Plan hard requirement (GAP adjacency slab packing P1): the counter
     // harvest MUST parse slab adjacency images in the same phase that
@@ -2673,15 +2741,16 @@ test "adjacency slab: counter harvest learns slab-block WAL images (ids in slab 
     rec.trackReplayedIdMaxima(.adj_out, 60, img);
     try testing.expectEqual(in_class_max, rec.max_replayed_edge_id);
 
-    // Sensitivity proof: restamp the SAME image with an UNKNOWN format byte
-    // (3) — a fresh harvest learns nothing. This is exactly the pre-P1
-    // treatment of format 2, so this test fails loudly if slab images ever
-    // fall back into the unknown-format skip.
+    // Sensitivity proof: restamp the SAME image with a genuinely UNKNOWN
+    // format byte (0xFE — not v1/v2/v3/slab/slab-v3) — a fresh harvest learns
+    // nothing. This fails loudly if slab images ever fall back into the
+    // unknown-format skip. GAP-0060: format 3 is now v3 (a valid chain), so the
+    // guard uses a value above every known format.
     var rec2 = Recovery.init(testing.allocator, null);
     defer rec2.deinit();
     rec2.id_stride = 16;
     rec2.shard_residue = 0;
-    img[page_mod.PAGE_HEADER_SIZE + 11] = edge_mod.ENTRY_FORMAT_SLAB + 1;
+    img[page_mod.PAGE_HEADER_SIZE + 11] = 0xFE;
     rec2.trackReplayedIdMaxima(.adj_out, 60, img);
     try testing.expectEqual(@as(u64, 0), rec2.max_replayed_edge_id);
 

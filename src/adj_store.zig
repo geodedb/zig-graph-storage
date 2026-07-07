@@ -131,6 +131,17 @@ pub const AdjStore = struct {
     /// slab-enabled store wrote). The engine flips it on per adjacency store.
     slab_packing: bool = false,
 
+    /// GAP-0060: when true, NEW blocks this writer creates use the WIDE (v3 /
+    /// slab-v3, 40 B) entry format so an edge's `prop_head` can be widened
+    /// to a prop-store slab head (u64) IN PLACE later — geode adds the edge
+    /// with `prop_head==0` then attaches props, so the durable record must
+    /// have room for the eventual u64 head without changing the node head.
+    /// Default OFF — a false value is byte-identical to pre-0060 (v2 / slab-v2
+    /// writes). Read-both parses v1/v2/v3/slab-v2/slab-v3 by each block's
+    /// format byte regardless of this flag. The engine sets it from
+    /// `GraphConfig.edge_prop_slab_packing`.
+    wide_heads: bool = false,
+
     /// The shared "current fill block" new slab runs append to. In-memory
     /// only: after a reopen the first slab write starts a fresh fill block (a
     /// partially-filled predecessor keeps its data and is read normally). The
@@ -233,6 +244,30 @@ pub const AdjStore = struct {
         return edge_mod.entriesPerBlock(self.page_size, entry_format);
     }
 
+    /// GAP-0060: an entry needs the WIDE (v3 / slab-v3) format when its
+    /// `prop_head` does not fit 32 bits (a prop-store slab head, bit 63 set).
+    fn entryNeedsWide(entry: EdgeEntry) bool {
+        return (entry.prop_head >> 32) != 0;
+    }
+
+    /// Chain-block format for a NEW block holding `entry`: v3 when this writer
+    /// is wide-heads OR the entry already carries a >u32 head; else v2 (the
+    /// no-truncate rule — a wide head is never packed into a v2 record).
+    fn newChainFormat(self: *const AdjStore, entry: EdgeEntry) u8 {
+        return if (self.wide_heads or entryNeedsWide(entry))
+            edge_mod.ENTRY_FORMAT_V3
+        else
+            edge_mod.ENTRY_FORMAT_V2;
+    }
+
+    /// Slab-block format for a NEW slab block this writer creates: slab-v3 when
+    /// wide-heads OR any entry needs the wide head; else slab-v2.
+    fn newSlabFormat(self: *const AdjStore, entries: []const EdgeEntry) u8 {
+        if (self.wide_heads) return edge_mod.ENTRY_FORMAT_SLAB_V3;
+        for (entries) |e| if (entryNeedsWide(e)) return edge_mod.ENTRY_FORMAT_SLAB_V3;
+        return edge_mod.ENTRY_FORMAT_SLAB;
+    }
+
     /// Add an edge entry to a node's adjacency list (O(1) head-insert).
     /// If the head block has space, inserts there. Otherwise allocates a new
     /// head block whose overflow points to the old head (0 head = new chain).
@@ -274,10 +309,14 @@ pub const AdjStore = struct {
             var bh = try self.readBlockHeader(data);
 
             const has_space = bh.count < @as(u16, @intCast(self.capacityFor(bh.entry_format)));
-            // No-truncate rule: a v1 slot cannot carry a real public_id.
+            // No-truncate rule: a v1 slot cannot carry a real public_id, and a
+            // v1/v2 slot cannot carry a >u32 prop_head (GAP-0060). Either forces
+            // a fresh wider head block instead of an in-place append.
             const would_drop_public_id =
                 bh.entry_format == edge_mod.ENTRY_FORMAT_V1 and entry.public_id != 0;
-            if (has_space and !would_drop_public_id) {
+            const would_drop_wide_head =
+                bh.entry_format != edge_mod.ENTRY_FORMAT_V3 and entryNeedsWide(entry);
+            if (has_space and !would_drop_public_id and !would_drop_wide_head) {
                 // Record the WAL touch BEFORE the first byte is mutated.
                 self.recordTouched(head_page) catch |err| {
                     self.buffer_pool.unpin(frame_idx, false);
@@ -311,15 +350,18 @@ pub const AdjStore = struct {
 
         const new_data = new_frame.dataSlice();
         // pinNew zeroes the page; write header with count=1, then slot 0.
+        // GAP-0060: a wide-heads writer (or a >u32-head entry) creates a v3
+        // block so the head fits now and any in-place widen fits later.
+        const new_fmt = self.newChainFormat(entry);
         self.writeBlockHeader(new_data, .{
             .next_block = head_page,
             .count = 1,
             .kind = 0,
-            .entry_format = edge_mod.ENTRY_FORMAT_V2,
-            .payload_size = @intCast(edge_mod.entrySize(edge_mod.ENTRY_FORMAT_V2)),
+            .entry_format = new_fmt,
+            .payload_size = @intCast(edge_mod.entrySize(new_fmt)),
             .checksum = 0,
         });
-        self.writeEntry(new_data, 0, entry, edge_mod.ENTRY_FORMAT_V2);
+        self.writeEntry(new_data, 0, entry, new_fmt);
         self.buffer_pool.unpin(new_frame_idx, true);
         return new_page;
     }
@@ -333,14 +375,19 @@ pub const AdjStore = struct {
     // slot LAST (the live-head invariant) and arms `undoLastSlabTombstone`.
     // ------------------------------------------------------------------
 
-    const SlabState = struct { slot_count: u32, next_off: u32 };
+    /// GAP-0060: a slab block's write state now carries its entry `fmt`
+    /// (ENTRY_FORMAT_SLAB=32B or ENTRY_FORMAT_SLAB_V3=40B) so run arithmetic
+    /// strides at the block's own width.
+    const SlabState = struct { slot_count: u32, next_off: u32, fmt: u8 };
 
     /// Re-derive a slab block's write state from the page (never cached):
-    /// slot count (from the header) and the free-run frontier (max live run
-    /// end). Tombstoned slots do not extend the frontier. Fails DataCorruption
-    /// on a non-slab / chained / malformed block.
+    /// slot count + entry format (from the header) and the free-run frontier
+    /// (max live run end, strided at the block's width). Tombstoned slots do
+    /// not extend the frontier. Fails DataCorruption on a non-slab / chained /
+    /// malformed block.
     fn slabBlockState(self: *const AdjStore, data: []const u8) error{DataCorruption}!SlabState {
         const bh = try self.readSlabBlockHeader(data);
+        const stride = edge_mod.slabEntrySize(bh.entry_format);
         const slot_count: u32 = bh.count;
         const dir_start = edge_mod.slabDirStart(data.len, self.tail_reserve, slot_count);
         var next_off: u32 = edge_mod.SLAB_RUNS_OFFSET;
@@ -349,11 +396,11 @@ pub const AdjStore = struct {
             const s = edge_mod.readSlabSlot(data, self.tail_reserve, i);
             if (s.offset == edge_mod.SLAB_SLOT_TOMBSTONE) continue;
             if (s.offset < edge_mod.SLAB_RUNS_OFFSET) return error.DataCorruption;
-            const end = @as(u64, s.offset) + @as(u64, s.entry_count) * edge_mod.ENTRY_SIZE_V2;
+            const end = @as(u64, s.offset) + @as(u64, s.entry_count) * stride;
             if (end > dir_start) return error.DataCorruption;
             if (end > next_off) next_off = @intCast(end);
         }
-        return .{ .slot_count = slot_count, .next_off = next_off };
+        return .{ .slot_count = slot_count, .next_off = next_off, .fmt = bh.entry_format };
     }
 
     /// Max run bytes that can ever fit a FRESH single-slot slab block.
@@ -361,17 +408,18 @@ pub const AdjStore = struct {
         return @as(u64, self.page_size) - self.tail_reserve - edge_mod.SLAB_RUNS_OFFSET - edge_mod.SLAB_DIR_ENTRY_SIZE;
     }
 
-    fn writeSlabRunEntryInto(data: []u8, run_offset: u32, idx: u32, entry: EdgeEntry) void {
-        const off = @as(usize, run_offset) + @as(usize, idx) * edge_mod.ENTRY_SIZE_V2;
-        edge_mod.encodeEntry(data[off..][0..edge_mod.ENTRY_SIZE_V2], entry, edge_mod.ENTRY_FORMAT_SLAB);
+    fn writeSlabRunEntryInto(data: []u8, run_offset: u32, idx: u32, entry: EdgeEntry, fmt: u8) void {
+        const size = edge_mod.slabEntrySize(fmt);
+        const off = @as(usize, run_offset) + @as(usize, idx) * size;
+        edge_mod.encodeEntry(data[off .. off + size], entry, fmt);
     }
 
-    /// Write a contiguous run of v2 entries at `run_off` and its slot-dir entry
-    /// (offset, count). Does NOT touch the header slot_count — the caller makes
-    /// the new slot visible (fresh block: header count preset; fill block:
-    /// bumpSlabSlotCount after).
-    fn writeSlabRun(self: *const AdjStore, data: []u8, run_off: u32, slot: u32, entries: []const EdgeEntry) void {
-        for (entries, 0..) |e, k| writeSlabRunEntryInto(data, run_off, @intCast(k), e);
+    /// Write a contiguous run of `fmt`-strided entries at `run_off` and its
+    /// slot-dir entry (offset, count). Does NOT touch the header slot_count —
+    /// the caller makes the new slot visible (fresh block: header count preset;
+    /// fill block: bumpSlabSlotCount after).
+    fn writeSlabRun(self: *const AdjStore, data: []u8, run_off: u32, slot: u32, entries: []const EdgeEntry, fmt: u8) void {
+        for (entries, 0..) |e, k| writeSlabRunEntryInto(data, run_off, @intCast(k), e, fmt);
         edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = run_off, .entry_count = @intCast(entries.len) });
     }
 
@@ -398,10 +446,18 @@ pub const AdjStore = struct {
     /// is mutated; the new slot becomes visible only via the last write.
     fn appendSlabRun(self: *AdjStore, entries: []const EdgeEntry) !?u64 {
         std.debug.assert(entries.len >= 1);
-        const run_bytes: u32 = @intCast(entries.len * edge_mod.ENTRY_SIZE_V2);
+        // GAP-0060: the run's stride is the writer's chosen slab format (v3 when
+        // wide-heads or any entry needs the wide head; else v2).
+        const want_fmt = self.newSlabFormat(entries);
+        const stride = edge_mod.slabEntrySize(want_fmt);
+        const run_bytes: u32 = @intCast(entries.len * stride);
         if (run_bytes > self.slabFreshRunCap()) return null;
 
-        // Try the current fill block first.
+        // Try the current fill block first — but only if its on-disk format
+        // matches the run's required width (a wide entry can never append to a
+        // v2 fill block, and vice versa). Within one session wide_heads is
+        // constant so this always matches; the guard protects the wide-entry-
+        // in-a-non-wide-session case (colocation rebuild of a widened edge).
         if (self.current_fill_page) |fill_page| {
             const frame = try self.buffer_pool.pin(self.file_id, fill_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
@@ -410,7 +466,7 @@ pub const AdjStore = struct {
                 self.buffer_pool.unpin(frame_idx, false);
                 return err;
             };
-            if (state.slot_count <= SLAB_HEAD_SLOT_MASK) {
+            if (state.fmt == want_fmt and state.slot_count <= SLAB_HEAD_SLOT_MASK) {
                 const slot: u32 = state.slot_count;
                 const dir_needed: u64 = (@as(u64, slot) + 1) * edge_mod.SLAB_DIR_ENTRY_SIZE;
                 const avail_end: u64 = @as(u64, self.page_size) - self.tail_reserve - dir_needed;
@@ -419,13 +475,13 @@ pub const AdjStore = struct {
                         self.buffer_pool.unpin(frame_idx, false);
                         return err;
                     };
-                    self.writeSlabRun(data, state.next_off, slot, entries);
+                    self.writeSlabRun(data, state.next_off, slot, entries, want_fmt);
                     self.bumpSlabSlotCount(data, slot + 1, run_bytes);
                     self.buffer_pool.unpin(frame_idx, true);
                     return encodeSlabHead(fill_page, slot); // fill_page already in range
                 }
             }
-            // Full (or slot indices exhausted): retire it as the fill block.
+            // Full (or slot indices exhausted, or format mismatch): retire it.
             self.buffer_pool.unpin(frame_idx, false);
             self.current_fill_page = null;
         }
@@ -451,11 +507,11 @@ pub const AdjStore = struct {
             .next_block = 0,
             .count = 1,
             .kind = 0,
-            .entry_format = edge_mod.ENTRY_FORMAT_SLAB,
+            .entry_format = want_fmt,
             .payload_size = @truncate(run_bytes),
             .checksum = 0,
         });
-        self.writeSlabRun(data, edge_mod.SLAB_RUNS_OFFSET, 0, entries);
+        self.writeSlabRun(data, edge_mod.SLAB_RUNS_OFFSET, 0, entries, want_fmt);
         self.buffer_pool.unpin(frame_idx, true);
         self.current_fill_page = new_page;
         return head;
@@ -525,27 +581,33 @@ pub const AdjStore = struct {
             self.buffer_pool.unpin(frame_idx, false);
             return error.DataCorruption;
         }
+        // GAP-0060: stride at the block's own format (slab-v2 32B or slab-v3 40B).
+        const fmt = state.fmt;
+        const stride = edge_mod.slabEntrySize(fmt);
         const s = edge_mod.readSlabSlot(data, self.tail_reserve, slot);
         if (s.offset == edge_mod.SLAB_SLOT_TOMBSTONE or s.offset < edge_mod.SLAB_RUNS_OFFSET) {
             self.buffer_pool.unpin(frame_idx, false);
             return error.DataCorruption; // live-head invariant: head → live run
         }
-        const run_end: u64 = @as(u64, s.offset) + @as(u64, s.entry_count) * edge_mod.ENTRY_SIZE_V2;
+        const run_end: u64 = @as(u64, s.offset) + @as(u64, s.entry_count) * stride;
         const dir_start = edge_mod.slabDirStart(data.len, self.tail_reserve, state.slot_count);
         if (run_end > dir_start) {
             self.buffer_pool.unpin(frame_idx, false);
             return error.DataCorruption;
         }
 
-        // (A) In-place tail-grow: run ends at the block frontier, one more fits.
-        if (run_end == state.next_off and run_end + edge_mod.ENTRY_SIZE_V2 <= dir_start) {
+        // (A) In-place tail-grow: run ends at the block frontier, one more fits,
+        // AND the entry's head fits the block's width (a wide head can never be
+        // appended into a v2 run — that falls through to a v3 relocation in (B)).
+        const fits_fmt = !(entryNeedsWide(entry) and fmt != edge_mod.ENTRY_FORMAT_SLAB_V3);
+        if (fits_fmt and run_end == state.next_off and run_end + stride <= dir_start) {
             self.recordTouched(page) catch |err| {
                 self.buffer_pool.unpin(frame_idx, false);
                 return err;
             };
-            edge_mod.encodeEntry(data[@intCast(run_end)..][0..edge_mod.ENTRY_SIZE_V2], entry, edge_mod.ENTRY_FORMAT_SLAB);
+            edge_mod.encodeEntry(data[@intCast(run_end)..][0..stride], entry, fmt);
             edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = s.offset, .entry_count = s.entry_count + 1 });
-            self.bumpSlabPayload(data, edge_mod.ENTRY_SIZE_V2);
+            self.bumpSlabPayload(data, @intCast(stride));
             self.buffer_pool.unpin(frame_idx, true);
             return head; // head unchanged
         }
@@ -560,8 +622,8 @@ pub const AdjStore = struct {
         defer alloc.free(new_run);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const eoff: usize = @as(usize, s.offset) + i * edge_mod.ENTRY_SIZE_V2;
-            new_run[i] = edge_mod.decodeEntry(data[eoff..][0..edge_mod.ENTRY_SIZE_V2], edge_mod.ENTRY_FORMAT_SLAB);
+            const eoff: usize = @as(usize, s.offset) + i * stride;
+            new_run[i] = edge_mod.decodeEntry(data[eoff .. eoff + stride], fmt);
         }
         new_run[n] = entry;
         self.buffer_pool.unpin(frame_idx, false);
@@ -592,12 +654,12 @@ pub const AdjStore = struct {
         const run = try self.resolveSlabRun(data, slot);
         var i: u32 = 0;
         while (i < run.entry_count) : (i += 1) {
-            const e = readSlabRunEntry(data, run.offset, i);
+            const e = readSlabRunEntry(data, run.offset, i, run.fmt);
             if (e.edge_id == edge_id) {
                 try self.recordTouched(page);
                 if (i < run.entry_count - 1) {
-                    const last = readSlabRunEntry(data, run.offset, run.entry_count - 1);
-                    writeSlabRunEntryInto(data, run.offset, i, last);
+                    const last = readSlabRunEntry(data, run.offset, run.entry_count - 1, run.fmt);
+                    writeSlabRunEntryInto(data, run.offset, i, last, run.fmt);
                 }
                 edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = run.offset, .entry_count = run.entry_count - 1 });
                 dirty = true;
@@ -619,13 +681,21 @@ pub const AdjStore = struct {
         defer self.buffer_pool.unpin(frame_idx, dirty);
         const data = frame.dataSlice();
         const run = try self.resolveSlabRun(data, slot);
+        // GAP-0060: writing a >u32 (slab) head requires a slab-v3 run. A fresh
+        // 0060 store's runs are all v3, so this is the in-place path. A PRE-0060
+        // (v2) run can't hold the wide head in place — fail LOUDLY rather than
+        // truncate; relocating the run to v3 (a head change) is the documented
+        // old-store-upgrade follow-up (never reached by fresh ingest).
+        if ((new_prop_head >> 32) != 0 and run.fmt != edge_mod.ENTRY_FORMAT_SLAB_V3) {
+            return error.WideHeadInLegacySlabRun;
+        }
         var i: u32 = 0;
         while (i < run.entry_count) : (i += 1) {
-            var e = readSlabRunEntry(data, run.offset, i);
+            var e = readSlabRunEntry(data, run.offset, i, run.fmt);
             if (e.edge_id == edge_id) {
                 try self.recordTouched(page);
                 e.prop_head = new_prop_head;
-                writeSlabRunEntryInto(data, run.offset, i, e);
+                writeSlabRunEntryInto(data, run.offset, i, e, run.fmt);
                 dirty = true;
                 return page;
             }
@@ -768,7 +838,7 @@ pub const AdjStore = struct {
                 const run = try self.store.resolveSlabRun(data, slot);
 
                 while (self.current_index < run.entry_count) {
-                    const entry = readSlabRunEntry(data, run.offset, self.current_index);
+                    const entry = readSlabRunEntry(data, run.offset, self.current_index, run.fmt);
                     self.current_index += 1;
 
                     if (self.rel_type) |rt| {
@@ -955,33 +1025,39 @@ pub const AdjStore = struct {
         const off = self.blockHeaderOffset();
         const bytes = data[off..][0..BLOCK_HEADER_SIZE];
         const bh: EdgeBlockHeader = @bitCast(bytes.*);
-        if (bh.entry_format != edge_mod.ENTRY_FORMAT_SLAB) return error.DataCorruption;
+        // GAP-0060: a tagged head lands on a slab-v2 OR slab-v3 block.
+        if (bh.entry_format != edge_mod.ENTRY_FORMAT_SLAB and
+            bh.entry_format != edge_mod.ENTRY_FORMAT_SLAB_V3) return error.DataCorruption;
         if (bh.next_block != 0) return error.DataCorruption;
         const dir_bytes = @as(u64, bh.count) * edge_mod.SLAB_DIR_ENTRY_SIZE;
         if (edge_mod.SLAB_RUNS_OFFSET + dir_bytes + self.tail_reserve > data.len) return error.DataCorruption;
         return bh;
     }
 
+    /// A validated slab run plus the block's entry `fmt` (its stride), so
+    /// callers read/write entries at the right width (v2 32B or v3 40B).
+    const ResolvedRun = struct { offset: u32, entry_count: u32, fmt: u8 };
+
     /// Resolve a slab (block, slot) to its validated run. The live-head
     /// invariant makes a tombstoned or out-of-range slot reached via a stored
     /// head ref corruption — never silently empty.
-    fn resolveSlabRun(self: *const AdjStore, data: []const u8, slot: u32) error{DataCorruption}!edge_mod.SlabSlot {
+    fn resolveSlabRun(self: *const AdjStore, data: []const u8, slot: u32) error{DataCorruption}!ResolvedRun {
         const bh = try self.readSlabBlockHeader(data);
         if (slot >= bh.count) return error.DataCorruption;
         const run = edge_mod.readSlabSlot(data, self.tail_reserve, slot);
         if (run.offset == edge_mod.SLAB_SLOT_TOMBSTONE) return error.DataCorruption;
         if (run.offset < edge_mod.SLAB_RUNS_OFFSET) return error.DataCorruption;
-        const run_end = @as(u64, run.offset) + @as(u64, run.entry_count) * edge_mod.ENTRY_SIZE_V2;
+        const run_end = @as(u64, run.offset) + @as(u64, run.entry_count) * edge_mod.slabEntrySize(bh.entry_format);
         if (run_end > edge_mod.slabDirStart(data.len, self.tail_reserve, bh.count)) return error.DataCorruption;
-        return run;
+        return .{ .offset = run.offset, .entry_count = run.entry_count, .fmt = bh.entry_format };
     }
 
-    /// Read entry `idx` of a validated slab run at the v2 (32 B) stride.
-    /// GAP-0060: v3 slab runs use `readSlabRunEntryFmt`; this legacy-stride
-    /// reader stays for the existing v2 slab callers.
-    fn readSlabRunEntry(data: []const u8, run_offset: u32, idx: u32) EdgeEntry {
-        const off = @as(usize, run_offset) + @as(usize, idx) * edge_mod.ENTRY_SIZE_V2;
-        return edge_mod.decodeEntry(data[off..][0..edge_mod.ENTRY_SIZE_V2], edge_mod.ENTRY_FORMAT_SLAB);
+    /// Read entry `idx` of a validated slab run at the block's `fmt` stride
+    /// (slab-v2 32B or slab-v3 40B). GAP-0060.
+    fn readSlabRunEntry(data: []const u8, run_offset: u32, idx: u32, fmt: u8) EdgeEntry {
+        const size = edge_mod.slabEntrySize(fmt);
+        const off = @as(usize, run_offset) + @as(usize, idx) * size;
+        return edge_mod.decodeEntry(data[off .. off + size], fmt);
     }
 };
 
@@ -1806,6 +1882,160 @@ test "P2 writer: relocate then undoLastSlabTombstone brings the old head back to
     try testing.expectEqual(@as(u64, 1), try store.edgeCount(a));
     const e = try firstEdge(&store, a);
     try testing.expectEqual(@as(u64, 10), e.neighbor);
+}
+
+// ============================================================================
+// GAP-0060 — wide (v3 / slab-v3) edge prop_head write path
+// ============================================================================
+
+/// Read the entry-format byte of the slab block a slab head points at.
+fn slabBlockFmt(store: *AdjStore, head: u64) !u8 {
+    const page = slabHeadPageId(head);
+    const frame = try store.buffer_pool.pin(store.file_id, page);
+    const idx = store.buffer_pool.frameIndex(frame);
+    defer store.buffer_pool.unpin(idx, false);
+    return frame.dataSlice()[PAGE_HEADER_SIZE + 11]; // EdgeBlockHeader.entry_format
+}
+
+test "GAP-0060: wide_heads writer packs slab-v3 runs; u64 prop_head widens IN PLACE" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+    store.wide_heads = true;
+
+    // Edges added with prop_head=0 (geode adds the edge, then attaches props).
+    var head = try store.addEdge(0, v2Edge(10, 101, 5, 0xA1));
+    head = try store.addEdge(head, v2Edge(20, 102, 5, 0xA2));
+    head = try store.addEdge(head, v2Edge(30, 103, 5, 0xA3));
+    try testing.expect(isSlabHead(head));
+    try testing.expectEqual(edge_mod.ENTRY_FORMAT_SLAB_V3, try slabBlockFmt(&store, head));
+    try testing.expectEqual(@as(u64, 3), try store.edgeCount(head));
+
+    // Widen the middle edge's prop_head to a prop-store SLAB head (bit 63) IN
+    // PLACE — the node's out_head (== head) is unchanged (no relocation).
+    const wide: u64 = (@as(u64, 1) << 63) | 0x00AB_CDEF_1234;
+    const up = try store.updateEdgePropHead(head, 102, wide);
+    try testing.expectEqual(@as(?PageId, slabHeadPageId(head)), up);
+
+    var it = store.expand(head, null);
+    defer it.deinit();
+    var seen: usize = 0;
+    while (try it.next()) |e| {
+        seen += 1;
+        if (e.edge_id == 102) {
+            try testing.expectEqual(wide, e.prop_head); // full u64 survived
+            try testing.expectEqual(@as(u64, 0xA2), e.public_id); // public_id intact
+        } else {
+            try testing.expectEqual(@as(u64, 0), e.prop_head);
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "GAP-0060: v3 CHAIN block carries a u64 prop_head (wide_heads, no slab)" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = false; // legacy chain writer
+    store.wide_heads = true;
+
+    const wide: u64 = (@as(u64, 1) << 63) | 0xFEED_1234;
+    var e = v2Edge(10, 201, 5, 0xB1);
+    e.prop_head = wide;
+    const head = try store.addEdge(0, e);
+    try testing.expect(!isSlabHead(head)); // a bare chain head, not slab
+    {
+        const frame = try store.buffer_pool.pin(store.file_id, head);
+        const idx = store.buffer_pool.frameIndex(frame);
+        defer store.buffer_pool.unpin(idx, false);
+        try testing.expectEqual(edge_mod.ENTRY_FORMAT_V3, frame.dataSlice()[PAGE_HEADER_SIZE + 11]);
+    }
+    const got = try firstEdge(&store, head);
+    try testing.expectEqual(wide, got.prop_head);
+    try testing.expectEqual(@as(u64, 0xB1), got.public_id);
+}
+
+test "GAP-0060: slab-v3 grow + remove round-trips all edges" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+    store.wide_heads = true;
+
+    var head: u64 = 0;
+    var k: u64 = 0;
+    while (k < 10) : (k += 1) head = try store.addEdge(head, v2Edge(100 + k, 300 + k, 5, 0));
+    try testing.expect(isSlabHead(head));
+    try testing.expectEqual(edge_mod.ENTRY_FORMAT_SLAB_V3, try slabBlockFmt(&store, head));
+    try testing.expectEqual(@as(u64, 10), try store.edgeCount(head));
+
+    const wide: u64 = (@as(u64, 1) << 63) | 7;
+    _ = try store.updateEdgePropHead(head, 305, wide);
+    _ = try store.removeEdge(head, 302);
+    try testing.expectEqual(@as(u64, 9), try store.edgeCount(head));
+
+    var it = store.expand(head, null);
+    defer it.deinit();
+    var found305 = false;
+    var found302 = false;
+    while (try it.next()) |e| {
+        if (e.edge_id == 305) {
+            found305 = true;
+            try testing.expectEqual(wide, e.prop_head);
+        }
+        if (e.edge_id == 302) found302 = true;
+    }
+    try testing.expect(found305);
+    try testing.expect(!found302);
+}
+
+test "GAP-0060: read-both — a wide_heads store reads a legacy slab-v2 block" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+    store.wide_heads = true;
+
+    // A pre-0060 slab-v2 block laid down directly on disk.
+    const runs = [_][]const EdgeEntry{&[_]EdgeEntry{ v2Edge(10, 401, 5, 0xC1), v2Edge(20, 402, 5, 0xC2) }};
+    const page = try writeRawSlabBlock(&store, &runs);
+    const v2head = encodeSlabHead(page, 0);
+    var it = store.expand(v2head, null);
+    defer it.deinit();
+    var n: usize = 0;
+    while (try it.next()) |e| : (n += 1) {
+        try testing.expectEqual(@as(u64, 0), e.prop_head >> 32); // legacy u32 head widened
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+
+    // ...and a fresh v3 slab chain in the SAME store writes/reads at 40B stride.
+    const v3head = try store.addEdge(0, v2Edge(30, 403, 5, 0xC3));
+    try testing.expectEqual(edge_mod.ENTRY_FORMAT_SLAB_V3, try slabBlockFmt(&store, v3head));
+    try testing.expectEqual(@as(u64, 1), try store.edgeCount(v3head));
+}
+
+test "GAP-0060: updateEdgePropHead refuses a wide head in a legacy slab-v2 run (loud, no truncation)" {
+    var env = try TestEnv.init();
+    env.fixup();
+    defer env.deinit();
+    var store = AdjStore.init(&env.pool, &env.fsm, .adj_out, 4096);
+    store.slab_packing = true;
+    store.wide_heads = true;
+
+    const runs = [_][]const EdgeEntry{&[_]EdgeEntry{v2Edge(10, 501, 5, 0)}};
+    const page = try writeRawSlabBlock(&store, &runs);
+    const v2head = encodeSlabHead(page, 0);
+    // A narrow head fits the v2 run.
+    _ = try store.updateEdgePropHead(v2head, 501, 42);
+    try testing.expectEqual(@as(u64, 42), (try firstEdge(&store, v2head)).prop_head);
+    // A WIDE head cannot fit 32B — refused loudly rather than silently truncated.
+    const wide: u64 = (@as(u64, 1) << 63) | 9;
+    try testing.expectError(error.WideHeadInLegacySlabRun, store.updateEdgePropHead(v2head, 501, wide));
 }
 
 test {
