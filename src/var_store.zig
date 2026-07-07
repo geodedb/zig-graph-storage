@@ -803,6 +803,10 @@ test "P0 parity: short strings + label blocks round-trip byte-identical (legacy,
     defer env.deinit();
 
     var store = VarStore.init(&env.pool, &env.fsm, 4096);
+    // Legacy one-page-per-chain writer under test (name: "legacy, after
+    // flush"): pin it so store.write() exercises the legacy chain + eviction
+    // disk round-trip, not the slab writer (default ON since P7).
+    store.slab_packing = false;
 
     var records: std.ArrayList([]const u8) = .empty;
     defer {
@@ -907,6 +911,10 @@ test "P1 slab read path: each (block, slot) head reads byte-identical to the leg
     env.register();
     defer env.deinit();
     var store = VarStore.init(&env.pool, &env.fsm, 4096);
+    // store.write() must produce LEGACY chain refs so the read-both comparison
+    // below is genuinely legacy-vs-slab (slab default ON since P7);
+    // writeRawSlabVarBlock builds the slab block directly regardless.
+    store.slab_packing = false;
 
     // The SAME payloads, written two ways — a legacy page-chain per payload and
     // all payloads packed into ONE shared slab block. Every read must match the
@@ -967,6 +975,9 @@ test "P1: slab + legacy var chains coexist; an untagged head into a slab block i
     env.register();
     defer env.deinit();
     var store = VarStore.init(&env.pool, &env.fsm, 4096);
+    // The "legacy" write must be a real legacy chain ref for slab + legacy
+    // coexistence to be exercised (slab default ON since P7).
+    store.slab_packing = false;
 
     const legacy = try store.write("legacy payload");
     const runs = [_][]const u8{"slabbed payload"};
