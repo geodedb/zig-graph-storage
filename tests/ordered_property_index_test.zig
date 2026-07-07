@@ -9,7 +9,8 @@
 // engine's ORDER BY order. Correctness asserted here:
 //   * ASC cursor == values ascending; DESC == exact reverse (orderable-only).
 //   * a not-orderable value (decimal) is SKIPPED (no tree growth, no error).
-//   * save -> load round-trips the snapshot counter and the exact cursor walk.
+//   * save -> load round-trips the Path B (epoch, covered_lsn) stamp and the
+//     exact cursor walk (GAP-0050).
 //   * an unregistered (label,key) is never indexed (openCursor returns null).
 //
 // All trees own heap copies of their keys, so the suite runs under
@@ -22,6 +23,9 @@ const OrderedPropertyIndex = gs.ordered_property_index.OrderedPropertyIndex;
 const Direction = OrderedPropertyIndex.Direction;
 const PropertyValue = gs.PropertyValue;
 const ordered_encoding = gs.ordered_encoding;
+const index_snapshot = gs.index_snapshot;
+const Stamp = index_snapshot.Stamp;
+const SNAPSHOT_MAGIC = gs.ordered_property_index.SNAPSHOT_MAGIC;
 
 const testing = std.testing;
 const io = std.Io.Threaded.global_single_threaded.io();
@@ -121,7 +125,7 @@ test "remove drops the entry from the cursor walk" {
     try testing.expectEqualSlices(i64, &[_]i64{ -3, 42 }, asc.items);
 }
 
-test "save -> load round-trips counter and the cursor walk" {
+test "save -> load round-trips the (epoch, covered_lsn) stamp and the cursor walk" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
@@ -129,7 +133,10 @@ test "save -> load round-trips counter and the cursor walk" {
 
     const label_a: u32 = 1;
     const label_b: u32 = 2;
-    const counter: u64 = 77;
+    // GAP-0050: distinct epoch + covered_lsn prove the two stamp slots round-trip
+    // independently (the old counter gate only carried one value).
+    const epoch: u64 = 77;
+    const covered_lsn: u64 = 4242;
 
     {
         var idx = OrderedPropertyIndex.init(testing.allocator);
@@ -143,7 +150,7 @@ test "save -> load round-trips counter and the cursor walk" {
         try idx.insert(label_b, "rank", .{ .int = 9 }, 200);
         try idx.insert(label_b, "rank", .{ .int = 1 }, 201);
 
-        try idx.saveToFile(dir_path, counter);
+        try idx.saveToFile(dir_path, epoch, covered_lsn);
     }
 
     {
@@ -151,7 +158,7 @@ test "save -> load round-trips counter and the cursor walk" {
         defer idx.deinit();
 
         const loaded = try idx.loadFromFile(dir_path);
-        try testing.expectEqual(@as(?u64, counter), loaded);
+        try testing.expectEqual(@as(?Stamp, Stamp{ .epoch = epoch, .covered_lsn = covered_lsn }), loaded);
 
         try testing.expectEqual(@as(?usize, 3), idx.treeLen(label_a, "score"));
         try testing.expectEqual(@as(?usize, 2), idx.treeLen(label_b, "rank"));
@@ -286,7 +293,8 @@ test "eligibility: survives save -> load and is recomputed by a clearTrees rebui
     const dir_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
 
-    const counter: u64 = 88;
+    const epoch: u64 = 88;
+    const covered_lsn: u64 = 909;
     const L_ok: u32 = 1; // homogeneous int -> eligible
     const L_bad: u32 = 2; // int+float -> ineligible
 
@@ -302,14 +310,14 @@ test "eligibility: survives save -> load and is recomputed by a clearTrees rebui
 
         try testing.expect(idx.isEligible(L_ok, "score"));
         try testing.expect(!idx.isEligible(L_bad, "measure"));
-        try idx.saveToFile(dir_path, counter);
+        try idx.saveToFile(dir_path, epoch, covered_lsn);
     }
 
     {
         var idx = OrderedPropertyIndex.init(testing.allocator);
         defer idx.deinit();
         const loaded = try idx.loadFromFile(dir_path);
-        try testing.expectEqual(@as(?u64, counter), loaded);
+        try testing.expectEqual(@as(?Stamp, Stamp{ .epoch = epoch, .covered_lsn = covered_lsn }), loaded);
 
         // Restored from the snapshot, not recomputed.
         try testing.expect(idx.isEligible(L_ok, "score"));
@@ -342,5 +350,51 @@ test "loadFromFile returns null when no snapshot exists" {
     var idx = OrderedPropertyIndex.init(testing.allocator);
     defer idx.deinit();
 
-    try testing.expectEqual(@as(?u64, null), try idx.loadFromFile(dir_path));
+    try testing.expectEqual(@as(?Stamp, null), try idx.loadFromFile(dir_path));
+}
+
+// ── GAP-0050 (c): an old-magic (GSORDIX3 or earlier) snapshot is version-
+// rejected, never misparsed under the new (checkpoint_epoch, covered_lsn)
+// header ──────────────────────────────────────────────────────────────────
+//
+// The 3 -> 4 magic bump IS the format-version guard: the loader must REJECT a
+// GSORDIX3 file (whose slot0 carried manifest.counter, slot1 == 0) rather than
+// read its counter as an epoch. A minimal but structurally VALID GSORDIX3
+// snapshot (item_count == 0, correct CRC via SnapshotWriter) is written, then
+// loadFromFile must return error.InvalidFormat — proving the magic check trips
+// BEFORE any payload interpretation.
+test "GAP-0050 (c): old-magic GSORDIX3 snapshot is rejected, not misparsed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    // Sanity: the guard is only meaningful while the live magic has moved past
+    // the retired one we forge below.
+    try testing.expect(!std.mem.eql(u8, SNAPSHOT_MAGIC, "GSORDIX3"));
+
+    // Forge a structurally-valid GSORDIX3 snapshot (retired magic, empty item
+    // set, correct trailing CRC) at the canonical snapshot path.
+    const snap_path = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/{s}",
+        .{ dir_path, gs.ordered_property_index.SNAPSHOT_FILE_NAME },
+    );
+    defer testing.allocator.free(snap_path);
+    {
+        var w = index_snapshot.SnapshotWriter.init(testing.allocator);
+        defer w.deinit();
+        // Old semantics: slot0 == counter, slot1 == 0, item_count == 0.
+        try w.writeHeader("GSORDIX3", 99, 0, 0);
+        var file = try std.Io.Dir.cwd().createFile(io, snap_path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        try w.finalize(file);
+    }
+
+    var idx = OrderedPropertyIndex.init(testing.allocator);
+    defer idx.deinit();
+    // Version rejection (magic mismatch) — NOT a silent misparse into a bogus
+    // registration/tree set.
+    try testing.expectError(error.InvalidFormat, idx.loadFromFile(dir_path));
+    try testing.expectEqual(@as(usize, 0), idx.count());
 }

@@ -520,13 +520,21 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
         engine.metrics.ordered_index_refreshes += 1;
     }
 
-    // H3-P1: persist the value-ordered index on the FULL path only, gated on its
-    // dirty flag (reuse the Lever-B derived gating). The light path passes
-    // save_derived=false so it stays O(dirty); a stale snapshot after a crash is
-    // rejected by the counter gate on open and rebuilt from a scan. The snapshot
-    // is stamped at the NOW-advanced manifest.counter so a CLEAN restart loads it.
+    // GAP-0050: persist the value-ordered index on the FULL path only, gated on
+    // its dirty flag (reuse the Lever-B derived gating). The light path passes
+    // save_derived=false so it stays O(dirty); a stale-after-crash snapshot is
+    // rejected by the Path B gate on open and rebuilt from a scan. The snapshot
+    // is stamped at the NOW-advanced `(checkpoint_epoch, last_checkpoint_lsn)` —
+    // the SAME token the derived snapshots just took — so a CLEAN reopen (epoch
+    // current, no tail) LOADS it. The refresh above (rebuildOrderedIndex) ran
+    // AFTER doCheckpoint with no intervening writes, so the trees reflect exactly
+    // the covered_lsn (last_checkpoint_lsn) state.
     if (save_derived and engine.ordered_index_dirty) {
-        try engine.ordered_property_index.saveToFile(engine.graph_dir.path, engine.manifest.counter);
+        try engine.ordered_property_index.saveToFile(
+            engine.graph_dir.path,
+            engine.manifest.checkpoint_epoch,
+            engine.manifest.last_checkpoint_lsn,
+        );
         engine.ordered_index_dirty = false;
         engine.metrics.ordered_index_saves += 1;
     }
