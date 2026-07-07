@@ -53,6 +53,13 @@ fn baselineConfig() gs.GraphConfig {
         .page_size = PAGE_SIZE,
         .buffer_pool_pages = 256,
         .data_dir = "data",
+        // This suite exercises the LEGACY v1/v2 adjacency BLOCK format and the
+        // inline-public-id-in-block feature (hand-built blocks, bytes/edge
+        // bounds, v1/v2 mixing, rebuild id surfacing). Adjacency slab packing —
+        // a different layout — defaults ON since P7, so pin the legacy block
+        // writer here to keep testing this path. Slab + inline-public-id parity
+        // is covered separately in tests/adjacency_slab.zig (slabConfig).
+        .adjacency_slab_packing = false,
     };
 }
 
@@ -885,7 +892,11 @@ test "P2 crash: fresh v2 block linked into a v1 chain replays via WAL page-image
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xE4} ** 16;
-    const cfg = test_support.testConfig(); // sync_each_commit => WAL tail survives the crash
+    var cfg = test_support.testConfig(); // sync_each_commit => WAL tail survives the crash
+    // Rewrites a v2 adjacency block to v1 in place and pins the raw out_head
+    // page; adjacency slab packing (default ON since P7) makes out_head a slab
+    // head instead, so pin the legacy block writer for this legacy scenario.
+    cfg.adjacency_slab_packing = false;
 
     const pid: u64 = 0xCAFE_F00D_0000_0001;
     var node_a: u64 = 0;
@@ -1398,7 +1409,11 @@ test "P3 mixed v1/v2 adjacency → rebuild → v1 edges surface id 0, v2 edges r
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xEA} ** 16;
-    const cfg = test_support.testConfig();
+    var cfg = test_support.testConfig();
+    // Rewrites a v2 adjacency block to v1 in place and pins the raw out_head
+    // page; adjacency slab packing (default ON since P7) makes out_head a slab
+    // head instead, so pin the legacy block writer for this legacy scenario.
+    cfg.adjacency_slab_packing = false;
 
     const pid: u64 = 0xCAFE_0000_0000_0077;
     var node_a: u64 = 0;
