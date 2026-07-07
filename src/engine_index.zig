@@ -33,16 +33,24 @@ const EDGE_EXIST_IDX_NAME = file_manager_mod.FILE_NAMES[@intFromEnum(types.FileI
 // (error.InvalidFormat → materializeDerivedIndexes' `catch false` → clean
 // one-time rebuild from durable adjacency); an old file can never be
 // misparsed, and an old binary rejects a new file the same way. Never reuse
-// a retired magic ("GSEIDX2"/"GSEIDX3"/"GSEIDX4"/"GSXIDX1"/"GSXIDX2") for a
-// future layout.
+// a retired magic ("GSEIDX2"/"GSEIDX3"/"GSEIDX4"/"GSEIDX5"/"GSXIDX1"/"GSXIDX2")
+// for a future layout.
 //
 // WAL-aware derived-index durability: the sorted-container header grew a
 // second stamp field — checkpoint_epoch + covered_lsn (see
-// sorted_index_snapshot.zig) — so the edge magics bump GSEIDX4 -> GSEIDX5 and
-// GSXIDX2 -> GSXIDX3. Records are unchanged (40 B / 28 B), sorted, per-block
-// CRC directory, loaded by mmap-adopt.
-const EDGE_SNAPSHOT_MAGIC = "GSEIDX5\x00";
-const EDGE_RECORD_SIZE: u32 = edge_index_map_mod.RECORD_SIZE; // 40
+// sorted_index_snapshot.zig) — so the edge magics bumped GSEIDX4 -> GSEIDX5 and
+// GSXIDX2 -> GSXIDX3.
+//
+// GAP-0060 (edge-prop slab): the edge-index record grew 40 B -> 44 B
+// (prop_head u32 -> u64, so an edge prop head can be a prop-store slab ref) →
+// GSEIDX5 -> GSEIDX6. A pre-0060 store's GSEIDX5 snapshot is rejected by the
+// record-size/magic gate → `tryLoadDerivedIndexes` returns `.rebuild` and the
+// edge index is rebuilt from durable adjacency (whose legacy v1/v2 entries
+// carry a u32 prop_head that widens losslessly). The existence index is
+// unchanged (28 B) and keeps GSXIDX3. Records sorted, per-block CRC directory,
+// loaded by mmap-adopt.
+const EDGE_SNAPSHOT_MAGIC = "GSEIDX6\x00";
+const EDGE_RECORD_SIZE: u32 = edge_index_map_mod.RECORD_SIZE; // 44
 
 // PHASE 3 existence index: 28 B records sorted by (from, to, rel_type, edge_id)
 // in the mmap container, under the bumped GSXIDX3 magic.

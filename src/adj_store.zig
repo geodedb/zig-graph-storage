@@ -363,7 +363,7 @@ pub const AdjStore = struct {
 
     fn writeSlabRunEntryInto(data: []u8, run_offset: u32, idx: u32, entry: EdgeEntry) void {
         const off = @as(usize, run_offset) + @as(usize, idx) * edge_mod.ENTRY_SIZE_V2;
-        @memcpy(data[off..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&entry)[0..edge_mod.ENTRY_SIZE_V2]);
+        edge_mod.encodeEntry(data[off..][0..edge_mod.ENTRY_SIZE_V2], entry, edge_mod.ENTRY_FORMAT_SLAB);
     }
 
     /// Write a contiguous run of v2 entries at `run_off` and its slot-dir entry
@@ -543,7 +543,7 @@ pub const AdjStore = struct {
                 self.buffer_pool.unpin(frame_idx, false);
                 return err;
             };
-            @memcpy(data[@intCast(run_end)..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&entry)[0..edge_mod.ENTRY_SIZE_V2]);
+            edge_mod.encodeEntry(data[@intCast(run_end)..][0..edge_mod.ENTRY_SIZE_V2], entry, edge_mod.ENTRY_FORMAT_SLAB);
             edge_mod.writeSlabSlot(data, self.tail_reserve, slot, .{ .offset = s.offset, .entry_count = s.entry_count + 1 });
             self.bumpSlabPayload(data, edge_mod.ENTRY_SIZE_V2);
             self.buffer_pool.unpin(frame_idx, true);
@@ -561,7 +561,7 @@ pub const AdjStore = struct {
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const eoff: usize = @as(usize, s.offset) + i * edge_mod.ENTRY_SIZE_V2;
-            new_run[i] = @bitCast(data[eoff..][0..edge_mod.ENTRY_SIZE_V2].*);
+            new_run[i] = edge_mod.decodeEntry(data[eoff..][0..edge_mod.ENTRY_SIZE_V2], edge_mod.ENTRY_FORMAT_SLAB);
         }
         new_run[n] = entry;
         self.buffer_pool.unpin(frame_idx, false);
@@ -609,7 +609,7 @@ pub const AdjStore = struct {
 
     /// Update an edge's prop_head in a slab-packed chain (in-place rewrite).
     /// Head unchanged; returns the DECODED slab block page (or null when absent).
-    fn updateEdgePropHeadSlab(self: *AdjStore, head: u64, edge_id: EdgeId, new_prop_head: u32) !?PageId {
+    fn updateEdgePropHeadSlab(self: *AdjStore, head: u64, edge_id: EdgeId, new_prop_head: u64) !?PageId {
         const page = slabHeadPageId(head);
         if (page == 0) return error.DataCorruption;
         const slot = slabHeadSlot(head);
@@ -821,7 +821,7 @@ pub const AdjStore = struct {
     /// exactly that page in the same txn as the property write — the same
     /// contract as `removeEdge` (edge-remove non-head imaging fix). Returns
     /// null when the edge was not found (no page touched, nothing to log).
-    pub fn updateEdgePropHead(self: *AdjStore, head_page: PageId, edge_id: EdgeId, new_prop_head: u32) !?PageId {
+    pub fn updateEdgePropHead(self: *AdjStore, head_page: PageId, edge_id: EdgeId, new_prop_head: u64) !?PageId {
         self.beginOp();
         if (isSlabHead(head_page)) return self.updateEdgePropHeadSlab(head_page, edge_id, new_prop_head);
         if (head_page == 0) return null;
@@ -910,7 +910,11 @@ pub const AdjStore = struct {
         const bh: EdgeBlockHeader = @bitCast(bytes.*);
         // Unknown entry formats are corruption — reject loudly, never parse
         // entries at a guessed stride (GAP-ENT-0024 unguarded-consumer hazard).
-        if (bh.entry_format > edge_mod.ENTRY_FORMAT_V2) return error.DataCorruption;
+        // GAP-0060: v3 (40 B, u64 head) is now a valid CHAIN format; slab
+        // formats never reach here (they come via readSlabBlockHeader).
+        if (bh.entry_format != edge_mod.ENTRY_FORMAT_V1 and
+            bh.entry_format != edge_mod.ENTRY_FORMAT_V2 and
+            bh.entry_format != edge_mod.ENTRY_FORMAT_V3) return error.DataCorruption;
         if (bh.count > @as(u16, @intCast(self.capacityFor(bh.entry_format)))) return error.DataCorruption;
         return bh;
     }
@@ -921,27 +925,24 @@ pub const AdjStore = struct {
         @memcpy(data[off..][0..BLOCK_HEADER_SIZE], bytes);
     }
 
-    /// Parse one entry at the given block format. A v1 record is exactly the
-    /// 24-byte prefix of `EdgeEntry`; its `public_id` surfaces as 0.
+    /// Parse one entry at the given chain-block format (v1/v2/v3) via the
+    /// versioned wire decoder. A v1 record's `public_id` surfaces 0; a v1/v2
+    /// record's `prop_head` high bits surface 0 (a legacy u32 head, losslessly
+    /// widened). GAP-0060: v3 records carry the full u64 `prop_head`.
     fn readEntry(self: *const AdjStore, data: []u8, slot: u16, entry_format: u8) EdgeEntry {
         const off = self.entryOffset(slot, entry_format);
-        if (entry_format == edge_mod.ENTRY_FORMAT_V2) {
-            const bytes = data[off..][0..edge_mod.ENTRY_SIZE_V2];
-            return @bitCast(bytes.*);
-        }
-        var entry = EdgeEntry{ .neighbor = 0, .edge_id = 0, .rel_type = 0, .prop_head = 0, .public_id = 0 };
-        @memcpy(std.mem.asBytes(&entry)[0..edge_mod.ENTRY_SIZE_V1], data[off..][0..edge_mod.ENTRY_SIZE_V1]);
-        return entry;
+        const size = edge_mod.entrySize(entry_format);
+        return edge_mod.decodeEntry(data[off..][0..size], entry_format);
     }
 
-    /// Write one entry at the given block format. Writing v1 stores only the
-    /// 24-byte prefix — the entry's `public_id` is dropped, which is why
-    /// `addEdge` only ever writes v1 records for `public_id == 0` entries
-    /// (a real public id gets a fresh v2 block instead — no-truncate rule).
+    /// Write one entry at the given chain-block format. v1 drops `public_id`;
+    /// v1/v2 drop the high 32 bits of `prop_head` (the no-truncate rule in
+    /// `encodeEntry` asserts they are zero — a slab/high head must be routed to
+    /// a v3 block, exactly as a real public_id is routed to a v2 block).
     fn writeEntry(self: *const AdjStore, data: []u8, slot: u16, entry: EdgeEntry, entry_format: u8) void {
         const off = self.entryOffset(slot, entry_format);
         const size = edge_mod.entrySize(entry_format);
-        @memcpy(data[off..][0..size], std.mem.asBytes(&entry)[0..size]);
+        edge_mod.encodeEntry(data[off..][0..size], entry, entry_format);
     }
 
     // Slab helpers (GAP adjacency slab packing — layout spec in edge.zig)
@@ -975,11 +976,12 @@ pub const AdjStore = struct {
         return run;
     }
 
-    /// Read entry `idx` of a validated slab run (always the v2 32 B stride).
+    /// Read entry `idx` of a validated slab run at the v2 (32 B) stride.
+    /// GAP-0060: v3 slab runs use `readSlabRunEntryFmt`; this legacy-stride
+    /// reader stays for the existing v2 slab callers.
     fn readSlabRunEntry(data: []const u8, run_offset: u32, idx: u32) EdgeEntry {
         const off = @as(usize, run_offset) + @as(usize, idx) * edge_mod.ENTRY_SIZE_V2;
-        const bytes = data[off..][0..edge_mod.ENTRY_SIZE_V2];
-        return @bitCast(bytes.*);
+        return edge_mod.decodeEntry(data[off..][0..edge_mod.ENTRY_SIZE_V2], edge_mod.ENTRY_FORMAT_SLAB);
     }
 };
 
@@ -1395,7 +1397,7 @@ fn writeRawSlabBlock(store: *AdjStore, runs: []const []const EdgeEntry) !PageId 
         }
         edge_mod.writeSlabSlot(data, 0, @intCast(i), .{ .offset = run_off, .entry_count = @intCast(run.len) });
         for (run) |e| {
-            @memcpy(data[run_off..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e)[0..edge_mod.ENTRY_SIZE_V2]);
+            edge_mod.encodeEntry(data[run_off..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
             run_off += edge_mod.ENTRY_SIZE_V2;
         }
     }

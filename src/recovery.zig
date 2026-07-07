@@ -2539,7 +2539,7 @@ test "0025 mechanism: replay heals manifest node/edge counts from applied images
                     .prop_head = 0,
                     .public_id = 0,
                 };
-                @memcpy(buf[hdr_off + @sizeOf(edge_mod.EdgeBlockHeader) + @as(usize, i) * 32 ..][0..32], std.mem.asBytes(&e));
+                edge_mod.encodeEntry(buf[hdr_off + @sizeOf(edge_mod.EdgeBlockHeader) + @as(usize, i) * 32 ..][0..32], e, edge_mod.ENTRY_FORMAT_V2);
             }
         }
     }.mk;
@@ -2652,15 +2652,15 @@ test "adjacency slab: counter harvest learns slab-block WAL images (ids in slab 
     // Slot 0: live 2-entry run [small, max] — both in-class.
     const run0: u32 = edge_mod.SLAB_RUNS_OFFSET;
     var e = slabRunEntry(in_class_small);
-    @memcpy(img[run0..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.encodeEntry(img[run0..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
     e = slabRunEntry(in_class_max);
-    @memcpy(img[run0 + edge_mod.ENTRY_SIZE_V2 ..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.encodeEntry(img[run0 + edge_mod.ENTRY_SIZE_V2 ..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
     edge_mod.writeSlabSlot(img, 0, 0, .{ .offset = run0, .entry_count = 2 });
 
     // Slot 1: live run carrying a HIGHER foreign-residue id — skipped (I1).
     const run1: u32 = run0 + 2 * edge_mod.ENTRY_SIZE_V2;
     e = slabRunEntry(foreign_higher);
-    @memcpy(img[run1..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.encodeEntry(img[run1..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
     edge_mod.writeSlabSlot(img, 0, 1, .{ .offset = run1, .entry_count = 1 });
 
     // Slot 2: tombstone — contributes nothing.
@@ -2714,7 +2714,7 @@ test "adjacency slab: harvest reads the slot directory above the AES-GCM tail re
 
     const eid: u64 = 424_242;
     const e = slabRunEntry(eid);
-    @memcpy(img[edge_mod.SLAB_RUNS_OFFSET..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.encodeEntry(img[edge_mod.SLAB_RUNS_OFFSET..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
     edge_mod.writeSlabSlot(img, encryption_mod.TAG_SIZE, 0, .{ .offset = edge_mod.SLAB_RUNS_OFFSET, .entry_count = 1 });
 
     rec.trackReplayedIdMaxima(.adj_out, 60, img);
@@ -2738,13 +2738,13 @@ test "0025 x adjacency slab: edge census counts slab-run entries exactly as the 
     // Slot 0: live 2-entry run; slot 1: live 1-entry run — census 3.
     const run0: u32 = edge_mod.SLAB_RUNS_OFFSET;
     var e = slabRunEntry(100);
-    @memcpy(img[run0..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.encodeEntry(img[run0..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
     e = slabRunEntry(101);
-    @memcpy(img[run0 + edge_mod.ENTRY_SIZE_V2 ..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.encodeEntry(img[run0 + edge_mod.ENTRY_SIZE_V2 ..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
     edge_mod.writeSlabSlot(img, 0, 0, .{ .offset = run0, .entry_count = 2 });
     const run1: u32 = run0 + 2 * edge_mod.ENTRY_SIZE_V2;
     e = slabRunEntry(102);
-    @memcpy(img[run1..][0..edge_mod.ENTRY_SIZE_V2], std.mem.asBytes(&e));
+    edge_mod.encodeEntry(img[run1..][0..edge_mod.ENTRY_SIZE_V2], e, edge_mod.ENTRY_FORMAT_SLAB);
     edge_mod.writeSlabSlot(img, 0, 1, .{ .offset = run1, .entry_count = 1 });
 
     // Slot 2: tombstone; slot 3: malformed (run overruns the directory) —
