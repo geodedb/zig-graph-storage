@@ -19,21 +19,43 @@ pub const ENTRY_FORMAT_V2: u8 = 1; // 32 B entries with inline public_id
 /// block chain, so the chain-walking readers keep rejecting format 2 as
 /// corruption (readBlockHeader's `> ENTRY_FORMAT_V2` guard).
 pub const ENTRY_FORMAT_SLAB: u8 = 2;
+/// GAP-0060: a v3 CHAIN block — 40 B entries carrying a full u64
+/// `prop_head` (v2 + the high 32 bits). Written only when an entry's prop_head
+/// exceeds 32 bits (a prop-store slab head); legacy v1/v2 blocks keep reading.
+pub const ENTRY_FORMAT_V3: u8 = 3;
+/// GAP-0060: a v3 SLAB block — like `ENTRY_FORMAT_SLAB` but its runs are
+/// v3-strided (40 B), so a slab-packed edge can carry a u64 prop_head in
+/// place. Reached only via a bit-63-tagged slab head, never chained.
+pub const ENTRY_FORMAT_SLAB_V3: u8 = 4;
 
-/// On-disk size of one entry in a v1-format block (the first 24 bytes of
-/// `EdgeEntry`: neighbor, edge_id, rel_type, prop_head).
+/// On-disk size of one entry in a v1-format block: neighbor, edge_id,
+/// rel_type, prop_head-low32 (no public_id, no prop_head-high32).
 pub const ENTRY_SIZE_V1: u32 = 24;
-/// On-disk size of one entry in a v2-format block (all 32 bytes of `EdgeEntry`).
+/// On-disk size of one entry in a v2-format block: v1 + inline public_id.
 pub const ENTRY_SIZE_V2: u32 = 32;
+/// GAP-0060: on-disk size of one entry in a v3-format block: v2 + the
+/// high 32 bits of a widened u64 `prop_head` (so an edge prop head can be a
+/// prop-store SLAB ref, `bit63|page|slot`). Wire layout is a strict SUPERSET
+/// of v1/v2 (see `encodeEntry`), so a v1/v2 record is still a valid prefix and
+/// read-both never has to relocate a legacy block.
+pub const ENTRY_SIZE_V3: u32 = 40;
 
-/// Adjacency edge entry. In-memory representation and the exact v2 on-disk
-/// record (32 bytes). A v1 on-disk record is exactly the first 24 bytes
-/// (`public_id` is absent on disk and surfaces as 0 when read).
-pub const EdgeEntry = extern struct {
+/// Adjacency edge entry — IN-MEMORY representation. GAP-0060 widened
+/// `prop_head` u32 -> u64; the struct is therefore NO LONGER the wire record
+/// (a v1/v2 wire record stores only the low 32 bits of `prop_head`, a v3 wire
+/// record stores all 64). All (de)serialization goes through `encodeEntry` /
+/// `decodeEntry`; nothing byte-casts this struct any more.
+pub const EdgeEntry = struct {
     neighbor: u64, // target node ID
     edge_id: u64, // unique edge ID
     rel_type: u32, // relationship type (LabelId)
-    prop_head: u32, // property page/slot ref (lower 32 bits sufficient for initial scale)
+    /// GAP-0060: property chain head, u64. A legacy bare-page-id head is
+    /// < 2^39 and rides in the low 32 bits (v1/v2 wire stores exactly those
+    /// low 32 bits, hi=0). A prop-store slab head (bit 63 set) needs a v3
+    /// (or slab-v3) wire record — `encodeEntry` asserts a non-u32 head is
+    /// never written to a v1/v2 record (the no-truncate rule, extended from
+    /// public_id to prop_head).
+    prop_head: u64,
     /// Inline 64-bit public edge id (GAP-ENT-0024). 0 = unknown/absent:
     /// entries read from v1 blocks always surface 0, and callers fall back to
     /// the legacy `__geode_internal_edge_id` property in that case.
@@ -46,24 +68,72 @@ pub const EdgeEntry = extern struct {
     public_id: u64,
 };
 
-comptime {
-    if (@sizeOf(EdgeEntry) != ENTRY_SIZE_V2) @compileError("EdgeEntry must be exactly 32 bytes");
-    // A v1 record must be the exact prefix of EdgeEntry: field offsets are
-    // load-bearing for the read-both block parser.
-    if (@offsetOf(EdgeEntry, "neighbor") != 0) @compileError("EdgeEntry.neighbor must be at offset 0");
-    if (@offsetOf(EdgeEntry, "edge_id") != 8) @compileError("EdgeEntry.edge_id must be at offset 8");
-    if (@offsetOf(EdgeEntry, "rel_type") != 16) @compileError("EdgeEntry.rel_type must be at offset 16");
-    if (@offsetOf(EdgeEntry, "prop_head") != 20) @compileError("EdgeEntry.prop_head must be at offset 20");
-    if (@offsetOf(EdgeEntry, "public_id") != ENTRY_SIZE_V1) @compileError("EdgeEntry.public_id must start exactly where a v1 record ends");
+/// True when this format carries the widened high 32 bits of `prop_head`
+/// (v3 chain block or v3 slab run). v1/v2 store only the low 32 bits.
+pub fn formatHasWideHead(entry_format: u8) bool {
+    return entry_format == ENTRY_FORMAT_V3 or entry_format == ENTRY_FORMAT_SLAB_V3;
 }
 
-/// Byte size of one on-disk entry for a block's `entry_format`. Chain-block
-/// formats only (v1/v2) — a slab block's runs are always v2-strided and its
-/// layout is parsed via the slab helpers below, never through this. Callers
-/// must have validated the format (readBlockHeader rejects unknown values).
+/// Byte size of one on-disk chain-block entry for `entry_format` (v1/v2/v3).
+/// Slab blocks stride by `slabEntrySize` (their runs may be v2 or v3), parsed
+/// via the slab helpers. Callers must have validated the format.
 pub fn entrySize(entry_format: u8) u32 {
-    std.debug.assert(entry_format <= ENTRY_FORMAT_V2);
-    return if (entry_format == ENTRY_FORMAT_V2) ENTRY_SIZE_V2 else ENTRY_SIZE_V1;
+    return switch (entry_format) {
+        ENTRY_FORMAT_V1 => ENTRY_SIZE_V1,
+        ENTRY_FORMAT_V2 => ENTRY_SIZE_V2,
+        ENTRY_FORMAT_V3 => ENTRY_SIZE_V3,
+        else => unreachable, // readBlockHeader rejects unknown chain formats
+    };
+}
+
+/// Stride of one entry in a slab block's runs, keyed by the block's format:
+/// legacy `ENTRY_FORMAT_SLAB` runs are v2 (32 B, u32 head); GAP-0060
+/// `ENTRY_FORMAT_SLAB_V3` runs are v3 (40 B, u64 head).
+pub fn slabEntrySize(entry_format: u8) u32 {
+    return if (entry_format == ENTRY_FORMAT_SLAB_V3) ENTRY_SIZE_V3 else ENTRY_SIZE_V2;
+}
+
+/// Wire encode one `EdgeEntry` at the given format into `dst` (len must equal
+/// the format's entry size). The wire layout is a strict superset:
+///   [neighbor u64 @0][edge_id u64 @8][rel_type u32 @16][prop_head_lo u32 @20]
+///   [public_id u64 @24]                        (v2/v3/slab only)
+///   [prop_head_hi u32 @32][reserved u32 @36]   (v3/slab-v3 only)
+/// so a v1 record is the first 24 bytes and a v2 record the first 32 — the
+/// exact bytes the pre-0060 extern-struct layout produced (byte-for-byte).
+pub fn encodeEntry(dst: []u8, e: EdgeEntry, entry_format: u8) void {
+    const wide = formatHasWideHead(entry_format);
+    // No-truncate rule (extended from public_id): a slab/high head must never
+    // be written to a narrow (v1/v2/slab-v2) record — its high bits would be
+    // silently dropped. Callers route such entries to a v3 record instead.
+    std.debug.assert(wide or (e.prop_head >> 32) == 0);
+    std.mem.writeInt(u64, dst[0..8], e.neighbor, .little);
+    std.mem.writeInt(u64, dst[8..16], e.edge_id, .little);
+    std.mem.writeInt(u32, dst[16..20], e.rel_type, .little);
+    std.mem.writeInt(u32, dst[20..24], @truncate(e.prop_head), .little);
+    // v1 stops here (public_id dropped — the no-public-id rule).
+    if (dst.len >= ENTRY_SIZE_V2) {
+        std.mem.writeInt(u64, dst[24..32], e.public_id, .little);
+    }
+    if (wide) {
+        std.mem.writeInt(u32, dst[32..36], @intCast(e.prop_head >> 32), .little);
+        std.mem.writeInt(u32, dst[36..40], 0, .little); // reserved
+    }
+}
+
+/// Wire decode one `EdgeEntry` at the given format from `src` (len must equal
+/// the format's entry size). `public_id` surfaces 0 for v1; `prop_head` high
+/// bits surface 0 (a legacy u32 head) for v1/v2/slab-v2 — losslessly widened.
+pub fn decodeEntry(src: []const u8, entry_format: u8) EdgeEntry {
+    const lo: u64 = std.mem.readInt(u32, src[20..24], .little);
+    const public_id: u64 = if (src.len >= ENTRY_SIZE_V2) std.mem.readInt(u64, src[24..32], .little) else 0;
+    const hi: u64 = if (formatHasWideHead(entry_format)) std.mem.readInt(u32, src[32..36], .little) else 0;
+    return .{
+        .neighbor = std.mem.readInt(u64, src[0..8], .little),
+        .edge_id = std.mem.readInt(u64, src[8..16], .little),
+        .rel_type = std.mem.readInt(u32, src[16..20], .little),
+        .prop_head = lo | (hi << 32),
+        .public_id = public_id,
+    };
 }
 
 /// Edge block header preceding entries in an adjacency block page. Exactly 16 bytes.
@@ -88,7 +158,8 @@ comptime {
 /// the page header and block header. Chain-block formats only (v1/v2): a slab
 /// block's capacity is dynamic (runs + slot directory share the body).
 pub fn entriesPerBlock(page_size: u32, entry_format: u8) u32 {
-    std.debug.assert(entry_format <= ENTRY_FORMAT_V2);
+    std.debug.assert(entry_format == ENTRY_FORMAT_V1 or
+        entry_format == ENTRY_FORMAT_V2 or entry_format == ENTRY_FORMAT_V3);
     return (page_size - PAGE_HEADER_SIZE - @sizeOf(EdgeBlockHeader)) / entrySize(entry_format);
 }
 
@@ -159,10 +230,53 @@ pub fn writeSlabSlot(data: []u8, tail_reserve: u32, idx: u32, slot: SlabSlot) vo
 // Unit Tests
 // ============================================================================
 
-test "EdgeEntry is 32 bytes (v2 record); v1 record is its 24-byte prefix" {
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(EdgeEntry));
+test "wire entry sizes: v1=24, v2=32, v3=40" {
     try std.testing.expectEqual(@as(u32, 24), entrySize(ENTRY_FORMAT_V1));
     try std.testing.expectEqual(@as(u32, 32), entrySize(ENTRY_FORMAT_V2));
+    try std.testing.expectEqual(@as(u32, 40), entrySize(ENTRY_FORMAT_V3));
+    try std.testing.expectEqual(@as(u32, 32), slabEntrySize(ENTRY_FORMAT_SLAB));
+    try std.testing.expectEqual(@as(u32, 40), slabEntrySize(ENTRY_FORMAT_SLAB_V3));
+}
+
+test "GAP-0060: encode/decode round-trips every format; v1/v2 wire is byte-identical" {
+    const e_full = EdgeEntry{
+        .neighbor = 0x1111_2222_3333_4444,
+        .edge_id = 0x5555_6666_7777_8888,
+        .rel_type = 0x9ABC_DEF0,
+        .prop_head = 0, // narrow-safe head for v1/v2
+        .public_id = 0xCAFE_BABE_DEAD_0001,
+    };
+
+    // v2 wire must be byte-identical to the old extern-struct memory image
+    // (neighbor@0, edge_id@8, rel_type@16, prop_head_lo@20, public_id@24).
+    var v2: [ENTRY_SIZE_V2]u8 = undefined;
+    encodeEntry(&v2, e_full, ENTRY_FORMAT_V2);
+    try std.testing.expectEqual(e_full.neighbor, std.mem.readInt(u64, v2[0..8], .little));
+    try std.testing.expectEqual(e_full.edge_id, std.mem.readInt(u64, v2[8..16], .little));
+    try std.testing.expectEqual(e_full.rel_type, std.mem.readInt(u32, v2[16..20], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, v2[20..24], .little));
+    try std.testing.expectEqual(e_full.public_id, std.mem.readInt(u64, v2[24..32], .little));
+    try std.testing.expectEqual(e_full, decodeEntry(&v2, ENTRY_FORMAT_V2));
+
+    // v1: public_id dropped (surfaces 0), head low bits preserved.
+    var v1: [ENTRY_SIZE_V1]u8 = undefined;
+    encodeEntry(&v1, e_full, ENTRY_FORMAT_V1);
+    const d1 = decodeEntry(&v1, ENTRY_FORMAT_V1);
+    try std.testing.expectEqual(@as(u64, 0), d1.public_id);
+    try std.testing.expectEqual(e_full.prop_head, d1.prop_head);
+    try std.testing.expectEqual(e_full.edge_id, d1.edge_id);
+
+    // v3: a full u64 slab-shaped head (bit 63 set) survives; v2 prefix of the
+    // v3 record still decodes the low 32 bits + public_id.
+    var e_slab = e_full;
+    e_slab.prop_head = (@as(u64, 1) << 63) | (0x7F_FFFF_FFFF << 24) | 0xABCDEF;
+    var v3: [ENTRY_SIZE_V3]u8 = undefined;
+    encodeEntry(&v3, e_slab, ENTRY_FORMAT_V3);
+    try std.testing.expectEqual(e_slab, decodeEntry(&v3, ENTRY_FORMAT_V3));
+    // The first 32 bytes of a v3 record ARE a valid v2 record (superset).
+    const as_v2 = decodeEntry(v3[0..ENTRY_SIZE_V2], ENTRY_FORMAT_V2);
+    try std.testing.expectEqual(e_slab.public_id, as_v2.public_id);
+    try std.testing.expectEqual(@as(u64, @as(u32, @truncate(e_slab.prop_head))), as_v2.prop_head);
 }
 
 test "EdgeEntry.public_id has NO default — every literal site states it (F5)" {

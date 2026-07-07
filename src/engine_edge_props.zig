@@ -52,16 +52,18 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     errdefer engine.txn_manager.abort(txn) catch {};
 
     // 3. Write property, get new prop_head.
-    //    GAP prop-store slab packing (P5): edge property chains are
-    //    LEGACY-ONLY. The head is packed as u32 below (adjacency entries +
-    //    edge index), which cannot represent a slab head (tag bit 63), so
-    //    slab allocation is gated off for this owner class.
-    const new_head_u64 = try engine.putPropertyLegacyTxn(@as(u64, found_prop_head), key, value, txn);
-    // Loud invariant guard: a slab-encoded head must never reach the u32
-    // packing. Unreachable via the legacy-only put above; fails hard (never
-    // truncates) if the gate is ever bypassed.
-    if (prop_store_mod.isSlabHead(new_head_u64)) return error.UnexpectedSlabHead;
-    const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
+    //    GAP-0060: edge property chains slab-pack exactly like node props when
+    //    `edge_prop_slab_packing` is on — the head is a full u64 (a prop-store
+    //    slab head, bit 63) stored durably in the WIDE (v3 / slab-v3) adjacency
+    //    entry + edge index. The routing is gated on the SAME flag as the
+    //    adjacency `wide_heads`: a slab head must only ever be produced for a
+    //    store whose adjacency can hold it (else a legacy v2 run can't take the
+    //    wide head — the exact invariant `updateEdgePropHead*` enforces loudly).
+    //    When off, edges keep the legacy one-page-per-edge writer (u32 head).
+    const new_head: u64 = if (engine.config.edge_prop_slab_packing)
+        try engine.putPropertyTxn(@as(u64, found_prop_head), key, value, txn)
+    else
+        try engine.putPropertyLegacyTxn(@as(u64, found_prop_head), key, value, txn);
 
     // 4. If prop_head changed, update BOTH adjacency copies and edge index.
     //    Edge co-location (Phase A): the incoming copy now lives in THIS shard's
@@ -101,7 +103,7 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     if (found_prop_head != 0 and found_prop_head != new_head) {
         engine.property_index.removeChain(found_prop_head);
     }
-    try engine.refreshPropertyChainIndex(new_head_u64);
+    try engine.refreshPropertyChainIndex(new_head);
 }
 
 /// Remove a property from an edge. The removal is in-place so the prop_head

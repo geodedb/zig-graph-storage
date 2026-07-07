@@ -2177,3 +2177,182 @@ test "PHASE G reverse-map: tail reconcile (insert + delete) equals a full rebuil
     const rec4 = (try engine.getNode(4)).?;
     try testing.expectEqual(@as(?NodeId, 4), snap.get(rec4.prop_head));
 }
+
+// ============================================================================
+// GAP-0060 — edge-property slab packing: oracle, round-trip, upgrade
+// ============================================================================
+
+fn zeroRec() NodeRec {
+    return .{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+}
+
+/// Build a store of `n_edges` parallel a->b edges, each with ONE small edge
+/// property (`run_id`, 16 bytes — the exact taxonomic-ingest shape), checkpoint,
+/// and return the props.store page count. `slab` selects the GAP-0060 slab
+/// routing vs the legacy one-page-per-edge writer.
+fn edgePropsPageCount(slab: bool, n_edges: u64) !u64 {
+    var td = try testDataDir();
+    defer td.deinit();
+    var cfg = testConfig();
+    cfg.edge_prop_slab_packing = slab;
+    const uuid = [_]u8{0x60} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    const a = try engine.allocNode();
+    try engine.putNode(a, zeroRec());
+    const b = try engine.allocNode();
+    try engine.putNode(b, zeroRec());
+
+    var i: u64 = 0;
+    while (i < n_edges) : (i += 1) {
+        const eid = try engine.addEdge(a, b, 5);
+        try engine.setEdgeProperty(a, b, eid, "run_id", .{ .string = "edges-1783388992" });
+    }
+    try engine.checkpoint();
+
+    // Round-trip parity: every edge's prop reads back byte-identical.
+    var e: u64 = 1;
+    while (e <= n_edges) : (e += 1) {
+        const got = try engine.getEdgeProperty(a, e, "run_id", testing.allocator);
+        try testing.expect(got != null);
+        defer testing.allocator.free(got.?.string);
+        try testing.expectEqualStrings("edges-1783388992", got.?.string);
+    }
+
+    const pager = engine.file_manager.getPager(.props) orelse return error.NoPropsPager;
+    return pager.pageCount();
+}
+
+test "GAP-0060 ORACLE: edge props slab-pack — page-per-edge -> densely packed" {
+    const N: u64 = 200;
+    const legacy_pages = try edgePropsPageCount(false, N);
+    const slab_pages = try edgePropsPageCount(true, N);
+
+    const page_size: u64 = 4096; // testConfig
+    std.debug.print(
+        "\nGAP-0060 oracle: {d} edges (16B run_id each)  LEGACY={d} pages ({d} B/edge)  SLAB={d} pages ({d} B/edge)  ~{d}x denser\n",
+        .{ N, legacy_pages, legacy_pages * page_size / N, slab_pages, slab_pages * page_size / N, legacy_pages / @max(slab_pages, 1) },
+    );
+
+    // Legacy: at least one dedicated page per edge (the ~8KB/edge bloat at
+    // production 8KB page size; 4KB here) — this is what GAP-0060 kills.
+    try testing.expect(legacy_pages >= N);
+    // Slab: many edge props share a page — dramatically fewer pages.
+    try testing.expect(slab_pages * 5 < legacy_pages);
+}
+
+test "GAP-0060: existing v0.2.34-shaped store (edge_prop_slab OFF) opens under the new binary and reads edge props" {
+    // Simulate a pre-0060 store: legacy edge props (u32 head, one page/edge) +
+    // legacy v2 adjacency. Create it with the feature OFF, then reopen with the
+    // feature ON (the v0.2.35 default) — read-both + the GSEIDX5->rebuild path
+    // must open it and read every edge prop back unchanged. New writes slab-pack.
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x61} ** 16;
+
+    var legacy_cfg = testConfig();
+    legacy_cfg.edge_prop_slab_packing = false;
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, legacy_cfg);
+        defer engine.close() catch {};
+        const a = try engine.allocNode();
+        try engine.putNode(a, zeroRec());
+        const b = try engine.allocNode();
+        try engine.putNode(b, zeroRec());
+        var i: u64 = 0;
+        while (i < 8) : (i += 1) {
+            const eid = try engine.addEdge(a, b, 5);
+            try engine.setEdgeProperty(a, b, eid, "run_id", .{ .string = "legacy-edge-prop" });
+        }
+        try engine.checkpoint();
+    }
+
+    // Reopen with the feature ON (default). Existing legacy edge props still read.
+    var new_cfg = testConfig();
+    new_cfg.edge_prop_slab_packing = true;
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, new_cfg);
+    defer engine.close() catch {};
+
+    var e: u64 = 1;
+    while (e <= 8) : (e += 1) {
+        const got = try engine.getEdgeProperty(1, e, "run_id", testing.allocator);
+        try testing.expect(got != null);
+        defer testing.allocator.free(got.?.string);
+        try testing.expectEqualStrings("legacy-edge-prop", got.?.string);
+    }
+
+    // A NEW edge added post-upgrade slab-packs its prop and reads back.
+    const new_eid = try engine.addEdge(1, 2, 5);
+    try engine.setEdgeProperty(1, 2, new_eid, "run_id", .{ .string = "new-slab-prop-val" });
+    const ng = try engine.getEdgeProperty(1, new_eid, "run_id", testing.allocator);
+    try testing.expect(ng != null);
+    defer testing.allocator.free(ng.?.string);
+    try testing.expectEqualStrings("new-slab-prop-val", ng.?.string);
+}
+
+test "GAP-0060 CRASH: edge slab props survive rebuild-from-adjacency (durable u64 head, no dangling)" {
+    // Simulate a crash where the edge-index snapshot is stale/absent: the next
+    // open rebuilds the edge index FROM DURABLE ADJACENCY. If the adjacency did
+    // not carry the full u64 slab head, the rebuilt index would point at the
+    // wrong (truncated) prop chain — a dangling head — and the read-back would
+    // fail. Each edge carries a UNIQUE value so a mis-linked head is caught.
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x62} ** 16;
+    const cfg = testConfig(); // edge_prop_slab_packing = true (v0.2.35 default)
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const N: u64 = 40;
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const a = try engine.allocNode();
+        try engine.putNode(a, zeroRec());
+        const b = try engine.allocNode();
+        try engine.putNode(b, zeroRec());
+        var i: u64 = 0;
+        while (i < N) : (i += 1) {
+            const eid = try engine.addEdge(a, b, 5);
+            var buf: [24]u8 = undefined;
+            const v = try std.fmt.bufPrint(&buf, "run-{d:0>6}", .{eid});
+            try engine.setEdgeProperty(a, b, eid, "run_id", .{ .string = v });
+        }
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Truncate edges.idx → the load gate rejects it → rebuild from adjacency.
+    const gdir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&gdir).deinit();
+    const eidx_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges.idx", .{gdir.path});
+    defer testing.allocator.free(eidx_path);
+    (try std.Io.Dir.cwd().createFile(io, eidx_path, .{ .read = true, .truncate = true })).close(io);
+
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    // Every edge's slab prop_head resolves to a LIVE run with the RIGHT value.
+    var e: u64 = 1;
+    while (e <= N) : (e += 1) {
+        var buf: [24]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "run-{d:0>6}", .{e});
+        const got = try engine.getEdgeProperty(1, e, "run_id", testing.allocator);
+        try testing.expect(got != null);
+        defer testing.allocator.free(got.?.string);
+        try testing.expectEqualStrings(want, got.?.string);
+    }
+
+    // Counter intact after the rebuild: a fresh edge id never collides with a
+    // live one (the id-heal / manifest counter survived).
+    const new_eid = try engine.addEdge(1, 2, 5);
+    try testing.expect(new_eid > N);
+}

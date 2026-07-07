@@ -38,7 +38,12 @@ pub const EdgeIndexEntry = struct {
     from: NodeId,
     neighbor: NodeId,
     rel_type: u32,
-    prop_head: u32,
+    /// GAP-0060: widened u32 -> u64 so an edge's property-chain head can be
+    /// a prop-store SLAB head (`bit63 | 39-bit page | 24-bit slot`), exactly
+    /// like a node's prop_head. A legacy bare-page-id head is < 2^39 and rides
+    /// in the low bits unchanged (an old u32 head widens losslessly). Persisted
+    /// as 8 LE bytes at rec[28..36] under the bumped GSEIDX6 edge-index magic.
+    prop_head: u64,
     /// GAP-ENT-0024 P3: inline 64-bit public edge id, mirrored from the
     /// durable adjacency record (edge.zig EdgeEntry.public_id). 0 = unknown/
     /// absent (legacy edges / v1 blocks) — callers fall back to the legacy
@@ -48,10 +53,17 @@ pub const EdgeIndexEntry = struct {
     public_id: u64,
 };
 
-/// On-disk record: edge_id u64 | from u64 | neighbor u64 | rel_type u32 |
-/// prop_head u32 | public_id u64 — same field order as the GSEIDX3 records,
-/// but SORTED by edge_id under the GSEIDX4 magic.
-pub const RECORD_SIZE: u32 = 40;
+/// On-disk record (GAP-0060, GSEIDX6): edge_id u64 | from u64 |
+/// neighbor u64 | rel_type u32 | prop_head u64 | public_id u64 — SORTED by
+/// edge_id. `prop_head` grew u32 -> u64 (44 B, was 40 B under GSEIDX5) so an
+/// edge prop head can carry a prop-store slab ref (`bit63|page|slot`). The
+/// old GSEIDX5 (40 B, u32 prop_head) records are read via
+/// `decodeLegacyEntryV5` / rebuilt from durable adjacency — see engine_index.
+pub const RECORD_SIZE: u32 = 44;
+
+/// GSEIDX5 record size (u32 prop_head, no slab edge heads) — retained for the
+/// upgrade read of a pre-0060 edge-index snapshot.
+pub const RECORD_SIZE_V5: u32 = 40;
 
 pub fn encodeRecord(buf: []u8, edge_id: EdgeId, e: EdgeIndexEntry) void {
     std.debug.assert(buf.len == RECORD_SIZE);
@@ -59,11 +71,25 @@ pub fn encodeRecord(buf: []u8, edge_id: EdgeId, e: EdgeIndexEntry) void {
     std.mem.writeInt(u64, buf[8..16], e.from, .little);
     std.mem.writeInt(u64, buf[16..24], e.neighbor, .little);
     std.mem.writeInt(u32, buf[24..28], e.rel_type, .little);
-    std.mem.writeInt(u32, buf[28..32], e.prop_head, .little);
-    std.mem.writeInt(u64, buf[32..40], e.public_id, .little);
+    std.mem.writeInt(u64, buf[28..36], e.prop_head, .little);
+    std.mem.writeInt(u64, buf[36..44], e.public_id, .little);
 }
 
 fn decodeEntry(rec: []const u8) EdgeIndexEntry {
+    return .{
+        .from = std.mem.readInt(u64, rec[8..16], .little),
+        .neighbor = std.mem.readInt(u64, rec[16..24], .little),
+        .rel_type = std.mem.readInt(u32, rec[24..28], .little),
+        .prop_head = std.mem.readInt(u64, rec[28..36], .little),
+        .public_id = std.mem.readInt(u64, rec[36..44], .little),
+    };
+}
+
+/// Decode a legacy GSEIDX5 (40 B) record: `prop_head` is a u32 at rec[28..32]
+/// widened to u64 (a legacy bare-page-id head, always < 2^32), `public_id` at
+/// rec[32..40]. Used by the upgrade read so a pre-0060 store still opens
+/// without a full O(graph) rebuild. `edge_id` is at rec[0..8] in both formats.
+pub fn decodeLegacyEntryV5(rec: []const u8) EdgeIndexEntry {
     return .{
         .from = std.mem.readInt(u64, rec[8..16], .little),
         .neighbor = std.mem.readInt(u64, rec[16..24], .little),
@@ -202,7 +228,7 @@ pub const EdgeIndexMap = struct {
     /// In-place prop_head refresh (the old `getPtr(id).?.prop_head = x` site).
     /// No-op when the edge is absent. A base-resident entry is copied into the
     /// overlay with the new head (copy-on-write) — the base is immutable.
-    pub fn updatePropHead(self: *EdgeIndexMap, edge_id: EdgeId, new_head: u32) !void {
+    pub fn updatePropHead(self: *EdgeIndexMap, edge_id: EdgeId, new_head: u64) !void {
         if (self.overlay.getPtr(edge_id)) |p| {
             p.prop_head = new_head;
             return;
@@ -253,7 +279,53 @@ pub const EdgeIndexMap = struct {
 
 const t = std.testing;
 
-const TEST_MAGIC = "GSTEIDX4"; // test-local; production magic lives in engine_index.zig
+const TEST_MAGIC = "GSTEIDX6"; // test-local; production magic lives in engine_index.zig
+
+test "GAP-0060: u64 slab-shaped prop_head round-trips through encode/decode" {
+    // A prop-store slab head sets bit 63 and packs (page, slot) — it would be
+    // truncated by the old u32 prop_head field. Prove the widened record
+    // preserves it byte-for-byte.
+    const prop_store = @import("prop_store.zig");
+    const slab_head: u64 = prop_store.encodeSlabHead(0x7F_FFFF_FFFF, 0x00FF_FFFF); // near-max page+slot
+    try t.expect(prop_store.isSlabHead(slab_head));
+
+    var e = testEntry(123);
+    e.prop_head = slab_head;
+    var buf: [RECORD_SIZE]u8 = undefined;
+    encodeRecord(&buf, 4242, e);
+    const got = decodeEntry(&buf);
+    try t.expectEqual(slab_head, got.prop_head);
+    try t.expectEqual(e.public_id, got.public_id); // public_id survives the shift to rec[36..44]
+    try t.expectEqual(recordEdgeId(&buf), @as(EdgeId, 4242));
+
+    // ...and through the map + mmap base (adopt path used at reopen).
+    var m = EdgeIndexMap.init(t.allocator);
+    defer m.deinit();
+    try m.put(4242, e);
+    try t.expectEqual(slab_head, (try m.get(4242)).?.prop_head);
+    // updatePropHead now carries a full u64 slab head (was u32).
+    const slab_head2: u64 = prop_store.encodeSlabHead(5, 9);
+    try m.updatePropHead(4242, slab_head2);
+    try t.expectEqual(slab_head2, (try m.get(4242)).?.prop_head);
+}
+
+test "GAP-0060: legacy GSEIDX5 (40 B) record upgrades to a widened entry" {
+    // Hand-lay a v5 record (u32 prop_head at [28..32], public_id at [32..40])
+    // and prove the upgrade decoder widens the head losslessly.
+    var rec = [_]u8{0} ** RECORD_SIZE_V5;
+    std.mem.writeInt(u64, rec[0..8], 77, .little); // edge_id
+    std.mem.writeInt(u64, rec[8..16], 3, .little); // from
+    std.mem.writeInt(u64, rec[16..24], 4, .little); // neighbor
+    std.mem.writeInt(u32, rec[24..28], 5, .little); // rel_type
+    std.mem.writeInt(u32, rec[28..32], 0x0009_ABCD, .little); // legacy page-id head
+    std.mem.writeInt(u64, rec[32..40], 0xDEAD_BEEF_0000_0001, .little); // public_id
+    const up = decodeLegacyEntryV5(&rec);
+    try t.expectEqual(@as(u64, 3), up.from);
+    try t.expectEqual(@as(u64, 4), up.neighbor);
+    try t.expectEqual(@as(u32, 5), up.rel_type);
+    try t.expectEqual(@as(u64, 0x0009_ABCD), up.prop_head); // widened, top bits clear
+    try t.expectEqual(@as(u64, 0xDEAD_BEEF_0000_0001), up.public_id);
+}
 
 fn testEntry(seed: u64) EdgeIndexEntry {
     return .{

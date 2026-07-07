@@ -325,6 +325,13 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.adj_in.slab_packing = cfg.adjacency_slab_packing;
     self.adj_in_remote.slab_packing = cfg.adjacency_slab_packing;
 
+    // GAP-0060: edge-prop slab packing needs the adjacency writer to emit the
+    // WIDE (v3 / slab-v3) entry format so an edge's u64 prop_head is durable
+    // and in-place-widenable. Read-both parses legacy blocks regardless.
+    self.adj_out.wide_heads = cfg.edge_prop_slab_packing;
+    self.adj_in.wide_heads = cfg.edge_prop_slab_packing;
+    self.adj_in_remote.wide_heads = cfg.edge_prop_slab_packing;
+
     // Label dictionary, label store, and label index
     self.label_dict = LabelDictionary.init(allocator);
     errdefer self.label_dict.deinit();
