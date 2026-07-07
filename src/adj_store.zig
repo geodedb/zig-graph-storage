@@ -597,10 +597,15 @@ pub const AdjStore = struct {
         }
 
         // (A) In-place tail-grow: run ends at the block frontier, one more fits,
-        // AND the entry's head fits the block's width (a wide head can never be
-        // appended into a v2 run — that falls through to a v3 relocation in (B)).
+        // the entry's head fits the block's width, AND we are not obliged to
+        // upgrade a legacy v2 run to v3. GAP-0060: a wide-heads writer growing a
+        // pre-0060 slab-v2 chain must MIGRATE it to slab-v3 on first append
+        // (falls through to the (B) relocation, which changes the head — the
+        // caller already stores addEdge's returned head), so a later in-place
+        // prop_head widen fits. Fresh stores are all v3, so this never fires.
         const fits_fmt = !(entryNeedsWide(entry) and fmt != edge_mod.ENTRY_FORMAT_SLAB_V3);
-        if (fits_fmt and run_end == state.next_off and run_end + stride <= dir_start) {
+        const must_upgrade = self.wide_heads and fmt != edge_mod.ENTRY_FORMAT_SLAB_V3;
+        if (fits_fmt and !must_upgrade and run_end == state.next_off and run_end + stride <= dir_start) {
             self.recordTouched(page) catch |err| {
                 self.buffer_pool.unpin(frame_idx, false);
                 return err;
@@ -909,8 +914,17 @@ pub const AdjStore = struct {
             while (i < bh.count) : (i += 1) {
                 const e = self.readEntry(data, i, bh.entry_format);
                 if (e.edge_id == edge_id) {
+                    // GAP-0060: a >u32 (slab) head only fits a v3 record. In a
+                    // fresh wide-heads store every chain block is v3; a legacy
+                    // v1/v2 block (old store) cannot hold it in place — refuse
+                    // LOUDLY rather than let `encodeEntry`'s assert be stripped
+                    // in ReleaseFast and silently truncate the head.
+                    if ((new_prop_head >> 32) != 0 and bh.entry_format != edge_mod.ENTRY_FORMAT_V3) {
+                        self.buffer_pool.unpin(frame_idx, false);
+                        return error.WideHeadInLegacyChainBlock;
+                    }
                     // In-place rewrite at the block's own format; public_id
-                    // is preserved (v2) or remains absent on disk (v1).
+                    // is preserved (v2/v3) or remains absent on disk (v1).
                     self.writeEntry(data, i, .{
                         .neighbor = e.neighbor,
                         .edge_id = e.edge_id,
