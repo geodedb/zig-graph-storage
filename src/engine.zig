@@ -680,22 +680,31 @@ pub const GraphEngine = struct {
         // (backward compat). Snapshots that fail verification are rebuilt.
         try engine_property_index.load(self);
 
-        // 7c. H3-P1: load the per-(label,key) ordered index COUNTER-GATED,
-        // mirroring tryLoadDerivedIndexes (Lever B). The snapshot records the
-        // registered (label,key) pairs AND the trees, stamped with the
-        // manifest.counter at save time:
-        //   * snapshot.counter == manifest.counter  -> LOAD (clean restart).
-        //   * snapshot.counter != manifest.counter  -> the registration is kept
-        //     but the trees are REBUILT from a live scan (crash restart: a WAL
-        //     replay bumped manifest.counter past the snapshot stamp, so the
-        //     persisted trees may be stale and must NOT be trusted).
-        //   * no snapshot file (or unreadable)      -> no ordered index (no-op).
-        // The CRC-only validity check is intentionally NOT the gate (that is the
-        // pre-existing staleness gap); the counter is.
+        // 7c. GAP-0050: load the per-(label,key) ordered index on the SAME Path B
+        // `(checkpoint_epoch, covered_lsn)` reload contract the 4 engine derived
+        // indexes use (engine_index.tryLoadDerivedIndexes). The snapshot records
+        // the registered (label,key) pairs AND the trees, stamped with the
+        // durable freshness token at checkpoint time:
+        //   * epoch == manifest.checkpoint_epoch AND covered_lsn ==
+        //     manifest.last_checkpoint_lsn  -> LOAD (clean reopen: epoch current
+        //     AND no committed WAL tail past the snapshot). ORDER BY reopen is
+        //     then O(snapshot), not the O(graph) rebuild.
+        //   * epoch mismatch (a checkpoint ran after the snapshot) OR a tail
+        //     (covered_lsn < last_checkpoint_lsn: recovery replayed committed
+        //     records the snapshot predates) -> the registration is kept (already
+        //     loaded) but the trees are REBUILT from a live scan. checkpoint_epoch
+        //     advances ONLY at checkpoint (never by a WAL-tail recovery), so a
+        //     clean shutdown reloads instead of the counter gate's forced rebuild.
+        //   * no snapshot file (or old/corrupt -> error) -> no ordered index.
+        // The btree tail-reconcile the derived indexes do (Path B Phase 3) is OUT
+        // OF SCOPE (needs a node->old-ordered-key reverse map the PropRevIndex
+        // does not carry — GAP-0050 crash-leg follow-up); the tail leg REBUILDS.
         var ordered_loaded = false;
-        const ordered_snapshot_counter = self.ordered_property_index.loadFromFile(self.graph_dir.path) catch null;
-        if (ordered_snapshot_counter) |snap_counter| {
-            if (snap_counter == self.manifest.counter) {
+        const ordered_snapshot_stamp = self.ordered_property_index.loadFromFile(self.graph_dir.path) catch null;
+        if (ordered_snapshot_stamp) |stamp| {
+            if (stamp.epoch == self.manifest.checkpoint_epoch and
+                stamp.covered_lsn == self.manifest.last_checkpoint_lsn)
+            {
                 ordered_loaded = true;
             } else {
                 try self.rebuildOrderedIndex();
@@ -1233,17 +1242,20 @@ pub const GraphEngine = struct {
         //       snapshot; without this block the next open finds no snapshot and
         //       LOSES the registration (planner heap fallback).
         // The REBUILD runs BEFORE saveToFile (#1): close() must not persist a
-        // snapshot stamped at manifest.counter that the next clean open LOADS as
-        // fresh while it is empty/stale. The online label/property hooks only
-        // mark the tree stale; in-place value drift is corrected here. After a
-        // successful rebuild `ordered_index_stale` is false and the snapshot
-        // reflects every committed write.
+        // snapshot stamped at the current (epoch, covered_lsn) that the next
+        // clean open LOADS as fresh while it is empty/stale. The online
+        // label/property hooks only mark the tree stale; in-place value drift is
+        // corrected here. After a successful rebuild `ordered_index_stale` is
+        // false and the snapshot reflects every committed write as of the last
+        // checkpoint.
         //
-        // manifest.counter == the value the next open() reads (the load gate
-        // requires snapshot.counter == manifest.counter): if the dirty block
-        // above ran doCheckpoint it advanced + persisted the counter; if
-        // persistence_dirty was false, the prior (light) checkpoint already
-        // persisted the manifest at this counter. Neither path here re-bumps it.
+        // GAP-0050: stamp `(manifest.checkpoint_epoch, manifest.last_checkpoint_lsn)`
+        // — the durable freshness token the next open() gates on (LOAD iff both
+        // match). If the dirty block above ran doCheckpoint it advanced +
+        // persisted BOTH; if persistence_dirty was false, the prior checkpoint
+        // (light or full) already persisted the manifest at these values and no
+        // write has happened since, so the rebuilt trees reflect exactly the
+        // covered_lsn state. Neither path here re-bumps the manifest.
         if (close_err == null and self.ordered_property_index.count() > 0) {
             // H3-P4: rebuild only when the tree has drifted since the last refresh
             // (ordered_index_stale ⇔ a write occurred). A clean/no-op close skips the
@@ -1255,7 +1267,11 @@ pub const GraphEngine = struct {
                 };
             }
             if (close_err == null) {
-                self.ordered_property_index.saveToFile(self.graph_dir.path, self.manifest.counter) catch |err| {
+                self.ordered_property_index.saveToFile(
+                    self.graph_dir.path,
+                    self.manifest.checkpoint_epoch,
+                    self.manifest.last_checkpoint_lsn,
+                ) catch |err| {
                     if (close_err == null) close_err = err;
                 };
                 self.ordered_index_dirty = false;
