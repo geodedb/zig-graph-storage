@@ -480,6 +480,278 @@ fn addIntegrationTests(
     });
     const run_pin_nodeadlock = b.addRunArtifact(pin_nodeadlock_tests);
     pin_nodeadlock_step.dependOn(&run_pin_nodeadlock.step);
+
+    // GAP-ENT-0018: the lock-free pin page-table read must stay safe against a
+    // concurrent structural writer AND must never dereference a freed/moved
+    // page-table backing store. Own step so it can be looped under ReleaseSafe
+    // (invariants armed) / ReleaseFast.
+    const recreate_uaf_step = b.step("test-recreate-uaf", "Run buffer-pool pin-vs-structural-write / page-table-free UAF regression");
+    const recreate_uaf_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_recreate_uaf.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_recreate_uaf = b.addRunArtifact(recreate_uaf_tests);
+    recreate_uaf_step.dependOn(&run_recreate_uaf.step);
+
+    // GAP-ENT-0020 Phase P0: prop-store slab-packing FOUNDATION — props-store
+    // efficiency metric (one-page-per-node baseline), property-set parity oracle,
+    // and the read-both parity skeleton (legacy half passing; slab half TODO for
+    // P1). Own step so the baseline metric is easy to re-run and diff against as
+    // the slab write path lands. No production format change in P0.
+    const prop_store_slab_step = b.step("test-prop-store-slab", "Run prop-store slab-packing P0: efficiency metric + parity oracle + read-both skeleton");
+    const prop_store_slab_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/prop_store_slab.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_prop_store_slab = b.addRunArtifact(prop_store_slab_tests);
+    prop_store_slab_step.dependOn(&run_prop_store_slab.step);
+
+    // GAP var-store slab packing P2 — WRITE-path acceptance gates: bytes/node
+    // re-measure, slab-vs-legacy parity, on-disk reopen, WAL imaging
+    // (logVarChain slab-aware), the crash gate (committed slab labels/strings
+    // survive a deinit-crash; uncommitted is invisible; every var_head live),
+    // clean-shutdown, and graduation-across-crash.
+    const var_store_slab_step = b.step("test-var-store-slab", "Run var-store slab-packing P2: bytes/node, parity, reopen, WAL imaging, and crash/graduation gates");
+    const var_store_slab_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/var_store_slab.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_var_store_slab = b.addRunArtifact(var_store_slab_tests);
+    var_store_slab_step.dependOn(&run_var_store_slab.step);
+
+    // GAP edge-inline-public-id P0/P1 — baseline oracle for the per-edge
+    // `__geode_internal_edge_id` LEGACY property cost (one ≥8 KB props page
+    // per edge) + parity oracle over full edge enumeration, and the v1/v2
+    // adjacency-block read-both tests (per-block `entry_format`
+    // discriminator). The baseline scenario stays green through all phases:
+    // legacy stores keep working forever.
+    const edge_inline_pubid_step = b.step("test-edge-inline-public-id", "Run inline-public-edge-id tests: legacy per-edge id-property baseline (bytes/edge lock-in + parity oracle) and v1/v2 adjacency block read-both");
+    const edge_inline_pubid_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_inline_public_id.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_inline_pubid = b.addRunArtifact(edge_inline_pubid_tests);
+    edge_inline_pubid_step.dependOn(&run_edge_inline_pubid.step);
+
+    // GAP adjacency-slab-packing P0/P1 — baseline oracle for the
+    // block-per-chain adjacency cost (~16.5 KB/edge for low-fanout graphs) +
+    // enumeration parity both directions (out-chain walk + FanInEdgeIterator
+    // scatter), and the slab-block read path (tagged bit-63 (block,slot) head
+    // refs; slot-directory runs of v2 entries; recovery-harvest coverage).
+    // The baseline scenario stays green through all phases: legacy chains
+    // keep working forever.
+    const adjacency_slab_step = b.step("test-adjacency-slab", "Run adjacency slab-packing tests: block-per-chain baseline lock-in (bytes/edge + parity oracle) and slab-block read-both (tagged heads, slot runs, harvest)");
+    const adjacency_slab_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab = b.addRunArtifact(adjacency_slab_tests);
+    adjacency_slab_step.dependOn(&run_adjacency_slab.step);
+
+    // GAP adjacency-slab-packing P3 — consumer sweep: every path that READS
+    // adjacency stays slab-transparent. Backup/restore byte-copy round-trip,
+    // derived edge-index rebuild from a slab adj_out, FanIn-source
+    // (adj_in_remote) rebuild, and the integrity walk over slab chains.
+    const adjacency_slab_consumers_step = b.step("test-adjacency-slab-consumers", "Run adjacency slab-packing P3 consumer sweep: backup/restore round-trip, derived edge-index rebuild, FanIn-source rebuild, integrity walk over slab chains");
+    const adjacency_slab_consumers_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab_consumers.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab_consumers = b.addRunArtifact(adjacency_slab_consumers_tests);
+    adjacency_slab_consumers_step.dependOn(&run_adjacency_slab_consumers.step);
+
+    // GAP adjacency-slab-packing P4 — crash/WAL matrix for the hottest
+    // structure: relocation, graduation, slab remove/update (tombstone),
+    // deferred-WAL tail + harvest, and a mixed legacy+slab store. Each builds,
+    // crashes (deinit without checkpoint — only the fsynced WAL survives),
+    // reopens, and asserts full parity with no dangling head / no lost edge.
+    const adjacency_slab_crash_step = b.step("test-adjacency-slab-crash", "Run adjacency slab-packing P4 crash matrix: relocation/graduation/tombstone/deferred-tail/mixed — kill+reopen parity, no dangling head");
+    const adjacency_slab_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adjacency_slab_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adjacency_slab_crash = b.addRunArtifact(adjacency_slab_crash_tests);
+    adjacency_slab_crash_step.dependOn(&run_adjacency_slab_crash.step);
+
+    // GAP-ENT-0011 — free-space map vs WAL-tail allocations. Crash-restart
+    // tests proving pages allocated after the last checkpoint and recovered
+    // from the WAL tail are marked ALLOCATED in the restored free-space map
+    // (no double allocation of live pages, no invisible recovered nodes),
+    // including across a double crash before the next checkpoint.
+    const free_space_wal_tail_step = b.step("test-free-space-wal-tail", "Run free-space WAL-tail crash-recovery tests: recovered pages stay allocated, aggressive post-reopen allocation preserves full pre-crash parity");
+    const free_space_wal_tail_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/free_space_wal_tail.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_free_space_wal_tail = b.addRunArtifact(free_space_wal_tail_tests);
+    free_space_wal_tail_step.dependOn(&run_free_space_wal_tail.step);
+
+    // GAP-ENT-0032 — committed edge REMOVE in a non-head adjacency block must
+    // stay deleted across a crash. removeEdgeTxn WAL-images the block the
+    // removal actually mutated (same class as the GAP-ENT-0011 logVarChain
+    // label fix), otherwise older WAL images of that page resurrect the edge
+    // with its old public_id.
+    const edge_remove_crash_step = b.step("test-edge-remove-crash", "Run edge-remove crash-recovery tests: a committed remove whose entry lives in a non-head adjacency block stays deleted after WAL replay (both directions, exact surviving public_ids)");
+    const edge_remove_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_remove_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_remove_crash = b.addRunArtifact(edge_remove_crash_tests);
+    edge_remove_crash_step.dependOn(&run_edge_remove_crash.step);
+
+    // WAL-recovery counter staleness — recovery replays committed WAL-tail
+    // page images but left manifest.next_node_id/next_edge_id/next_txn_id at
+    // checkpoint-era values: replayed records invisible to counter-bounded
+    // scans AND their slots re-issued to new writes (silent overwrite of
+    // committed data). Crash-restart tests proving the counters are
+    // re-derived from the replayed images, persisted crash-safely, and never
+    // re-issue a live slot (single-engine + sharded stride).
+    const wal_recovery_counters_step = b.step("test-wal-recovery-counters", "Run WAL-recovery counter-staleness crash tests: manifest id counters re-derived from the replayed tail, scans see every committed record, aggressive creates never re-issue a replayed slot, double-crash safe");
+    const wal_recovery_counters_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/wal_recovery_counters.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_wal_recovery_counters = b.addRunArtifact(wal_recovery_counters_tests);
+    wal_recovery_counters_step.dependOn(&run_wal_recovery_counters.step);
+
+    // checkpoint_epoch invariant — the durable derived-index freshness token
+    // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
+    // recovery (unlike manifest.counter, which recovery bumps for A/B
+    // freshness). This is the core invariant the WAL-aware derived-index
+    // durability contract rests on.
+    const checkpoint_epoch_step = b.step("test-checkpoint-epoch", "Run checkpoint_epoch invariant test: epoch advances only at checkpoint, never across WAL-tail recovery");
+    const checkpoint_epoch_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/test_checkpoint_epoch.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_checkpoint_epoch = b.addRunArtifact(checkpoint_epoch_tests);
+    checkpoint_epoch_step.dependOn(&run_checkpoint_epoch.step);
+
+    // Label WAL imaging — regression guards for the raw-ref vs page-id
+    // confusion on the label var-chain write paths (addLabelTxn /
+    // removeLabelTxn image the FULL chain via logVarChain + the node page).
+    // Crash tests: add+remove replay to the exact label set, last-label
+    // removal replays label_head=0, MULTI-PAGE chains replay byte-exactly.
+    const label_crash_replay_step = b.step("test-label-crash-replay", "Run label WAL-imaging crash tests: crash-window label add/remove (incl. multi-page var chains) replays to the exact label set");
+    const label_crash_replay_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/label_crash_replay.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_label_crash_replay = b.addRunArtifact(label_crash_replay_tests);
+    label_crash_replay_step.dependOn(&run_label_crash_replay.step);
+
+    // Edge-prop-head WAL under-logging — setEdgeProperty rewrites prop_heads
+    // in-place in possibly NON-HEAD adjacency blocks of BOTH chains; the
+    // mutated pages must be WAL-imaged in the SAME txn as the property
+    // write or the committed property silently vanishes on crash replay.
+    const edge_prop_crash_step = b.step("test-edge-prop-crash", "Run edge-property crash tests: committed setEdgeProperty on non-head adjacency blocks (both directions) survives WAL replay, incl. older-image resurrection in the same tail");
+    const edge_prop_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/edge_prop_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_prop_crash = b.addRunArtifact(edge_prop_crash_tests);
+    edge_prop_crash_step.dependOn(&run_edge_prop_crash.step);
+
+    // GAP warm-reopen P1 — mmap-adopted edge-index snapshots (GSEIDX4/GSXIDX2):
+    // clean-reopen adopt, checkpoint merge (base + overlay - tombstones),
+    // dirty-gate no-op persist, crash-rebuild via counter gate, corrupt/
+    // truncated-snapshot reject, lazy payload-CRC failure model, and the
+    // 1M-edge load bench (legacy read+build vs mmap-adopt).
+    const mmap_index_step = b.step("test-mmap-index-snapshot", "Run mmap-adopted edge-index snapshot tests: adopt-on-clean-reopen, checkpoint merge, dirty-gate, crash/corruption recovery, 1M-edge load bench");
+    const mmap_index_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/mmap_index_snapshot.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_mmap_index = b.addRunArtifact(mmap_index_tests);
+    mmap_index_step.dependOn(&run_mmap_index.step);
+
+    // GAP warm-reopen P2 — cross-index checkpoint-counter restamp: an
+    // edges-only session keeps every clean snapshot loadable (no O(graph)
+    // rebuild on the next open), dirty-never-restamped, torn-restamp crash
+    // window rejected, crash-stale + never-hydrated safety gate (no restamp
+    // blessing of stale snapshots).
+    const derived_restamp_step = b.step("test-derived-restamp", "Run derived-index counter-restamp tests: clean-snapshot restamp on full checkpoint, dirty-never-restamped, torn-restamp reject, crash-stale safety gate");
+    const derived_restamp_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/derived_restamp.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_derived_restamp = b.addRunArtifact(derived_restamp_tests);
+    derived_restamp_step.dependOn(&run_derived_restamp.step);
+
+    // WAL-aware derived-index durability (Path B) Phase 2 — the epoch-gate
+    // acceptance proofs: a no-tail clean reopen LOADS via the epoch (rebuild==0),
+    // and a crash-tail reopen whose epoch MATCHES (not counter-rejected) is
+    // counted as a tail-deferral and routed to a CORRECT rebuild (never stale).
+    const epoch_gate_step = b.step("test-derived-epoch-gate", "Run WAL-aware derived-index epoch-gate tests: no-tail reload via epoch, tail-present epoch-match routed to a correct rebuild");
+    const epoch_gate_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/derived_index_epoch_gate.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_epoch_gate = b.addRunArtifact(epoch_gate_tests);
+    epoch_gate_step.dependOn(&run_epoch_gate.step);
+
+    // WAL-aware derived-index durability (Path B) Phase 3 — the RELEASE GATE:
+    // rebuild-equivalence of the bounded WAL-tail reconcile (insert / in-place
+    // property VALUE change / DELETED node / removed edge) for a clean-shutdown
+    // tail AND a kill-9 crash tail.
+    const tail_reconcile_step = b.step("test-index-tail-reconcile", "Run WAL-aware derived-index tail-reconcile == full-rebuild property tests (clean + crash tail)");
+    const tail_reconcile_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/test_index_tail_reconcile.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_tail_reconcile = b.addRunArtifact(tail_reconcile_tests);
+    tail_reconcile_step.dependOn(&run_tail_reconcile.step);
+
+    // Review F-5 (GAP-ENT-0011): CI runs `zig build test`, `test-integration`
+    // and `test-fuzz-regression` only — standalone named steps never run
+    // there. Silent-corruption crash-recovery regression guards must be gated,
+    // so hang both suites under the `test-integration` umbrella as well (they
+    // remain individually invokable via their named steps).
+    integration_step.dependOn(&run_free_space_wal_tail.step);
+    integration_step.dependOn(&run_edge_remove_crash.step);
+    integration_step.dependOn(&run_tail_reconcile.step);
+    // P1: the mmap-snapshot crash/corruption guards are the same class — gate
+    // them under the integration umbrella too.
+    integration_step.dependOn(&run_mmap_index.step);
+    // P2: the restamp crash/staleness guards likewise.
+    integration_step.dependOn(&run_derived_restamp.step);
+    // Phase 2 epoch-gate acceptance (no-tail reload + tail-present correct rebuild).
+    integration_step.dependOn(&run_epoch_gate.step);
+    // WAL-recovery counter healing is the same silent-corruption class.
+    integration_step.dependOn(&run_wal_recovery_counters.step);
+    // checkpoint_epoch recovery-invariance is the durability foundation the
+    // WAL-aware derived-index contract rests on — gate it under integration.
+    integration_step.dependOn(&run_checkpoint_epoch.step);
+    // Label WAL-imaging crash guards likewise.
+    integration_step.dependOn(&run_label_crash_replay.step);
+    integration_step.dependOn(&run_var_store_slab.step);
+    // Edge-prop-head under-logging crash guards likewise.
+    integration_step.dependOn(&run_edge_prop_crash.step);
+    // Adjacency-slab read-both + harvest coverage (silent-counter-staleness
+    // class once slab writers land) likewise.
+    integration_step.dependOn(&run_adjacency_slab.step);
+    // P3 consumer sweep (backup/rebuild/integrity over slab chains) and P4
+    // crash matrix (relocation/graduation/tombstone/deferred-tail/mixed) are
+    // the release gate for the slab writer — gate both under the umbrella.
+    integration_step.dependOn(&run_adjacency_slab_consumers.step);
+    integration_step.dependOn(&run_adjacency_slab_crash.step);
 }
 
 fn addExample(

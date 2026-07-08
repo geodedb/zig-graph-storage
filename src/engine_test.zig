@@ -15,6 +15,7 @@ const page_mod = @import("page.zig");
 const edge_mod = @import("edge.zig");
 const test_support = @import("testing_support.zig");
 const engine_mod = @import("engine.zig");
+const engine_index = @import("engine_index.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -320,6 +321,104 @@ test "open rebuilds derived indexes when snapshot files are stale" {
     };
     try testing.expect(email != null);
     try testing.expectEqualStrings("alice@example.com", email.?.string);
+}
+
+test "getPropertyNoDerived matches getProperty for present keys without hydrating the derived index" {
+    // H1-engine: loop1's per-node chain read must not trigger
+    // ensureDerivedHydrated (the full derived property-chain index build).
+    // getPropertyNoDerived walks prop_store directly; verify it returns the
+    // same value as getProperty for a chain that spans multiple property
+    // pages, and that calling ONLY getPropertyNoDerived never materializes
+    // the derived indexes (derived_hydrated stays false, derived_materialize_runs
+    // stays 0).
+    var td = try testDataDir();
+    defer td.deinit();
+
+    const uuid = [_]u8{0x20} ** 16;
+    const cfg = testConfig();
+
+    // Build a property chain that spans more than one page (page_size=4096
+    // in testConfig; ~36 bytes/entry incl. directory overhead means well
+    // under 200 entries overflows a single page).
+    const entry_count: usize = 200;
+    var head: u64 = 0;
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+
+        var buf: [32]u8 = undefined;
+        var i: usize = 0;
+        while (i < entry_count) : (i += 1) {
+            const key = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+            var vbuf: [32]u8 = undefined;
+            const val = try std.fmt.bufPrint(&vbuf, "v{d}", .{i});
+            head = try engine.putProperty(head, key, .{ .string = val });
+        }
+
+        try testing.expect(head != 0);
+
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Re-open: Phase A means the derived indexes are NOT yet hydrated.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    try testing.expect(!engine.derived_hydrated.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), engine.derived_materialize_runs);
+
+    // prop_head == 0 returns null without touching prop_store.
+    try testing.expectEqual(@as(?PropertyValue, null), try engine.getPropertyNoDerived(0, "k0", testing.allocator));
+
+    // Present key, no-derived path: must succeed and match the expected value.
+    const nd_first = try engine.getPropertyNoDerived(head, "k0", testing.allocator);
+    defer if (nd_first) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(nd_first != null);
+    try testing.expectEqualStrings("v0", nd_first.?.string);
+
+    // A key near the tail of the chain (forces a multi-page walk).
+    const nd_last = try engine.getPropertyNoDerived(head, "k199", testing.allocator);
+    defer if (nd_last) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(nd_last != null);
+    try testing.expectEqualStrings("v199", nd_last.?.string);
+
+    // The derived index must STILL be unhydrated: getPropertyNoDerived never
+    // calls ensureDerivedHydrated.
+    try testing.expect(!engine.derived_hydrated.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), engine.derived_materialize_runs);
+
+    // Now compare against getProperty (which DOES hydrate) for byte-identical
+    // results on present keys.
+    const d_first = try engine.getProperty(head, "k0", testing.allocator);
+    defer if (d_first) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(d_first != null);
+    try testing.expectEqualStrings(nd_first.?.string, d_first.?.string);
+
+    const d_last = try engine.getProperty(head, "k199", testing.allocator);
+    defer if (d_last) |v| switch (v) {
+        .string => |s| testing.allocator.free(s),
+        .ext => |e| testing.allocator.free(e.data),
+        else => {},
+    };
+    try testing.expect(d_last != null);
+    try testing.expectEqualStrings(nd_last.?.string, d_last.?.string);
+
+    // getProperty hydrated the derived index exactly once, as expected.
+    try testing.expect(engine.derived_hydrated.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), engine.derived_materialize_runs);
 }
 
 test "GraphStorage vtable interface works" {
@@ -913,7 +1012,7 @@ test "getStorageStats returns correct counters" {
     const stats0 = engine.getStorageStats();
     try testing.expectEqual(@as(u64, 0), stats0.node_count);
     try testing.expectEqual(@as(u64, 0), stats0.edge_count);
-    try testing.expectEqual(@as(u32, 2), stats0.format_version); // V2
+    try testing.expectEqual(@as(u32, 4), stats0.format_version); // V4 (v0.2.29 checkpoint_epoch downgrade gate)
     try testing.expectEqual(@as(u32, 4096), stats0.page_size);
 
     // Add a node and check stats update
@@ -996,7 +1095,13 @@ test "checkIntegrity propagates adjacency-scan I/O errors" {
     defer td.deinit();
 
     const uuid = [_]u8{0x73} ** 16;
-    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, testConfig());
+    // This test corrupts a LEGACY EdgeBlockHeader (block-per-chain layout) to
+    // force a circular chain. Adjacency slab packing defaults ON since P7, which
+    // makes a low-fanout out_head a slab head instead of a raw block page — so
+    // opt the legacy adjacency writer back in to keep exercising this path.
+    var cfg = testConfig();
+    cfg.adjacency_slab_packing = false;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
     defer engine.close() catch {};
 
     // Two nodes with a single edge so node n1 has a non-empty out_head chain.
@@ -1525,6 +1630,11 @@ test "PERF-0055: putProperty no redundant ArrayList alloc for fixed-size values"
     const engine2 = try GraphEngine.create(count_alloc, td2.path, uuid2, cfg);
     defer engine2.close() catch {};
 
+    // PERF-0055 asserts the LEGACY upsertKey stack-buffer encode path (a slab
+    // in-place update legitimately rebuilds the blob and may allocate) —
+    // force the legacy writer now that slab_packing defaults ON (P7).
+    engine2.prop_store.slab_packing = false;
+
     // First write: creates the property chain and index entry.
     var head2: u64 = 0;
     head2 = try engine2.putProperty(head2, "counter", .{ .int = 0 });
@@ -1743,4 +1853,506 @@ test "GAP-0900 L2: checkpointLight is O(dirty) — skips derived-index save, tru
         defer testing.allocator.free(out);
         try testing.expectEqual(N, out.len);
     }
+}
+
+// ============================================================================
+// PHASE G — crash-reopen exact-index reconcile: gs public API tests (G2).
+// checkpointEpoch / durableFrontierLsn / preRecoveryFrontierLsn — stable
+// accessors over the manifest + recovery state. ADDITIVE; pure reads.
+// ============================================================================
+
+test "PHASE G G2: getters reflect manifest + recovery state across checkpoint and crash" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4B} ** 16;
+    const cfg = testConfig();
+
+    var epoch_after_ckpt: u64 = undefined;
+    var durable_after_ckpt: u64 = undefined;
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const epoch0 = engine.checkpointEpoch();
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(1));
+        try engine.checkpoint();
+        // A checkpoint advances the epoch and the durable frontier.
+        try testing.expect(engine.checkpointEpoch() > epoch0);
+        try testing.expect(engine.durableFrontierLsn() > 0);
+        epoch_after_ckpt = engine.checkpointEpoch();
+        durable_after_ckpt = engine.durableFrontierLsn();
+        try engine.close();
+    }
+    {
+        // Clean reopen: pre-recovery == durable; epoch preserved.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        try testing.expectEqual(engine.durableFrontierLsn(), engine.preRecoveryFrontierLsn());
+        try testing.expectEqual(epoch_after_ckpt, engine.checkpointEpoch());
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(2));
+        engine.deinit(); // committed tail, then crash
+    }
+    // Crash reopen with a replayed tail: durable advanced past pre-recovery;
+    // the epoch did NOT advance (recovery never bumps it); pre-recovery frontier
+    // == the last checkpoint's durable frontier.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try testing.expect(engine.durableFrontierLsn() > engine.preRecoveryFrontierLsn());
+    try testing.expectEqual(epoch_after_ckpt, engine.checkpointEpoch());
+    try testing.expectEqual(durable_after_ckpt, engine.preRecoveryFrontierLsn());
+}
+
+// ============================================================================
+// PHASE G — crash-reopen exact-index reconcile: tailAffectedNodeIds (G1).
+// Resolve the Path-B tail-affected page set to owning node ids; empty is the
+// "full rebuild / nothing to reconcile" sentinel. ADDITIVE; pure reads.
+// ============================================================================
+
+test "PHASE G G1: tailAffectedNodeIds resolves a nodes-page tail to exactly the affected node ids" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x47} ** 16;
+    const cfg = testConfig();
+
+    var new_ids: [3]NodeId = undefined;
+    {
+        // Session 1: fill nodes page 0 exactly, checkpoint (durable), close —
+        // so page 0 is NOT in the crash tail and new nodes start a fresh page.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const npp = engine.node_store.nodes_per_page;
+        var created: u64 = 0;
+        while (created < npp - 1) : (created += 1) {
+            const id = try engine.allocNode();
+            try engine.putNode(id, test_support.emptyNode(1));
+        }
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2: create 3 NEW nodes on the fresh page (the tail), CRASH
+        // (deinit — no checkpoint).
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        for (&new_ids) |*nid| {
+            const id = try engine.allocNode();
+            try engine.putNode(id, test_support.emptyNode(2));
+            nid.* = id;
+        }
+        engine.deinit();
+    }
+    // Session 3: reopen (capture on) → the tail-affected node ids are exactly
+    // the 3 new nodes (their page holds only them).
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
+    defer testing.allocator.free(got);
+    std.mem.sort(NodeId, &new_ids, {}, std.sort.asc(NodeId));
+    try testing.expectEqualSlices(NodeId, &new_ids, got);
+}
+
+test "PHASE G G1: tailAffectedNodeIds is empty on a clean reopen (no tail)" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x48} ** 16;
+    const cfg = testConfig();
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(1));
+        try engine.checkpoint();
+        try engine.close();
+    }
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    // Clean reopen: pre-recovery frontier == durable frontier, no captured tail.
+    try testing.expectEqual(engine.durableFrontierLsn(), engine.preRecoveryFrontierLsn());
+    // No tail → non-null EMPTY ("nothing to reconcile"), distinct from the
+    // null "rebuild required" sentinel exercised by the overflow test below.
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "PHASE G G1: tailAffectedNodeIds is null (rebuild required) when the tail capture is unavailable (overflow)" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x49} ** 16;
+    const cfg = testConfig();
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(1));
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        try engine.putNode(id, test_support.emptyNode(2));
+        engine.deinit(); // crash with a committed tail
+    }
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    // A committed tail advanced the durable frontier past the pre-recovery one.
+    try testing.expect(engine.durableFrontierLsn() > engine.preRecoveryFrontierLsn());
+    try testing.expect(engine.tail_affected_pages != null);
+    // Simulate an overflowed / absent capture: drop the captured set while the
+    // frontier still shows a tail was applied → must fall back to full rebuild.
+    testing.allocator.free(engine.tail_affected_pages.?);
+    engine.tail_affected_pages = null;
+    // A committed tail with no usable capture returns the null "rebuild
+    // required" sentinel — NOT an empty slice (which would read as "nothing to
+    // reconcile" and leave the external index silently stale on the tail node).
+    const got = try engine.tailAffectedNodeIds(testing.allocator);
+    try testing.expect(got == null);
+}
+
+test "PHASE G reverse-map: an in-place property value change (props-only tail) resolves the changed node" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4A} ** 16;
+    const cfg = testConfig();
+    {
+        // Session 1: node 1 with a fixed-size property; checkpoint (persists the
+        // reverse map node1->head); close.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        var rec = test_support.emptyNode(1);
+        rec.prop_head = try engine.putProperty(0, "k", .{ .int = 1 });
+        try engine.putNode(id, rec);
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2: IN-PLACE value change (same key, same-size i64) rewrites
+        // ONLY the props page, never node 1's record → node 1 is on NO tail
+        // nodes page. Crash.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const rec = (try engine.getNode(1)).?;
+        const new_head = try engine.putProperty(rec.prop_head, "k", .{ .int = 2 });
+        try testing.expectEqual(rec.prop_head, new_head); // in-place: head unchanged
+        engine.deinit();
+    }
+    // Session 3: the tail props page's live slot resolves to node 1 via the
+    // reverse map (loaded on demand) — RED->GREEN: previously an empty rebuild.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try testing.expect(engine.tail_affected_pages != null);
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(NodeId, &[_]NodeId{1}, got);
+}
+
+test "PHASE G reverse-map: fill-page co-tenant is resolved (not a rebuild) on an in-place change" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4C} ** 16;
+    const cfg = testConfig();
+    {
+        // Session 1: nodes 1 and 2 both get a small property → they share one
+        // slab fill page. Checkpoint persists the reverse map for BOTH; close.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id1 = try engine.allocNode();
+        var r1 = test_support.emptyNode(1);
+        r1.prop_head = try engine.putProperty(0, "k", .{ .int = 1 });
+        try engine.putNode(id1, r1);
+        const id2 = try engine.allocNode();
+        var r2 = test_support.emptyNode(1);
+        r2.prop_head = try engine.putProperty(0, "k", .{ .int = 2 });
+        try engine.putNode(id2, r2);
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2: IN-PLACE change to node 1 only → rewrites the shared fill
+        // page (node 2's live slot rides along, unchanged). No nodes page in the
+        // tail. Crash.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const rec = (try engine.getNode(1)).?;
+        _ = try engine.putProperty(rec.prop_head, "k", .{ .int = 9 });
+        engine.deinit();
+    }
+    // Session 3: the shared props page resolves BOTH the changed node 1 AND the
+    // co-tenant node 2 (harmless superset) via the reverse map — where the
+    // nodes-page pass alone would have force-rebuilt.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    const got = (try engine.tailAffectedNodeIds(testing.allocator)).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(NodeId, &[_]NodeId{ 1, 2 }, got);
+}
+
+// ============================================================================
+// PHASE G reverse map (prop_head -> node_id) — build/persist/reload wiring.
+// ============================================================================
+
+test "PHASE G reverse-map: fresh-graph build + checkpoint + reopen LOADS prop_head->node (not rebuilt)" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x5A} ** 16;
+    const cfg = testConfig();
+    var head1: u64 = undefined;
+    var head2: u64 = undefined;
+    {
+        // A fresh graph is hydrated from creation, so putNode maintains the
+        // reverse map live (no scan).
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const id1 = try engine.allocNode();
+        var r1 = test_support.emptyNode(1);
+        r1.prop_head = try engine.putProperty(0, "k", .{ .int = 1 });
+        try engine.putNode(id1, r1);
+        head1 = r1.prop_head;
+        const id2 = try engine.allocNode();
+        var r2 = test_support.emptyNode(1);
+        r2.prop_head = try engine.putProperty(0, "k", .{ .int = 2 });
+        try engine.putNode(id2, r2);
+        head2 = r2.prop_head;
+        try testing.expectEqual(@as(?NodeId, id1), engine.prop_rev_index.get(head1));
+        try testing.expectEqual(@as(?NodeId, id2), engine.prop_rev_index.get(head2));
+        try engine.checkpoint();
+        try engine.close();
+    }
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try engine.ensureDerivedHydrated();
+    // Epoch matched → derived indexes LOADED clean (not rebuilt); the reverse
+    // map loaded from its snapshot in the same path (no O(nodes) scan).
+    try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_loads);
+    try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
+    try testing.expectEqual(@as(?NodeId, 1), engine.prop_rev_index.get(head1));
+    try testing.expectEqual(@as(?NodeId, 2), engine.prop_rev_index.get(head2));
+}
+
+test "PHASE G reverse-map: tail reconcile (insert + delete) equals a full rebuild of the map" {
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x4D} ** 16;
+    const cfg = testConfig();
+    {
+        // Session 1: nodes 1,2,3 each with a property; checkpoint; close.
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        var n: u64 = 0;
+        while (n < 3) : (n += 1) {
+            const id = try engine.allocNode();
+            var r = test_support.emptyNode(1);
+            r.prop_head = try engine.putProperty(0, "k", .{ .int = @intCast(id) });
+            try engine.putNode(id, r);
+        }
+        try engine.checkpoint();
+        try engine.close();
+    }
+    {
+        // Session 2 (committed tail): INSERT node 4 (with a prop) + DELETE node 1.
+        // Crash (deinit — no checkpoint) so session 3 must reconcile.
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        const id = try engine.allocNode();
+        var r = test_support.emptyNode(2);
+        r.prop_head = try engine.putProperty(0, "k", .{ .int = 99 });
+        try engine.putNode(id, r);
+        try engine.deleteNode(1);
+        engine.deinit();
+    }
+    // Session 3: hydrate → the bounded tail is RECONCILED into the loaded map.
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.deinit();
+    try engine.ensureDerivedHydrated();
+    try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_reconciles);
+
+    // Snapshot the RECONCILED reverse map.
+    var snap: std.AutoHashMapUnmanaged(u64, NodeId) = .empty;
+    defer snap.deinit(testing.allocator);
+    {
+        var it = engine.prop_rev_index.map.iterator();
+        while (it.next()) |e| try snap.put(testing.allocator, e.key_ptr.*, e.value_ptr.*);
+    }
+
+    // Ground truth: a full rebuild from a live node scan (deleted node 1 is
+    // excluded by scanNodes; inserted node 4 is present).
+    try engine_index.buildPropRevIndexFromScan(engine);
+
+    try testing.expectEqual(engine.prop_rev_index.count(), snap.count());
+    var it = engine.prop_rev_index.map.iterator();
+    while (it.next()) |e| {
+        try testing.expectEqual(@as(?NodeId, e.value_ptr.*), snap.get(e.key_ptr.*));
+    }
+    // Node 1 was deleted → absent from both; node 4 present in both.
+    const rec4 = (try engine.getNode(4)).?;
+    try testing.expectEqual(@as(?NodeId, 4), snap.get(rec4.prop_head));
+}
+
+// ============================================================================
+// GAP-0060 — edge-property slab packing: oracle, round-trip, upgrade
+// ============================================================================
+
+fn zeroRec() NodeRec {
+    return .{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+}
+
+/// Build a store of `n_edges` parallel a->b edges, each with ONE small edge
+/// property (`run_id`, 16 bytes — the exact taxonomic-ingest shape), checkpoint,
+/// and return the props.store page count. `slab` selects the GAP-0060 slab
+/// routing vs the legacy one-page-per-edge writer.
+fn edgePropsPageCount(slab: bool, n_edges: u64) !u64 {
+    var td = try testDataDir();
+    defer td.deinit();
+    var cfg = testConfig();
+    cfg.edge_prop_slab_packing = slab;
+    const uuid = [_]u8{0x60} ** 16;
+    const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    const a = try engine.allocNode();
+    try engine.putNode(a, zeroRec());
+    const b = try engine.allocNode();
+    try engine.putNode(b, zeroRec());
+
+    var i: u64 = 0;
+    while (i < n_edges) : (i += 1) {
+        const eid = try engine.addEdge(a, b, 5);
+        try engine.setEdgeProperty(a, b, eid, "run_id", .{ .string = "edges-1783388992" });
+    }
+    try engine.checkpoint();
+
+    // Round-trip parity: every edge's prop reads back byte-identical.
+    var e: u64 = 1;
+    while (e <= n_edges) : (e += 1) {
+        const got = try engine.getEdgeProperty(a, e, "run_id", testing.allocator);
+        try testing.expect(got != null);
+        defer testing.allocator.free(got.?.string);
+        try testing.expectEqualStrings("edges-1783388992", got.?.string);
+    }
+
+    const pager = engine.file_manager.getPager(.props) orelse return error.NoPropsPager;
+    return pager.pageCount();
+}
+
+test "GAP-0060 ORACLE: edge props slab-pack — page-per-edge -> densely packed" {
+    const N: u64 = 200;
+    const legacy_pages = try edgePropsPageCount(false, N);
+    const slab_pages = try edgePropsPageCount(true, N);
+
+    const page_size: u64 = 4096; // testConfig
+    std.debug.print(
+        "\nGAP-0060 oracle: {d} edges (16B run_id each)  LEGACY={d} pages ({d} B/edge)  SLAB={d} pages ({d} B/edge)  ~{d}x denser\n",
+        .{ N, legacy_pages, legacy_pages * page_size / N, slab_pages, slab_pages * page_size / N, legacy_pages / @max(slab_pages, 1) },
+    );
+
+    // Legacy: at least one dedicated page per edge (the ~8KB/edge bloat at
+    // production 8KB page size; 4KB here) — this is what GAP-0060 kills.
+    try testing.expect(legacy_pages >= N);
+    // Slab: many edge props share a page — dramatically fewer pages.
+    try testing.expect(slab_pages * 5 < legacy_pages);
+}
+
+test "GAP-0060: existing v0.2.34-shaped store (edge_prop_slab OFF) opens under the new binary and reads edge props" {
+    // Simulate a pre-0060 store: legacy edge props (u32 head, one page/edge) +
+    // legacy v2 adjacency. Create it with the feature OFF, then reopen with the
+    // feature ON (the v0.2.35 default) — read-both + the GSEIDX5->rebuild path
+    // must open it and read every edge prop back unchanged. New writes slab-pack.
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x61} ** 16;
+
+    var legacy_cfg = testConfig();
+    legacy_cfg.edge_prop_slab_packing = false;
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, legacy_cfg);
+        defer engine.close() catch {};
+        const a = try engine.allocNode();
+        try engine.putNode(a, zeroRec());
+        const b = try engine.allocNode();
+        try engine.putNode(b, zeroRec());
+        var i: u64 = 0;
+        while (i < 8) : (i += 1) {
+            const eid = try engine.addEdge(a, b, 5);
+            try engine.setEdgeProperty(a, b, eid, "run_id", .{ .string = "legacy-edge-prop" });
+        }
+        try engine.checkpoint();
+    }
+
+    // Reopen with the feature ON (default). Existing legacy edge props still read.
+    var new_cfg = testConfig();
+    new_cfg.edge_prop_slab_packing = true;
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, new_cfg);
+    defer engine.close() catch {};
+
+    var e: u64 = 1;
+    while (e <= 8) : (e += 1) {
+        const got = try engine.getEdgeProperty(1, e, "run_id", testing.allocator);
+        try testing.expect(got != null);
+        defer testing.allocator.free(got.?.string);
+        try testing.expectEqualStrings("legacy-edge-prop", got.?.string);
+    }
+
+    // A NEW edge added post-upgrade slab-packs its prop and reads back.
+    const new_eid = try engine.addEdge(1, 2, 5);
+    try engine.setEdgeProperty(1, 2, new_eid, "run_id", .{ .string = "new-slab-prop-val" });
+    const ng = try engine.getEdgeProperty(1, new_eid, "run_id", testing.allocator);
+    try testing.expect(ng != null);
+    defer testing.allocator.free(ng.?.string);
+    try testing.expectEqualStrings("new-slab-prop-val", ng.?.string);
+}
+
+test "GAP-0060 CRASH: edge slab props survive rebuild-from-adjacency (durable u64 head, no dangling)" {
+    // Simulate a crash where the edge-index snapshot is stale/absent: the next
+    // open rebuilds the edge index FROM DURABLE ADJACENCY. If the adjacency did
+    // not carry the full u64 slab head, the rebuilt index would point at the
+    // wrong (truncated) prop chain — a dangling head — and the read-back would
+    // fail. Each edge carries a UNIQUE value so a mis-linked head is caught.
+    var td = try testDataDir();
+    defer td.deinit();
+    const uuid = [_]u8{0x62} ** 16;
+    const cfg = testConfig(); // edge_prop_slab_packing = true (v0.2.35 default)
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const N: u64 = 40;
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        const a = try engine.allocNode();
+        try engine.putNode(a, zeroRec());
+        const b = try engine.allocNode();
+        try engine.putNode(b, zeroRec());
+        var i: u64 = 0;
+        while (i < N) : (i += 1) {
+            const eid = try engine.addEdge(a, b, 5);
+            var buf: [24]u8 = undefined;
+            const v = try std.fmt.bufPrint(&buf, "run-{d:0>6}", .{eid});
+            try engine.setEdgeProperty(a, b, eid, "run_id", .{ .string = v });
+        }
+        try engine.checkpoint();
+        try engine.close();
+    }
+
+    // Truncate edges.idx → the load gate rejects it → rebuild from adjacency.
+    const gdir = try GraphDir.open(testing.allocator, td.path, uuid);
+    defer @constCast(&gdir).deinit();
+    const eidx_path = try std.fmt.allocPrint(testing.allocator, "{s}/edges.idx", .{gdir.path});
+    defer testing.allocator.free(eidx_path);
+    (try std.Io.Dir.cwd().createFile(io, eidx_path, .{ .read = true, .truncate = true })).close(io);
+
+    const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+    defer engine.close() catch {};
+
+    // Every edge's slab prop_head resolves to a LIVE run with the RIGHT value.
+    var e: u64 = 1;
+    while (e <= N) : (e += 1) {
+        var buf: [24]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "run-{d:0>6}", .{e});
+        const got = try engine.getEdgeProperty(1, e, "run_id", testing.allocator);
+        try testing.expect(got != null);
+        defer testing.allocator.free(got.?.string);
+        try testing.expectEqualStrings(want, got.?.string);
+    }
+
+    // Counter intact after the rebuild: a fresh edge id never collides with a
+    // live one (the id-heal / manifest counter survived).
+    const new_eid = try engine.addEdge(1, 2, 5);
+    try testing.expect(new_eid > N);
 }

@@ -106,6 +106,25 @@ pub const GraphConfig = struct {
     checkpoint_time_threshold_ms: u64 = 60_000,
     encryption_key: ?[32]u8 = null,
     data_dir: []const u8 = "data",
+    /// GAP adjacency slab packing (P2): when true, NEW small adjacency chains
+    /// pack into shared slab blocks instead of a whole ≥8 KB block per (node,
+    /// direction) chain — killing the block-per-chain bloat that dominates
+    /// low-fanout graphs. A chain that outgrows its slab slot graduates to a
+    /// legacy block chain. Reads are always slab-aware (read-both is permanent),
+    /// so a slab-packed store opens on any build that has the P1 read path.
+    /// Default ON since P7: freshly-created stores pack new adjacency chains;
+    /// existing legacy chains keep reading via the read-both path (no migration).
+    /// Toggle retained for rollback/diagnostics (set false → pure legacy writer).
+    adjacency_slab_packing: bool = true,
+    /// GAP-0060: when true, edge property chains slab-pack (like node props)
+    /// instead of one legacy ~8 KB page per edge, and the adjacency writer uses
+    /// the WIDE (v3 / slab-v3, 40 B) entry format so an edge's `prop_head` can
+    /// hold a prop-store slab head (u64) durably. Read-both parses legacy
+    /// v1/v2/slab-v2 forever, so an existing store opens unchanged; only NEW
+    /// blocks/props use the wide/slab layout. Default ON since GAP-0060: freshly
+    /// created stores slab-pack edge props (killing the ~8 KB-per-edge legacy
+    /// page — ~111 GB on the 14.27M store). Toggle retained for rollback.
+    edge_prop_slab_packing: bool = true,
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
     /// Policy for handling legacy (V1) graph formats during recovery.
     legacy_policy: LegacyPolicy = .reject,

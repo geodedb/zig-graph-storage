@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tp = @import("thread_pool");
 const observability = @import("observability");
 const Allocator = std.mem.Allocator;
@@ -37,6 +38,7 @@ const engine_index = @import("engine_index.zig");
 const engine_persist = @import("engine_persist.zig");
 const engine_property_index = @import("engine_property_index.zig");
 const edge_exist_index_mod = @import("edge_exist_index.zig");
+const edge_index_map_mod = @import("edge_index_map.zig");
 const ordered_property_index_mod = @import("ordered_property_index.zig");
 
 const NodeId = types.NodeId;
@@ -64,6 +66,7 @@ const Checkpointer = checkpoint_mod.Checkpointer;
 const Recovery = recovery_mod.Recovery;
 const LabelIndex = label_index_mod.LabelIndex;
 const PropertyChainIndex = property_chain_index_mod.PropertyChainIndex;
+const PropRevIndex = @import("prop_rev_index.zig").PropRevIndex;
 const LabelStore = label_store_mod.LabelStore;
 const Metrics = metrics_mod.Metrics;
 const NodeRec = node_mod.NodeRec;
@@ -72,11 +75,28 @@ const PropertyIndexSet = engine_property_index.PropertyIndexSet;
 const OrderedPropertyIndex = ordered_property_index_mod.OrderedPropertyIndex;
 
 /// In-memory index entry for O(1) edge lookup by EdgeId.
-pub const EdgeIndexEntry = struct {
-    from: NodeId,
-    neighbor: NodeId,
-    rel_type: u32,
-    prop_head: u32,
+/// GAP warm-reopen P1: definition moved to edge_index_map.zig (re-exported
+/// here so every existing `engine_mod.EdgeIndexEntry` reference keeps working).
+pub const EdgeIndexEntry = edge_index_map_mod.EdgeIndexEntry;
+
+/// WAL-aware derived-index durability Phase 3: one tail-affected primary page,
+/// captured by recovery and consumed by the first-access tail reconcile.
+pub const TailPage = struct { file_id: types.FileId, page_id: u64 };
+
+/// TEST/introspection: order-independent content digest of the four derived
+/// indexes. Two equal digests ⇒ the indexes are key-for-key equal (negligible
+/// collision probability). Used to assert a WAL-tail reconcile == a full
+/// rebuild over the same store.
+pub const DerivedDigests = struct {
+    label: u64,
+    property: u64,
+    edge: u64,
+    edge_exist: u64,
+
+    pub fn eql(a: DerivedDigests, b: DerivedDigests) bool {
+        return a.label == b.label and a.property == b.property and
+            a.edge == b.edge and a.edge_exist == b.edge_exist;
+    }
 };
 
 /// Default worker count for the owned (no-`external_thread_pool`) path.
@@ -127,7 +147,17 @@ pub const GraphEngine = struct {
     label_store: LabelStore,
     label_index: LabelIndex,
     property_index: PropertyChainIndex,
-    edge_index: std.AutoHashMap(EdgeId, EdgeIndexEntry),
+    /// PHASE G reverse map: prop_head -> node_id, so a crash-reopen exact-index
+    /// reconcile resolves a tail PROPS-page slab slot to its owning node. Built
+    /// by the hydration scan, kept current on the record-write path
+    /// (putNode/deleteNode, when hydrated), persisted with the other derived
+    /// snapshots (epoch + covered_lsn stamped), reconciled from the nodes-page
+    /// tail. See prop_rev_index.zig.
+    prop_rev_index: PropRevIndex,
+    /// GAP warm-reopen P1: overlay hashmap + optional immutable mmap base
+    /// (see edge_index_map.zig). Resident mode (no base) behaves exactly like
+    /// the previous `std.AutoHashMap(EdgeId, EdgeIndexEntry)`.
+    edge_index: edge_index_map_mod.EdgeIndexMap,
     /// PHASE 3 (edge-engine-direct): durable, derived edge-EXISTENCE index
     /// mapping (from, rel_type, to) -> edge_id(s) for O(1) MERGE dedup. Same
     /// crash-safety lifecycle as `edge_index` (snapshot at checkpoint; rebuilt
@@ -166,6 +196,10 @@ pub const GraphEngine = struct {
     persistence_dirty: bool = false,
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
+    /// PHASE G reverse map: set when a record write moved/added/removed a
+    /// prop_head->node mapping since the last persist, so the next checkpoint
+    /// re-saves the reverse-map snapshot (and a clean one is restamped).
+    prop_rev_index_dirty: bool = false,
     edge_index_dirty: bool = true,
     /// PHASE 3: set when the edge-existence index changed since the last persist,
     /// so the next checkpoint/close writes its snapshot. Tracked in lock-step
@@ -204,6 +238,65 @@ pub const GraphEngine = struct {
     /// MUST be exactly 1 across any number of concurrent first-accesses.
     derived_materialize_runs: u32 = 0,
 
+    /// GAP warm-reopen P2: TRUE when the invariant "every gated derived
+    /// snapshot (label/prop/edge/edge-exist) whose dirty flag is FALSE is
+    /// content-identical to its in-memory index" is KNOWN to hold. Only
+    /// under this invariant may a full checkpoint cheaply RE-STAMP a clean
+    /// snapshot's counter to the new manifest.counter (restampClean-
+    /// DerivedSnapshots) instead of leaving it counter-stale.
+    ///
+    /// Transitions:
+    ///   * create(): true — all four dirty flags start true, so the
+    ///     invariant holds vacuously (the first full checkpoint SAVES all
+    ///     four, making it hold materially).
+    ///   * open(): FALSE — the dirty flags start clean but the on-disk
+    ///     snapshots are UNKNOWN: after a crash restart they are stale
+    ///     (recovery bumped manifest.counter past their stamp) even though
+    ///     nothing in this session dirtied them. Restamping here would
+    ///     bless crash-stale indexes = silent data loss. A page-only
+    ///     session that never hydrates therefore never restamps (its
+    ///     snapshots stay counter-stale → next open rebuilds, exactly the
+    ///     pre-P2 behavior).
+    ///   * materializeDerivedIndexes(): true — LOAD branch: memory :=
+    ///     snapshot with all flags clean (holds materially); REBUILD
+    ///     branch: all four flags set dirty (holds vacuously; the next full
+    ///     checkpoint saves them).
+    ///   * full checkpoint that saved ALL FOUR (all were dirty): true.
+    /// Mutations never clear it. Instead, the invariant is an OBLIGATION on
+    /// every derived-index mutation entry point: set that index's dirty flag
+    /// at the mutation point, which removes the index from the invariant's
+    /// scope until the next save. Any mutator that forgets converts the next
+    /// full checkpoint's restamp into a blessing of a stale snapshot =
+    /// silent durable data loss (re-review F1/F2 were exactly this shape:
+    /// engine_edge_props.setEdgeProperty's updatePropHead and
+    /// sharded_recovery's dangling-2PC edge_index.put replay). Audited
+    /// mutation sites that uphold it: label add/remove → label_index_dirty;
+    /// property chain writes (refreshPropertyChainIndex/removeChain) →
+    /// property_index_dirty; edge add/remove and setEdgeProperty's
+    /// prop_head update → edge_index_dirty; existence-index put/remove
+    /// (including 2PC recovery replay) → edge_exist_index_dirty; a full
+    /// rebuild sets all four.
+    derived_snapshots_trusted: bool = false,
+
+    /// WAL-aware derived-index durability Phase 3 (tail reconcile): the
+    /// tail-affected primary pages recovery applied at OPEN, copied out of the
+    /// (soon-deinit) Recovery for the DEFERRED first-access reconcile. Null
+    /// means "no bounded tail to reconcile" — either a clean reopen, or the
+    /// capture was unavailable/overflowed → materializeDerivedIndexes rebuilds
+    /// (always safe). Owned; freed and nulled once the reconcile consumes it
+    /// (or in cleanupResources on an un-hydrated teardown).
+    tail_affected_pages: ?[]TailPage = null,
+
+    /// WAL-aware derived-index durability Phase 3 (multi-recovery guard): the
+    /// durable committed frontier as it stood BEFORE this session's recovery ran
+    /// (recovery's `pre_recovery_last_checkpoint_lsn`). The first-access tail
+    /// reconcile is valid ONLY when a snapshot's `covered_lsn` == this value —
+    /// otherwise a PRIOR un-checkpointed recovery advanced the frontier past the
+    /// snapshot and `tail_affected_pages` is only the latest recovery slice, so
+    /// the gate forces a full rebuild instead of a (silently-incomplete) partial
+    /// reconcile. 0 on a freshly created graph (no recovery, never gated).
+    tail_pre_recovery_lsn: u64 = 0,
+
     /// Create a new graph.
     pub fn create(allocator: Allocator, data_dir: []const u8, graph_uuid: [16]u8, cfg: GraphConfig) !*GraphEngine {
         const self = try allocator.create(GraphEngine);
@@ -227,6 +320,11 @@ pub const GraphEngine = struct {
         self.derived_hydrated = std.atomic.Value(bool).init(true);
         self.derived_hydrate_mutex = std.Io.Mutex.init;
         self.derived_materialize_runs = 0;
+        // P2: all four dirty flags are true → the clean-snapshot invariant
+        // holds vacuously (see the field doc).
+        self.derived_snapshots_trusted = true;
+        self.tail_affected_pages = null; // fresh graph: no WAL tail to reconcile
+        self.tail_pre_recovery_lsn = 0;
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -367,6 +465,12 @@ pub const GraphEngine = struct {
         self.derived_hydrated = std.atomic.Value(bool).init(false);
         self.derived_hydrate_mutex = std.Io.Mutex.init;
         self.derived_materialize_runs = 0;
+        // P2: the on-disk snapshots are UNKNOWN until the counter gate runs
+        // (they may be crash-stale behind clean dirty flags) — restamping is
+        // forbidden until materializeDerivedIndexes establishes the invariant.
+        self.derived_snapshots_trusted = false;
+        self.tail_affected_pages = null; // set from recovery's captured set below
+        self.tail_pre_recovery_lsn = 0; // set from recovery below
         self.submitter_slot = null;
         self.owned_thread_pool = null;
 
@@ -393,6 +497,25 @@ pub const GraphEngine = struct {
         // 4. Run recovery (loads manifest, replays WAL)
         var recovery = Recovery.init(allocator, cfg.encryption_key);
         recovery.legacy_policy = cfg.legacy_policy;
+        // Counter healing (WAL-recovery counter staleness): a sharded member
+        // allocates node/edge ids at SHARD_COUNT stride, so recovery must
+        // re-derive counters in the same residue class (see Recovery.id_stride).
+        recovery.id_stride = if (cfg.base_shard_index != null)
+            @intCast(@import("sharded_store.zig").SHARD_COUNT)
+        else
+            1;
+        // Residue guard (I1): the harvest must skip legacy foreign-residue
+        // ids (pre-co-location `.adj_in` images carry source-shard edge ids)
+        // or the healed counter leaves the shard's id class and shardOfNode
+        // routing breaks for every subsequently created edge.
+        recovery.shard_residue = if (cfg.base_shard_index) |base|
+            @as(u64, @intCast(base)) % recovery.id_stride
+        else
+            0;
+        // WAL-aware derived-index durability Phase 3: capture the tail-affected
+        // (file_id,page_id) set so first-access hydration can reconcile ONLY the
+        // bounded tail into the loaded snapshot instead of an O(graph) rebuild.
+        recovery.capture_affected_pages = true;
         defer recovery.deinit();
         self.manifest = try recovery.recover(&self.graph_dir, &self.buffer_pool, &self.file_manager);
         self.read_only = recovery.read_only;
@@ -435,8 +558,29 @@ pub const GraphEngine = struct {
             // authoritative manifest — re-create with the correct capacity,
             // re-register pagers. With the anon-mmap backing this re-create no
             // longer pays an eager zero-fill either.
+            //
+            // LOCK-FREE POOL LIFETIME INVARIANT (GAP-ENT-0018): the buffer pool's
+            // `page_table` metadata base and frame array MUST NOT be freed or
+            // moved while any thread can call `pin` — the PERF-0058 lock-free
+            // fast path reads that backing store WITHOUT the pool mutex, so a
+            // free-under-reader is an immediate use-after-free segfault (the
+            // `page_table.get` dereferences a dangling `metadata` base). This
+            // re-create is safe ONLY because it runs on the open path BEFORE
+            // `open` returns `self` — the engine is not yet published, so no
+            // reader exists. recovery.recover already `flushAll`ed, so the old
+            // (clean) pool can be discarded without data loss. Do NOT introduce a
+            // pool deinit+recreate (or any metadata-moving grow) on a path where
+            // reads may be in flight.
+            //
+            // CORRECTNESS (double-free on OOM): build the replacement BEFORE
+            // tearing down the old pool. If `init` fails (OOM), `self.buffer_pool`
+            // still points at the valid old pool, so the `errdefer` registered at
+            // step 3 frees it EXACTLY ONCE. The prior order (deinit then assign)
+            // left `self.buffer_pool` referencing freed memory on an init failure,
+            // and the errdefer double-freed it.
+            const resized_pool = try BufferPool.init(allocator, cfg.page_size, effective);
             self.buffer_pool.deinit();
-            self.buffer_pool = try BufferPool.init(allocator, cfg.page_size, effective);
+            self.buffer_pool = resized_pool;
             self.registerDataPagers();
         }
         // PERF-0051: reserve a floor of frames for the hot node store so cold
@@ -455,9 +599,62 @@ pub const GraphEngine = struct {
         // 5b. Restore free space bitmaps. Prefer the persisted free.store
         // file which accurately tracks freed pages. Fall back to rebuilding
         // from on-disk file sizes (lossy — freed pages appear allocated).
-        const loaded_free_store = try self.loadFreeStore();
-        if (!loaded_free_store) {
+        //
+        // GAP-ENT-0011 (free-space map vs WAL tail): free.store is written at
+        // CHECKPOINT time only. When recovery just replayed (and flushed)
+        // committed WAL-tail page images, pages allocated AFTER that
+        // checkpoint are still marked FREE in the persisted bitmap. Loading
+        // it would (1) hide recovered nodes — NodeStore.getNode/scanNodes
+        // gate on isAllocated — and (2) let allocPage hand a LIVE page to the
+        // next writer (double allocation → pinNew zeroes and overwrites
+        // committed data). So on a crash restart the persisted bitmap is
+        // untrusted: rebuild from on-disk file sizes (recovery flushAll'ed
+        // the replayed pages, so the files cover them). The rebuild is
+        // O(total pages) bit-sets — negligible next to the derived-index
+        // rebuild a crash restart already pays (the derived-snapshot load
+        // gate is counter-excluded on this same path). Then persist the
+        // rebuilt bitmap IMMEDIATELY: recovery already advanced
+        // last_checkpoint_lsn past the replayed tail, so a second crash
+        // before the next checkpoint would otherwise take the clean path on
+        // the NEXT open and trust the stale checkpoint-era file.
+        // WAL-aware derived-index durability Phase 3 (multi-recovery guard):
+        // record the durable frontier as it stood BEFORE this recovery ran. The
+        // first-access reconcile gate compares each snapshot's covered_lsn to
+        // this: covered < this ⇒ a prior un-checkpointed recovery advanced the
+        // frontier and the captured set below is only the latest slice ⇒ rebuild.
+        self.tail_pre_recovery_lsn = recovery.pre_recovery_last_checkpoint_lsn;
+
+        // WAL-aware derived-index durability Phase 3: copy the tail-affected
+        // page set out of `recovery` (about to deinit) for the DEFERRED
+        // first-access reconcile. Only when a committed tail was applied and the
+        // capture is COMPLETE — an overflow (OOM mid-capture) or an empty set
+        // leaves it null so materializeDerivedIndexes rebuilds (always safe; a
+        // partial set would leave stale index entries).
+        if (recovery.applied_committed_pages and
+            !recovery.affected_pages_overflow and
+            recovery.affected_pages.count() > 0)
+        {
+            const n = recovery.affected_pages.count();
+            const buf = try allocator.alloc(TailPage, n);
+            var it = recovery.affected_pages.keyIterator();
+            var i: usize = 0;
+            while (it.next()) |k| : (i += 1) {
+                buf[i] = .{
+                    .file_id = @enumFromInt(@as(u8, @intCast(k.* >> 64))),
+                    .page_id = @truncate(k.*),
+                };
+            }
+            self.tail_affected_pages = buf;
+        }
+
+        if (recovery.applied_committed_pages) {
             try self.rebuildFreeSpaceFromDisk();
+            try self.saveFreeStore();
+        } else {
+            const loaded_free_store = try self.loadFreeStore();
+            if (!loaded_free_store) {
+                try self.rebuildFreeSpaceFromDisk();
+            }
         }
 
         // 6. Load persisted label dictionary if it exists
@@ -483,22 +680,31 @@ pub const GraphEngine = struct {
         // (backward compat). Snapshots that fail verification are rebuilt.
         try engine_property_index.load(self);
 
-        // 7c. H3-P1: load the per-(label,key) ordered index COUNTER-GATED,
-        // mirroring tryLoadDerivedIndexes (Lever B). The snapshot records the
-        // registered (label,key) pairs AND the trees, stamped with the
-        // manifest.counter at save time:
-        //   * snapshot.counter == manifest.counter  -> LOAD (clean restart).
-        //   * snapshot.counter != manifest.counter  -> the registration is kept
-        //     but the trees are REBUILT from a live scan (crash restart: a WAL
-        //     replay bumped manifest.counter past the snapshot stamp, so the
-        //     persisted trees may be stale and must NOT be trusted).
-        //   * no snapshot file (or unreadable)      -> no ordered index (no-op).
-        // The CRC-only validity check is intentionally NOT the gate (that is the
-        // pre-existing staleness gap); the counter is.
+        // 7c. GAP-0050: load the per-(label,key) ordered index on the SAME Path B
+        // `(checkpoint_epoch, covered_lsn)` reload contract the 4 engine derived
+        // indexes use (engine_index.tryLoadDerivedIndexes). The snapshot records
+        // the registered (label,key) pairs AND the trees, stamped with the
+        // durable freshness token at checkpoint time:
+        //   * epoch == manifest.checkpoint_epoch AND covered_lsn ==
+        //     manifest.last_checkpoint_lsn  -> LOAD (clean reopen: epoch current
+        //     AND no committed WAL tail past the snapshot). ORDER BY reopen is
+        //     then O(snapshot), not the O(graph) rebuild.
+        //   * epoch mismatch (a checkpoint ran after the snapshot) OR a tail
+        //     (covered_lsn < last_checkpoint_lsn: recovery replayed committed
+        //     records the snapshot predates) -> the registration is kept (already
+        //     loaded) but the trees are REBUILT from a live scan. checkpoint_epoch
+        //     advances ONLY at checkpoint (never by a WAL-tail recovery), so a
+        //     clean shutdown reloads instead of the counter gate's forced rebuild.
+        //   * no snapshot file (or old/corrupt -> error) -> no ordered index.
+        // The btree tail-reconcile the derived indexes do (Path B Phase 3) is OUT
+        // OF SCOPE (needs a node->old-ordered-key reverse map the PropRevIndex
+        // does not carry — GAP-0050 crash-leg follow-up); the tail leg REBUILDS.
         var ordered_loaded = false;
-        const ordered_snapshot_counter = self.ordered_property_index.loadFromFile(self.graph_dir.path) catch null;
-        if (ordered_snapshot_counter) |snap_counter| {
-            if (snap_counter == self.manifest.counter) {
+        const ordered_snapshot_stamp = self.ordered_property_index.loadFromFile(self.graph_dir.path) catch null;
+        if (ordered_snapshot_stamp) |stamp| {
+            if (stamp.epoch == self.manifest.checkpoint_epoch and
+                stamp.covered_lsn == self.manifest.last_checkpoint_lsn)
+            {
                 ordered_loaded = true;
             } else {
                 try self.rebuildOrderedIndex();
@@ -685,31 +891,194 @@ pub const GraphEngine = struct {
     /// `derived_hydrate_mutex`.
     fn materializeDerivedIndexes(self: *GraphEngine) !void {
         self.derived_materialize_runs += 1;
-        const loaded_indexes = self.tryLoadDerivedIndexes() catch false;
-        if (!loaded_indexes) {
-            try engine_index.rebuildDerivedIndexes(self);
-            // Rebuilt indexes differ from the disk snapshots; mark dirty so the
-            // next checkpoint writes them.
-            self.label_index_dirty = true;
-            self.property_index_dirty = true;
-            self.edge_index_dirty = true;
-            self.edge_exist_index_dirty = true;
-            self.metrics.derived_index_rebuilds = 1;
-        } else {
-            self.metrics.derived_index_loads = 1;
+        // WAL-aware derived-index durability: the load gate returns one of three
+        // outcomes. On any load error, fall back to a rebuild (safe).
+        const outcome = self.tryLoadDerivedIndexes() catch engine_index.LoadOutcome.rebuild;
+        switch (outcome) {
+            .rebuild => {
+                try engine_index.rebuildDerivedIndexes(self);
+                self.markDerivedIndexesDirty();
+                self.metrics.derived_index_rebuilds = 1;
+            },
+            .loaded_clean => {
+                // Snapshot covers the durable frontier — served directly, no tail.
+                // PHASE G: load the reverse-map snapshot (or scan-rebuild it if
+                // its stamp lags, e.g. a light checkpoint left it un-restamped).
+                try self.hydratePropRevIndex();
+                self.metrics.derived_index_loads = 1;
+            },
+            .loaded_needs_reconcile => {
+                // Epoch matched AND a committed tail exists beyond covered_lsn.
+                // Reconcile ONLY the bounded tail-affected pages (captured by
+                // recovery at OPEN) into the loaded snapshot — O(tail), not
+                // O(graph). If the captured set is unavailable (overflow / a
+                // path that did not capture), rebuild (safe).
+                // PHASE G: load the reverse-map BASE (as of covered_lsn) BEFORE
+                // the tail reconcile — reconcileOneNode updates it for the
+                // nodes-page tail set (adds inserts/relocations, drops deletes).
+                try self.hydratePropRevIndex();
+                try self.reconcileOrRebuildTail();
+            },
         }
+        // P2: either branch establishes the clean-snapshot invariant — LOAD:
+        // memory := snapshot with all dirty flags clean (holds materially);
+        // REBUILD/RECONCILE: all four flags went dirty (a rebuild vacuously; a
+        // reconcile because the loaded snapshot no longer matches the tail-
+        // advanced store) and the next full checkpoint's save makes it material.
+        // From here on, a full checkpoint may restamp clean snapshots.
+        self.derived_snapshots_trusted = true;
+    }
+
+    /// WAL-aware derived-index durability Phase 3: on the epoch-matched
+    /// tail-present path, reconcile the captured tail-affected pages into the
+    /// loaded snapshot; rebuild if the captured set is unavailable or the
+    /// reconcile cannot decode a page exactly. Consumes tail_affected_pages.
+    fn reconcileOrRebuildTail(self: *GraphEngine) !void {
+        if (self.tail_affected_pages) |pages| {
+            defer {
+                self.allocator.free(pages);
+                self.tail_affected_pages = null;
+            }
+            const result = engine_index.reconcileDerivedIndexesFromTail(self, pages) catch blk: {
+                // A reconcile error (unexpected decode/IO): the safe recovery is
+                // a full rebuild, which clears any partially reconciled state.
+                try engine_index.rebuildDerivedIndexes(self);
+                break :blk engine_index.ReconcileResult.rebuilt;
+            };
+            // The reconciled/rebuilt indexes differ from the on-disk (covered_lsn)
+            // snapshots → mark dirty so the next checkpoint persists them.
+            self.markDerivedIndexesDirty();
+            switch (result) {
+                .reconciled => {
+                    self.metrics.derived_index_loads = 1;
+                    self.metrics.derived_index_reconciles = 1;
+                },
+                .rebuilt => {
+                    self.metrics.derived_index_rebuilds = 1;
+                },
+            }
+        } else {
+            // No captured tail set (overflow / non-capturing path): rebuild. The
+            // loaded bases are released by rebuildDerivedIndexes' clears.
+            try engine_index.rebuildDerivedIndexes(self);
+            self.markDerivedIndexesDirty();
+            self.metrics.derived_index_rebuilds = 1;
+        }
+    }
+
+    /// Mark all four derived-index dirty flags so the next checkpoint persists
+    /// them (used after a rebuild or a tail reconcile — the resident indexes no
+    /// longer match the on-disk snapshots).
+    fn markDerivedIndexesDirty(self: *GraphEngine) void {
+        self.label_index_dirty = true;
+        self.property_index_dirty = true;
+        self.edge_index_dirty = true;
+        self.edge_exist_index_dirty = true;
+        // PHASE G: a rebuild/reconcile also changed the reverse map vs the
+        // on-disk snapshot → persist it on the next checkpoint.
+        self.prop_rev_index_dirty = true;
+    }
+
+    /// PHASE G: bring the reverse map (prop_head -> node_id) in-memory to its
+    /// covered_lsn BASE for the load/reconcile hydration branches. Loads the
+    /// epoch-stamped snapshot when it is current; if it is absent or its stamp
+    /// lags the manifest epoch (e.g. a light checkpoint did not restamp it),
+    /// rebuild it from a live node scan (O(nodes), safe). On the reconcile
+    /// branch the caller then applies the nodes-page tail on top of this base.
+    fn hydratePropRevIndex(self: *GraphEngine) !void {
+        if (self.prop_rev_index.loadFromFile(self.graph_dir.path) catch null) |stamp| {
+            if (stamp.epoch == self.manifest.checkpoint_epoch) return;
+        }
+        try engine_index.buildPropRevIndexFromScan(self);
     }
 
     fn rebuildEdgeIndex(self: *GraphEngine) !void {
         return engine_index.rebuildEdgeIndex(self);
     }
 
-    fn tryLoadDerivedIndexes(self: *GraphEngine) !bool {
+    fn tryLoadDerivedIndexes(self: *GraphEngine) !engine_index.LoadOutcome {
         return engine_index.tryLoadDerivedIndexes(self);
     }
 
-    fn saveDerivedIndexes(self: *GraphEngine) !void {
-        return engine_index.saveDerivedIndexes(self);
+    /// TEST/introspection: order-independent content digest of the four derived
+    /// indexes (label / property-chain / edge / edge-existence). Hydrates first.
+    /// Two engines over the same store with equal digests are key-for-key
+    /// identical — the assertion the WAL-tail reconcile == full-rebuild property
+    /// test rests on.
+    pub fn debugDerivedDigests(self: *GraphEngine) !DerivedDigests {
+        try self.ensureDerivedHydrated();
+        var d = DerivedDigests{ .label = 0, .property = 0, .edge = 0, .edge_exist = 0 };
+
+        // label: sum over every (label_id, node_id) posting.
+        var lit = self.label_index.index.iterator();
+        while (lit.next()) |e| {
+            var nit = e.value_ptr.keyIterator();
+            while (nit.next()) |n| {
+                var buf: [16]u8 = undefined;
+                std.mem.writeInt(u64, buf[0..8], e.key_ptr.*, .little);
+                std.mem.writeInt(u64, buf[8..16], n.*, .little);
+                d.label +%= std.hash.Wyhash.hash(0xA1, &buf);
+            }
+        }
+
+        // property: sum over every (prop_head, key, value_hash) chain entry.
+        var cit = self.property_index.chains.iterator();
+        while (cit.next()) |e| {
+            const ph = e.key_ptr.*;
+            for (e.value_ptr.entries.items) |entry| {
+                var h = std.hash.Wyhash.init(0xB2);
+                h.update(std.mem.asBytes(&ph));
+                h.update(entry.key);
+                h.update(std.mem.asBytes(&entry.value_hash));
+                d.property +%= h.final();
+            }
+        }
+
+        // edge: sum over every live edge_index record.
+        const EC = struct { total: *u64 };
+        var ec = EC{ .total = &d.edge };
+        try self.edge_index.forEachLive(&ec, struct {
+            fn f(c: *EC, edge_id: u64, e: EdgeIndexEntry) anyerror!void {
+                var h = std.hash.Wyhash.init(0xC3);
+                h.update(std.mem.asBytes(&edge_id));
+                h.update(std.mem.asBytes(&e.from));
+                h.update(std.mem.asBytes(&e.neighbor));
+                h.update(std.mem.asBytes(&e.rel_type));
+                h.update(std.mem.asBytes(&e.prop_head));
+                h.update(std.mem.asBytes(&e.public_id));
+                c.total.* +%= h.final();
+            }
+        }.f);
+
+        // edge_exist: sum over every live (from, rel, to, edge_id) record.
+        const XC = struct { total: *u64 };
+        var xc = XC{ .total = &d.edge_exist };
+        try self.edge_exist_index.forEachRecord(&xc, struct {
+            fn f(c: *XC, from: u64, rel_type: u32, to: u64, edge_id: u64) anyerror!void {
+                var buf: [28]u8 = undefined;
+                std.mem.writeInt(u64, buf[0..8], from, .little);
+                std.mem.writeInt(u32, buf[8..12], rel_type, .little);
+                std.mem.writeInt(u64, buf[12..20], to, .little);
+                std.mem.writeInt(u64, buf[20..28], edge_id, .little);
+                c.total.* +%= std.hash.Wyhash.hash(0xD4, &buf);
+            }
+        }.f);
+
+        return d;
+    }
+
+    /// TEST: force a full O(graph) rebuild of the derived indexes IN PLACE over
+    /// the current store (releases any adopted mmap bases). Lets a test compare
+    /// a tail-reconciled index against the ground-truth rebuild on the SAME
+    /// on-disk pages. Does not touch metrics (the reconcile-open counters stay
+    /// as observed).
+    pub fn rebuildDerivedForTest(self: *GraphEngine) !void {
+        try self.ensureDerivedHydrated();
+        try engine_index.rebuildDerivedIndexes(self);
+    }
+
+    fn saveDerivedIndexes(self: *GraphEngine, covered_lsn: u64) !void {
+        return engine_index.saveDerivedIndexes(self, covered_lsn);
     }
 
     fn saveLabelDictionary(self: *GraphEngine) !void {
@@ -800,6 +1169,7 @@ pub const GraphEngine = struct {
         self.label_dict.deinit();
         self.label_index.deinit();
         self.property_index.deinit();
+        self.prop_rev_index.deinit();
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -843,7 +1213,10 @@ pub const GraphEngine = struct {
             // would have hydrated first, so a dirtied derived index is always
             // hydrated here.
             if (close_err == null and self.derived_hydrated.load(.acquire)) {
-                self.saveDerivedIndexes() catch |err| {
+                // doCheckpoint above set manifest.last_checkpoint_lsn to the LSN
+                // this checkpoint covered; stamp the snapshots with it as
+                // covered_lsn (paired with the advanced checkpoint_epoch).
+                self.saveDerivedIndexes(self.manifest.last_checkpoint_lsn) catch |err| {
                     if (close_err == null) close_err = err;
                 };
             }
@@ -869,17 +1242,20 @@ pub const GraphEngine = struct {
         //       snapshot; without this block the next open finds no snapshot and
         //       LOSES the registration (planner heap fallback).
         // The REBUILD runs BEFORE saveToFile (#1): close() must not persist a
-        // snapshot stamped at manifest.counter that the next clean open LOADS as
-        // fresh while it is empty/stale. The online label/property hooks only
-        // mark the tree stale; in-place value drift is corrected here. After a
-        // successful rebuild `ordered_index_stale` is false and the snapshot
-        // reflects every committed write.
+        // snapshot stamped at the current (epoch, covered_lsn) that the next
+        // clean open LOADS as fresh while it is empty/stale. The online
+        // label/property hooks only mark the tree stale; in-place value drift is
+        // corrected here. After a successful rebuild `ordered_index_stale` is
+        // false and the snapshot reflects every committed write as of the last
+        // checkpoint.
         //
-        // manifest.counter == the value the next open() reads (the load gate
-        // requires snapshot.counter == manifest.counter): if the dirty block
-        // above ran doCheckpoint it advanced + persisted the counter; if
-        // persistence_dirty was false, the prior (light) checkpoint already
-        // persisted the manifest at this counter. Neither path here re-bumps it.
+        // GAP-0050: stamp `(manifest.checkpoint_epoch, manifest.last_checkpoint_lsn)`
+        // — the durable freshness token the next open() gates on (LOAD iff both
+        // match). If the dirty block above ran doCheckpoint it advanced +
+        // persisted BOTH; if persistence_dirty was false, the prior checkpoint
+        // (light or full) already persisted the manifest at these values and no
+        // write has happened since, so the rebuilt trees reflect exactly the
+        // covered_lsn state. Neither path here re-bumps the manifest.
         if (close_err == null and self.ordered_property_index.count() > 0) {
             // H3-P4: rebuild only when the tree has drifted since the last refresh
             // (ordered_index_stale ⇔ a write occurred). A clean/no-op close skips the
@@ -891,7 +1267,11 @@ pub const GraphEngine = struct {
                 };
             }
             if (close_err == null) {
-                self.ordered_property_index.saveToFile(self.graph_dir.path, self.manifest.counter) catch |err| {
+                self.ordered_property_index.saveToFile(
+                    self.graph_dir.path,
+                    self.manifest.checkpoint_epoch,
+                    self.manifest.last_checkpoint_lsn,
+                ) catch |err| {
                     if (close_err == null) close_err = err;
                 };
                 self.ordered_index_dirty = false;
@@ -908,6 +1288,13 @@ pub const GraphEngine = struct {
     /// Internal cleanup of all engine resources. Always runs on close,
     /// even when errors have occurred.
     fn cleanupResources(self: *GraphEngine, allocator: Allocator) void {
+        // Phase 3 tail reconcile: free the captured tail-affected page set if
+        // the reconcile never consumed it (e.g. an engine closed before any
+        // derived-index first-access).
+        if (self.tail_affected_pages) |pages| {
+            allocator.free(pages);
+            self.tail_affected_pages = null;
+        }
         // Release the submitter slot before draining the pool. The TLS-
         // owner check inside releaseSubmitter (F-005) handles the case
         // where the engine was torn down from a thread other than the one
@@ -945,6 +1332,7 @@ pub const GraphEngine = struct {
         self.label_dict.deinit();
         self.label_index.deinit();
         self.property_index.deinit();
+        self.prop_rev_index.deinit();
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -957,6 +1345,203 @@ pub const GraphEngine = struct {
         self.config.zeroKey();
 
         allocator.destroy(self);
+    }
+
+    // ========================================================================
+    // PHASE G — crash-reopen exact-index reconcile: public API for an EXTERNAL
+    // derived index (e.g. geode's prop_exact.idx) to reconcile the bounded WAL
+    // tail instead of a full O(graph) rebuild after a crash reopen. ADDITIVE:
+    // pure reads over already-recovered state; no behaviour change to any
+    // existing path.
+    // ========================================================================
+
+    /// G2. The durable checkpoint epoch (manifest.checkpoint_epoch). Advances
+    /// ONLY at checkpoint, NEVER by a WAL-tail recovery — so an external index
+    /// snapshot stamped at epoch E stays valid-as-of its covered LSN across a
+    /// crash reopen (a genuine mismatch means a checkpoint ran after it). On a
+    /// sharded engine this is PER-SHARD; geode compares its per-graph
+    /// prop_exact.idx against the owning shard's value
+    /// (`sge.shard(s).checkpointEpoch()`).
+    pub fn checkpointEpoch(self: *GraphEngine) u64 {
+        return self.manifest.checkpoint_epoch;
+    }
+
+    /// G2. The durable committed frontier AFTER recovery
+    /// (manifest.last_checkpoint_lsn): a checkpoint sets it to the checkpoint
+    /// LSN; a WAL-tail recovery bumps it to the replayed tail end. An external
+    /// index whose covered_lsn < this has a committed tail to reconcile.
+    pub fn durableFrontierLsn(self: *GraphEngine) u64 {
+        return self.manifest.last_checkpoint_lsn;
+    }
+
+    /// G2. The durable committed frontier as it stood BEFORE this session's
+    /// recovery replayed (Path B's `tail_pre_recovery_lsn`). A sound
+    /// single-recovery reconcile requires the on-disk snapshot's covered_lsn ==
+    /// this value; if covered_lsn < this, a PRIOR un-checkpointed recovery
+    /// advanced the frontier past the snapshot and the captured tail slice is
+    /// incomplete → the external index must full-rebuild. Equals
+    /// durableFrontierLsn() on a clean reopen (no tail replayed).
+    pub fn preRecoveryFrontierLsn(self: *GraphEngine) u64 {
+        return self.tail_pre_recovery_lsn;
+    }
+
+    /// G1. Resolve the recovery tail-affected PAGE set captured by Path B
+    /// (`tail_affected_pages`) to the OWNING node ids, for an external derived
+    /// index that reconciles the bounded WAL tail after a crash reopen.
+    ///
+    /// THREE-WAY signal (a thin pass-through of the core
+    /// `resolveTailAffectedNodeIds`, kept distinct so "rebuild required" is
+    /// never mistaken for "nothing to do"):
+    ///   * `null`             — a full REBUILD is required: the affected-page
+    ///     capture was unavailable / overflowed, or a tail props slot could not
+    ///     be attributed to a node. The external index MUST rebuild wholesale.
+    ///   * non-null EMPTY     — nothing to reconcile: a clean reopen, or a
+    ///     committed tail that touched no node-owning pages. The external index
+    ///     is already current.
+    ///   * non-null non-empty — the resolved (super)set of affected node ids
+    ///     (owned, ascending, deduped; caller frees with `allocator.free`).
+    /// Collapsing `null` into an empty slice would let a caller read "rebuild
+    /// required" as "nothing to do" ⇒ a stale external index ⇒ silently-wrong
+    /// query results; the distinct `null` prevents exactly that. A non-null set
+    /// is never a partial-but-complete-looking slice (empty-on-doubt mirrors
+    /// Path B — genuine doubt returns `null`, never a truncated set).
+    ///
+    /// LIFECYCLE: reads `tail_affected_pages` without consuming it, but gs's
+    /// own lazy derived hydration frees that set on first access — so the
+    /// external reconcile MUST call this after open() and BEFORE the first
+    /// accessor that triggers derived hydration.
+    pub fn tailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) !?[]NodeId {
+        return self.resolveTailAffectedNodeIds(allocator);
+    }
+
+    /// G1 core (also the per-shard primitive the ShardedGraphEngine aggregate
+    /// consumes). Three outcomes:
+    ///   * `null`  — a full REBUILD is required: a committed tail advanced the
+    ///     durable frontier but the affected-page capture is unavailable
+    ///     (overflow / capture off → `tail_affected_pages` null while
+    ///     `had_tail`), OR a tail props slab slot cannot be attributed to a node
+    ///     (the reverse map was absent, or a non-slab legacy page — see below).
+    ///   * non-null EMPTY — nothing to reconcile (a clean reopen: no committed
+    ///     tail; or a tail that touched no node-owning pages).
+    ///   * non-null non-empty — the resolved (super)set of affected node ids.
+    /// The `null` vs empty distinction lets the sharded aggregate poison the
+    /// whole result on any single shard that needs a rebuild without confusing
+    /// it with a clean shard.
+    ///
+    /// SOUNDNESS. NODES-page entries decode directly to node ids by the SAME
+    /// page→node slot arithmetic reconcileOneNode uses
+    /// (`node_id = page_id*nodes_per_page + slot`); every allocated slot on an
+    /// affected nodes page is included (live AND tombstoned — a deleted node's
+    /// external postings must be evicted). A nodes page is shared by
+    /// nodes_per_page nodes and the WAL granularity is the whole page, so the
+    /// set is a harmless SUPERSET (re-deriving an unchanged page-mate is a
+    /// no-op for the caller).
+    ///
+    /// PROPS pages (resolved via the reverse map). An IN-PLACE property value
+    /// mutation rewrites ONLY the props page (putPropertyTxnImpl logs `.props`,
+    /// never the node record) so the changed node is on NO tail nodes page; a
+    /// slab props page is shared by many nodes and stores no owner. The
+    /// `prop_head→node` reverse map (prop_rev_index.zig) inverts this: for every
+    /// LIVE slab slot on a tail props page, if its head is already in N (a
+    /// tail-new / relocated node) it is covered, else the reverse map resolves it
+    /// to its EXISTING owner (the in-place-changed node, or a fill-page
+    /// co-tenant added as a harmless superset). A slot resolvable by NEITHER
+    /// (the reverse map was absent / not loaded) or a non-slab legacy chain page
+    /// → `null` (rebuild — the safe fallback). This closes the in-place
+    /// value-change and ingest checkpoint-boundary fill-page cases that the
+    /// nodes-page pass alone could not. The reverse map is loaded on demand from
+    /// its covered_lsn snapshot when this runs before hydration.
+    pub fn resolveTailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) !?[]NodeId {
+        const had_tail = self.manifest.last_checkpoint_lsn > self.tail_pre_recovery_lsn;
+        const pages = self.tail_affected_pages orelse {
+            // No captured set: a committed tail with no capture (overflow /
+            // off) → rebuild; a clean reopen (no tail) → nothing to reconcile.
+            if (had_tail) return null;
+            return try allocator.alloc(NodeId, 0);
+        };
+
+        // Pass 1 — nodes pages → node-id set N and the set of N's current
+        // prop_heads (used to attribute tail props pages in pass 2).
+        var node_set: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
+        defer node_set.deinit(allocator);
+        var head_set: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer head_set.deinit(allocator);
+        const npp = self.node_store.nodes_per_page;
+        const max_node = self.manifest.next_node_id;
+        for (pages) |p| {
+            if (p.file_id != .nodes) continue;
+            var slot: u64 = 0;
+            while (slot < npp) : (slot += 1) {
+                const node_id = p.page_id * npp + slot;
+                if (node_id >= max_node) break;
+                const rec = (try self.node_store.getRawSlot(node_id)) orelse continue;
+                try node_set.put(allocator, node_id, {});
+                if (rec.prop_head != 0) try head_set.put(allocator, rec.prop_head, {});
+            }
+        }
+
+        // PHASE G resolution: a tail props-page slot resolves to its OWNING node
+        // via the reverse map. Load its covered_lsn snapshot on demand when this
+        // runs BEFORE hydration (the documented lifecycle); when already
+        // hydrated the in-memory map is current — use it as-is. Only paid when
+        // the tail actually touched a props page.
+        var has_props = false;
+        for (pages) |p| {
+            if (p.file_id == .props) {
+                has_props = true;
+                break;
+            }
+        }
+        if (has_props and !self.derived_hydrated.load(.acquire)) {
+            _ = self.prop_rev_index.loadFromFile(self.graph_dir.path) catch {};
+        }
+
+        // Pass 2 — props pages: attribute every LIVE slab slot to a node. It is
+        // already in N (tail-new / relocated → its head is in H_N), or the
+        // reverse map resolves it to its existing owner (an in-place value change
+        // or a fill-page co-tenant — added as a harmless superset; re-deriving an
+        // unchanged co-tenant is a caller no-op). A slot resolvable by NEITHER
+        // (reverse map absent / incomplete) or a non-slab legacy page → rebuild.
+        for (pages) |p| {
+            if (p.file_id != .props) continue;
+            const Ctx = struct {
+                heads: *std.AutoHashMapUnmanaged(u64, void),
+                rev: *PropRevIndex,
+                node_set: *std.AutoHashMapUnmanaged(NodeId, void),
+                allocator: Allocator,
+                ok: bool,
+            };
+            var ctx = Ctx{
+                .heads = &head_set,
+                .rev = &self.prop_rev_index,
+                .node_set = &node_set,
+                .allocator = allocator,
+                .ok = true,
+            };
+            self.prop_store.forEachSlabSlotOnPage(p.page_id, &ctx, struct {
+                fn f(c: *Ctx, prop_head: u64, live: bool) anyerror!void {
+                    if (!live) return;
+                    if (c.heads.contains(prop_head)) return; // already in N (tail-new/relocated)
+                    if (c.rev.get(prop_head)) |owner| {
+                        try c.node_set.put(c.allocator, owner, {}); // existing owner
+                        return;
+                    }
+                    c.ok = false; // unresolvable → rebuild (safe fallback)
+                }
+            }.f) catch |e| switch (e) {
+                error.NotSlabPage => return null, // legacy/undecodable page → rebuild
+                else => return e,
+            };
+            if (!ctx.ok) return null;
+        }
+
+        const out = try allocator.alloc(NodeId, node_set.count());
+        errdefer allocator.free(out);
+        var it = node_set.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) out[i] = k.*;
+        std.mem.sort(NodeId, out, {}, std.sort.asc(NodeId));
+        return out;
     }
 
     /// Get a GraphStorage interface backed by this engine.
@@ -991,6 +1576,49 @@ pub const GraphEngine = struct {
         const frame_idx = self.buffer_pool.frameIndex(frame);
         defer self.buffer_pool.unpin(frame_idx, false);
         _ = try self.txn_manager.logPageUpdate(txn_id, @intFromEnum(file_id), page_id, frame.dataSlice());
+    }
+
+    /// GAP adjacency slab packing (P2): WAL-image every page an AdjStore
+    /// mutation dirtied. An addEdge return value is a chain HEAD, which is no
+    /// longer always a page id (slab heads encode tag|block|slot) and one
+    /// mutation can dirty several pages (a slab relocation tombstones the old
+    /// block and appends to the fill block; a graduation additionally writes
+    /// the fresh legacy chain). Logging the raw head would image a bogus page
+    /// (slab) or under-log (multi-page). The store records the exact dirtied
+    /// set; with slab packing off it is exactly the one block a legacy
+    /// head-insert touched (== the returned head), so imaging is unchanged.
+    fn logTouchedAdj(self: *GraphEngine, txn_id: u64, file_id: FileId, store: *const AdjStore) anyerror!void {
+        for (store.touchedPages()) |p| try self.logPage(txn_id, file_id, p);
+    }
+
+    /// WAL-image every page of a var-store chain (labels live there).
+    ///
+    /// Found by the GAP-ENT-0011 acceptance test: a var-store `ref` is
+    /// `first_page << 16`, NOT a page id. The label write paths used to log
+    /// the raw ref, imaging a far-away (nonexistent) page and leaving the
+    /// REAL label-block pages out of the WAL — so labels written since the
+    /// last checkpoint silently vanished on crash recovery.
+    fn logVarChain(self: *GraphEngine, txn_id: u64, ref: u64) anyerror!void {
+        if (ref == 0) return;
+        // GAP var-store slab packing (P2): a slab head packs (block, slot), NOT
+        // a `first_page << 16` ref — the whole var-chain is ONE shared slab
+        // block (never chained). Image that single block; walking it as a page
+        // chain would trip the marker/data_len guard AND miss the real page.
+        // This is the GAP-ENT-0030-critical decode: image the DECODED page id,
+        // never the raw head. Must be slab-aware BEFORE any slab head is ever
+        // persisted (landed ahead of the slab writer for exactly this reason).
+        if (var_store_mod.isSlabHead(ref)) {
+            const page_id = var_store_mod.slabHeadPageId(ref);
+            if (page_id == 0) return error.DataCorruption; // page 0 reserved (F1)
+            return self.logPage(txn_id, .var_store, page_id);
+        }
+        var current = var_store_mod.VarStore.refFirstPage(ref);
+        var hops: u32 = 0;
+        while (current != 0) : (hops += 1) {
+            if (hops >= 100_000) return error.CircularChainDetected;
+            try self.logPage(txn_id, .var_store, current);
+            current = try self.var_store.nextChainPage(current);
+        }
     }
 
     /// Edge co-location (Phase B): public `logPage` for the migration rebuild
@@ -1046,6 +1674,16 @@ pub const GraphEngine = struct {
         try self.ensureWritable();
         try self.node_store.putNode(id, rec);
         try self.logPage(txn, .nodes, self.nodePageId(id));
+        // PHASE G reverse map: record this node's current prop_head -> id when the
+        // derived indexes are hydrated (a fresh graph is hydrated from creation;
+        // a reopened graph's pre-hydration writes are captured by the hydration
+        // scan instead — so this never forces a hydration on the write path).
+        // put() no-ops for prop_head==0; overwriting is exactly the rebuild
+        // result for slab-slot reuse. In-memory only — no write amplification.
+        if (rec.prop_head != 0 and self.derived_hydrated.load(.acquire)) {
+            try self.prop_rev_index.put(rec.prop_head, id);
+            self.prop_rev_index_dirty = true;
+        }
         self.markDirty();
     }
 
@@ -1097,6 +1735,17 @@ pub const GraphEngine = struct {
             // until the next rebuild at the durability boundary.
             self.ordered_index_stale = true;
         }
+        // PHASE G reverse map: drop this node's prop_head -> id before the record
+        // is tombstoned (deleteNode keeps prop_head, but read it now to be
+        // explicit). Only when hydrated (see putNodeTxn). In-memory only.
+        if (self.derived_hydrated.load(.acquire)) {
+            if (try self.node_store.getRawSlot(id)) |rec| {
+                if (rec.prop_head != 0) {
+                    self.prop_rev_index.remove(rec.prop_head);
+                    self.prop_rev_index_dirty = true;
+                }
+            }
+        }
         try self.node_store.deleteNode(id);
         try self.logPage(txn, .nodes, self.nodePageId(id));
 
@@ -1130,7 +1779,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         try self.ensureDerivedHydrated(); // Phase A: edge_index is deferred.
-        const entry = self.edge_index.get(edge_id) orelse {
+        const entry = (try self.edge_index.get(edge_id)) orelse {
             observability.endOperationSpan(__obs_span, true, "");
             return null;
         };
@@ -1140,6 +1789,9 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = entry.rel_type,
             .prop_head = entry.prop_head,
+            // P3: the edge_index-sourced route surfaces the SAME public_id the
+            // adjacency-sourced routes (expand*/FanIn) yield for this edge.
+            .public_id = entry.public_id,
         };
     }
 
@@ -1259,11 +1911,21 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            // Legacy (pre-public-id) API: 0 = no inline id by design. Callers
+            // on this path persist the public id as the
+            // `__geode_internal_edge_id` property; readers fall back to it for
+            // public_id == 0 entries.
+            .public_id = 0,
         };
 
         // Update source node's out adjacency list
         var from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         const new_out_head = try self.adj_out.addEdge(from_rec.out_head, entry);
+        // GAP-ENT-0022(b): a slab relocation/graduation inside addEdge already
+        // tombstoned the old slot; if anything below errors the caller keeps
+        // the old head, so roll the tombstone back to keep it referencing a
+        // live run (no-op for legacy/in-slab writes).
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
         from_rec.out_head = new_out_head;
         try self.node_store.putNode(from, from_rec);
 
@@ -1273,15 +1935,19 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = 0, // legacy path — see out-entry comment above
         };
         var to_rec = try self.node_store.getNode(to) orelse return error.NodeNotFound;
         const new_in_head = try self.adj_in.addEdge(to_rec.in_head, in_entry);
+        errdefer self.adj_in.undoLastSlabTombstone() catch {};
         to_rec.in_head = new_in_head;
         try self.node_store.putNode(to, to_rec);
 
-        // Log all dirty pages: adj_out page, adj_in page, from-node page, to-node page
-        try self.logPage(txn, .adj_out, new_out_head);
-        try self.logPage(txn, .adj_in, new_in_head);
+        // Log all dirty pages: adj_out page(s), adj_in page(s), from-node page,
+        // to-node page. Adjacency heads are imaged via the store's touched set
+        // (a head may be a slab (block,slot) ref; one write may dirty several).
+        try self.logTouchedAdj(txn, .adj_out, &self.adj_out);
+        try self.logTouchedAdj(txn, .adj_in, &self.adj_in);
         try self.logPage(txn, .nodes, self.nodePageId(from));
         // Avoid duplicate log if from and to share the same node page
         const to_page = self.nodePageId(to);
@@ -1295,6 +1961,9 @@ pub const GraphEngine = struct {
             .neighbor = to,
             .rel_type = rel_type,
             .prop_head = 0,
+            // Legacy add path: no public id (matches the 0 written into the
+            // adjacency entries above — readers use the property fallback).
+            .public_id = 0,
         });
         self.edge_index_dirty = true;
 
@@ -1322,6 +1991,13 @@ pub const GraphEngine = struct {
 
         const edge_id = try self.addEdgeTxn(from, to, rel_type, txn);
 
+        // GAP-ENT-0022(b): a COMMIT failure is the last window in which this op
+        // errors after a slab relocation/graduation tombstoned an old slot
+        // while the caller keeps the old head — roll both stores' tombstones
+        // back (no-op for legacy writes). The aborted txn's images never replay.
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
+        errdefer self.adj_in.undoLastSlabTombstone() catch {};
+
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");
 
@@ -1342,9 +2018,58 @@ pub const GraphEngine = struct {
     /// traversal has a single uniform source of truth (the legacy `NodeRec.in_head`
     /// field is left write-dead for new edges).
     pub fn addEdgeColocatedTxn(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId) anyerror!EdgeId {
+        return self.addEdgeColocatedTxnWithPublicId(from, to, rel_type, txn, 0);
+    }
+
+    /// GAP-ENT-0024 P2: co-located edge add carrying the caller's 64-bit
+    /// PUBLIC edge id (geode-minted) INLINE in BOTH durable adjacency records
+    /// (adj_out + adj_in_remote) — new blocks are v2 so the id persists, and
+    /// AdjStore never truncates a real id into a legacy v1 tail block (it
+    /// allocates a fresh v2 block instead). `public_id == 0` means "no public
+    /// id" (legacy callers; readers fall back to the id property).
+    ///
+    /// CONTRACT — create-node-before-edge (GAP-ENT-0037, 0027-train review
+    /// I2): `to` must already have been putNode'd DURABLY (its create
+    /// committed to the WAL of the shard that owns it) before this call.
+    /// This function deliberately never touches `to`'s node record (`to` may
+    /// live on another shard), so nothing in the write itself can enforce
+    /// or repair the invariant. If it is violated — `to` was allocNode'd but
+    /// its putNode never became durable (caller skipped it, or a crash under
+    /// deferred WAL lost shard(to)'s create while THIS shard's edge commit
+    /// survived: the pre-existing cross-shard-atomicity gap) — then after a
+    /// crash the id-counter heal cannot see `to` (no node record in any
+    /// replayed image), recovery re-issues its id, and the surviving
+    /// in-edge silently ALIASES onto whatever unrelated node is created
+    /// under the re-issued id. geode always putNodes before edges; any new
+    /// caller must do the same. Debug builds assert the resident-shard half
+    /// of the contract below; the cross-shard half is uncheckable here by
+    /// construction. No release-mode behavior change (stays fail-open —
+    /// this is a documented contract, not a validation gate).
+    pub fn addEdgeColocatedTxnWithPublicId(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, txn: TxnId, public_id: u64) anyerror!EdgeId {
         try self.ensureWritable();
         // Phase A: mutates edge_index + edge_exist_index — materialize first.
         try self.ensureDerivedHydrated();
+
+        // GAP-ENT-0037: debug-only contract check (see doc comment). Only the
+        // resident half is checkable: when `to` routes to THIS engine
+        // (standalone, or `to`'s residue class is this shard's), its node
+        // record must already exist. A cross-shard `to` is not resident here
+        // and cannot be probed without breaking single-shard write locality.
+        if (comptime builtin.mode == .Debug) {
+            const to_resident = if (self.config.base_shard_index) |base|
+                to % @as(u64, @intCast(@import("sharded_store.zig").SHARD_COUNT)) == @as(u64, @intCast(base))
+            else
+                true;
+            if (to_resident) {
+                const to_exists = ((self.node_store.getNode(to) catch null) != null);
+                if (!to_exists) {
+                    std.debug.panic(
+                        "addEdgeColocatedTxnWithPublicId: `to`={d} has no node record on its owning shard — the create-node-before-edge contract was violated (putNode `to` durably before adding edges to it; a dangling in-edge would alias onto a re-issued node id after crash recovery)",
+                        .{to},
+                    );
+                }
+            }
+        }
         const edge_id = self.manifest.next_edge_id;
         const stride: u64 = if (self.config.base_shard_index != null)
             @intCast(@import("sharded_store.zig").SHARD_COUNT)
@@ -1358,9 +2083,13 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = public_id,
         };
         var from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
         const new_out_head = try self.adj_out.addEdge(from_rec.out_head, out_entry);
+        // GAP-ENT-0022(b): roll back a slab tombstone if anything below errors
+        // (no-op for legacy/in-slab writes) — the caller keeps the old head.
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
         from_rec.out_head = new_out_head;
         try self.node_store.putNode(from, from_rec);
 
@@ -1371,25 +2100,32 @@ pub const GraphEngine = struct {
             .edge_id = edge_id,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = public_id,
         };
         const old_in_head = try self.in_head_dir.getHead(to);
         const new_in_head = try self.adj_in_remote.addEdge(old_in_head, in_entry);
+        errdefer self.adj_in_remote.undoLastSlabTombstone() catch {};
         const dir_page = try self.in_head_dir.setHead(to, new_in_head);
 
         // 3. Log every dirty page under the ONE txn: out-adj, from-node, in-adj
         //    body, in-dir page. No remote pages, no `to`-node page — strictly
-        //    fewer pages than addEdgeTxn's two-node write.
-        try self.logPage(txn, .adj_out, new_out_head);
+        //    fewer pages than addEdgeTxn's two-node write. Adjacency heads are
+        //    imaged via each store's touched set (a head may be a slab
+        //    (block,slot) ref; one write may dirty several pages).
+        try self.logTouchedAdj(txn, .adj_out, &self.adj_out);
         try self.logPage(txn, .nodes, self.nodePageId(from));
-        try self.logPage(txn, .in_idx, new_in_head);
+        try self.logTouchedAdj(txn, .in_idx, &self.adj_in_remote);
         try self.logPage(txn, .in_dir, dir_page);
 
         // 4. Derived in-memory indexes (same as addEdgeTxn — already source-shard).
+        //    P3: the edge_index carries the SAME public_id as the durable
+        //    adjacency entries so getEdge agrees with the adjacency routes.
         try self.edge_index.put(edge_id, .{
             .from = from,
             .neighbor = to,
             .rel_type = rel_type,
             .prop_head = 0,
+            .public_id = public_id,
         });
         self.edge_index_dirty = true;
         try self.edge_exist_index.put(from, rel_type, to, edge_id);
@@ -1406,6 +2142,16 @@ pub const GraphEngine = struct {
     /// ShardedGraphEngine routes BOTH same-shard and cross-endpoint edges here
     /// (on shard(from)); the cross-shard 2PC add path was removed in Phase C.
     pub fn addEdgeColocated(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32) anyerror!EdgeId {
+        return self.addEdgeColocatedWithPublicId(from, to, rel_type, 0);
+    }
+
+    /// GAP-ENT-0024 P2: auto-commit variant of
+    /// `addEdgeColocatedTxnWithPublicId` — the geode adapter's target surface
+    /// for new edges (inline id, NO `__geode_internal_edge_id` property).
+    /// CONTRACT (review F4): `public_id == 0` is RESERVED = "no inline id"
+    /// (legacy class; readers fall back to the id property, which this path
+    /// does not write). Callers must pass a nonzero id for real edges.
+    pub fn addEdgeColocatedWithPublicId(self: *GraphEngine, from: NodeId, to: NodeId, rel_type: u32, public_id: u64) anyerror!EdgeId {
         var __obs_span = observability.startOperationSpan("add_edge");
         defer __obs_span.end(null);
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
@@ -1413,7 +2159,12 @@ pub const GraphEngine = struct {
         const txn = try self.txn_manager.begin();
         errdefer self.txn_manager.abort(txn) catch {};
 
-        const edge_id = try self.addEdgeColocatedTxn(from, to, rel_type, txn);
+        const edge_id = try self.addEdgeColocatedTxnWithPublicId(from, to, rel_type, txn, public_id);
+
+        // GAP-ENT-0022(b): roll back a slab tombstone on commit failure (the
+        // last error window; no-op for legacy/in-slab writes).
+        errdefer self.adj_out.undoLastSlabTombstone() catch {};
+        errdefer self.adj_in_remote.undoLastSlabTombstone() catch {};
 
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");
@@ -1445,29 +2196,50 @@ pub const GraphEngine = struct {
         try self.ensureDerivedHydrated();
         // Remove from source node's out adjacency list (from IS resident here).
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
-        try self.adj_out.removeEdge(from_rec.out_head, edge_id);
+        const out_mutated = try self.adj_out.removeEdge(from_rec.out_head, edge_id);
 
         // Remove from THIS shard's co-located incoming adjacency, keyed by `to`
         // via the page-backed directory. We do NOT read `to`'s NodeRec.
         const in_head = try self.in_head_dir.getHead(to);
-        try self.adj_in_remote.removeEdge(in_head, edge_id);
+        const in_mutated = try self.adj_in_remote.removeEdge(in_head, edge_id);
 
-        // Log dirty adjacency pages (out-adj head + in-index head).
-        if (from_rec.out_head != 0) try self.logPage(txn, .adj_out, from_rec.out_head);
-        if (in_head != 0) try self.logPage(txn, .in_idx, in_head);
+        // GAP-ENT-0032: WAL-image exactly the block each removal MUTATED.
+        // The entry may live in ANY block of the chain (removeEdge is a
+        // same-block swap-with-last + count--), not just the head — imaging
+        // only the head let older WAL images of a deeper block resurrect a
+        // committed delete (with its old public_id) on crash recovery, the
+        // same under-logging class as the label logVarChain fix. The head
+        // pointer itself never changes on remove, so the node record /
+        // in-dir page need no image; a not-found removal (null) touched no
+        // page and logs nothing.
+        if (out_mutated) |p| try self.logPage(txn, .adj_out, p);
+        if (in_mutated) |p| try self.logPage(txn, .in_idx, p);
+
+        // WAL-aware derived-index durability Phase 3: also log `from`'s node
+        // page. removeEdge leaves `from.out_head` unchanged, so this images an
+        // UNCHANGED node record (harmless on replay: same bytes, zero census /
+        // id-counter effect) — but it puts `from` in recovery's tail-affected
+        // NODE set, which is what the first-access tail reconcile scans to find
+        // the edges to re-derive. Without it, a crash right after a committed
+        // removeEdge would leave the removed edge stale in the reloaded
+        // edge_index/edge_exist snapshot (the adj_out page alone carries no
+        // back-pointer to its owning node). Skipped when the removal was a
+        // no-op (out_mutated == null): nothing changed, nothing to reconcile.
+        if (out_mutated != null) try self.logPage(txn, .nodes, self.nodePageId(from));
 
         // PHASE 3: drop the edge-existence entry BEFORE removing the edge_index
         // record (we need its rel_type to form the key). No-op if absent.
         // `edge_present` gates the edge_count decrement so a no-op re-remove of
         // an already-deleted edge does NOT corrupt the count (idempotency).
-        const edge_present = self.edge_index.get(edge_id) != null;
-        if (self.edge_index.get(edge_id)) |idx_entry| {
-            self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
+        const idx_entry_opt = try self.edge_index.get(edge_id);
+        const edge_present = idx_entry_opt != null;
+        if (idx_entry_opt) |idx_entry| {
+            try self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
             self.edge_exist_index_dirty = true;
         }
 
         // Remove from in-memory edge index
-        _ = self.edge_index.remove(edge_id);
+        try self.edge_index.remove(edge_id);
         self.edge_index_dirty = true;
 
         if (edge_present and self.manifest.edge_count > 0) {
@@ -1518,6 +2290,25 @@ pub const GraphEngine = struct {
         return result;
     }
 
+    /// H1-engine (cold-open): a sibling of `getProperty` that skips
+    /// `ensureDerivedHydrated` and the `property_index` negative-lookup
+    /// entirely. Intended for callers (e.g. loop1's per-node chain read at
+    /// cold-open) that only ever look up keys known to be present on the
+    /// chain — for those callers the derived property-chain index gives no
+    /// benefit, and `ensureDerivedHydrated` is a full O(graph) index build
+    /// that should not be paid just to serve a property read. Walking the
+    /// chain via `prop_store.getProperty` directly is correct and sufficient;
+    /// it returns byte-identical results to `getProperty` for any key that
+    /// IS present on the chain. For a key that is ABSENT, `getProperty`'s
+    /// negative-lookup may short-circuit via the (now possibly stale or
+    /// unhydrated) derived index — callers needing that optimization, or a
+    /// hydrated-index guarantee, should use `getProperty` instead.
+    pub fn getPropertyNoDerived(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
+        self.metrics.properties_read += 1;
+        if (prop_head == 0) return null;
+        return try self.prop_store.getProperty(prop_head, key, alloc);
+    }
+
     pub fn getAllProperties(self: *GraphEngine, prop_head: u64) anyerror!PropStore.PropIterator {
         var __obs_span = observability.startOperationSpan("get_all_properties");
         defer __obs_span.end(null);
@@ -1530,13 +2321,73 @@ pub const GraphEngine = struct {
 
     /// Put a property within an existing transaction (no auto-commit).
     pub fn putPropertyTxn(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId) anyerror!u64 {
+        return self.putPropertyTxnImpl(owner, key, val, txn, true);
+    }
+
+    /// GAP prop-store slab packing (P5): the LEGACY-ONLY put for edge
+    /// property chains. Identical to `putPropertyTxn` except a new chain is
+    /// never slab-packed (see PropStore.putPropertyLegacyOnly): edge
+    /// prop_heads are packed as u32 in adjacency entries and the edge index,
+    /// which cannot represent a slab head. Every edge-property write path
+    /// (engine_edge_props.setEdgeProperty here; geode's adapter edge sites
+    /// once slab packing rolls out) must use this instead of putPropertyTxn.
+    pub fn putPropertyLegacyTxn(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId) anyerror!u64 {
+        return self.putPropertyTxnImpl(owner, key, val, txn, false);
+    }
+
+    /// Auto-commit wrapper for `putPropertyLegacyTxn` (edge-prop chains).
+    pub fn putPropertyLegacy(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        const txn = try self.txn_manager.begin();
+        errdefer self.txn_manager.abort(txn) catch {};
+        const new_head = try self.putPropertyLegacyTxn(owner, key, val, txn);
+        try self.txn_manager.commit(txn);
+        return new_head;
+    }
+
+    fn putPropertyTxnImpl(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue, txn: TxnId, allow_slab: bool) anyerror!u64 {
         try self.ensureWritable();
         // Phase A: reads/mutates the property_index chain — materialize first.
         try self.ensureDerivedHydrated();
-        const new_head = try self.prop_store.putProperty(owner, key, val);
+        const new_head = if (allow_slab)
+            try self.prop_store.putProperty(owner, key, val)
+        else
+            try self.prop_store.putPropertyLegacyOnly(owner, key, val);
 
-        // Log the property page that was written to
-        try self.logPage(txn, .props, new_head);
+        // GAP-ENT-0022(b): if anything below fails, this call reports an
+        // error and OUR caller keeps the OLD head — but a slab relocation /
+        // migration inside putProperty has already tombstoned the old slot.
+        // Roll that tombstone back (best effort, allocation-free) so the
+        // stored head still references a LIVE blob; the placed new blob is
+        // merely leaked until compaction.
+        //
+        // Crash-consistency caveats (review 0022b I-1/I-2 — the pre-existing
+        // no-undo-abort family, GAP-ENT-0022(a), NOT closed here):
+        //  * An ABORTED txn's WAL images never replay, but the buffer pool's
+        //    steal policy may have evict-FLUSHED the tombstoned page before
+        //    this undo ran; if the process then crashes before the restored
+        //    page re-flushes, the tombstone is durable and the head dangles.
+        //    This fix strictly NARROWS the window (live process always
+        //    restores; only steal+crash loses), it does not eliminate it.
+        //  * CALLER-OWNED txns: a caller that receives an error from
+        //    putPropertyTxn MUST abort the txn. Committing anyway durably
+        //    logs a PARTIAL image set of a rolled-back op (the tombstoned
+        //    page may be imaged while the new blob's page is not) → dangling
+        //    head after crash-replay. Both in-repo callers abort; external
+        //    callers inherit this contract.
+        // No-op for legacy ops / in-place slab rewrites (no tombstone
+        // recorded).
+        errdefer self.prop_store.undoLastSlabTombstone() catch {};
+
+        // P4 (GAP prop-store slab packing): WAL-image EVERY props page the
+        // put dirtied. `new_head` is not necessarily a page id — a slab head
+        // encodes tag|page|slot, so logging it raw would image a bogus page —
+        // and one put can dirty several pages (slab relocation: old-page
+        // tombstone + fill-page append; slab→legacy migration: tombstone +
+        // every page of the new chain; legacy chain put: possibly a non-head
+        // page). The store records the exact dirtied set.
+        for (self.prop_store.touchedPages()) |touched_page| {
+            try self.logPage(txn, .props, touched_page);
+        }
 
         if (owner != 0 and owner != new_head) {
             self.property_index.removeChain(owner);
@@ -1586,6 +2437,12 @@ pub const GraphEngine = struct {
 
         const new_head = try self.putPropertyTxn(owner, key, val, txn);
 
+        // GAP-ENT-0022(b): a COMMIT failure is the last window in which this
+        // op errors after a slab relocation/migration tombstoned the old
+        // slot while the caller keeps the old head — roll the tombstone back
+        // (see putPropertyTxnImpl). The aborted txn's images never replay.
+        errdefer self.prop_store.undoLastSlabTombstone() catch {};
+
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");
 
@@ -1605,8 +2462,13 @@ pub const GraphEngine = struct {
 
         try self.prop_store.removeProperty(owner, key);
 
-        // Log the property page if there is one
-        if (owner != 0) try self.logPage(txn, .props, owner);
+        // P4 (GAP prop-store slab packing): WAL-image every props page the
+        // remove dirtied (see putPropertyTxn) — `owner` may be a slab head
+        // (not a page id) and a legacy remove can dirty a non-head chain
+        // page. A no-op remove (absent key / owner == 0) logs nothing.
+        for (self.prop_store.touchedPages()) |touched_page| {
+            try self.logPage(txn, .props, touched_page);
+        }
 
         try self.txn_manager.commit(txn);
 
@@ -1629,14 +2491,31 @@ pub const GraphEngine = struct {
         // Phase A: mutates label_index — materialize first.
         try self.ensureDerivedHydrated();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
+        const old_head = rec.label_head;
+        // GAP-ENT-0022(b): forget any prior op's tombstone before the label
+        // store may write a new one below.
+        self.var_store.resetSlabUndo();
         const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
+        // GAP-ENT-0022(b): the label store writes the NEW block, then
+        // tombstones the OLD slab slot (tombstone LAST). If anything below
+        // fails, our caller keeps the OLD head — so revive that tombstoned slot
+        // (best-effort, allocation-free) rather than leave the old head
+        // dangling. No-op for legacy frees / first writes / dedup no-ops.
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
         if (result.count != rec.label_count or result.head != rec.label_head) {
             rec.label_head = result.head;
             rec.label_count = result.count;
             try self.node_store.putNode(node_id, rec);
 
-            // Log dirty pages: the var_store page holding the label block, and the node page
-            try self.logPage(txn, .var_store, result.head);
+            // WAL-image every var-store page the mutation dirtied. `result.head`
+            // is a REF/slab head, NOT a page id — logVarChain decodes it (slab
+            // block image vs legacy chain walk). The OLD head's block ALSO
+            // needs imaging when it is a slab block, because the label store
+            // tombstoned its old slot in the SAME op (a different block from
+            // the new fill block, in general) — image it so the tombstone is
+            // durable and the slot never resurrects on replay.
+            try self.logVarChain(txn, result.head);
+            if (var_store_mod.isSlabHead(old_head)) try self.logVarChain(txn, old_head);
             try self.logPage(txn, .nodes, self.nodePageId(node_id));
         }
         try self.label_index.addNode(label, node_id);
@@ -1662,6 +2541,12 @@ pub const GraphEngine = struct {
 
         try self.addLabelTxn(node_id, label, txn);
 
+        // GAP-ENT-0022(b): a COMMIT failure is the last window where this op
+        // errors after addLabelTxn tombstoned the old slab slot while the
+        // caller keeps the old head — revive it. The aborted txn's images
+        // never replay.
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
+
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");
     }
@@ -1672,7 +2557,14 @@ pub const GraphEngine = struct {
         // Phase A: mutates label_index — materialize first.
         try self.ensureDerivedHydrated();
         var rec = try self.node_store.getNode(node_id) orelse return error.NodeNotFound;
+        const old_head = rec.label_head;
+        // GAP-ENT-0022(b): forget any prior op's tombstone before removeLabel
+        // may write a new one.
+        self.var_store.resetSlabUndo();
         const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
+        // GAP-ENT-0022(b): revive the old slab slot if a later step fails (see
+        // addLabelTxn).
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
         rec.label_head = result.head;
         rec.label_count = result.count;
         try self.node_store.putNode(node_id, rec);
@@ -1686,8 +2578,12 @@ pub const GraphEngine = struct {
         // H3-P4: removing a label can change index membership; mark stale.
         if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
 
-        // Log dirty pages: var_store page (if any) and node page
-        if (result.head != 0) try self.logPage(txn, .var_store, result.head);
+        // Log dirty pages: the NEW var-store block/chain (if any — result.head
+        // is a REF/slab head, not a page id; logVarChain decodes it), the OLD
+        // slab block whose slot removeLabel tombstoned in this op (so the
+        // tombstone is durable / never resurrects), and the node page.
+        if (result.head != 0) try self.logVarChain(txn, result.head);
+        if (var_store_mod.isSlabHead(old_head)) try self.logVarChain(txn, old_head);
         try self.logPage(txn, .nodes, self.nodePageId(node_id));
         self.markDirty();
     }
@@ -1702,6 +2598,10 @@ pub const GraphEngine = struct {
         errdefer self.txn_manager.abort(txn) catch {};
 
         try self.removeLabelTxn(node_id, label, txn);
+
+        // GAP-ENT-0022(b): revive the tombstoned old slab slot on a commit
+        // failure (see addLabel).
+        errdefer self.var_store.undoLastSlabTombstone() catch {};
 
         try self.txn_manager.commit(txn);
         observability.endOperationSpan(__obs_span, true, "");

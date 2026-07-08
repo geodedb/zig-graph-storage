@@ -16,6 +16,7 @@ pub const PagerError = error{
     ChecksumMismatch,
     PageNotFound,
     InvalidBufferSize,
+    InvalidPageId,
     DecryptionFailed,
     WriteCountExhausted,
 };
@@ -30,6 +31,31 @@ pub const Pager = struct {
         return .{ .file = file, .page_size = page_size };
     }
 
+    /// Byte offset of `page_id` in the file, with checked arithmetic.
+    ///
+    /// A hostile/corrupt page id (e.g. a garbage next-page pointer decoded
+    /// from a corrupted on-disk page and fed back through BufferPool.pin)
+    /// trips TWO distinct hazards in the unchecked `page_id * page_size`:
+    ///
+    ///  1. u64 overflow — panicked in Debug (QUAL-0044 T4 fuzz crash) and
+    ///     silently wrapped in ReleaseFast: with a 4096-byte page, id 2^52
+    ///     wraps to offset 0 and readPage would return page 0's bytes —
+    ///     checksum-VALID, since the header's page_id is never compared to
+    ///     the requested one — as if they were the requested page.
+    ///  2. Offsets past maxInt(i64) — pread/pwrite offsets are signed, so
+    ///     the kernel answers EINVAL, which std.Io escalates to a
+    ///     "programmer bug" panic even in Debug-safe builds.
+    ///
+    /// Both must fail loudly as data corruption, never panic and never
+    /// wrap: corrupt input must never alias another page. The bound checks
+    /// the WHOLE page (offset + page_size) so the last byte is addressable.
+    fn pageOffset(self: *const Pager, page_id: PageId) PagerError!u64 {
+        const offset = std.math.mul(u64, page_id, self.page_size) catch return error.InvalidPageId;
+        const end = std.math.add(u64, offset, self.page_size) catch return error.InvalidPageId;
+        if (end > std.math.maxInt(i64)) return error.InvalidPageId;
+        return offset;
+    }
+
     /// Read a page from disk into the provided buffer.
     /// Buffer must be exactly page_size bytes.
     /// When encryption is enabled, decrypts the page body after reading.
@@ -39,7 +65,7 @@ pub const Pager = struct {
     pub fn readPage(self: *const Pager, page_id: PageId, buf: []u8) !void {
         if (buf.len != self.page_size) return error.InvalidBufferSize;
 
-        const offset: u64 = page_id * @as(u64, self.page_size);
+        const offset: u64 = try self.pageOffset(page_id);
         const bytes_read = try self.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, offset);
 
         if (bytes_read < self.page_size) return error.PageNotFound;
@@ -91,7 +117,7 @@ pub const Pager = struct {
         }
 
         // Write page at the correct offset
-        const offset: u64 = page_id * @as(u64, self.page_size);
+        const offset: u64 = try self.pageOffset(page_id);
         try self.file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, offset);
     }
 
@@ -104,7 +130,7 @@ pub const Pager = struct {
     /// below what was already persisted (SEC-0037).
     pub fn readWriteCountOnDisk(self: *const Pager, page_id: PageId) !u24 {
         var header_buf: [PAGE_HEADER_SIZE]u8 = undefined;
-        const offset: u64 = page_id * @as(u64, self.page_size);
+        const offset: u64 = try self.pageOffset(page_id);
         const bytes_read = try self.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &header_buf, offset);
         if (bytes_read < PAGE_HEADER_SIZE) return 0;
         return page_mod.readWriteCount(&header_buf);
@@ -302,6 +328,59 @@ test "readPage returns PageNotFound for page beyond file end" {
     var buf: [4096]u8 = undefined;
     const result = pager.readPage(0, &buf);
     try testing.expectError(error.PageNotFound, result);
+}
+
+test "QUAL-0044 T4 regression: hostile page id whose byte offset overflows u64 is rejected, never wrapped" {
+    const file = try createTempFile();
+    defer cleanupTempFile(file);
+
+    const page_size: u32 = 4096;
+    const pager = Pager.init(file, page_size);
+
+    // Write a VALID page 0 first. The minimal overflowing page id for a
+    // 4096-byte page is 2^52: the unchecked ReleaseFast multiply would wrap
+    // 2^52 * 4096 = 2^64 to offset 0 and hand back page 0's (checksum-valid)
+    // bytes as if they were page 2^52. The Debug build panicked instead
+    // (integer overflow — the fuzz T4 crash). Both must now be error.InvalidPageId.
+    var buf: [4096]u8 = undefined;
+    @memset(&buf, 0);
+    const header = page_mod.initHeader(0, .node_data, page_size);
+    @memcpy(buf[0..PAGE_HEADER_SIZE], page_mod.headerToBytes(&header));
+    buf[PAGE_HEADER_SIZE] = 0x77;
+    try pager.writePage(0, &buf);
+
+    const min_overflow_id: PageId = @as(u64, 1) << 52; // smallest id whose u64 offset multiply overflows at 4KB pages
+    var read_buf: [4096]u8 = undefined;
+    try testing.expectError(error.InvalidPageId, pager.readPage(min_overflow_id, &read_buf));
+    try testing.expectError(error.InvalidPageId, pager.readPage(std.math.maxInt(u64), &read_buf));
+
+    // Second hazard class: ids whose offset fits u64 but lands past
+    // maxInt(i64) — the kernel EINVALs the signed pread offset and std.Io
+    // panics ("programmer bug"). E.g. 2^52 - 1 -> offset 2^64 - 4096,
+    // negative as an off_t. Must be the same loud InvalidPageId.
+    try testing.expectError(error.InvalidPageId, pager.readPage(min_overflow_id - 1, &read_buf));
+    const min_i64_violating_id: PageId = @as(u64, 1) << 51; // offset 2^63 exactly
+    try testing.expectError(error.InvalidPageId, pager.readPage(min_i64_violating_id, &read_buf));
+
+    // writePage and readWriteCountOnDisk share the same offset arithmetic:
+    // a hostile id must fail loudly there too, never wrap onto a real page.
+    try testing.expectError(error.InvalidPageId, pager.writePage(min_overflow_id, &buf));
+    try testing.expectError(error.InvalidPageId, pager.writePage(min_i64_violating_id, &buf));
+    try testing.expectError(error.InvalidPageId, pager.readWriteCountOnDisk(min_overflow_id));
+    try testing.expectError(error.InvalidPageId, pager.readWriteCountOnDisk(min_i64_violating_id));
+
+    // The largest id whose whole page stays inside the signed-64 file range
+    // must still take the normal I/O path (a beyond-EOF read is a short read
+    // -> PageNotFound, NOT the guard), proving the guard is not over-broad.
+    const max_ok_id: PageId = ((@as(u64, std.math.maxInt(i64)) - page_size) / page_size);
+    try testing.expectError(error.PageNotFound, pager.readPage(max_ok_id, &read_buf));
+
+    // An in-range id past EOF still reports PageNotFound as before.
+    try testing.expectError(error.PageNotFound, pager.readPage(1_000_000, &read_buf));
+
+    // Page 0 remains readable and intact.
+    try pager.readPage(0, &read_buf);
+    try testing.expectEqual(@as(u8, 0x77), read_buf[PAGE_HEADER_SIZE]);
 }
 
 test "readPage rejects buffer with wrong size" {

@@ -93,6 +93,22 @@ pub const BufferPool = struct {
     resident_counts: [FILE_COUNT]u32 = [_]u32{0} ** FILE_COUNT,
     // Optional metrics pointer for recording buffer hits/misses and page I/O
     metrics: ?*Metrics = null,
+    // PERF (CLOCK eviction): count of `moveToHead` calls made WHILE the eviction
+    // victim-selection loop is active (see `in_evict`). The textbook CLOCK
+    // hand-advance must NOT move frames while sweeping, so the current
+    // implementation makes ZERO such calls and this stays exactly 0. The prior
+    // second-chance code moved every referenced frame to the head per sweep (O(N)
+    // list writes per victim, O(K*N) for K victims under a hot scan — the
+    // 62%-self-time hotspot). `moveToHead` self-increments this ONLY when
+    // `in_evict` is set, so a reintroduced in-sweep `moveToHead` (the O(N)
+    // restart regression) is caught automatically by the `== 0` assertion in the
+    // CLOCK-eviction regression test — the ordinary pin/pinNew `moveToHead` runs
+    // with `in_evict` clear and is not counted. Both fields are mutated only
+    // under `mutex`, so plain (non-atomic) fields suffice.
+    evict_list_moves: usize = 0,
+    // Set for the duration of `evict()` (victim selection). Read by `moveToHead`
+    // to decide whether to bump `evict_list_moves`. Written only under `mutex`.
+    in_evict: bool = false,
     // PERF-0057: per-FileId "needs fsync" flags. Set whenever a page is
     // successfully written to a file's pager via any flush path (flushFrame,
     // flushAllParallel, eviction). Cleared only by takeDirtyFiles() once the
@@ -1130,28 +1146,54 @@ pub const BufferPool = struct {
     /// (that pool-wide list write is exactly what serialised readers). Instead a
     /// hit sets the frame's `referenced` clock bit. Eviction walks the LRU list
     /// from the tail and gives any frame whose bit is set a SECOND CHANCE: it
-    /// clears the bit and moves the frame to the head (so it is reconsidered last)
-    /// rather than evicting it. A frame with a clear bit (not touched since the
+    /// clears the bit and the CLOCK hand ADVANCES toward the head, leaving the
+    /// frame exactly where it is. A frame with a clear bit (not touched since the
     /// last sweep) is the victim. This keeps genuinely-hot pages resident without
-    /// any per-hit list mutation.
+    /// any per-hit OR per-eviction list mutation.
+    ///
+    /// PERF (CLOCK hand-advance): the prior code cleared the bit AND moved the
+    /// frame to the head AND restarted the whole tail sweep on every second
+    /// chance. On a full pool during a scan ~every frame is referenced, so that
+    /// was O(N) list writes + O(N) restarts to find ONE victim — O(K*N) for K
+    /// victims, the 62%-self-time cold-open hotspot. The textbook CLOCK fix: clear
+    /// the bit and advance the hand via the already-captured `prev` (no list
+    /// write, no restart). One sweep clears every set bit; the outer loop then
+    /// re-sweeps and finds the now-clear tail as the victim. Work is O(N) per
+    /// FULLY-HOT sweep but amortizes to O(1) per victim once bits are cleared.
     ///
     /// PERF-0051: the reservation floor is still honoured in pass 1 (don't drop a
     /// reserved class below its floor) with a pass-2 fallback so the floor can
     /// never deadlock or spuriously raise BufferPoolFull.
     ///
-    /// evictFrame ABORTS (returns false) if it cannot CLAIM the victim (the frame
-    /// got pinned between the isEvictable scan and the claim CAS); it also drops
-    /// the mutex to flush a dirty victim. On abort, and after every second-chance
-    /// list move, we restart the tail scan because the LRU list and frame states
-    /// may have changed; captured `lru_prev` pointers can be stale. A claimed or
-    /// pinned frame has pin_count != 0 so isEvictable skips it on the retry, and
-    /// every iteration makes progress (clears a reference bit or evicts/skips), so
-    /// this cannot livelock while any evictable frame exists.
+    /// CONCURRENCY — why advancing via the captured `prev` is sound: the caller
+    /// holds `mutex` for the whole call, and the LRU list is mutated ONLY under
+    /// `mutex` (the lock-free pin/unpin fast path touches only its own frame's
+    /// pin_count/referenced, never the list — PERF-0058). Within a sweep the loop
+    /// itself performs NO list mutation. `evictFrame` is the only callee that can
+    /// drop the mutex, and it does so ONLY on the SUCCESS/dirty-flush path, which
+    /// returns true → we `return idx` immediately and never reuse `prev`. On ABORT
+    /// (claim CAS 0→PIN_EVICTING failed because the frame was pinned) it returns
+    /// false WITHOUT dropping the mutex and WITHOUT touching the list, so the
+    /// captured `prev` is still a valid, current `lru_prev` — we advance to it.
+    /// An aborted/pinned frame has pin_count != 0, so `isEvictable` skips it on a
+    /// re-sweep. Each outer iteration makes progress (clears ≥1 bit, or aborts a
+    /// transiently-pinned frame, or evicts); a sweep that does NONE of these means
+    /// no frame is evictable → error.BufferPoolFull. So this cannot livelock while
+    /// any genuinely-evictable (unpinned, clear-bit) frame exists.
     fn evict(self: *BufferPool) !u32 {
-        restart: while (true) {
+        // Mark the eviction victim-selection context so any `moveToHead` reached
+        // from this call (there should be NONE — the CLOCK hand-advance never
+        // moves frames) self-increments `evict_list_moves`, arming the regression
+        // guard against a reintroduced in-sweep list move. Set/cleared only under
+        // the caller's `mutex`; cleared on every exit path via `defer`.
+        self.in_evict = true;
+        defer self.in_evict = false;
+        while (true) {
             // Pass 1: honour reservation floors; second-chance via clock bit.
+            // Sweep tail → head, advancing the clock hand without moving frames.
             var current = self.lru_tail;
             var saw_reserved_evictable = false;
+            var made_progress = false; // cleared a bit or aborted a pinned victim
             while (current) |idx| {
                 const frame = &self.frames[idx];
                 const prev = frame.lru_prev;
@@ -1159,37 +1201,57 @@ pub const BufferPool = struct {
                     if (self.wouldUnderflowReserve(frame.file_id)) {
                         saw_reserved_evictable = true;
                     } else if (@atomicLoad(u8, &frame.referenced, .acquire) != 0) {
-                        // Second chance: clear the bit, promote to head, restart.
+                        // Second chance: clear the bit and ADVANCE the hand. No
+                        // list write, no restart — the cleared bit makes this
+                        // frame a victim on the next sweep.
                         @atomicStore(u8, &frame.referenced, 0, .monotonic);
-                        self.moveToHead(idx);
-                        continue :restart;
+                        made_progress = true;
+                        current = prev;
+                        continue;
                     } else {
                         if (try self.evictFrame(idx)) return idx;
-                        continue :restart;
+                        // ABORT: victim got pinned (no mutex drop, list intact);
+                        // advance the hand and keep sweeping. Force a re-sweep so a
+                        // frame unpinned in the meantime gets retried.
+                        made_progress = true;
+                        current = prev;
+                        continue;
                     }
                 }
                 current = prev;
             }
 
+            // The sweep cleared bits and/or aborted transient pins but evicted
+            // nothing: re-sweep (now-clear bits become victims). Pass 1 takes
+            // priority over the reserved-class fallback.
+            if (made_progress) continue;
+
             // Pass 2: only reserved-class frames remain evictable. Evicting one is
             // required to make progress, so allow it (still respect the clock bit
-            // for second-chance ordering among them).
+            // for second-chance ordering among them). Same hand-advance discipline.
             if (saw_reserved_evictable) {
                 current = self.lru_tail;
+                var made_progress2 = false;
                 while (current) |idx| {
                     const frame = &self.frames[idx];
                     const prev = frame.lru_prev;
                     if (frame.isEvictable()) {
                         if (@atomicLoad(u8, &frame.referenced, .acquire) != 0) {
                             @atomicStore(u8, &frame.referenced, 0, .monotonic);
-                            self.moveToHead(idx);
-                            continue :restart;
+                            made_progress2 = true;
+                            current = prev;
+                            continue;
                         }
                         if (try self.evictFrame(idx)) return idx;
-                        continue :restart;
+                        made_progress2 = true;
+                        current = prev;
+                        continue;
                     }
                     current = prev;
                 }
+                // Re-sweep from pass 1 (an unpin/clear may now expose a non-reserved
+                // victim, matching the prior `continue :restart` semantics).
+                if (made_progress2) continue;
             }
 
             return error.BufferPoolFull;
@@ -1283,6 +1345,13 @@ pub const BufferPool = struct {
 
     /// Move a frame to the head of the LRU list (most recently used).
     fn moveToHead(self: *BufferPool, idx: u32) void {
+        // Regression guard: a `moveToHead` reached from the eviction
+        // victim-selection loop (`in_evict`) is exactly the O(N)-restart hotspot
+        // the CLOCK hand-advance removed. Count it so the CLOCK-eviction test's
+        // `evict_list_moves == 0` assertion fails if such a call is reintroduced.
+        // Ordinary pin/pinNew moves run with `in_evict` clear and are not counted.
+        if (self.in_evict) self.evict_list_moves += 1;
+
         // If already head, nothing to do
         if (self.lru_head) |head| {
             if (head == idx) return;
@@ -1685,6 +1754,80 @@ test "LRU ordering: head is most recent, tail is least recent" {
     // Head should be most recently pinned (f2), tail should be f0
     try testing.expectEqual(@as(?u32, f2_idx), pool.lru_head);
     try testing.expectEqual(@as(?u32, f0_idx), pool.lru_tail);
+}
+
+test "PERF: CLOCK eviction is O(1)-amortized (no per-victim LRU churn under a hot scan)" {
+    // Reproduces the 62%-self-time hotspot: on a FULL pool during a large scan,
+    // ~every frame's `referenced` bit is set when a miss forces eviction. The
+    // pre-CLOCK code gave each referenced frame a "second chance" by clearing the
+    // bit AND moving it to the LRU head, then RESTARTING the whole tail sweep —
+    // O(N) list writes + restarts per single victim, O(K*N) for K victims. The
+    // textbook CLOCK hand-advance clears the bit and advances the hand WITHOUT any
+    // list mutation, so victim selection does ZERO `moveToHead` calls.
+    //
+    // We simulate the worst case: before EVERY eviction we re-set all resident
+    // `referenced` bits (the ongoing scan touched the whole working set since the
+    // last sweep). With K == N evictions, the old code performed ~K*N list moves;
+    // the CLOCK loop performs EXACTLY ZERO. `evict_list_moves` is incremented by
+    // `moveToHead` ONLY while the eviction victim-selection loop is active
+    // (`in_evict`), so it measures precisely the in-sweep list moves the CLOCK
+    // fix eliminated. We assert it is 0: if anyone reintroduces an in-sweep
+    // `moveToHead` (the O(K*N) restart regression), this counter goes non-zero
+    // and the test fails. (The `<= 2*N` bound this replaced was vacuous — the
+    // counter was never incremented, so 0 <= 2*N always held.)
+    const file = try createTempFile(".test_bp_clock_evict");
+    defer cleanupTempFile(file, ".test_bp_clock_evict");
+
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+
+    const N: u32 = 64;
+    var pool = try BufferPool.init(testing.allocator, page_size, N);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    // Fill the pool to capacity with N clean, unpinned, resident pages.
+    var pid: PageId = 0;
+    while (pid < N) : (pid += 1) {
+        const f = try pool.pinNew(.nodes, pid);
+        pool.unpin(pool.frameIndex(f), false);
+    }
+    try testing.expectEqual(@as(usize, 0), pool.free_list.items.len); // pool is full
+
+    pool.evict_list_moves = 0;
+    const K: u32 = N; // evict a full pool's worth of victims
+    var evicted: u32 = 0;
+    var next_pid: PageId = N;
+    var i: u32 = 0;
+    while (i < K) : (i += 1) {
+        // Simulate the scan: every resident frame was referenced since the last
+        // sweep -> set all clock bits. This is the pathological eviction input.
+        for (pool.frames) |*fr| {
+            if (fr.valid) @atomicStore(u8, &fr.referenced, 1, .monotonic);
+        }
+
+        // Must always find a victim (pool full of unpinned frames); a CLOCK bug
+        // that fails to re-sweep after clearing bits would surface as BufferPoolFull.
+        const victim = try pool.evict();
+        evicted += 1;
+
+        // Re-fill the freed frame with a fresh page so the pool stays full and the
+        // next eviction must run the full second-chance machinery again. (pinNew's
+        // own moveToHead is NOT counted — only the eviction loop increments the
+        // counter.)
+        pool.free_list.appendAssumeCapacity(victim);
+        const nf = try pool.pinNew(.nodes, next_pid);
+        next_pid += 1;
+        pool.unpin(pool.frameIndex(nf), false);
+    }
+
+    try testing.expectEqual(K, evicted); // every eviction succeeded
+    try testing.expectEqual(@as(usize, 0), pool.free_list.items.len); // still full + consistent
+
+    // The whole point: victim selection must perform NO LRU-list moves. Old
+    // code: ~K*N == 4096 in-sweep moves. CLOCK hand-advance: exactly 0. Any
+    // non-zero value means an in-sweep `moveToHead` was reintroduced.
+    try testing.expectEqual(@as(usize, 0), pool.evict_list_moves);
 }
 
 test "flushDirtyPages flushes dirty unpinned frames from LRU tail" {

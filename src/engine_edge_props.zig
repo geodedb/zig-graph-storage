@@ -24,7 +24,7 @@ fn edgeIndexEntry(engine: *GraphEngine, from: NodeId, edge_id: EdgeId) !engine_m
     // here covers all of them. setEdgeProperty additionally touches the
     // property_index chain, but materialize hydrates the whole derived set.
     try engine.ensureDerivedHydrated();
-    const entry = engine.edge_index.get(edge_id) orelse return error.EdgeNotFound;
+    const entry = (try engine.edge_index.get(edge_id)) orelse return error.EdgeNotFound;
     if (entry.from != from) return error.EdgeNotFound;
     return entry;
 }
@@ -38,9 +38,32 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
     const found_prop_head = edge_entry.prop_head;
 
-    // 3. Write property, get new prop_head
-    const new_head_u64 = try engine.putProperty(@as(u64, found_prop_head), key, value);
-    const new_head: u32 = std.math.cast(u32, new_head_u64) orelse return error.Overflow;
+    // Edge-prop-head WAL imaging: ONE txn spans the property write AND the
+    // in-place adjacency prop_head rewrites below. The old shape committed
+    // the property pages in their own auto-commit txn and then mutated the
+    // adjacency blocks with NO WAL imaging at all — on crash replay the
+    // property chain came back but nothing referenced it (the entry's
+    // prop_head replayed from the checkpoint image, or from an OLDER image
+    // of the same block written when the edge was added), silently losing
+    // the committed property. Same under-logging class as the edge-remove
+    // non-head fix: image exactly the page each rewrite mutated, in the
+    // SAME txn, so replay is all-or-nothing.
+    const txn = try engine.txn_manager.begin();
+    errdefer engine.txn_manager.abort(txn) catch {};
+
+    // 3. Write property, get new prop_head.
+    //    GAP-0060: edge property chains slab-pack exactly like node props when
+    //    `edge_prop_slab_packing` is on — the head is a full u64 (a prop-store
+    //    slab head, bit 63) stored durably in the WIDE (v3 / slab-v3) adjacency
+    //    entry + edge index. The routing is gated on the SAME flag as the
+    //    adjacency `wide_heads`: a slab head must only ever be produced for a
+    //    store whose adjacency can hold it (else a legacy v2 run can't take the
+    //    wide head — the exact invariant `updateEdgePropHead*` enforces loudly).
+    //    When off, edges keep the legacy one-page-per-edge writer (u32 head).
+    const new_head: u64 = if (engine.config.edge_prop_slab_packing)
+        try engine.putPropertyTxn(@as(u64, found_prop_head), key, value, txn)
+    else
+        try engine.putPropertyLegacyTxn(@as(u64, found_prop_head), key, value, txn);
 
     // 4. If prop_head changed, update BOTH adjacency copies and edge index.
     //    Edge co-location (Phase A): the incoming copy now lives in THIS shard's
@@ -51,20 +74,36 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     //    which only ever touched one engine). `to` is not resident here, so we do
     //    NOT read its NodeRec.
     if (new_head != found_prop_head) {
-        _ = try engine.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head);
-        const in_head = try engine.in_head_dir.getHead(to);
-        _ = try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head);
-
-        // Keep edge index prop_head in sync
-        if (engine.edge_index.getPtr(edge_id)) |idx_entry| {
-            idx_entry.prop_head = new_head;
+        // The entry may live in ANY block of either chain (not just the
+        // head); AdjStore reports the exact PageId it mutated and that page
+        // is WAL-imaged under the spanning txn.
+        if (try engine.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head)) |p| {
+            try engine.logPagePublic(txn, .adj_out, p);
         }
+        const in_head = try engine.in_head_dir.getHead(to);
+        if (try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head)) |p| {
+            try engine.logPagePublic(txn, .in_idx, p);
+        }
+
+        // Keep edge index prop_head in sync (no-op if the edge is absent).
+        // GAP warm-reopen P1: a base-resident entry is copied into the overlay
+        // with the new head (the mmap base is immutable).
+        try engine.edge_index.updatePropHead(edge_id, new_head);
+        // P2 re-review F1: the in-memory edge index now diverges from the
+        // persisted edges.idx snapshot, so it MUST be marked dirty at the
+        // mutation point — otherwise a full checkpoint RESTAMPS the
+        // clean-looking snapshot to the new counter with the OLD prop_head
+        // content, and the next open silently loses the property linkage
+        // (blessed-stale, the 0018-class silent-loss shape).
+        engine.edge_index_dirty = true;
     }
+
+    try engine.txn_manager.commit(txn);
 
     if (found_prop_head != 0 and found_prop_head != new_head) {
         engine.property_index.removeChain(found_prop_head);
     }
-    try engine.refreshPropertyChainIndex(new_head_u64);
+    try engine.refreshPropertyChainIndex(new_head);
 }
 
 /// Remove a property from an edge. The removal is in-place so the prop_head

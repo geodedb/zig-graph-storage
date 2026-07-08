@@ -353,6 +353,92 @@ test "migration: crash mid-migration (drop + reopen) completes correctly, no dup
     }
 }
 
+test "migration F2 (GAP-ENT-0024): re-run over a v2 (real public-id) store carries public_id into rebuilt in-entries" {
+    // Review F2 landmine: the colocation migration re-runs whenever the shard
+    // manifest's `layout_version` parses as 0 — including when the sidecar
+    // JSON is lost/corrupt/restored-stale on a store FULL of v2 (real-id)
+    // edges. It rebuilds ALL of adj_in_remote from adj_out; the rebuilt
+    // in-entry literal used to drop `public_id` (silent-default 0), wiping
+    // every FanIn-route id while the forward route kept it — intermittent,
+    // direction-dependent id loss. This test forces exactly that re-run and
+    // asserts the reverse route surfaces the original ids.
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0xB5} ** 16;
+
+    const N = shard_count.SHARD_COUNT;
+    var nodes: [N]u64 = undefined;
+    const E = N - 1;
+    var ids: [E]u64 = undefined;
+    var pids: [E]u64 = undefined;
+    var froms: [E]u64 = undefined;
+
+    // 1. Build a co-located graph whose edges carry REAL inline public ids
+    //    (v2 adjacency records), cross-shard into one hot dst. Clean close.
+    {
+        var eng = try ShardedGraphEngine.create(testing.allocator, td.path, uuid, test_support.testConfig());
+        try allocOnePerShard(eng, &nodes);
+        const dst = nodes[0];
+        for (1..N) |s| {
+            const pid: u64 = 0xC0DE_0000_0000_0000 + @as(u64, @intCast(s));
+            const id = try eng.addEdgeColocatedWithPublicId(nodes[s], dst, REL_A, pid);
+            ids[s - 1] = id;
+            pids[s - 1] = pid;
+            froms[s - 1] = nodes[s];
+        }
+        // Sanity pre-downgrade: the reverse route already carries the ids.
+        {
+            var it0 = try eng.expandInIter(dst, null);
+            defer it0.deinit();
+            var pre: usize = 0;
+            while (try it0.next()) |entry| {
+                try testing.expect(entry.public_id != 0);
+                pre += 1;
+            }
+            try testing.expectEqual(@as(usize, E), pre);
+        }
+        try eng.close();
+    }
+
+    // 2. Downgrade ONLY the shard manifest (the lost/stale-sidecar scenario:
+    //    `readFromDir` parses a missing layout_version as 0). adj_out AND
+    //    adj_in_remote stay fully intact and full of real-id v2 entries.
+    const root5 = try graphRoot(testing.allocator, td.path, uuid);
+    defer testing.allocator.free(root5);
+    {
+        const sm = try shard_manifest.readFromDir(testing.allocator, root5);
+        try writeLegacyShardManifest(testing.allocator, root5, sm);
+    }
+
+    // 3. Reopen: the migration re-runs and rebuilds every in-entry from
+    //    adj_out. The FanIn route must surface each edge's ORIGINAL public_id
+    //    (not 0), with the exact edge set intact.
+    var eng = try ShardedGraphEngine.open(testing.allocator, td.path, uuid, test_support.testConfig());
+    defer eng.close() catch {};
+
+    var found: usize = 0;
+    var it = try eng.expandInIter(nodes[0], null);
+    defer it.deinit();
+    while (try it.next()) |entry| {
+        var matched = false;
+        for (ids, pids, froms) |id, pid, from| {
+            if (entry.edge_id == id) {
+                try testing.expectEqual(from, entry.neighbor);
+                try testing.expectEqual(pid, entry.public_id);
+                matched = true;
+            }
+        }
+        try testing.expect(matched);
+        found += 1;
+    }
+    try testing.expectEqual(@as(usize, E), found);
+
+    // The migration must have re-stamped the layout so the NEXT open does not
+    // re-migrate.
+    const sm_after = try shard_manifest.readFromDir(testing.allocator, root5);
+    try testing.expectEqual(shard_manifest.CURRENT_LAYOUT_VERSION, sm_after.layout_version);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

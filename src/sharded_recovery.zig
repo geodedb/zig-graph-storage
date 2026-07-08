@@ -148,6 +148,22 @@ pub fn reconcilePendingPrepares(self: *ShardedGraphEngine) !ReconcileStats {
             const committed = (st & 0b010) != 0;
             const aborted = (st & 0b100) != 0;
             if (committed and !aborted) {
+                // M1: the legacy prepare's edge id was minted by the OLD 2PC
+                // path and is invisible to the per-shard counter heal (a
+                // prepare payload is not a committed page image), so it can
+                // sit ABOVE the healed next_edge_id — allocEdge would later
+                // re-issue exactly that id and the edge_index put would
+                // silently overwrite the reconciled edge. Raise the counter
+                // above it BEFORE anything can allocate. Applies even when
+                // the adjacency itself proved durable (the early idempotence
+                // return below): durable adjacency does not imply a durable
+                // counter. Persistence rides the same discipline as the
+                // `edge_count += 1` below: the in-memory manifest reaches
+                // disk at the next checkpoint, whose manifest write precedes
+                // the WAL truncation that retires this prepare — any crash
+                // before that re-runs reconciliation and recomputes the bump
+                // idempotently.
+                bumpEdgeCounterAboveReconciled(eng, payload.edge_id);
                 // Always attempt to replay adjacency: the check inside
                 // replayAdjacencyIfNeeded is idempotent (source uses
                 // edge_index.contains; target re-applies adj_in which is
@@ -176,6 +192,24 @@ pub fn reconcilePendingPrepares(self: *ShardedGraphEngine) !ReconcileStats {
     return stats;
 }
 
+/// M1: ensure this shard's edge-id allocator can never re-issue a reconciled
+/// legacy 2PC edge id. Only ids in the shard's OWN residue class can ever be
+/// minted here (allocEdge advances by the stride within the class), so a
+/// foreign-residue payload id — the target-role case, whose edge id was
+/// allocated on the source shard — needs (and gets) no bump.
+fn bumpEdgeCounterAboveReconciled(eng: *GraphEngine, edge_id: u64) void {
+    const stride: u64 = if (eng.config.base_shard_index != null)
+        @intCast(sharded_engine.SHARD_COUNT)
+    else
+        1;
+    // The current counter is the authoritative carrier of the shard's residue
+    // class (allocEdge preserves it; the per-shard heal preserves it per I1).
+    if (edge_id % stride != eng.manifest.next_edge_id % stride) return;
+    if (eng.manifest.next_edge_id <= edge_id) {
+        eng.manifest.next_edge_id = edge_id + stride;
+    }
+}
+
 fn replayAdjacencyIfNeeded(
     eng: *GraphEngine,
     payload: two_pc.PreparePayload,
@@ -193,13 +227,19 @@ fn replayAdjacencyIfNeeded(
             // index MUST be materialized before the check. A clean restart has no
             // dangling prepares, so this never forces hydration on the hot path.
             try eng.ensureDerivedHydrated();
-            if (eng.edge_index.contains(payload.edge_id)) return;
+            if (try eng.edge_index.contains(payload.edge_id)) return;
             var from_rec = try eng.getNode(payload.from) orelse return error.NodeNotFound;
             const out_entry = edge_mod.EdgeEntry{
                 .neighbor = payload.to,
                 .edge_id = payload.edge_id,
                 .rel_type = payload.rel_type,
                 .prop_head = 0,
+                // Legacy 2PC prepare payloads predate the inline public id
+                // (the co-located write path emits no cross-shard prepares),
+                // so this reconciliation re-applies the edge as a legacy
+                // record: 0 → readers use the id-property fallback. Matches
+                // the edge_index put below.
+                .public_id = 0,
             };
             const new_out_head = try eng.adj_out.addEdge(from_rec.out_head, out_entry);
             from_rec.out_head = new_out_head;
@@ -209,6 +249,12 @@ fn replayAdjacencyIfNeeded(
                 .neighbor = payload.to,
                 .rel_type = payload.rel_type,
                 .prop_head = 0,
+                // Legacy 2PC prepare payloads predate the inline public id (the
+                // co-located write path emits no cross-shard prepares), so this
+                // reconciliation re-applies the edge as a legacy record: id 0 →
+                // readers use the id-property fallback, matching the
+                // public_id=0 adjacency entry re-applied above.
+                .public_id = 0,
             });
             // PHASE 3: the existence index was already rebuilt from adjacency in
             // GraphEngine.open; if this committed prepare's source adjacency was
@@ -216,6 +262,12 @@ fn replayAdjacencyIfNeeded(
             // mirror the existence-index put. `put` is idempotent per edge_id, so
             // the common (already-rebuilt) case is a harmless no-op.
             try eng.edge_exist_index.put(payload.from, payload.rel_type, payload.to, payload.edge_id);
+            // P2 re-review F2: this replay mutated BOTH the edge index (put
+            // above) and the existence index — dirty BOTH. Leaving edge_index
+            // clean would let the next full checkpoint restamp a stale
+            // edges.idx that is missing the reconciled edge (blessed-stale →
+            // edge invisible via getEdge after reopen).
+            eng.edge_index_dirty = true;
             eng.edge_exist_index_dirty = true;
             eng.manifest.edge_count += 1;
         },
@@ -235,6 +287,10 @@ fn replayAdjacencyIfNeeded(
                 .edge_id = payload.edge_id,
                 .rel_type = payload.rel_type,
                 .prop_head = 0,
+                // Legacy dst-shard in-adjacency for a pre-co-location dangling
+                // prepare — same legacy-payload reasoning as the source-shard
+                // out-entry above: no inline id exists, 0 is correct.
+                .public_id = 0,
             };
             const new_in_head = try eng.adj_in.addEdge(to_rec.in_head, in_entry);
             to_rec.in_head = new_in_head;

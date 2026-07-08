@@ -22,6 +22,11 @@ Thumbs.db
 *.out
 test_*
 !tests/
+# `test_*` (meant for binary artifacts) also matches SOURCE files named
+# tests/test_*.zig — `!tests/` only un-ignores the directory itself, not the
+# files inside it. This silently swallowed tests/test_edge_existence_index.zig
+# from the Phase 3 commit (GAP 0031(b)). Re-include Zig test sources.
+!tests/test_*.zig
 
 # Build artifacts
 *.exe

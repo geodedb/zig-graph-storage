@@ -51,14 +51,42 @@ pub const Metrics = struct {
     derived_index_loads: u64 = 0,
     derived_index_rebuilds: u64 = 0,
 
-    // H3-P1: per-(label,key) ordered-index restore path taken on the LAST open(),
-    // wired in engine.open AFTER the metrics reset (same discipline as the
-    // derived counters). At most one is 1 per open of a graph that HAS a
-    // registered ordered index: ordered_index_loads=1 means the snapshot counter
-    // matched manifest.counter and the trees were loaded (clean restart);
-    // ordered_index_rebuilds=1 means the snapshot was stale/absent and the trees
-    // were rebuilt from a live scan (crash restart). ordered_index_saves counts
-    // full-checkpoint snapshot saves (light checkpoints skip it).
+    // WAL-aware durability (Path B): counts opens where the derived-index
+    // snapshots matched the manifest checkpoint_epoch (so the epoch gate would
+    // have accepted them) BUT a committed WAL tail existed beyond their
+    // covered_lsn. In Phase 2 this case is routed to a full rebuild for
+    // correctness (never serve stale); Phase 3 replaces the rebuild with a
+    // bounded tail reconcile. A non-zero value here on a crash reopen proves
+    // the epoch gate no longer wrongly rejects on the recovery-bumped counter —
+    // it accepted the epoch and deferred solely because of the tail.
+    derived_index_tail_deferred: u64 = 0,
+
+    // WAL-aware durability (Path B) Phase 3: counts opens where the epoch gate
+    // ACCEPTED the snapshots AND a committed WAL tail existed, and the engine
+    // RECONCILED only the bounded tail-affected pages into the loaded snapshot
+    // (O(tail)) instead of rebuilding O(graph). On the tail path this is 1 and
+    // derived_index_loads is 1 (the snapshot was loaded, then reconciled),
+    // while derived_index_rebuilds stays 0.
+    derived_index_reconciles: u64 = 0,
+
+    // GAP warm-reopen P2: number of CLEAN derived-index snapshots whose
+    // persisted checkpoint_counter was cheaply re-stamped (header-only
+    // update, payload untouched) to the new manifest.counter by a FULL
+    // checkpoint, so a partially-dirty session (e.g. edges-only) does not
+    // counter-invalidate the untouched snapshots and force an O(graph)
+    // rebuild on the next open. A DIRTY index is saved, never restamped.
+    derived_index_restamps: u64 = 0,
+
+    // GAP-0050: per-(label,key) ordered-index restore path taken on the LAST
+    // open(), wired in engine.open AFTER the metrics reset (same discipline as
+    // the derived counters). At most one is 1 per open of a graph that HAS a
+    // registered ordered index: ordered_index_loads=1 means the snapshot's Path B
+    // stamp matched (checkpoint_epoch == manifest.checkpoint_epoch AND covered_lsn
+    // == manifest.last_checkpoint_lsn) and the trees were loaded (clean reopen);
+    // ordered_index_rebuilds=1 means the stamp mismatched (epoch stale or a WAL
+    // tail past covered_lsn) or was absent and the trees were rebuilt from a live
+    // scan. ordered_index_saves counts full-checkpoint snapshot saves (light
+    // checkpoints skip it).
     ordered_index_loads: u64 = 0,
     ordered_index_rebuilds: u64 = 0,
     ordered_index_saves: u64 = 0,

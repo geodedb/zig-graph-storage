@@ -31,6 +31,10 @@ const NodeId = graph_storage.NodeId;
 const PropertyValue = graph_storage.PropertyValue;
 const TestDataDir = graph_storage.test_support.TestDataDir;
 const ordered_encoding = graph_storage.ordered_encoding;
+const index_snapshot = graph_storage.index_snapshot;
+const SNAPSHOT_MAGIC = graph_storage.ordered_property_index.SNAPSHOT_MAGIC;
+const SNAPSHOT_FILE_NAME = graph_storage.ordered_property_index.SNAPSHOT_FILE_NAME;
+const io = std.Io.Threaded.global_single_threaded.io();
 
 const LABEL: u32 = 11;
 const KEY = "score";
@@ -198,5 +202,180 @@ test "Test B: crash restart REBUILDS the ordered index (stale snapshot rejected)
 
         // The rebuilt index reflects the durable (checkpointed) graph, in order.
         try verifyOrder(engine, values.items);
+    }
+}
+
+// ============================================================================
+// GAP-0050: ordered index on the Path B (checkpoint_epoch, covered_lsn) reload
+// contract. The tests below tamper ONLY the persisted snapshot's stamp header
+// (leaving the durable graph pages intact) to exercise each gate condition
+// deterministically, then assert reopen REBUILDS and ORDER BY stays correct.
+// ============================================================================
+
+/// Assert the ASC cursor is sorted non-decreasing and DESC is its exact reverse
+/// — the "sort order correct" property, robust to which exact node set the
+/// (rebuilt) index contains.
+fn verifySortedConsistent(engine: *GraphEngine) !void {
+    var asc: std.ArrayList(i64) = .empty;
+    defer asc.deinit(testing.allocator);
+    {
+        var cursor = engine.openOrderedCursor(LABEL, KEY, .asc) orelse return error.NoOrderedIndex;
+        var prev: ?i64 = null;
+        while (cursor.next()) |entry| {
+            var d = try ordered_encoding.decode(testing.allocator, entry.key);
+            defer d.deinit(testing.allocator);
+            if (prev) |p| try testing.expect(d.value.int >= p);
+            prev = d.value.int;
+            try asc.append(testing.allocator, d.value.int);
+        }
+    }
+    var desc: std.ArrayList(i64) = .empty;
+    defer desc.deinit(testing.allocator);
+    {
+        var cursor = engine.openOrderedCursor(LABEL, KEY, .desc) orelse return error.NoOrderedIndex;
+        while (cursor.next()) |entry| {
+            var d = try ordered_encoding.decode(testing.allocator, entry.key);
+            defer d.deinit(testing.allocator);
+            try desc.append(testing.allocator, d.value.int);
+        }
+    }
+    const rev = try testing.allocator.dupe(i64, asc.items);
+    defer testing.allocator.free(rev);
+    std.mem.reverse(i64, rev);
+    try testing.expectEqualSlices(i64, rev, desc.items);
+}
+
+/// The persisted ordered snapshot's current header.
+fn snapshotHeader(gdir: []const u8) !index_snapshot.SnapshotHeader {
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ gdir, SNAPSHOT_FILE_NAME });
+    defer testing.allocator.free(snap_path);
+    var file = try std.Io.Dir.cwd().openFile(io, snap_path, .{});
+    defer file.close(io);
+    return (try index_snapshot.loadHeader(&file, SNAPSHOT_MAGIC, 0)) orelse error.NoSnapshot;
+}
+
+/// Restamp the persisted ordered snapshot at `<gdir>/ordered_propidx.snap` to
+/// `(new_epoch, new_covered)` (valid CRC, via index_snapshot.restampStamps) so
+/// the next reopen sees a specific Path B gate mismatch. The graph pages are
+/// left untouched, so a forced rebuild reproduces the durable checkpointed set.
+fn restampSnapshot(gdir: []const u8, new_epoch: u64, new_covered: u64) !void {
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ gdir, SNAPSHOT_FILE_NAME });
+    defer testing.allocator.free(snap_path);
+    var file = try std.Io.Dir.cwd().openFile(io, snap_path, .{ .mode = .read_write });
+    defer file.close(io);
+    try testing.expect(try index_snapshot.restampStamps(&file, SNAPSHOT_MAGIC, new_epoch, new_covered));
+}
+
+/// create + register + bulk-load + full checkpoint; returns the graph dir path
+/// (caller frees) with a clean, loadable snapshot on disk.
+fn buildCleanSnapshot(uuid: [16]u8, cfg: GraphConfig, n: usize, values: *std.ArrayList(i64), td_path: []const u8) ![]u8 {
+    const engine = try GraphEngine.create(testing.allocator, td_path, uuid, cfg);
+    defer engine.close() catch {};
+    try engine.createOrderedIndex(LABEL, KEY);
+    try bulkLoad(engine, n, values);
+    try engine.checkpoint(); // clean, loadable snapshot at (epoch, covered==frontier)
+    return testing.allocator.dupe(u8, engine.graph_dir.path);
+}
+
+test "Test D1: a committed WAL tail (covered_lsn < frontier) REBUILDS (safe)" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xD1} ** 16;
+    var cfg = graph_storage.test_support.testConfig();
+    cfg.sync_mode = .deferred;
+    cfg.buffer_pool_pages = 64;
+
+    var values: std.ArrayList(i64) = .empty;
+    defer values.deinit(testing.allocator);
+
+    const gdir = try buildCleanSnapshot(uuid, cfg, 300, &values, td.path);
+    defer testing.allocator.free(gdir);
+
+    // Simulate a committed tail past the snapshot: keep the epoch current but
+    // drop covered_lsn below the durable frontier (the graph pages are intact).
+    const hdr = try snapshotHeader(gdir);
+    try testing.expect(hdr.covered_lsn > 0); // a real, non-zero durable frontier
+    try restampSnapshot(gdir, hdr.checkpoint_epoch, hdr.covered_lsn - 1);
+
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+        // Epoch matches but covered_lsn (< frontier) signals a tail -> REBUILD.
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().ordered_index_rebuilds);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().ordered_index_loads);
+        // ORDER BY correct: rebuild reflects the durable checkpointed graph.
+        try verifyOrder(engine, values.items);
+    }
+}
+
+test "Test D2: an epoch mismatch (checkpoint ran after the snapshot) REBUILDS" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xD2} ** 16;
+    var cfg = graph_storage.test_support.testConfig();
+    cfg.sync_mode = .deferred;
+    cfg.buffer_pool_pages = 64;
+
+    var values: std.ArrayList(i64) = .empty;
+    defer values.deinit(testing.allocator);
+
+    const gdir = try buildCleanSnapshot(uuid, cfg, 300, &values, td.path);
+    defer testing.allocator.free(gdir);
+
+    // Bump the snapshot epoch past the manifest's, keeping covered_lsn intact:
+    // models a checkpoint that advanced the epoch without re-saving this index.
+    const hdr = try snapshotHeader(gdir);
+    try restampSnapshot(gdir, hdr.checkpoint_epoch + 1, hdr.covered_lsn);
+
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().ordered_index_rebuilds);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().ordered_index_loads);
+        try verifyOrder(engine, values.items);
+    }
+}
+
+test "Test B2: crash restart REBUILDS and the ORDER BY sort stays correct" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xB2} ** 16;
+    var cfg = graph_storage.test_support.testConfig(); // sync_each_commit default
+    cfg.buffer_pool_pages = 64;
+
+    const N: usize = 1000;
+    var values: std.ArrayList(i64) = .empty;
+    defer values.deinit(testing.allocator);
+
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        try engine.createOrderedIndex(LABEL, KEY);
+        try bulkLoad(engine, N, &values);
+        try engine.checkpoint();
+
+        // Commit an extra labelled+propertied node AFTER the snapshot (fsynced).
+        const nid = try engine.allocNode();
+        var rec = emptyNode();
+        rec.prop_head = try engine.putProperty(rec.prop_head, KEY, .{ .int = 777 });
+        try engine.putNode(nid, rec);
+        try engine.addLabel(nid, LABEL);
+
+        engine.deinit(); // CRASH: no checkpoint/close.
+    }
+
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+        // The committed tail advanced the durable frontier past covered_lsn, so
+        // the ordered snapshot is REBUILT (never loaded stale).
+        try testing.expectEqual(@as(u64, 1), engine.getMetrics().ordered_index_rebuilds);
+        try testing.expectEqual(@as(u64, 0), engine.getMetrics().ordered_index_loads);
+        // Paramount property: the rebuilt index yields a CORRECT sort (ASC
+        // ascending, DESC its exact reverse) over whatever durable set recovery
+        // produced — never a stale/mis-ordered result.
+        try verifySortedConsistent(engine);
     }
 }

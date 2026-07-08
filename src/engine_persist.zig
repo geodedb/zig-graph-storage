@@ -82,9 +82,43 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
         offset += written;
     }
 
-    const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf[0..offset]);
+    // GAP-ENT-0011 (review F-2): write ATOMICALLY — tmp + fsync + rename +
+    // dir fsync. The crash-recovery path made this file correctness-
+    // load-bearing (the rebuilt bitmap is re-persisted right after recovery),
+    // and the previous in-place createFile truncated the old file first: a
+    // torn write could land exactly at the 5-bitmap legacy boundary, which
+    // loadFreeStore parses as a legacy file with EMPTY in_idx/in_dir bitmaps
+    // (silent double allocation of live co-located-adjacency pages), and a
+    // truncation elsewhere bricks the open until the file is hand-deleted.
+    // With the rename as the commit point, a crash mid-save leaves the OLD
+    // file intact (on the recovery path that is the recovery-truncated EMPTY
+    // file → rebuild fallback).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tmp_path = try std.fmt.allocPrint(engine.allocator, "{s}.tmp", .{path});
+    defer engine.allocator.free(tmp_path);
+
+    {
+        // exclusive is omitted: a stale .tmp from a previous killed save may
+        // exist and must simply be overwritten.
+        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{
+            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+            .resolve_beneath = true,
+        });
+        defer tmp_file.close(io);
+        try tmp_file.writeStreamingAll(io, buf[0..offset]);
+        try tmp_file.sync(io);
+    }
+
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
+
+    // fsync the graph directory so the rename itself is durable (the recovery
+    // path relies on the renamed file surviving power loss, not just process
+    // crash). `.iterate = true` forces a real O_RDONLY|O_DIRECTORY fd — the
+    // default openDir uses O_PATH, on which fsync fails with EBADF.
+    var gdir = try std.Io.Dir.cwd().openDir(io, engine.graph_dir.path, .{ .iterate = true });
+    defer gdir.close(io);
+    const gdir_file = std.Io.File{ .handle = gdir.handle, .flags = .{ .nonblocking = false } };
+    try gdir_file.sync(io);
 }
 
 /// Try to load free space bitmaps from a persisted `free.store` file.
@@ -165,8 +199,14 @@ pub fn rebuildFreeSpaceFromDisk(engine: *GraphEngine) !void {
     };
 
     for (pairs) |pair| {
-        const pager = engine.file_manager.getPager(pair.fid) orelse continue;
-        const page_count = pager.pageCount() catch continue;
+        // Review F-4 (GAP-ENT-0011): this rebuild is the PRIMARY defense on
+        // the crash-recovery path. Swallowing a missing pager or an fstat
+        // error here would leave that store's bitmap EMPTY (all free) —
+        // silent double allocation, the very bug under repair. All seven
+        // store files are opened before this runs, so both failures are
+        // exceptional and must fail the open loudly.
+        const pager = engine.file_manager.getPager(pair.fid) orelse return error.StorePagerUnavailable;
+        const page_count = try pager.pageCount();
         if (page_count == 0) continue;
 
         try pair.fsm.ensureCapacity(page_count);
@@ -260,6 +300,37 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
         @import("encryption.zig").TAG_SIZE
     else
         0;
+    // Same reservation for the adjacency stores' SLAB slot directories (GAP
+    // adjacency slab packing): a slab block's directory grows backward from
+    // the page end exactly like the prop-store key directory. Legacy v1/v2
+    // chain blocks grow forward only and never reached the tail, so this is
+    // a no-op for them.
+    self.adj_out.tail_reserve = self.prop_store.tail_reserve;
+    self.adj_in.tail_reserve = self.prop_store.tail_reserve;
+    self.adj_in_remote.tail_reserve = self.prop_store.tail_reserve;
+    // Same tail reservation for the var-store SLAB slot directory (GAP var-store
+    // slab packing): a slab block's directory grows backward from the page end
+    // exactly like the prop-store/adjacency directories. Legacy var chains grow
+    // forward only, so this is a no-op for them. The slab WRITER is ON by
+    // default since P7 (freshly-created stores pack new var-chains; existing
+    // legacy chains keep reading via the read-both path — no migration); set it
+    // explicitly for clarity / to keep the toggle discoverable for rollback.
+    self.var_store.tail_reserve = self.prop_store.tail_reserve;
+    self.var_store.slab_packing = true;
+
+    // GAP adjacency slab packing (P2): opt-in per config. New small chains on
+    // all three adjacency stores pack into shared slab blocks. Reads stay
+    // slab-aware regardless (read-both), so toggling this never strands data.
+    self.adj_out.slab_packing = cfg.adjacency_slab_packing;
+    self.adj_in.slab_packing = cfg.adjacency_slab_packing;
+    self.adj_in_remote.slab_packing = cfg.adjacency_slab_packing;
+
+    // GAP-0060: edge-prop slab packing needs the adjacency writer to emit the
+    // WIDE (v3 / slab-v3) entry format so an edge's u64 prop_head is durable
+    // and in-place-widenable. Read-both parses legacy blocks regardless.
+    self.adj_out.wide_heads = cfg.edge_prop_slab_packing;
+    self.adj_in.wide_heads = cfg.edge_prop_slab_packing;
+    self.adj_in_remote.wide_heads = cfg.edge_prop_slab_packing;
 
     // Label dictionary, label store, and label index
     self.label_dict = LabelDictionary.init(allocator);
@@ -269,7 +340,13 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     errdefer self.label_index.deinit();
     self.property_index = PropertyChainIndex.init(allocator);
     errdefer self.property_index.deinit();
-    self.edge_index = std.AutoHashMap(EdgeId, EdgeIndexEntry).init(allocator);
+    // PHASE G reverse map (prop_head -> node_id). Starts empty: create() leaves
+    // it empty (fresh graph, maintained live from the first putNode since a
+    // fresh graph is hydrated); open() loads its snapshot or rebuilds it during
+    // hydration.
+    self.prop_rev_index = @import("prop_rev_index.zig").PropRevIndex.init(allocator);
+    errdefer self.prop_rev_index.deinit();
+    self.edge_index = @import("edge_index_map.zig").EdgeIndexMap.init(allocator);
     errdefer self.edge_index.deinit();
     // PHASE 3: edge-existence index. Starts empty; open() loads its snapshot or
     // rebuilds from adjacency, create() leaves it empty.
@@ -350,7 +427,7 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     const derived_pending = save_derived and
         (engine.label_index_dirty or engine.property_index_dirty or
             engine.edge_index_dirty or engine.edge_exist_index_dirty or
-            engine.ordered_index_dirty);
+            engine.prop_rev_index_dirty or engine.ordered_index_dirty);
     if (!engine.persistence_dirty and !derived_pending) {
         return;
     }
@@ -381,18 +458,47 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     // GAP-0900 L2: the derived-index snapshot save is the only O(graph-size)
     // step here. The light path skips it (recovery rebuilds from pages) and
     // leaves the dirty flags set so a later full checkpoint still persists them.
+    // GAP warm-reopen P2: capture which gated snapshots were CLEAN at the
+    // moment the dirty flags were consumed — those are the restamp candidates
+    // at the end of this checkpoint (a dirty index is saved, NEVER restamped).
+    var label_was_dirty = false;
+    var property_was_dirty = false;
+    var edge_was_dirty = false;
+    var edge_exist_was_dirty = false;
+    var prop_rev_was_dirty = false;
     if (save_derived) {
+        label_was_dirty = engine.label_index_dirty;
+        property_was_dirty = engine.property_index_dirty;
+        edge_was_dirty = engine.edge_index_dirty;
+        edge_exist_was_dirty = engine.edge_exist_index_dirty;
+        prop_rev_was_dirty = engine.prop_rev_index_dirty;
+        // WAL-aware durability: doCheckpoint (above) set
+        // manifest.last_checkpoint_lsn to the LSN this checkpoint covered;
+        // stamp the derived-index snapshots with it (paired with the advanced
+        // checkpoint_epoch) so the next open's epoch gate can detect a tail.
         try engine_index.saveDerivedIndexesConditional(
             engine,
-            engine.label_index_dirty,
-            engine.property_index_dirty,
-            engine.edge_index_dirty,
-            engine.edge_exist_index_dirty,
+            label_was_dirty,
+            property_was_dirty,
+            edge_was_dirty,
+            edge_exist_was_dirty,
+            engine.manifest.last_checkpoint_lsn,
         );
+        // PHASE G reverse map: persist it when dirty, stamped with the same
+        // (epoch, covered_lsn) as the other derived snapshots so they load/gate
+        // together. A clean map is restamped below (not re-saved).
+        if (prop_rev_was_dirty) {
+            try engine.prop_rev_index.saveToFile(
+                engine.graph_dir.path,
+                engine.manifest.checkpoint_epoch,
+                engine.manifest.last_checkpoint_lsn,
+            );
+        }
         engine.label_index_dirty = false;
         engine.property_index_dirty = false;
         engine.edge_index_dirty = false;
         engine.edge_exist_index_dirty = false;
+        engine.prop_rev_index_dirty = false;
         engine.metrics.derived_index_saves += 1;
     }
     // Label dictionary is O(labels) and is NOT rebuildable from pages (it maps
@@ -421,15 +527,69 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
         engine.metrics.ordered_index_refreshes += 1;
     }
 
-    // H3-P1: persist the value-ordered index on the FULL path only, gated on its
-    // dirty flag (reuse the Lever-B derived gating). The light path passes
-    // save_derived=false so it stays O(dirty); a stale snapshot after a crash is
-    // rejected by the counter gate on open and rebuilt from a scan. The snapshot
-    // is stamped at the NOW-advanced manifest.counter so a CLEAN restart loads it.
+    // GAP-0050: persist the value-ordered index on the FULL path only, gated on
+    // its dirty flag (reuse the Lever-B derived gating). The light path passes
+    // save_derived=false so it stays O(dirty); a stale-after-crash snapshot is
+    // rejected by the Path B gate on open and rebuilt from a scan. The snapshot
+    // is stamped at the NOW-advanced `(checkpoint_epoch, last_checkpoint_lsn)` —
+    // the SAME token the derived snapshots just took — so a CLEAN reopen (epoch
+    // current, no tail) LOADS it. The refresh above (rebuildOrderedIndex) ran
+    // AFTER doCheckpoint with no intervening writes, so the trees reflect exactly
+    // the covered_lsn (last_checkpoint_lsn) state.
     if (save_derived and engine.ordered_index_dirty) {
-        try engine.ordered_property_index.saveToFile(engine.graph_dir.path, engine.manifest.counter);
+        try engine.ordered_property_index.saveToFile(
+            engine.graph_dir.path,
+            engine.manifest.checkpoint_epoch,
+            engine.manifest.last_checkpoint_lsn,
+        );
         engine.ordered_index_dirty = false;
         engine.metrics.ordered_index_saves += 1;
+    }
+
+    // GAP warm-reopen P2: cross-index counter re-stamp — the cure for "one
+    // dirty index counter-invalidates every clean snapshot". ORDERING: this
+    // runs LAST, strictly after (1) doCheckpoint durably wrote the manifest
+    // at the advanced counter, (2) every dirty derived snapshot save
+    // succeeded (stamped at that same counter), and (3) the label-dict /
+    // B+tree-catalog / ordered-index saves succeeded — so a restamp can
+    // never bless a clean snapshot while any part of this checkpoint failed
+    // partway (an error above propagates out before we get here). A crash
+    // anywhere before or during the restamps leaves each not-yet-restamped
+    // file counter-stale (→ rebuild, safe) and a torn restamp is rejected by
+    // the format's integrity check (→ rebuild, safe); see the per-format
+    // restampStamps docs for the exact torn-write analysis.
+    //
+    // Gated on derived_snapshots_trusted: only when the clean snapshots are
+    // KNOWN content-current for this session (established by create(), a
+    // counter-gated load, or a rebuild-then-save — see the engine field doc).
+    // Without the gate, a page-only session after a crash restart could
+    // stamp crash-stale snapshots current = silent data loss. When untrusted
+    // but this checkpoint saved ALL FOUR (post-rebuild path), the on-disk
+    // set is now content-current by construction — record that so the NEXT
+    // full checkpoint can restamp.
+    if (save_derived) {
+        if (engine.derived_snapshots_trusted) {
+            try engine_index.restampCleanDerivedSnapshots(
+                engine,
+                !label_was_dirty,
+                !property_was_dirty,
+                !edge_was_dirty,
+                !edge_exist_was_dirty,
+                engine.manifest.last_checkpoint_lsn,
+            );
+            // PHASE G: restamp a CLEAN reverse map to the advanced epoch so a
+            // partial checkpoint does not epoch-invalidate it (→ needless scan
+            // rebuild on the next open). A dirty map was saved above.
+            if (!prop_rev_was_dirty) {
+                _ = try engine.prop_rev_index.restampFile(
+                    engine.graph_dir.path,
+                    engine.manifest.checkpoint_epoch,
+                    engine.manifest.last_checkpoint_lsn,
+                );
+            }
+        } else if (label_was_dirty and property_was_dirty and edge_was_dirty and edge_exist_was_dirty) {
+            engine.derived_snapshots_trusted = true;
+        }
     }
 
     const end_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);

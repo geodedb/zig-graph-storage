@@ -17,18 +17,34 @@
 //! hot paths. Values that `orderable()` rejects (decimal, ext, NaN float) are
 //! silently skipped (the planner falls back to the heap for those columns).
 //!
-//! ## Crash-safe persistence (Lever B discipline)
+//! ## Crash-safe persistence (Path B checkpoint_epoch contract — GAP-0050)
 //!
-//! `saveToFile` stamps the snapshot with the engine's `manifest.counter`;
-//! `loadFromFile` returns that counter so the engine can gate load-vs-rebuild:
-//! load only when `snapshot.counter == manifest.counter` (clean restart), else
-//! REBUILD from a live scan (crash restart). The snapshot also records the
-//! REGISTERED pair set, so even on a counter mismatch the engine knows which
-//! `(label,key)` trees to rebuild — registration is durable from the last full
-//! checkpoint, the trees are not trusted across a crash.
+//! `saveToFile` stamps the snapshot with the engine's durable freshness token
+//! `(checkpoint_epoch, covered_lsn)` — the SAME contract the 4 engine derived
+//! indexes use (see engine_index.tryLoadDerivedIndexes). `loadFromFile` returns
+//! that `Stamp` so the engine can gate load-vs-rebuild:
+//!   * LOAD only when `snapshot.checkpoint_epoch == manifest.checkpoint_epoch`
+//!     AND `snapshot.covered_lsn == manifest.last_checkpoint_lsn` (clean reopen:
+//!     epoch current AND no committed WAL tail past the snapshot). `checkpoint_
+//!     epoch` advances ONLY at checkpoint (never by a WAL-tail recovery), so a
+//!     clean-shutdown reload no longer pays the O(graph) rebuild the old
+//!     `manifest.counter` gate could force (recovery bumps counter).
+//!   * REBUILD from a live scan when the epoch mismatches (a checkpoint ran
+//!     after the snapshot) OR a committed tail exists (covered_lsn <
+//!     last_checkpoint_lsn: a crash replayed committed records the snapshot
+//!     predates). The btree tail-reconcile the derived indexes do (Path B
+//!     Phase 3) is OUT OF SCOPE here: reconciling the btree would need a
+//!     node→old-ordered-key reverse map to delete a tail-changed node's stale
+//!     entry, and the PropRevIndex stores only value_hash (insufficient to
+//!     reconstruct the order-preserving key). The crash-with-tail leg therefore
+//!     safely REBUILDS — see the GAP-0050 crash-leg follow-up.
+//! The snapshot also records the REGISTERED pair set, so even on a rebuild the
+//! engine knows which `(label,key)` trees to rebuild — registration is durable
+//! from the last full checkpoint, the trees are not trusted across a crash.
 //!
 //! On-disk framing (one file `ordered_propidx.snap` under the graph dir) reuses
-//! `index_snapshot` (magic | counter | item_count | payload | CRC32):
+//! `index_snapshot` (magic | checkpoint_epoch | covered_lsn | item_count |
+//! payload | CRC32) — the SAME two-stamp header the derived indexes use.
 //!   item_count = number of registered indexes
 //!   per index: [u32 label_id][u32 key_len][key bytes][u64 blob_len][tree blob]
 //! where the tree blob is `OrderedBTree.serialize` output.
@@ -50,9 +66,16 @@ const OrderedBTree = ordered_btree.OrderedBTree;
 pub const SNAPSHOT_FILE_NAME = "ordered_propidx.snap";
 /// 8-byte snapshot magic (index_snapshot requires exactly 8 bytes). Bumped
 /// 1 -> 2 when the per-index framing gained the eligibility flag + value-order
-/// class (an old GSORDIX1 snapshot is then cleanly rejected by the magic check
-/// and rebuilt from a live scan rather than silently misparsed).
-pub const SNAPSHOT_MAGIC = "GSORDIX2";
+/// class; bumped 2 -> 3 when the shared `index_snapshot` header grew a second
+/// stamp field; bumped 3 -> 4 (GAP-0050) when the ordered index MOVED onto the
+/// Path B `(checkpoint_epoch, covered_lsn)` reload contract — the two stamp
+/// slots now carry the durable epoch + covered LSN (they carried
+/// `manifest.counter` + 0 under GSORDIX3). The magic IS the format version:
+/// bumping it makes the loader REJECT a GSORDIX3 snapshot outright
+/// (error.InvalidFormat) rather than mis-reading its counter stamp as an epoch —
+/// the registration is then re-declared / rebuilt, never silently misparsed.
+/// Never reuse a retired magic ("GSORDIX1"/"GSORDIX2"/"GSORDIX3").
+pub const SNAPSHOT_MAGIC = "GSORDIX4";
 const owner_only_file_mode = 0o600;
 
 fn io() std.Io {
@@ -313,16 +336,20 @@ pub const OrderedPropertyIndex = struct {
     }
 
     /// Save every registered index to `<dir_path>/ordered_propidx.snap`, stamped
-    /// with `counter` (the engine's manifest.counter). A no-op leaves a valid
-    /// empty snapshot (item_count == 0) so a clean restart still loads cleanly.
-    pub fn saveToFile(self: *Self, dir_path: []const u8, counter: u64) !void {
+    /// with the Path B freshness token `(checkpoint_epoch, covered_lsn)`
+    /// (GAP-0050). A no-op leaves a valid empty snapshot (item_count == 0) so a
+    /// clean reopen still loads cleanly.
+    pub fn saveToFile(self: *Self, dir_path: []const u8, checkpoint_epoch: u64, covered_lsn: u64) !void {
         const path = try self.snapshotPath(dir_path);
         defer self.allocator.free(path);
 
         var w = index_snapshot.SnapshotWriter.init(self.allocator);
         defer w.deinit();
 
-        try w.writeHeader(SNAPSHOT_MAGIC, counter, self.entries.items.len);
+        // Path B contract: stamp checkpoint_epoch into slot0 and covered_lsn into
+        // slot1 — the SAME two-stamp header the derived indexes use. See the
+        // module header and engine_index.tryLoadDerivedIndexes for the gate.
+        try w.writeHeader(SNAPSHOT_MAGIC, checkpoint_epoch, covered_lsn, self.entries.items.len);
         for (self.entries.items) |*e| {
             try w.writeU32(e.label_id);
             try w.writeU32(@intCast(e.property_key.len));
@@ -347,11 +374,14 @@ pub const OrderedPropertyIndex = struct {
 
     /// Load the snapshot from `<dir_path>/ordered_propidx.snap`, replacing the
     /// in-memory state with the persisted registration set + trees. Returns the
-    /// stamped counter, or null when no snapshot file exists (fresh graph / no
-    /// ordered index ever created). The caller compares the returned counter to
-    /// `manifest.counter`: equal -> trust the loaded trees; not-equal -> keep the
-    /// registration but rebuild the trees from a live scan (crash-safety gate).
-    pub fn loadFromFile(self: *Self, dir_path: []const u8) !?u64 {
+    /// stamped Path B `Stamp` `(checkpoint_epoch, covered_lsn)`, or null when no
+    /// snapshot file exists (fresh graph / no ordered index ever created). An old
+    /// (GSORDIX3 or earlier) or corrupt snapshot propagates an error, which the
+    /// engine treats as "no trusted snapshot". The caller gates on the returned
+    /// stamp: LOAD when `epoch == manifest.checkpoint_epoch AND covered_lsn ==
+    /// manifest.last_checkpoint_lsn`; else keep the registration (already loaded
+    /// here) but rebuild the trees from a live scan (crash-safety gate).
+    pub fn loadFromFile(self: *Self, dir_path: []const u8) !?index_snapshot.Stamp {
         const path = try self.snapshotPath(dir_path);
         defer self.allocator.free(path);
 
@@ -400,7 +430,8 @@ pub const OrderedPropertyIndex = struct {
             });
         }
 
-        return loaded.checkpoint_counter;
+        // Path B: return both stamps so the engine can gate on epoch + tail.
+        return .{ .epoch = loaded.checkpoint_epoch, .covered_lsn = loaded.covered_lsn };
     }
 };
 

@@ -414,6 +414,63 @@ pub const ShardedGraphEngine = struct {
         self.allocator.destroy(self);
     }
 
+    // ========================================================================
+    // PHASE G — crash-reopen exact-index reconcile: public API for an EXTERNAL
+    // derived index (e.g. geode's prop_exact.idx). ADDITIVE — pure reads over
+    // already-recovered state; no behaviour change to any existing path.
+    // ========================================================================
+
+    /// Number of shards backing this graph. The G2 durable-frontier / epoch
+    /// getters are PER-SHARD (each shard has its own manifest + recovery); an
+    /// external per-graph index compares against the owning shard via
+    /// `shard(s)` (geode already reads `shards[s].manifest`).
+    pub fn shardCount(self: *ShardedGraphEngine) usize {
+        _ = self;
+        return SHARD_COUNT;
+    }
+
+    /// Per-shard engine accessor for the G2 getters
+    /// (`shard(s).checkpointEpoch()` / `.durableFrontierLsn()` /
+    /// `.preRecoveryFrontierLsn()`).
+    pub fn shard(self: *ShardedGraphEngine, index: usize) *GraphEngine {
+        return self.shards[index];
+    }
+
+    /// G1. Resolve the recovery tail-affected page set to the OWNING node ids
+    /// across ALL shards, deduped and ascending (caller frees). THREE-WAY
+    /// signal, matching `GraphEngine.tailAffectedNodeIds`:
+    ///   * `null`             — a full REBUILD is required (some shard's capture
+    ///     overflowed / was off, or its tail touched props pages it cannot
+    ///     attribute). The external index MUST rebuild wholesale.
+    ///   * non-null EMPTY     — nothing to reconcile (no shard had a
+    ///     node-affecting committed tail).
+    ///   * non-null non-empty — the unioned affected node ids.
+    ///
+    /// SOUNDNESS across shards: if ANY shard requires a rebuild the WHOLE
+    /// result is `null` (never a partial cross-shard set, which would look
+    /// complete and leave the external index silently stale on the
+    /// un-reconciled shard). Shards with no committed tail contribute nothing
+    /// (an empty, non-null per-shard result — not a rebuild signal).
+    pub fn tailAffectedNodeIds(self: *ShardedGraphEngine, allocator: Allocator) !?[]NodeId {
+        var set: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
+        defer set.deinit(allocator);
+        for (self.shards) |eng| {
+            const ids = (try eng.resolveTailAffectedNodeIds(allocator)) orelse
+                // A shard needs a full rebuild → the external index must
+                // rebuild wholesale; never return a partial cross-shard set.
+                return null;
+            defer allocator.free(ids);
+            for (ids) |id| try set.put(allocator, id, {});
+        }
+        const out = try allocator.alloc(NodeId, set.count());
+        errdefer allocator.free(out);
+        var it = set.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) out[i] = k.*;
+        std.mem.sort(NodeId, out, {}, std.sort.asc(NodeId));
+        return out;
+    }
+
     pub fn getNode(self: *ShardedGraphEngine, id: NodeId) anyerror!?NodeRec {
         return self.shards[shard_count_mod.shardOfNode(id)].getNode(id);
     }
@@ -460,10 +517,36 @@ pub const ShardedGraphEngine = struct {
         };
     }
 
+    // -------------------------------------------------------------------
+    // Property ops — TWO surfaces (GAP prop-store slab packing, P5):
+    //
+    //  * HEAD-ROUTED (getProperty/putProperty/removeProperty/
+    //    getAllProperties): the GraphStorage-vtable compatibility surface.
+    //    It routes by `shardOfNode(prop_head)`, which is only meaningful for
+    //    the legacy layout heads this facade itself hands out. A SLAB head
+    //    (tag|page|slot) carries NO shard information — prop page ids are
+    //    per-shard-sequential, not shard-striped, and the head CHANGES on
+    //    relocation — so head-value routing would pin an arbitrary shard's
+    //    page (silent wrong data). Slab heads are therefore REJECTED loudly
+    //    here, and the head-routed create path is forced LEGACY so this
+    //    surface never mints a slab head in the first place.
+    //
+    //  * OWNER-ROUTED (putNodeProperty/removeNodeProperty/getNodeProperty/
+    //    getAllNodeProperties): the correct router. A node's property chain
+    //    lives on the shard that owns the NODE (geode's adapter routes the
+    //    same way), so ops route by the owning node id and work for both
+    //    legacy and slab heads.
+    // -------------------------------------------------------------------
+
     pub fn getProperty(self: *ShardedGraphEngine, prop_head: u64, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
-        // Property chain heads live on the same shard as their owning node;
-        // prop_head is itself shard-striped.
+        // Head-routed compatibility path: legacy heads only (see above).
+        if (prop_store_mod.isSlabHead(prop_head)) return error.SlabHeadRequiresOwnerRouting;
         return self.shards[shard_count_mod.shardOfNode(prop_head)].getProperty(prop_head, key, allocator);
+    }
+
+    /// Owner-routed single-property read: routes by the owning node id.
+    pub fn getNodeProperty(self: *ShardedGraphEngine, node_id: NodeId, prop_head: u64, key: []const u8, allocator: Allocator) anyerror!?PropertyValue {
+        return self.shards[shard_count_mod.shardOfNode(node_id)].getProperty(prop_head, key, allocator);
     }
 
     pub fn nodeCount(self: *ShardedGraphEngine) anyerror!u64 {
@@ -490,6 +573,26 @@ pub const ShardedGraphEngine = struct {
         return self.shards[s_from].addEdgeColocated(from, to, rel_type);
     }
 
+    /// GAP-ENT-0024 P2: co-located edge add carrying the geode-minted 64-bit
+    /// PUBLIC edge id inline. Routes to shard(from) exactly like `addEdge` —
+    /// one single-shard WAL txn; the id rides both durable adjacency records
+    /// (adj_out + adj_in_remote) in v2 blocks, so the edge needs NO
+    /// `__geode_internal_edge_id` property page. `addEdge` remains the
+    /// legacy public_id==0 path.
+    ///
+    /// CONTRACT (review F4): `public_id == 0` is RESERVED — it means "no
+    /// inline id" and silently degrades the edge to the legacy class (readers
+    /// fall back to the `__geode_internal_edge_id` property, which THIS path
+    /// does not write). A caller that stops writing the id property MUST NOT
+    /// pass 0 for a real edge (geode mints nonzero time-based ids; its
+    /// adapter must reject/handle 0 explicitly), otherwise the edge has no
+    /// durable public id anywhere. A debug assert is impossible here — the
+    /// legacy `addEdge`/`addEdgeColocated` delegates pass 0 by design.
+    pub fn addEdgeColocatedWithPublicId(self: *ShardedGraphEngine, from: NodeId, to: NodeId, rel_type: u32, public_id: u64) anyerror!EdgeId {
+        const s_from = shard_count_mod.shardOfNode(from);
+        return self.shards[s_from].addEdgeColocatedWithPublicId(from, to, rel_type, public_id);
+    }
+
     pub fn removeEdge(self: *ShardedGraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId) anyerror!void {
         // Edge co-location (Phase C): a co-located edge lives ENTIRELY on
         // shard(from) — out-adjacency, edge_index, existence index AND incoming
@@ -502,19 +605,46 @@ pub const ShardedGraphEngine = struct {
 
     pub fn putProperty(self: *ShardedGraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
         // `owner == 0` means "create a new chain"; round-robin to a shard.
+        // Forced LEGACY (P5): a slab head minted here would be unroutable by
+        // every other head-routed op (see the surface note above); slab
+        // packing is only reachable through owner-routed putNodeProperty.
         if (owner == 0) {
             const idx = self.coordinator_txn_counter.fetchAdd(1, .monotonic) % SHARD_COUNT;
-            return self.shards[idx].putProperty(owner, key, val);
+            return self.shards[idx].putPropertyLegacy(owner, key, val);
         }
+        if (prop_store_mod.isSlabHead(owner)) return error.SlabHeadRequiresOwnerRouting;
         return self.shards[shard_count_mod.shardOfNode(owner)].putProperty(owner, key, val);
     }
 
+    /// Owner-routed property write: routes by the owning node id, so the
+    /// chain (legacy or slab) co-locates with its node and every later
+    /// owner-routed op finds it. Returns the (possibly new) prop_head; the
+    /// caller must store it back into the node record exactly as with the
+    /// single-engine API.
+    pub fn putNodeProperty(self: *ShardedGraphEngine, node_id: NodeId, prop_head: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
+        return self.shards[shard_count_mod.shardOfNode(node_id)].putProperty(prop_head, key, val);
+    }
+
     pub fn removeProperty(self: *ShardedGraphEngine, owner: u64, key: []const u8) anyerror!void {
+        // Head-routed compatibility path: legacy heads only (see above).
+        if (prop_store_mod.isSlabHead(owner)) return error.SlabHeadRequiresOwnerRouting;
         return self.shards[shard_count_mod.shardOfNode(owner)].removeProperty(owner, key);
     }
 
+    /// Owner-routed property removal: routes by the owning node id.
+    pub fn removeNodeProperty(self: *ShardedGraphEngine, node_id: NodeId, prop_head: u64, key: []const u8) anyerror!void {
+        return self.shards[shard_count_mod.shardOfNode(node_id)].removeProperty(prop_head, key);
+    }
+
     pub fn getAllProperties(self: *ShardedGraphEngine, prop_head: u64) anyerror!PropStore.PropIterator {
+        // Head-routed compatibility path: legacy heads only (see above).
+        if (prop_store_mod.isSlabHead(prop_head)) return error.SlabHeadRequiresOwnerRouting;
         return self.shards[shard_count_mod.shardOfNode(prop_head)].getAllProperties(prop_head);
+    }
+
+    /// Owner-routed all-properties iterator: routes by the owning node id.
+    pub fn getAllNodeProperties(self: *ShardedGraphEngine, node_id: NodeId, prop_head: u64) anyerror!PropStore.PropIterator {
+        return self.shards[shard_count_mod.shardOfNode(node_id)].getAllProperties(prop_head);
     }
 
     pub fn setEdgeProperty(self: *ShardedGraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, val: PropertyValue) anyerror!void {
