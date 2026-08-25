@@ -29,6 +29,11 @@ const PROP_DATA_OFFSET: u32 = PAGE_HEADER_SIZE + PROP_META_SIZE;
 /// Maximum hops allowed in a page chain traversal before assuming corruption.
 const MAX_CHAIN_HOPS: u32 = 100_000;
 
+/// Smallest possible encoded property value (a bare `null` tag byte). Used to
+/// decide whether a rejected entry is a KEY problem (not even the shortest
+/// value fits alongside it) or a VALUE problem.
+const MIN_ENCODED_VALUE_SIZE: usize = 1;
+
 /// Per-page property key directory (PERF-0023).
 /// The directory grows backward from the end of each page and maps key hashes
 /// to entry offsets for O(1) lookup within a page.
@@ -1231,9 +1236,20 @@ pub const PropStore = struct {
         // (key_len field + key bytes + encoded value + one directory slot) would
         // cause an out-of-bounds write in writePropertyEntry for both the
         // prop_head==0 fast path and the overflow-page allocation in insertEntry.
-        // Treat this as an oversized key even when the u16 range guard above
-        // passed, because the key is still too long for the configured page size.
-        if (entry_size > self.dataCapacity() -| DIR_ENTRY_SIZE) return error.PropertyKeyTooLong;
+        //
+        // TRUTHFUL ERROR SPLIT: the two ways to blow the per-page entry budget
+        // are NOT the same failure and must not report the same error.
+        //   * The KEY alone (key_len field + key bytes + the smallest possible
+        //     value encoding) does not fit → genuinely PropertyKeyTooLong; no
+        //     value encoding could ever rescue it.
+        //   * Otherwise the VALUE is what overflows the budget → report that
+        //     truthfully. (This branch becomes the value-overflow write path;
+        //     until then it is a clean, accurate rejection.)
+        const entry_budget = self.dataCapacity() -| DIR_ENTRY_SIZE;
+        if (entry_size > entry_budget) {
+            if (2 + key.len + MIN_ENCODED_VALUE_SIZE > entry_budget) return error.PropertyKeyTooLong;
+            return error.PropertyValueTooLarge;
+        }
 
         // GAP prop-store slab packing (P2): a slab-resident node's put goes
         // through the slab write path (in-place / relocate / legacy-migrate).

@@ -34,6 +34,12 @@ pub const StorageError = error{
     FileTooLarge,
     WriteCountExhausted,
     PropertyKeyTooLong,
+    /// The property VALUE is too large to store: it exceeds
+    /// `GraphConfig.max_property_value_bytes` (the sanity cap that bounds WAL
+    /// record size and per-op memory), or it cannot be represented at all for
+    /// the configured page size. Distinct from `PropertyKeyTooLong`, which is
+    /// reserved for a genuinely oversized KEY.
+    PropertyValueTooLarge,
     WalRecordTooLarge,
 
     // Contract / usage (caller violated a precondition)
@@ -58,6 +64,12 @@ pub const StorageError = error{
     UnexpectedEndOfFile,
     UnexpectedEof,
     IncompatibleVersion,
+    /// A property value was decoded straight from its on-page bytes while it
+    /// is an OVERFLOW STUB (tag 7) that only references the real value in the
+    /// var store. Stubs must be resolved by the prop-store read path before
+    /// decoding; reaching `property.decode` with one is a caller/plumbing bug,
+    /// never valid input.
+    UnresolvedOverflowValue,
 
     // WAL
     WalCorrupted,
@@ -189,12 +201,14 @@ test "StorageError coherence guard — ad-hoc errors used by library code are de
     assertMember("UnexpectedEndOfInput");
     assertMember("UnexpectedEndOfFile");
     assertMember("UnexpectedEof");
+    assertMember("UnresolvedOverflowValue");
 
     // Capacity / limits
     assertMember("BackupTooLarge");
     assertMember("FileTooLarge");
     assertMember("WriteCountExhausted");
     assertMember("PropertyKeyTooLong");
+    assertMember("PropertyValueTooLarge");
     assertMember("WalRecordTooLarge");
 
     // Contract / usage
