@@ -16,7 +16,63 @@ pub const Tag = enum(u8) {
     string = 4,
     decimal = 5,
     ext = 6,
+    /// OVERFLOW STUB — never a `PropertyValue` variant. A value whose encoded
+    /// form does not fit the per-page property entry budget is written to a
+    /// var-store chain and the property entry holds a fixed 13-byte stub
+    /// instead (see `OVERFLOW_STUB_SIZE`). The prop-store read path resolves
+    /// the stub back into the real encoded bytes BEFORE decoding, so a decoder
+    /// that ever sees this tag is looking at an unresolved stub — a plumbing
+    /// bug, reported as `error.UnresolvedOverflowValue`.
+    ///
+    /// Forward compatibility: a reader built before this tag existed rejects
+    /// it as `error.InvalidFormat` (it is not a member of its Tag enum) — a
+    /// clean, loud refusal, never a misparse.
+    overflow = 7,
 };
+
+/// On-page size of an overflow stub: tag(1) + encoded_len u32(4) + var_ref u64(8).
+///
+/// Layout:
+///   [0]        u8  = 7 (`Tag.overflow`)
+///   [1..5)    u32 LE  encoded_len — length of the ORIGINAL encoded value
+///   [5..13)   u64 LE  var_ref — var-store chain holding those encoded bytes
+///
+/// `encoded_len` is redundant with the chain itself and exists precisely to
+/// cross-check it: a resolved chain whose length disagrees is corruption.
+pub const OVERFLOW_STUB_SIZE: usize = 13;
+
+/// Decoded form of an overflow stub.
+pub const OverflowStub = struct {
+    /// Length of the original encoded value stored in the var chain.
+    encoded_len: u32,
+    /// Var-store reference (legacy chain ref) holding the encoded value.
+    var_ref: u64,
+};
+
+/// True when `bytes` begins with an overflow stub tag. Empty input is not a stub.
+pub fn isOverflowStub(bytes: []const u8) bool {
+    return bytes.len >= 1 and bytes[0] == @intFromEnum(Tag.overflow);
+}
+
+/// Serialize an overflow stub into `buf` (which must hold OVERFLOW_STUB_SIZE bytes).
+pub fn writeOverflowStub(buf: []u8, encoded_len: u32, var_ref: u64) error{BufferTooSmall}!void {
+    if (buf.len < OVERFLOW_STUB_SIZE) return error.BufferTooSmall;
+    buf[0] = @intFromEnum(Tag.overflow);
+    std.mem.writeInt(u32, buf[1..5], encoded_len, .little);
+    std.mem.writeInt(u64, buf[5..13], var_ref, .little);
+}
+
+/// Parse an overflow stub from `bytes`. Fully bounds-checked: a truncated or
+/// mistagged entry fails loudly rather than reading past the slice.
+pub fn readOverflowStub(bytes: []const u8) error{ UnexpectedEndOfInput, InvalidFormat }!OverflowStub {
+    if (bytes.len < 1) return error.UnexpectedEndOfInput;
+    if (bytes[0] != @intFromEnum(Tag.overflow)) return error.InvalidFormat;
+    if (bytes.len < OVERFLOW_STUB_SIZE) return error.UnexpectedEndOfInput;
+    return .{
+        .encoded_len = std.mem.readInt(u32, bytes[1..5], .little),
+        .var_ref = std.mem.readInt(u64, bytes[5..13], .little),
+    };
+}
 
 /// Result of decoding a property value from bytes.
 pub const DecodeResult = struct {
@@ -159,13 +215,18 @@ pub fn decode(allocator: Allocator, bytes: []const u8) !DecodeResult {
                 .bytes_read = total,
             };
         },
+        .overflow => {
+            // An overflow stub only REFERENCES the real value; the prop-store
+            // read path must resolve it before decoding.
+            return error.UnresolvedOverflowValue;
+        },
     }
 }
 
 /// Zero-copy decode: string and ext slices borrow directly from `bytes`.
 /// Caller must ensure `bytes` remains valid for the lifetime of the returned value.
 /// No allocator needed — no heap allocation occurs.
-pub fn decodeView(bytes: []const u8) error{ UnexpectedEndOfInput, InvalidFormat }!DecodeResult {
+pub fn decodeView(bytes: []const u8) error{ UnexpectedEndOfInput, InvalidFormat, UnresolvedOverflowValue }!DecodeResult {
     if (bytes.len < 1) return error.UnexpectedEndOfInput;
 
     const tag: Tag = std.enums.fromInt(Tag, bytes[0]) orelse return error.InvalidFormat;
@@ -226,6 +287,11 @@ pub fn decodeView(bytes: []const u8) error{ UnexpectedEndOfInput, InvalidFormat 
                 .value = PropertyValue{ .ext = .{ .type_tag = type_tag, .data = bytes[7..total] } },
                 .bytes_read = total,
             };
+        },
+        .overflow => {
+            // See `decode`: a stub must be resolved by the prop-store read
+            // path before it reaches a decoder.
+            return error.UnresolvedOverflowValue;
         },
     }
 }
@@ -365,6 +431,38 @@ test "encodeInto round-trip matches encode for all fixed types" {
         defer allocator.free(heap);
         try std.testing.expectEqualSlices(u8, heap, buf[0..n]);
     }
+}
+
+test "overflow stub: round-trips through write/read and is exactly 13 bytes" {
+    var buf: [OVERFLOW_STUB_SIZE]u8 = undefined;
+    try writeOverflowStub(&buf, 123456, 0xABCDEF0123456789);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(Tag.overflow)), buf[0]);
+
+    const stub = try readOverflowStub(&buf);
+    try std.testing.expectEqual(@as(u32, 123456), stub.encoded_len);
+    try std.testing.expectEqual(@as(u64, 0xABCDEF0123456789), stub.var_ref);
+
+    try std.testing.expect(isOverflowStub(&buf));
+    try std.testing.expect(!isOverflowStub(&[_]u8{@intFromEnum(Tag.string)}));
+    try std.testing.expect(!isOverflowStub(&[_]u8{}));
+}
+
+test "overflow stub: truncated / mistagged input fails loudly, never reads OOB" {
+    var buf: [OVERFLOW_STUB_SIZE]u8 = undefined;
+    try writeOverflowStub(&buf, 1, 2);
+    try std.testing.expectError(error.UnexpectedEndOfInput, readOverflowStub(buf[0..12]));
+    try std.testing.expectError(error.UnexpectedEndOfInput, readOverflowStub(&[_]u8{}));
+    try std.testing.expectError(error.InvalidFormat, readOverflowStub(&[_]u8{ 4, 0, 0, 0, 0 }));
+
+    var tiny: [12]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, writeOverflowStub(&tiny, 1, 2));
+}
+
+test "overflow stub: decoding an UNRESOLVED stub is a hard error on both decode paths" {
+    var buf: [OVERFLOW_STUB_SIZE]u8 = undefined;
+    try writeOverflowStub(&buf, 4096, 0x1234);
+    try std.testing.expectError(error.UnresolvedOverflowValue, decodeView(&buf));
+    try std.testing.expectError(error.UnresolvedOverflowValue, decode(std.testing.allocator, &buf));
 }
 
 test "encodeInto returns BufferTooSmall for undersized buffer" {

@@ -1584,6 +1584,10 @@ fn encodedSizeFromBytes(bytes: []const u8) error{ InvalidData, DataCorruption }!
             const data_len = std.mem.bytesToValue(u32, bytes[3..7]);
             break :blk 7 + @as(usize, data_len);
         },
+        // An overflow stub is FIXED SIZE on the page: the real (arbitrarily
+        // large) value lives in the var store. Entry-walking code therefore
+        // skips exactly 13 bytes, never the value's true length.
+        .overflow => property_mod.OVERFLOW_STUB_SIZE,
     };
     if (size > bytes.len) return error.DataCorruption;
     return size;
