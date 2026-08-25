@@ -229,9 +229,18 @@ pub const VarStore = struct {
         self.last_slab_tombstone = null;
     }
 
-    /// Usable data bytes per page.
+    /// Usable data bytes per LEGACY chain page.
+    ///
+    /// SEC: the reserved tail must be excluded. When at-rest encryption is on,
+    /// the pager writes the per-page AES-GCM tag into the final `tail_reserve`
+    /// bytes on flush; a chunk that ran into that region round-tripped fine
+    /// within a session (reads hit the decrypted frame) but came back as tag
+    /// bytes after a restart — silent corruption of the chunk's tail. The slab
+    /// layout has always reserved the tail (`slabCapacity`); legacy chains now
+    /// do too. `tail_reserve` is 0 in plaintext mode, so the plaintext layout
+    /// is byte-for-byte unchanged.
     fn dataCapacity(self: *const VarStore) u32 {
-        return self.page_size - PAGE_HEADER_SIZE - VAR_META_SIZE;
+        return self.page_size - PAGE_HEADER_SIZE - VAR_META_SIZE - self.tail_reserve;
     }
 
     /// Bytes on a slab block available for byte runs + slot-directory entries
@@ -1073,6 +1082,44 @@ test "P2: free() slot-tombstones a slab run; sibling slots stay live and readabl
         defer testing.allocator.free(c);
         try testing.expectEqualStrings("gamma payload", c);
     }
+}
+
+test "legacy chain: a multi-page write never touches the reserved encryption tail" {
+    const page_size: u32 = 4096;
+    const tail: u32 = 16; // encryption.TAG_SIZE
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", page_size, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, page_size);
+    store.slab_packing = false;
+    store.tail_reserve = tail;
+
+    // Three pages' worth of non-zero payload.
+    const payload = try testing.allocator.alloc(u8, 3 * page_size);
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @as(u8, @truncate(i)) | 1;
+
+    const ref = try store.write(payload);
+    {
+        const back = try store.read(ref, testing.allocator);
+        defer testing.allocator.free(back);
+        try testing.expectEqualSlices(u8, payload, back);
+    }
+
+    // Every page of the chain must leave its final `tail` bytes untouched —
+    // that region belongs to the pager's AES-GCM tag.
+    var page: PageId = VarStore.refFirstPage(ref);
+    var pages: usize = 0;
+    while (page != 0) : (pages += 1) {
+        const frame = try env.pool.pin(.var_store, page);
+        const idx = env.pool.frameIndex(frame);
+        const data = frame.dataSlice();
+        for (data[data.len - tail ..]) |b| try testing.expectEqual(@as(u8, 0), b);
+        const next = std.mem.bytesToValue(u64, data[PAGE_HEADER_SIZE..][0..8]);
+        env.pool.unpin(idx, false);
+        page = next;
+    }
+    try testing.expect(pages >= 3);
 }
 
 test "writeLegacyChain: bypasses slab packing and frees without arming the shared undo slot" {
