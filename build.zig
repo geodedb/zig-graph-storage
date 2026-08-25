@@ -508,6 +508,22 @@ fn addIntegrationTests(
     const run_prop_store_slab = b.addRunArtifact(prop_store_slab_tests);
     prop_store_slab_step.dependOn(&run_prop_store_slab.step);
 
+    // Property-value OVERFLOW (tag 7): values larger than the per-page entry
+    // budget spill into a LEGACY var-store chain and leave a 13-byte stub in
+    // the property entry. Own step covering the round-trip/boundary/mixed-chain
+    // matrix, overwrite + delete free discipline, slab-resident overflow and
+    // slab→legacy relocation, property-index consistency, crash/WAL replay,
+    // backward compatibility, and the error identities (PropertyKeyTooLong vs
+    // PropertyValueTooLarge).
+    const prop_store_overflow_step = b.step("test-prop-store-overflow", "Run property-value overflow tests: round-trip, boundary, free discipline, index, crash replay, compat");
+    const prop_store_overflow_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/prop_store_overflow.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_prop_store_overflow = b.addRunArtifact(prop_store_overflow_tests);
+    prop_store_overflow_step.dependOn(&run_prop_store_overflow.step);
+
     // GAP var-store slab packing P2 — WRITE-path acceptance gates: bytes/node
     // re-measure, slab-vs-legacy parity, on-disk reopen, WAL imaging
     // (logVarChain slab-aware), the crash gate (committed slab labels/strings
