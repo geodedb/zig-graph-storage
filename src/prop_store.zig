@@ -29,11 +29,6 @@ const PROP_DATA_OFFSET: u32 = PAGE_HEADER_SIZE + PROP_META_SIZE;
 /// Maximum hops allowed in a page chain traversal before assuming corruption.
 const MAX_CHAIN_HOPS: u32 = 100_000;
 
-/// Smallest possible encoded property value (a bare `null` tag byte). Used to
-/// decide whether a rejected entry is a KEY problem (not even the shortest
-/// value fits alongside it) or a VALUE problem.
-const MIN_ENCODED_VALUE_SIZE: usize = 1;
-
 /// Per-page property key directory (PERF-0023).
 /// The directory grows backward from the end of each page and maps key hashes
 /// to entry offsets for O(1) lookup within a page.
@@ -293,7 +288,27 @@ pub const PropStore = struct {
     /// of every mutating op.
     last_slab_tombstone: ?SlabTombstoneUndo = null,
 
+    /// Property-value OVERFLOW: var-store refs WRITTEN by the current op —
+    /// the chains an oversized value spilled into, which the props page only
+    /// references through a 13-byte stub. The ENGINE WAL-images every entry
+    /// (`logVarChain`) in the SAME txn as the props page image; without that,
+    /// crash replay would restore a stub pointing at pages whose contents were
+    /// never logged. At most one per op (a put writes one value), so the
+    /// capacity below is pure slack and `recordTouchedVarRef` fails loudly
+    /// rather than ever silently dropping a chain.
+    touched_var_refs: [MAX_TOUCHED_VAR_REFS]u64 = undefined,
+    touched_var_len: u8 = 0,
+
+    /// Property-value OVERFLOW: var-store refs whose stubs the current op
+    /// REPLACED or REMOVED. Recorded while the outgoing entry is still intact
+    /// and released only by `freePendingVarRefs` once every page mutation of
+    /// the op has succeeded — the write-new-first / free-old-LAST ordering
+    /// that keeps every error exit's surviving stub pointing at a LIVE chain.
+    freed_var_refs: [MAX_TOUCHED_VAR_REFS]u64 = undefined,
+    freed_var_len: u8 = 0,
+
     pub const MAX_TOUCHED_PAGES: usize = 16;
+    pub const MAX_TOUCHED_VAR_REFS: usize = 4;
 
     const SlabTombstoneUndo = struct { page_id: PageId, slot: u32, offset: u32, len: u32 };
 
@@ -302,6 +317,8 @@ pub const PropStore = struct {
     fn resetTouched(self: *PropStore) void {
         self.touched_len = 0;
         self.last_slab_tombstone = null; // GAP-ENT-0022(b): per-op undo record
+        self.touched_var_len = 0; // overflow: chains written by this op
+        self.freed_var_len = 0; // overflow: chains this op must release
     }
 
     /// P4: record a page dirtied by the current mutating op (deduplicated).
@@ -323,6 +340,63 @@ pub const PropStore = struct {
     /// store. The engine WAL-logs a page image for each entry.
     pub fn touchedPages(self: *const PropStore) []const PageId {
         return self.touched_pages[0..self.touched_len];
+    }
+
+    /// Property-value OVERFLOW: record a var chain this op wrote (deduplicated).
+    /// Over-recording is harmless (a redundant chain image is still correct);
+    /// UNDER-recording loses the value on crash — so overflow fails the op
+    /// loudly instead of dropping a chain (unreachable by construction: an op
+    /// spills at most one value).
+    fn recordTouchedVarRef(self: *PropStore, ref: u64) !void {
+        for (self.touched_var_refs[0..self.touched_var_len]) |r| {
+            if (r == ref) return;
+        }
+        if (self.touched_var_len >= MAX_TOUCHED_VAR_REFS) return error.TooManyOverflowValues;
+        self.touched_var_refs[self.touched_var_len] = ref;
+        self.touched_var_len += 1;
+    }
+
+    /// Property-value OVERFLOW: the var chains written by the most recent
+    /// `putProperty` / `removeProperty` call. Valid until the next mutating
+    /// call on this store. The engine WAL-images each chain (`logVarChain`)
+    /// under the same txn as the props page images.
+    pub fn touchedVarRefs(self: *const PropStore) []const u64 {
+        return self.touched_var_refs[0..self.touched_var_len];
+    }
+
+    /// Property-value OVERFLOW: mark the chain behind an OUTGOING stub for
+    /// release at the end of the op (deduplicated — a ref must never be freed
+    /// twice). Recording is a pure in-memory note; nothing is released until
+    /// `freePendingVarRefs`.
+    fn recordFreedVarRef(self: *PropStore, ref: u64) !void {
+        for (self.freed_var_refs[0..self.freed_var_len]) |r| {
+            if (r == ref) return;
+        }
+        if (self.freed_var_len >= MAX_TOUCHED_VAR_REFS) return error.TooManyOverflowValues;
+        self.freed_var_refs[self.freed_var_len] = ref;
+        self.freed_var_len += 1;
+    }
+
+    /// Property-value OVERFLOW: the var chains released by the most recent
+    /// mutating call. Valid until the next mutating call on this store.
+    pub fn freedVarRefs(self: *const PropStore) []const u64 {
+        return self.freed_var_refs[0..self.freed_var_len];
+    }
+
+    /// Property-value OVERFLOW, R11 (free-old-LAST): release every chain whose
+    /// stub this op replaced or removed. Called ONLY after all of the op's page
+    /// mutations succeeded, so at every earlier error exit the entry that
+    /// survives still references a LIVE chain.
+    ///
+    /// Overflow chains are always written with `VarStore.writeLegacyChain`, so
+    /// this is a plain page release — it never tombstones a slab slot and so
+    /// never disturbs the VarStore's single shared `last_slab_tombstone` undo
+    /// record, which the label write paths rely on owning (PropStore and
+    /// LabelStore share one VarStore).
+    fn freePendingVarRefs(self: *PropStore) !void {
+        for (self.freed_var_refs[0..self.freed_var_len]) |ref| {
+            try self.var_store.free(ref);
+        }
     }
 
     /// WAL-aware derived-index tail reconcile: enumerate the slab slots on one
@@ -479,6 +553,52 @@ pub const PropStore = struct {
         }
     };
 
+    /// Property-value OVERFLOW: decode an entry's on-page value bytes into a
+    /// `PropertyValue`, transparently resolving an OVERFLOW STUB first.
+    ///
+    /// An inline value decodes exactly as before. A stub is resolved by
+    /// reading the referenced var chain into a scratch buffer (owned by the
+    /// buffer pool's allocator, released before returning) and decoding THAT,
+    /// so no caller ever observes tag 7.
+    ///
+    /// R10: the resolved chain's length is cross-checked against the length
+    /// recorded in the stub. A mismatch means the entry and the chain have
+    /// diverged (truncated replay, reused pages, tampering) — reported as
+    /// DataCorruption rather than decoded into a plausible wrong value.
+    fn decodeMaybeOverflow(self: *PropStore, bytes: []const u8, allocator: Allocator) !PropertyValue {
+        if (!property_mod.isOverflowStub(bytes)) {
+            const decoded = try property_mod.decode(allocator, bytes);
+            return decoded.value;
+        }
+        const scratch_alloc = self.buffer_pool.allocator;
+        const stub = property_mod.readOverflowStub(bytes) catch return error.DataCorruption;
+        const real = try self.var_store.read(stub.var_ref, scratch_alloc);
+        defer scratch_alloc.free(real);
+        if (real.len != stub.encoded_len) return error.DataCorruption;
+        const decoded = try property_mod.decode(allocator, real);
+        return decoded.value;
+    }
+
+    /// Property-value OVERFLOW: the var ref behind `bytes` when they are an
+    /// OVERFLOW STUB, else null. A stub tag with a truncated body is
+    /// corruption, never a silent "not a stub".
+    fn overflowRefIn(bytes: []const u8) error{DataCorruption}!?u64 {
+        if (!property_mod.isOverflowStub(bytes)) return null;
+        const stub = property_mod.readOverflowStub(bytes) catch return error.DataCorruption;
+        return stub.var_ref;
+    }
+
+    /// Property-value OVERFLOW: the var ref of the entry starting at
+    /// `entry_start` within `data` (a page or a slab blob), or null when that
+    /// entry's value is inline. Fully bounds-checked.
+    fn entryOverflowRef(_: *const PropStore, data: []const u8, entry_start: usize) error{DataCorruption}!?u64 {
+        if (entry_start + 2 > data.len) return error.DataCorruption;
+        const key_len = std.mem.bytesToValue(u16, data[entry_start..][0..2]);
+        const val_off = entry_start + 2 + @as(usize, key_len);
+        if (val_off > data.len) return error.DataCorruption;
+        return overflowRefIn(data[val_off..]);
+    }
+
     /// Get a property value by key from a property page chain.
     /// Returns null if not found.
     ///
@@ -516,9 +636,11 @@ pub const PropStore = struct {
                                 const entry_key = data[off + 2 ..][0..key_len];
                                 if (std.mem.eql(u8, entry_key, key)) {
                                     const val_start = off + 2 + key_len;
-                                    const decode_result = try property_mod.decode(allocator, data[val_start..]);
+                                    // Overflow-aware: a stub resolves to the
+                                    // real value in the var store.
+                                    const value = try self.decodeMaybeOverflow(data[val_start..], allocator);
                                     cursor.unpinCurrent(false);
-                                    return decode_result.value;
+                                    return value;
                                 }
                             }
                         }
@@ -543,10 +665,10 @@ pub const PropStore = struct {
                 offset += key_len;
 
                 if (std.mem.eql(u8, entry_key, key)) {
-                    // Found it — decode the value
-                    const decode_result = try property_mod.decode(allocator, data[offset..]);
+                    // Found it — decode the value (overflow-aware).
+                    const value = try self.decodeMaybeOverflow(data[offset..], allocator);
                     cursor.unpinCurrent(false);
-                    return decode_result.value;
+                    return value;
                 }
 
                 // Not the key we want: skip value by encoded size (no heap alloc)
@@ -613,8 +735,8 @@ pub const PropStore = struct {
 
             const val_size = try encodedSizeFromBytes(blob[off..]);
             if (std.mem.eql(u8, entry_key, key)) {
-                const decode_result = try property_mod.decode(allocator, blob[off..]);
-                return decode_result.value;
+                // Overflow-aware: a stub resolves to the real value.
+                return try self.decodeMaybeOverflow(blob[off..], allocator);
             }
             off += @intCast(val_size);
         }
@@ -813,6 +935,14 @@ pub const PropStore = struct {
                     @memcpy(new_blob_buf[w..][0..entry_len], old_blob[off..][0..entry_len]);
                     w += entry_len;
                     kept += 1;
+                } else {
+                    // Property-value OVERFLOW, R11: this entry is being
+                    // REPLACED and drops out of the rebuilt blob — note its var
+                    // chain for release after the op succeeds. Entries that are
+                    // KEPT carry their stub bytes through verbatim (a relocate
+                    // or a slab→legacy migration copies them unchanged), so
+                    // their chains must NOT be touched.
+                    if (try self.entryOverflowRef(old_blob, off)) |ref| try self.recordFreedVarRef(ref);
                 }
                 off += entry_len;
             }
@@ -1007,6 +1137,10 @@ pub const PropStore = struct {
             const val_size = try encodedSizeFromBytes(blob[off + 2 + key_len ..]);
             const entry_len = 2 + @as(usize, key_len) + val_size;
             if (std.mem.eql(u8, entry_key, key)) {
+                // Property-value OVERFLOW, R11: note the outgoing entry's var
+                // chain before the blob is compacted; released only after the
+                // op succeeds.
+                if (try self.entryOverflowRef(blob, off)) |ref| try self.recordFreedVarRef(ref);
                 // GAP-ENT-0022(b): record the WAL touch BEFORE the first
                 // byte is mutated — no slab error exit after a page write.
                 try self.recordTouched(page_id);
@@ -1029,14 +1163,25 @@ pub const PropStore = struct {
         encoded_value: []const u8,
     };
 
-    /// Zero-allocation iterator over property entries in a page chain.
+    /// Iterator over property entries in a page chain.
     ///
     /// **Lifetime:** Returned `PropertyEntrySlice` values contain slices that
-    /// point directly into pinned buffer pool frames. These slices become
-    /// invalid after the next call to `next()` (which may unpin the current
-    /// frame and pin a new one) or after `deinit()` is called. Callers must
-    /// copy any key or encoded_value data they need to retain beyond the
-    /// current iteration step.
+    /// point directly into pinned buffer pool frames — or, for a property
+    /// whose value OVERFLOWED to the var store, into an iterator-owned scratch
+    /// buffer. Either way the slices become invalid after the next call to
+    /// `next()` (which may unpin the current frame, pin a new one, and reuse
+    /// the scratch buffer) or after `deinit()` is called. Callers must copy
+    /// any key or encoded_value data they need to retain beyond the current
+    /// iteration step.
+    ///
+    /// **Allocation:** the iterator is allocation-free for inline values (the
+    /// overwhelmingly common case). It allocates exactly once per OVERFLOWED
+    /// value — a single scratch buffer holding the resolved encoded bytes,
+    /// reused across entries and released by `deinit()`. That resolution is
+    /// deliberately done INSIDE `next()` so `encoded_value` is ALWAYS the real
+    /// encoded value: the property-chain / property indexes hash
+    /// `encoded_value` directly, and they must hash the same bytes the write
+    /// path hashed, not a stub.
     pub const PropIterator = struct {
         store: *PropStore,
         current_page: u64,
@@ -1051,12 +1196,42 @@ pub const PropStore = struct {
         slab_slot: u32 = 0,
         /// Absolute end offset (within the logical page) of the slab blob.
         slab_blob_end: u32 = 0,
+        /// Property-value OVERFLOW: buffer holding the encoded value resolved
+        /// from the CURRENT entry's stub. Owned by the iterator, allocated
+        /// from `store.buffer_pool.allocator`, reused per `next()` and freed
+        /// by `deinit()`. Null while no overflowed entry has been yielded.
+        scratch: ?[]u8 = null,
 
         pub fn deinit(self: *PropIterator) void {
             if (self.current_frame_idx) |idx| {
                 self.store.buffer_pool.unpin(idx, false);
                 self.current_frame_idx = null;
             }
+            if (self.scratch) |s| {
+                self.store.buffer_pool.allocator.free(s);
+                self.scratch = null;
+            }
+        }
+
+        /// Property-value OVERFLOW: turn an entry's on-page bytes into the
+        /// REAL encoded value. Inline values pass through untouched (zero
+        /// allocation); an OVERFLOW STUB is resolved by reading its var chain
+        /// into the iterator-owned scratch buffer.
+        ///
+        /// R10: the resolved chain length must match the length recorded in
+        /// the stub, else the entry and chain have diverged → DataCorruption.
+        /// The previous scratch buffer is released only AFTER the new read
+        /// succeeds, so a failed resolve cannot dangle the last yielded slice.
+        fn resolveValue(self: *PropIterator, raw: []const u8) ![]const u8 {
+            if (!property_mod.isOverflowStub(raw)) return raw;
+            const alloc = self.store.buffer_pool.allocator;
+            const stub = property_mod.readOverflowStub(raw) catch return error.DataCorruption;
+            const real = try self.store.var_store.read(stub.var_ref, alloc);
+            errdefer alloc.free(real);
+            if (real.len != stub.encoded_len) return error.DataCorruption;
+            if (self.scratch) |s| alloc.free(s);
+            self.scratch = real;
+            return real;
         }
 
         pub fn next(self: *PropIterator) anyerror!?PropertyEntrySlice {
@@ -1085,14 +1260,14 @@ pub const PropStore = struct {
                     self.current_offset += key_len;
 
                     const val_size = try encodedSizeFromBytes(data[self.current_offset..]);
-                    const encoded_val = data[self.current_offset..][0..val_size];
+                    const raw_val = data[self.current_offset..][0..val_size];
                     self.current_offset += @intCast(val_size);
 
                     self.current_index += 1;
 
                     return PropertyEntrySlice{
                         .key = entry_key,
-                        .encoded_value = encoded_val,
+                        .encoded_value = try self.resolveValue(raw_val),
                     };
                 }
 
@@ -1148,14 +1323,14 @@ pub const PropStore = struct {
                 self.current_offset += key_len;
 
                 const val_size = try encodedSizeFromBytes(data[self.current_offset..end]);
-                const encoded_val = data[self.current_offset..][0..val_size];
+                const raw_val = data[self.current_offset..][0..val_size];
                 self.current_offset += @intCast(val_size);
 
                 self.current_index += 1;
 
                 return PropertyEntrySlice{
                     .key = entry_key,
-                    .encoded_value = encoded_val,
+                    .encoded_value = try self.resolveValue(raw_val),
                 };
             }
 
@@ -1230,30 +1405,71 @@ pub const PropStore = struct {
         };
         defer if (heap_alloc) |h| self.buffer_pool.allocator.free(h);
 
-        const entry_size: u32 = 2 + @as(u32, @intCast(key.len)) + @as(u32, @intCast(encoded_val.len));
-
         // Guard: an entry that cannot fit on any single fresh property page
         // (key_len field + key bytes + encoded value + one directory slot) would
         // cause an out-of-bounds write in writePropertyEntry for both the
         // prop_head==0 fast path and the overflow-page allocation in insertEntry.
         //
         // TRUTHFUL ERROR SPLIT: the two ways to blow the per-page entry budget
-        // are NOT the same failure and must not report the same error.
-        //   * The KEY alone (key_len field + key bytes + the smallest possible
-        //     value encoding) does not fit → genuinely PropertyKeyTooLong; no
-        //     value encoding could ever rescue it.
-        //   * Otherwise the VALUE is what overflows the budget → report that
-        //     truthfully. (This branch becomes the value-overflow write path;
-        //     until then it is a clean, accurate rejection.)
+        // are NOT the same failure and must not be handled the same way.
+        //   * The KEY alone (key_len field + key bytes + the smallest entry a
+        //     value can occupy — the 13-byte OVERFLOW STUB) does not fit →
+        //     genuinely PropertyKeyTooLong; no value representation could ever
+        //     rescue it.
+        //   * Otherwise the VALUE is what overflows the budget → spill the
+        //     encoded value into a var-store chain and store a fixed-size stub
+        //     in its place. From here the insert path is UNCHANGED: it sees a
+        //     perfectly ordinary 13-byte value.
         const entry_budget = self.dataCapacity() -| DIR_ENTRY_SIZE;
-        if (entry_size > entry_budget) {
-            if (2 + key.len + MIN_ENCODED_VALUE_SIZE > entry_budget) return error.PropertyKeyTooLong;
-            return error.PropertyValueTooLarge;
+        var stub_buf: [property_mod.OVERFLOW_STUB_SIZE]u8 = undefined;
+        var entry_val: []const u8 = encoded_val;
+        if (2 + key.len + encoded_val.len > entry_budget) {
+            if (2 + key.len + property_mod.OVERFLOW_STUB_SIZE > entry_budget) return error.PropertyKeyTooLong;
+            // Overflow chains are ALWAYS legacy: `free` on a slab head
+            // tombstones a slot and arms the VarStore's single shared
+            // `last_slab_tombstone` undo record, which belongs to the label
+            // write paths (PropStore and LabelStore share one VarStore).
+            const ref = try self.var_store.writeLegacyChain(encoded_val);
+            // A failure to record would silently drop the chain from the WAL
+            // image set — release it and fail instead (unreachable in practice:
+            // an op spills at most one value).
+            self.recordTouchedVarRef(ref) catch |err| {
+                self.var_store.free(ref) catch {};
+                return err;
+            };
+            property_mod.writeOverflowStub(&stub_buf, @intCast(encoded_val.len), ref) catch unreachable;
+            entry_val = &stub_buf;
+            // NOTE: if a page mutation below fails, the chain written here is
+            // LEAKED rather than freed. That is deliberate — the same benign
+            // choice the slab→legacy migration already makes. Freeing on the
+            // way out would risk releasing a chain a partially-written entry
+            // already references; a leak is always safe, a dangling ref is not.
         }
+        const entry_size: u32 = @intCast(2 + key.len + entry_val.len);
 
+        const head = try self.placeEntry(prop_head, key, entry_val, entry_size, allow_slab);
+        // R11: free-old-LAST. Every page mutation of this op has succeeded, so
+        // the chains behind the entries it replaced are now unreachable.
+        try self.freePendingVarRefs();
+        return head;
+    }
+
+    /// Place an already-encoded entry value (inline bytes or a 13-byte overflow
+    /// stub — this path cannot tell the difference and must not care) into the
+    /// property chain, returning the possibly-new head. Extracted from
+    /// putPropertyImpl so the overflow decision above stays separate from the
+    /// unchanged slab/legacy placement strategy.
+    fn placeEntry(
+        self: *PropStore,
+        prop_head: u64,
+        key: []const u8,
+        entry_val: []const u8,
+        entry_size: u32,
+        allow_slab: bool,
+    ) !u64 {
         // GAP prop-store slab packing (P2): a slab-resident node's put goes
         // through the slab write path (in-place / relocate / legacy-migrate).
-        if (isSlabHead(prop_head)) return self.putSlabProperty(prop_head, key, encoded_val);
+        if (isSlabHead(prop_head)) return self.putSlabProperty(prop_head, key, entry_val);
 
         if (prop_head == 0) {
             // GAP prop-store slab packing (P2): pack the first property into a
@@ -1263,21 +1479,21 @@ pub const PropStore = struct {
             // node-property owners (edge chains are legacy-only — see
             // putPropertyLegacyOnly).
             if (allow_slab and self.slab_packing) {
-                if (try self.slabFirstWrite(key, encoded_val)) |head| return head;
+                if (try self.slabFirstWrite(key, entry_val)) |head| return head;
             }
-            return try self.legacyNewChain(key, encoded_val);
+            return try self.legacyNewChain(key, entry_val);
         }
 
         // Pass 1: find and remove existing key. If the key is found and
         // there is enough space on the same page, inserts immediately
         // (PERF-0021 fast path) and returns the prop_head directly.
-        if (try self.findAndRemoveKey(prop_head, key, encoded_val, entry_size)) |head| {
+        if (try self.findAndRemoveKey(prop_head, key, entry_val, entry_size)) |head| {
             return head;
         }
 
         // Pass 2: insert the new entry into the first page with space,
         // allocating an overflow page if necessary.
-        return try self.insertEntry(prop_head, key, encoded_val, entry_size);
+        return try self.insertEntry(prop_head, key, entry_val, entry_size);
     }
 
     /// Allocate and initialize a fresh LEGACY property page holding a single
@@ -1318,6 +1534,13 @@ pub const PropStore = struct {
             const data = page.data;
 
             if (try self.findEntrySpan(data, page.entry_count, key)) |span| {
+                // Property-value OVERFLOW, R11: note the OUTGOING entry's var
+                // chain while its bytes are still intact. Recording is purely
+                // in-memory — the chain is released by freePendingVarRefs only
+                // after the whole op succeeds, so if anything below fails the
+                // surviving entry still references a LIVE chain.
+                if (try self.entryOverflowRef(data, span.start)) |ref| try self.recordFreedVarRef(ref);
+
                 const removal = try self.removeEntryAt(data, page.entry_count, span);
                 const entry_count = removal.entry_count;
 
@@ -1424,6 +1647,13 @@ pub const PropStore = struct {
         self.resetTouched(); // P4: this op's dirtied pages, for the engine's WAL logging
         if (prop_head == 0) return;
 
+        try self.removePropertyImpl(prop_head, key);
+        // Property-value OVERFLOW, R11: free-old-LAST — the removal succeeded,
+        // so the chain behind a removed stub is now unreachable.
+        try self.freePendingVarRefs();
+    }
+
+    fn removePropertyImpl(self: *PropStore, prop_head: u64, key: []const u8) !void {
         // GAP prop-store slab packing (P2): slab-resident nodes shrink their
         // blob in place (removal never grows, and removeProperty cannot
         // return a new head, so the head must stay valid).
@@ -1435,6 +1665,11 @@ pub const PropStore = struct {
             const data = page.data;
 
             if (try self.findEntrySpan(data, page.entry_count, key)) |span| {
+                // Property-value OVERFLOW, R11: note the outgoing entry's var
+                // chain before its bytes are compacted away (see
+                // findAndRemoveKey); the release happens after the op succeeds.
+                if (try self.entryOverflowRef(data, span.start)) |ref| try self.recordFreedVarRef(ref);
+
                 const removal = try self.removeEntryAt(data, page.entry_count, span);
                 writeEntryCount(data, removal.entry_count);
                 rebuildDirectory(data, removal.entry_count, self.page_size);

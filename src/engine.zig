@@ -2389,6 +2389,16 @@ pub const GraphEngine = struct {
             try self.logPage(txn, .props, touched_page);
         }
 
+        // Property-value OVERFLOW: a value too large for the per-page entry
+        // budget lives in a var-store chain and the props page holds only a
+        // 13-byte stub. Image that chain in the SAME txn as the props page —
+        // otherwise crash replay restores a stub that references pages whose
+        // contents were never logged (the exact under-logging class the label
+        // logVarChain fix closed). Empty for every non-overflowing put.
+        for (self.prop_store.touchedVarRefs()) |ref| {
+            try self.logVarChain(txn, ref);
+        }
+
         if (owner != 0 and owner != new_head) {
             self.property_index.removeChain(owner);
             self.property_index_dirty = true;
@@ -2468,6 +2478,13 @@ pub const GraphEngine = struct {
         // page. A no-op remove (absent key / owner == 0) logs nothing.
         for (self.prop_store.touchedPages()) |touched_page| {
             try self.logPage(txn, .props, touched_page);
+        }
+
+        // Property-value OVERFLOW: symmetric with putPropertyTxnImpl. A remove
+        // writes no new chain, so this set is normally empty — logging it keeps
+        // the two paths identical and correct if that ever changes.
+        for (self.prop_store.touchedVarRefs()) |ref| {
+            try self.logVarChain(txn, ref);
         }
 
         try self.txn_manager.commit(txn);

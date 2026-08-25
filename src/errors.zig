@@ -40,6 +40,11 @@ pub const StorageError = error{
     /// the configured page size. Distinct from `PropertyKeyTooLong`, which is
     /// reserved for a genuinely oversized KEY.
     PropertyValueTooLarge,
+    /// One mutating property op tried to record more overflow var chains than
+    /// the fixed per-op budget allows. Unreachable by construction (an op
+    /// spills at most one value); it exists so the store fails LOUDLY rather
+    /// than ever silently dropping a chain from the WAL image set.
+    TooManyOverflowValues,
     WalRecordTooLarge,
 
     // Contract / usage (caller violated a precondition)
@@ -209,6 +214,7 @@ test "StorageError coherence guard — ad-hoc errors used by library code are de
     assertMember("WriteCountExhausted");
     assertMember("PropertyKeyTooLong");
     assertMember("PropertyValueTooLarge");
+    assertMember("TooManyOverflowValues");
     assertMember("WalRecordTooLarge");
 
     // Contract / usage
