@@ -125,6 +125,19 @@ pub const GraphConfig = struct {
     /// created stores slab-pack edge props (killing the ~8 KB-per-edge legacy
     /// page — ~111 GB on the 14.27M store). Toggle retained for rollback.
     edge_prop_slab_packing: bool = true,
+    /// Upper bound on the ENCODED size of a single property value, in bytes.
+    /// A value larger than the per-page entry budget is spilled to a var-store
+    /// overflow chain; this cap is the sanity limit on how large that spill may
+    /// get. Exceeding it fails the put with `error.PropertyValueTooLarge`
+    /// BEFORE anything is written.
+    ///
+    /// SEC (DoS): an overflowed value is WAL-imaged page by page and buffered
+    /// in memory while it is encoded, read back and hashed for the property
+    /// index. Without a cap, one caller-supplied value could dictate an
+    /// unbounded WAL record volume and per-op memory footprint. 1 MiB
+    /// comfortably holds the workloads this feature targets (a 4096-dim f32
+    /// embedding is 16 KB) while keeping both bounded. Raise it deliberately.
+    max_property_value_bytes: u32 = 1024 * 1024,
     log_fn: ?*const fn (level: LogLevel, msg: []const u8) void = null,
     /// Policy for handling legacy (V1) graph formats during recovery.
     legacy_policy: LegacyPolicy = .reject,
@@ -191,6 +204,7 @@ test "default config values" {
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), cfg.checkpoint_byte_threshold);
     try std.testing.expectEqual(@as(u64, 60_000), cfg.checkpoint_time_threshold_ms);
     try std.testing.expectEqual(@as(?[32]u8, null), cfg.encryption_key);
+    try std.testing.expectEqual(@as(u32, 1024 * 1024), cfg.max_property_value_bytes);
     try std.testing.expectEqualStrings("data", cfg.data_dir);
     try std.testing.expectEqual(@as(?*const fn (level: LogLevel, msg: []const u8) void, null), cfg.log_fn);
 }

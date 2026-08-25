@@ -252,6 +252,19 @@ pub const PropStore = struct {
     /// writer).
     slab_packing: bool = true,
 
+    /// Property-value OVERFLOW: sanity cap on the ENCODED size of a single
+    /// property value (`GraphConfig.max_property_value_bytes`). A value above
+    /// the per-page entry budget spills to a var-store chain; a value above
+    /// THIS bound is refused outright with `error.PropertyValueTooLarge`,
+    /// before anything is written.
+    ///
+    /// SEC (DoS): the spill is WAL-imaged page by page and buffered in memory
+    /// while it is encoded, read back and hashed for the property index —
+    /// without a cap a single caller-supplied value dictates unbounded WAL
+    /// volume and per-op memory. Defaulted here (not just at the engine) so a
+    /// directly constructed PropStore is bounded too.
+    max_property_value_bytes: u32 = 1024 * 1024,
+
     /// The shared "current fill page" that new slab blobs append to.
     /// In-memory only: after a reopen the first slab write simply starts a
     /// fresh fill page (a partially-filled predecessor keeps its data and is
@@ -1425,6 +1438,9 @@ pub const PropStore = struct {
         var entry_val: []const u8 = encoded_val;
         if (2 + key.len + encoded_val.len > entry_budget) {
             if (2 + key.len + property_mod.OVERFLOW_STUB_SIZE > entry_budget) return error.PropertyKeyTooLong;
+            // Sanity cap FIRST: refuse an unbounded spill before a single
+            // page is allocated or a single WAL byte is owed (SEC / DoS).
+            if (encoded_val.len > self.max_property_value_bytes) return error.PropertyValueTooLarge;
             // Overflow chains are ALWAYS legacy: `free` on a slab head
             // tombstones a slot and arms the VarStore's single shared
             // `last_slab_tombstone` undo record, which belongs to the label

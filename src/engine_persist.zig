@@ -296,6 +296,10 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     // directory (which grows backward from the page end) never collides with
     // the tag — otherwise dir_count is overwritten by tag bytes and the page
     // fails to read back after a restart (integer-overflow panic).
+    // Property-value OVERFLOW: the configured sanity cap on a single property
+    // value's encoded size (bounds WAL volume and per-op memory — see
+    // GraphConfig.max_property_value_bytes).
+    self.prop_store.max_property_value_bytes = cfg.max_property_value_bytes;
     self.prop_store.tail_reserve = if (cfg.encryption_key != null)
         @import("encryption.zig").TAG_SIZE
     else
