@@ -222,6 +222,40 @@ The constant is sourced from `src/prop_store.zig` (`PropStore.tail_reserve`).
 | 2      | key_len | `key`       | [N]u8  | Property key name (UTF-8)    |
 | 2+N    | varies  | `value`     | bytes  | Encoded property value (see Section 4) |
 
+**Value overflow (tag 7).** An entry must fit within a single page's entry
+budget (`page_size - PROP_DATA_OFFSET - dir_count footer - one directory
+entry - tail_reserve`). When the encoded value alone pushes the entry past
+that budget, the value is written to a **legacy var-store page chain** and the
+entry's `value` field holds a fixed **13-byte overflow stub** instead:
+
+| Offset | Size | Field         | Type   | Description                                    |
+|--------|------|---------------|--------|------------------------------------------------|
+| 0      | 1    | `tag`         | u8     | `7` (`Tag.overflow`)                            |
+| 1      | 4    | `encoded_len` | u32 LE | Length of the ORIGINAL encoded value            |
+| 5      | 8    | `var_ref`     | u64 LE | Var-store ref (`first_page << 16`) of the chain |
+
+Notes:
+
+- The stub is **fixed size**, so every entry-walking routine skips exactly 13
+  bytes; the value's true length never affects on-page layout.
+- The overflow chain is always the **legacy** var-store layout, never a slab
+  run (a slab head could not be freed without tombstoning a slot in a block
+  shared with the label store).
+- `encoded_len` is deliberately redundant with the chain. Readers cross-check
+  the resolved chain length against it and report `DataCorruption` on any
+  mismatch rather than decoding a plausible wrong value.
+- The stub is resolved by the prop-store read path (`getProperty`,
+  `getSlabProperty`, and both `PropIterator` paths) **before** decoding, so a
+  decoder never observes tag 7. Property indexes therefore hash the real
+  encoded value, identically to an inline one.
+- A single value's encoded size is capped by
+  `GraphConfig.max_property_value_bytes` (1 MiB default); larger values are
+  rejected with `PropertyValueTooLarge`.
+- Overflow entries are written into slab-packed blobs as readily as legacy
+  chain pages; the 13-byte stub is just an ordinary value to the placement
+  logic, and a slab→legacy migration copies it verbatim (the chain is
+  untouched and the ref stays valid).
+
 ### 3.5.3 Per-Page Key Directory (PERF-0023)
 
 The key directory is an optimization structure stored at the end of each
@@ -281,6 +315,27 @@ encoding are **little-endian**.
 | 4     | `string`  | Variable-length UTF-8 string|
 | 5     | `decimal` | Fixed-point decimal         |
 | 6     | `ext`     | Extension / opaque binary   |
+| 7     | `overflow`| Overflow stub — the value lives in a var-store chain (see Section 3.5.2) |
+
+Tag 7 is **not a `PropertyValue` variant**: it never appears in an encoded
+value, only in a property *entry* whose value was spilled. Both decoders
+(`decode`, `decodeView`) reject it with `UnresolvedOverflowValue`, because
+reaching a decoder with an unresolved stub means the prop-store read path was
+bypassed.
+
+**Compatibility.** Tag 7 is a pure format ADDITION:
+
+- A store that never writes an oversized value contains no tag-7 entry and is
+  **byte-identical** to the pre-overflow layout. Such stores open unchanged on
+  any reader, old or new.
+- There is **no manifest/format-version bump** (`format_version` stays 4) — the
+  same precedent as GAP-0060's wide adjacency entries: readers discriminate on
+  the data itself, and a store only contains the new shape if it was written
+  with the new feature.
+- A reader built before tag 7 existed refuses it cleanly: the byte is not a
+  member of its `Tag` enum, so `decode`/`decodeView`/`encodedSizeFromBytes`
+  return `InvalidFormat` / `InvalidData`. It is a loud refusal at the single
+  affected property, never a misparse or an out-of-bounds read.
 
 ### 4.2 Encoding Formats
 
