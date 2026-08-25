@@ -343,6 +343,20 @@ pub const VarStore = struct {
             if (try self.appendSlabRun(data)) |head| return head;
         }
 
+        return self.writeLegacyChain(data);
+    }
+
+    /// Write variable-length data as a LEGACY `first_page << 16` page chain,
+    /// bypassing slab packing entirely. Returns the chain ref.
+    ///
+    /// Callers that must be able to `free` the result WITHOUT disturbing the
+    /// store's shared `last_slab_tombstone` undo slot use this entry point
+    /// instead of `write`: `free` on a slab head tombstones a slot and ARMS
+    /// that single per-store undo record, and PropStore shares one VarStore
+    /// with LabelStore (see engine_persist.zig) — a prop-store free could
+    /// otherwise overwrite / consume a label op's pending undo. A legacy chain
+    /// frees by releasing its own pages and never touches the undo slot.
+    pub fn writeLegacyChain(self: *VarStore, data: []const u8) !u64 {
         const cap = self.dataCapacity();
         var remaining = data;
         var first_page: PageId = 0;
@@ -1059,6 +1073,40 @@ test "P2: free() slot-tombstones a slab run; sibling slots stay live and readabl
         defer testing.allocator.free(c);
         try testing.expectEqualStrings("gamma payload", c);
     }
+}
+
+test "writeLegacyChain: bypasses slab packing and frees without arming the shared undo slot" {
+    var env = try SingleStoreEnv.init(testing.allocator, .var_store, "var.store", 4096, 32);
+    env.register();
+    defer env.deinit();
+    var store = VarStore.init(&env.pool, &env.fsm, 4096);
+    store.slab_packing = true;
+
+    // A run small enough that `write` WOULD slab-pack it.
+    const small = "tiny run";
+    try testing.expect(isSlabHead(try store.write(small)));
+
+    // writeLegacyChain always produces a legacy `first_page << 16` ref…
+    const legacy_ref = try store.writeLegacyChain(small);
+    try testing.expect(!isSlabHead(legacy_ref));
+    {
+        const back = try store.read(legacy_ref, testing.allocator);
+        defer testing.allocator.free(back);
+        try testing.expectEqualStrings(small, back);
+    }
+
+    // …and freeing it must NOT touch the per-store slab undo slot, which the
+    // label path relies on being exclusively its own (PropStore and
+    // LabelStore share one VarStore).
+    const runs = [_][]const u8{ "keep-me", "armed" };
+    const page = try writeRawSlabVarBlock(&store, &runs);
+    store.resetSlabUndo();
+    try store.free(encodeSlabHead(page, 1)); // arms the undo record
+    try store.free(legacy_ref); // must leave that record intact
+    try store.undoLastSlabTombstone();
+    const revived = try store.read(encodeSlabHead(page, 1), testing.allocator);
+    defer testing.allocator.free(revived);
+    try testing.expectEqualStrings("armed", revived);
 }
 
 test "P2: undoLastSlabTombstone revives the slot the current op tombstoned" {
