@@ -1,6 +1,6 @@
 .{
     .name = .graph_storage,
-    .version = "0.4.0",
+    .version = "0.4.2",
     .fingerprint = 0x713d4f134b894cf5,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
@@ -9,12 +9,12 @@
             // human-readable `ref` tag (v0.1.5) may trail the version declared
             // by the upstream build.zig.zon at that commit (wal-0.1.4); the
             // label mismatch originates upstream and is expected.
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#v0.1.12",
-            .hash = "wal-0.1.12-EqPqpmVXBQBXfTTDLspnODMxihbhEg744Xlwd2JhR9Lx",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.14#9c860b83006bebaade1295561ca1742643b48fb3",
+            .hash = "wal-0.1.14-EqPqpr9XBQDur-fOz7R4BTMK6Dtb-FwyFECADRFdJUdV",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.6#f92bce89fcff2c96b3a0c101dd1281caa049d415",
-            .hash = "uuid-0.1.6-tL1irqfjHABYd5_hiee3UxxRXTSPPh-0fbtMdHAs8tZ6",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.7#c23fb4e8d923a06cc5d94e563c0ae85fb3f87782",
+            .hash = "uuid-0.1.7-tL1irlHkHAAKEQXWa1gN8GmQB6TTnmdjNGPG2cS1GKPe",
         },
         .thread_pool = .{
             .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.7#54a2ddda1a356c32ba2e4df70691459570fb6339",
@@ -25,8 +25,8 @@
             // human-readable `ref` tag (v0.1.8) may trail the version declared
             // by the upstream build.zig.zon at that commit (otel-0.1.7); the
             // label mismatch originates upstream and is expected.
-            .url = "git+https://gitlab.com/devnw/zig/otel.git#v0.1.17",
-            .hash = "otel-0.1.17-B0v3lvT2NQAYURxdLxS-8cMcAqL8Qfniddlwq1ai86G7",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.19#d928525c34a4b50c9536b064e601ee45760cbabd",
+            .hash = "otel-0.1.19-B0v3liP3NQDyqyLnDV_6rFYepKA7MNgekcHFstany4dq",
             .lazy = true,
         },
     },
