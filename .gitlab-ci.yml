@@ -245,3 +245,14 @@ zig-format:
     key: zig-${ZIG_VERSION}
     paths:
       - .zig-cache/
+
+# Disable merge_request_event pipelines. Jobs without rules never run in MR
+# pipelines, so the few MR-ruled jobs fail on `needs:` of jobs that are not
+# there ("error on the CI/CD configuration file"), and that failed MR pipeline
+# becomes the head pipeline that blocks auto-merge. Branch pipelines carry the
+# real jobs; evaluate those. (Same fix as devnw/zig/uuid fc0d25fd.)
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: always
