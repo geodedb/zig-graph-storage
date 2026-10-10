@@ -15,24 +15,27 @@
 default:
   tags:
     - company
+    # The group's Windows runner also carries the `company` tag and was
+    # picking up Linux shell jobs; require a Linux runner.
+    - linux
 
 include:
   # Security scanning
-  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.54.0
-  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.54.0
-  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.54.0
-  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.54.0
+  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.8
 
   # Code quality
-  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.54.0
+  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.8
 
   # SBOM
-  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.54.0
-  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.54.0
+  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.8
 
   # Release
-  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.54.0
-  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.54.0
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
+  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.8
 
 variables:
   ZIG_VERSION: "0.16.0"
@@ -242,3 +245,14 @@ zig-format:
     key: zig-${ZIG_VERSION}
     paths:
       - .zig-cache/
+
+# Disable merge_request_event pipelines. Jobs without rules never run in MR
+# pipelines, so the few MR-ruled jobs fail on `needs:` of jobs that are not
+# there ("error on the CI/CD configuration file"), and that failed MR pipeline
+# becomes the head pipeline that blocks auto-merge. Branch pipelines carry the
+# real jobs; evaluate those. (Same fix as devnw/zig/uuid fc0d25fd.)
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: always
