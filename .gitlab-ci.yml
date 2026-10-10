@@ -15,6 +15,9 @@
 default:
   tags:
     - company
+    # The group's Windows runner also carries the `company` tag and was
+    # picking up Linux shell jobs; require a Linux runner.
+    - linux
 
 include:
   # Security scanning
