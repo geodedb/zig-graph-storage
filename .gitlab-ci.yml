@@ -55,7 +55,11 @@ stages:
 .install-zig: &install-zig
   - apt-get update && apt-get install -y curl xz-utils python3
   - |
-    if [ ! -f "zig-${ZIG_VERSION}/zig" ]; then
+    # Reuse a cached/artifact Zig only if it runs on this runner: jobs land on
+    # both x86_64 and aarch64 runners, so a binary from another job can be the
+    # wrong architecture ("cannot execute binary file: Exec format error").
+    if ! "./zig-${ZIG_VERSION}/zig" version >/dev/null 2>&1; then
+      rm -rf "zig-${ZIG_VERSION}"
       ARCH=$(uname -m)
       case "$ARCH" in
         x86_64)  ZIG_ARCH="x86_64" ;;
@@ -98,8 +102,9 @@ stages:
     # Zig fetches git+https:// dependencies in `zig build`; the slim image has
     # no CA bundle, so TLS handshake fails with TlsInitializationFailed.
     - apt-get update && apt-get install -y --no-install-recommends ca-certificates git
-    - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
-    - zig version
+    # The prepare-zig artifact may come from a runner of another architecture;
+    # install-zig keeps it when it runs here and re-downloads it otherwise.
+    - *install-zig
   cache:
     key: zig-${ZIG_VERSION}
     paths:
@@ -239,8 +244,7 @@ zig-format:
     - job: prepare-zig
       artifacts: true
   before_script:
-    - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
-    - zig version
+    - *install-zig
   cache:
     key: zig-${ZIG_VERSION}
     paths:
