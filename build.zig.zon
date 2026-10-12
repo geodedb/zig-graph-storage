@@ -1,6 +1,6 @@
 .{
     .name = .graph_storage,
-    .version = "0.4.7",
+    .version = "0.4.8",
     .fingerprint = 0x713d4f134b894cf5,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
@@ -9,8 +9,8 @@
             // human-readable `ref` tag (v0.1.5) may trail the version declared
             // by the upstream build.zig.zon at that commit (wal-0.1.4); the
             // label mismatch originates upstream and is expected.
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.20#a9fd381da111a0eed167b2b43a9c8c59bc6e7f75",
-            .hash = "wal-0.1.20-EqPqpgQ1BwD2vdptMa-kOC-izrAfKygkfl51Os3_9llU",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.21#ee11bfdb2e08817212ba13c808d508851533a733",
+            .hash = "wal-0.1.21-EqPqpgQ1BwCKBWBmzTZIV-44XIQ4Po8x07TPda_1pU40",
         },
         .uuid = .{
             .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.9#88374241b83ced6c6ec8996b8e5529ee0573bbc5",
@@ -25,8 +25,8 @@
             // human-readable `ref` tag (v0.1.8) may trail the version declared
             // by the upstream build.zig.zon at that commit (otel-0.1.7); the
             // label mismatch originates upstream and is expected.
-            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.26#36b56fa3cce4161b8c3db60b16ca986234f0cfd5",
-            .hash = "otel-0.1.26-B0v3ltusNQDirCpbgd4p9Pjotmhyr1lL54hcsVrYwKtj",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.27#027fd8cb4799378dca301f1c51ba8b06e73e109c",
+            .hash = "otel-0.1.27-B0v3lj-uNQChk7EkatR41wvCa5jN2Vg9GOPaCotOR1Ne",
             .lazy = true,
         },
     },
