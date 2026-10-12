@@ -67,7 +67,7 @@ fn expectEdgePropInt(eng: *GraphEngine, alloc: Allocator, from: u64, edge_id: u6
 
 /// Find the in-direction entry for `public_id` in the sink's co-located
 /// in-adjacency and return its prop_head.
-fn inChainPropHead(eng: *GraphEngine, sink: u64, public_id: u64) !u32 {
+fn inChainPropHead(eng: *GraphEngine, sink: u64, public_id: u64) !u64 {
     var it = try eng.expandInRemoteIter(sink, null);
     defer it.deinit();
     while (try it.next()) |e| {

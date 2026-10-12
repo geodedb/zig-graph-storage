@@ -538,8 +538,11 @@ test "I1: foreign-residue ids in a legacy replayed image never poison a shard's 
             .prop_head = 0,
             .public_id = 0,
         };
-        @memcpy(adj_img[entries_off..][0..32], std.mem.asBytes(&e_own));
-        @memcpy(adj_img[entries_off + 32 ..][0..32], std.mem.asBytes(&e_foreign));
+        // EdgeEntry is the in-memory form (prop_head widened to u64), not the
+        // wire record: serialize through encodeEntry, as the engine does.
+        const v2 = gs.edge.ENTRY_SIZE_V2;
+        gs.edge.encodeEntry(adj_img[entries_off..][0..v2], e_own, gs.edge.ENTRY_FORMAT_V2);
+        gs.edge.encodeEntry(adj_img[entries_off + v2 ..][0..v2], e_foreign, gs.edge.ENTRY_FORMAT_V2);
 
         // Crafted `.nodes` page image: slot 0 (id 8400, in-class) and slot 7
         // (id 8407, foreign) non-empty (any nonzero byte in the 48-byte rec).
@@ -757,7 +760,7 @@ test "adjacency slab: an edge id living ONLY in a replayed slab-block image is h
             .prop_head = 0,
             .public_id = 0,
         };
-        @memcpy(img[run0..][0..esz], std.mem.asBytes(&e_own));
+        gs.edge.encodeEntry(img[run0..][0..esz], e_own, gs.edge.ENTRY_FORMAT_SLAB);
         gs.edge.writeSlabSlot(img, 0, 0, .{ .offset = run0, .entry_count = 1 });
         // Slot 1: higher foreign-residue id — the residue guard must skip it.
         const run1: u32 = run0 + esz;
@@ -768,7 +771,7 @@ test "adjacency slab: an edge id living ONLY in a replayed slab-block image is h
             .prop_head = 0,
             .public_id = 0,
         };
-        @memcpy(img[run1..][0..esz], std.mem.asBytes(&e_foreign));
+        gs.edge.encodeEntry(img[run1..][0..esz], e_foreign, gs.edge.ENTRY_FORMAT_SLAB);
         gs.edge.writeSlabSlot(img, 0, 1, .{ .offset = run1, .entry_count = 1 });
         // Slot 2: tombstone.
         gs.edge.writeSlabSlot(img, 0, 2, .{ .offset = gs.edge.SLAB_SLOT_TOMBSTONE, .entry_count = 0 });

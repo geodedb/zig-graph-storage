@@ -18,24 +18,44 @@ default:
     # The group's Windows runner also carries the `company` tag and was
     # picking up Linux shell jobs; require a Linux runner.
     - linux
+    - x86
 
 include:
   # Security scanning
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # Code quality
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # SBOM
   - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # Release
   - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
+      release_auth: job_token
   - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
 variables:
   ZIG_VERSION: "0.16.0"
@@ -55,7 +75,11 @@ stages:
 .install-zig: &install-zig
   - apt-get update && apt-get install -y curl xz-utils python3
   - |
-    if [ ! -f "zig-${ZIG_VERSION}/zig" ]; then
+    # Reuse a cached/artifact Zig only if it runs on this runner: jobs land on
+    # both x86_64 and aarch64 runners, so a binary from another job can be the
+    # wrong architecture ("cannot execute binary file: Exec format error").
+    if ! "./zig-${ZIG_VERSION}/zig" version >/dev/null 2>&1; then
+      rm -rf "zig-${ZIG_VERSION}"
       ARCH=$(uname -m)
       case "$ARCH" in
         x86_64)  ZIG_ARCH="x86_64" ;;
@@ -98,8 +122,9 @@ stages:
     # Zig fetches git+https:// dependencies in `zig build`; the slim image has
     # no CA bundle, so TLS handshake fails with TlsInitializationFailed.
     - apt-get update && apt-get install -y --no-install-recommends ca-certificates git
-    - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
-    - zig version
+    # The prepare-zig artifact may come from a runner of another architecture;
+    # install-zig keeps it when it runs here and re-downloads it otherwise.
+    - *install-zig
   cache:
     key: zig-${ZIG_VERSION}
     paths:
@@ -239,8 +264,7 @@ zig-format:
     - job: prepare-zig
       artifacts: true
   before_script:
-    - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
-    - zig version
+    - *install-zig
   cache:
     key: zig-${ZIG_VERSION}
     paths:
@@ -256,3 +280,25 @@ workflow:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       when: never
     - when: always
+
+# SONNY-4778: tools must not redirect Git operations into this worktree.
+hook-env-regression:
+  stage: lint
+  image: python:3.14-slim-bookworm
+  tags: [company, linux, x86]
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends git
+  script:
+    - python3 scripts/test_hook_env.py
+
+# SONNY-4848: verify the filtered package, including crash-replay regressions.
+test-source-package:
+  <<: *zig-job
+  stage: test
+  needs:
+    - job: prepare-zig
+      artifacts: true
+    - build
+  script:
+    - python3 scripts/check_source_package.py --jobs 2
+  allow_failure: false

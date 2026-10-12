@@ -1,6 +1,6 @@
 .{
     .name = .graph_storage,
-    .version = "0.4.6",
+    .version = "0.4.7",
     .fingerprint = 0x713d4f134b894cf5,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
@@ -9,24 +9,24 @@
             // human-readable `ref` tag (v0.1.5) may trail the version declared
             // by the upstream build.zig.zon at that commit (wal-0.1.4); the
             // label mismatch originates upstream and is expected.
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.18#a285a2aaf8f784f57d39f2f70d587acf4130faf8",
-            .hash = "wal-0.1.18-EqPqpr9XBQBR58RXcQnEidRKadJIvHhXg-crePwAqzxW",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.20#a9fd381da111a0eed167b2b43a9c8c59bc6e7f75",
+            .hash = "wal-0.1.20-EqPqpgQ1BwD2vdptMa-kOC-izrAfKygkfl51Os3_9llU",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.7#c23fb4e8d923a06cc5d94e563c0ae85fb3f87782",
-            .hash = "uuid-0.1.7-tL1irlHkHAAKEQXWa1gN8GmQB6TTnmdjNGPG2cS1GKPe",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.9#88374241b83ced6c6ec8996b8e5529ee0573bbc5",
+            .hash = "uuid-0.1.9-tL1irrHrHABbxhdPA7uz_Qk5mAXaS6QoDVEKL-mK9twq",
         },
         .thread_pool = .{
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.7#54a2ddda1a356c32ba2e4df70691459570fb6339",
-            .hash = "thread_pool-0.2.7-11B1BvRneQBnMkDnRbKd76THvZn4ZhDhmlWQw-aziWQm",
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.9#1d7275da020a43588c4f1885f7f725d5e8ce079e",
+            .hash = "thread_pool-0.2.9-11B1Bqf7eQDfHhrQAkHk0e2ABigRBFNkFEAmc8t9raZe",
         },
         .otel = .{
             // The content hash + commit SHA are the authoritative pin. The
             // human-readable `ref` tag (v0.1.8) may trail the version declared
             // by the upstream build.zig.zon at that commit (otel-0.1.7); the
             // label mismatch originates upstream and is expected.
-            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.24#2e5e5e4609c8f452c75846c91a59de76417e85f4",
-            .hash = "otel-0.1.24-B0v3liX3NQBKK7oqRuCRfgu0FIwR6nNQOGpIjs8YoCrY",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.26#36b56fa3cce4161b8c3db60b16ca986234f0cfd5",
+            .hash = "otel-0.1.26-B0v3ltusNQDirCpbgd4p9Pjotmhyr1lL54hcsVrYwKtj",
             .lazy = true,
         },
     },
@@ -34,6 +34,9 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "tests",
+        "examples",
+        "benchmarks",
         "LICENSE",
         "README.md",
     },
