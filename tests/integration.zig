@@ -53,7 +53,7 @@ fn makeNode(label: u32) NodeRec {
 // ============================================================================
 
 test "integration: version is defined" {
-    try std.testing.expectEqualStrings("0.4.9", lib.version);
+    try std.testing.expectEqualStrings("0.4.10", lib.version);
 }
 
 test "integration: full lifecycle — create graph, add data, checkpoint, close, reopen, verify" {
