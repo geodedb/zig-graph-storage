@@ -79,6 +79,15 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
         // is WAL-imaged under the spanning txn.
         if (try engine.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head)) |p| {
             try engine.logPagePublic(txn, .adj_out, p);
+            // Also image `from`'s (unchanged) node page, exactly as removeEdge
+            // does: it puts `from` in recovery's tail-affected NODE set, which
+            // is what the first-access tail reconcile scans to re-derive the
+            // node's out-edges. The adj_out page alone has no back-pointer to
+            // its owner, and a slab-packed props page only refreshes the
+            // property chain — so without this a crash after a committed
+            // setEdgeProperty reloads the edge_index snapshot with the OLD
+            // prop_head and the property is unreachable.
+            try engine.logPagePublic(txn, .nodes, from / engine.node_store.nodes_per_page);
         }
         const in_head = try engine.in_head_dir.getHead(to);
         if (try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head)) |p| {
