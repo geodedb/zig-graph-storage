@@ -519,6 +519,8 @@ test "C1: mid-session full checkpoint; live base keeps serving reads (multi-bloc
 const BENCH_N: usize = 1_000_000;
 const LEGACY_MAGIC = "GSEIDX3\x00";
 const Crc32 = std.hash.crc.Crc32Iscsi;
+/// Current edge-index record size (GAP-0060 widened prop_head to u64: 44 B).
+const REC = edge_index_map.RECORD_SIZE;
 
 fn benchEntry(i: usize) edge_index_map.EdgeIndexEntry {
     return .{
@@ -537,15 +539,15 @@ test "BENCH 1M-edge snapshot load: legacy read+build vs mmap-adopt" {
     const a = testing.allocator;
 
     // --- Write the LEGACY (GSEIDX3-style) container: magic | counter |
-    // count | 40 B records | whole-file CRC32.
+    // count | REC-byte records | whole-file CRC32.
     {
-        var buf = try a.alloc(u8, 24 + BENCH_N * 40 + 4);
+        var buf = try a.alloc(u8, 24 + BENCH_N * REC + 4);
         defer a.free(buf);
         @memcpy(buf[0..8], LEGACY_MAGIC);
         std.mem.writeInt(u64, buf[8..16], 42, .little);
         std.mem.writeInt(u64, buf[16..24], BENCH_N, .little);
         for (0..BENCH_N) |i| {
-            const rec = buf[24 + i * 40 ..][0..40];
+            const rec = buf[24 + i * REC ..][0..REC];
             edge_index_map.encodeRecord(rec, @as(u64, i) + 1, benchEntry(i));
         }
         const crc = Crc32.hash(buf[0 .. buf.len - 4]);
@@ -558,14 +560,14 @@ test "BENCH 1M-edge snapshot load: legacy read+build vs mmap-adopt" {
 
     // --- Write the NEW sorted container (records already id-sorted).
     {
-        const payload = try a.alloc(u8, BENCH_N * 40);
+        const payload = try a.alloc(u8, BENCH_N * REC);
         defer a.free(payload);
         for (0..BENCH_N) |i| {
-            edge_index_map.encodeRecord(payload[i * 40 ..][0..40], @as(u64, i) + 1, benchEntry(i));
+            edge_index_map.encodeRecord(payload[i * REC ..][0..REC], @as(u64, i) + 1, benchEntry(i));
         }
         const f = try tmp.dir.createFile(io, "sorted.idx", .{ .read = true });
         defer f.close(io);
-        try sorted.write(a, f, "GSEIDX4\x00", 42, 0, 40, payload);
+        try sorted.write(a, f, "GSEIDX4\x00", 42, 0, REC, payload);
     }
 
     // --- Legacy path: read whole file, CRC-verify, build the hashmap.
@@ -584,13 +586,13 @@ test "BENCH 1M-edge snapshot load: legacy read+build vs mmap-adopt" {
         defer map.deinit();
         try map.ensureTotalCapacity(@intCast(BENCH_N));
         for (0..BENCH_N) |i| {
-            const rec = data[24 + i * 40 ..];
+            const rec = data[24 + i * REC ..];
             map.putAssumeCapacity(std.mem.readInt(u64, rec[0..8], .little), .{
                 .from = std.mem.readInt(u64, rec[8..16], .little),
                 .neighbor = std.mem.readInt(u64, rec[16..24], .little),
                 .rel_type = std.mem.readInt(u32, rec[24..28], .little),
-                .prop_head = std.mem.readInt(u32, rec[28..32], .little),
-                .public_id = std.mem.readInt(u64, rec[32..40], .little),
+                .prop_head = std.mem.readInt(u64, rec[28..36], .little),
+                .public_id = std.mem.readInt(u64, rec[36..44], .little),
             });
         }
         legacy_ns = @intCast(nowNs() - t0);
@@ -606,7 +608,7 @@ test "BENCH 1M-edge snapshot load: legacy read+build vs mmap-adopt" {
         var m = edge_index_map.EdgeIndexMap.init(a);
         defer m.deinit();
         const t0 = nowNs();
-        try m.adoptBase((try sorted.load(a, &f, "GSEIDX4\x00", 40)).?);
+        try m.adoptBase((try sorted.load(a, &f, "GSEIDX4\x00", REC)).?);
         adopt_ns = @intCast(nowNs() - t0);
         try testing.expectEqual(BENCH_N, m.count());
 
@@ -622,13 +624,14 @@ test "BENCH 1M-edge snapshot load: legacy read+build vs mmap-adopt" {
     }
 
     std.debug.print(
-        "\nBENCH 1M-edge snapshot load (40 B records, {d} MiB payload):\n" ++
+        "\nBENCH 1M-edge snapshot load ({d} B records, {d} MiB payload):\n" ++
             "  legacy  (read whole file + CRC + hashmap build): {d:.2} ms\n" ++
             "  mmap    (adopt: mmap + header/dir verify)      : {d:.3} ms\n" ++
             "  mmap    (1000 random binary-search lookups)    : {d:.3} ms total\n" ++
             "  adopt speedup vs legacy: {d:.0}x\n",
         .{
-            BENCH_N * 40 / (1024 * 1024),
+            REC,
+            BENCH_N * REC / (1024 * 1024),
             @as(f64, @floatFromInt(legacy_ns)) / 1e6,
             @as(f64, @floatFromInt(adopt_ns)) / 1e6,
             @as(f64, @floatFromInt(lookups_ns)) / 1e6,
