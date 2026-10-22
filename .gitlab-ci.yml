@@ -19,7 +19,7 @@ default:
     # The group's Windows runner also carries the `company` tag and was
     # picking up Linux shell jobs; require a Linux runner.
     - linux
-    # Inherited GitLab SAST images are AMD64-only; avoid ARM fleet runners.
+    # Keep these jobs on Linux AMD64 runners.
     - amd64
 
 include:
