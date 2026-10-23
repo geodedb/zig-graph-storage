@@ -771,7 +771,7 @@ fn archiveLayoutFromFileSize(file_size: usize, version: u16) !ArchiveLayout {
     };
 }
 
-fn ensureDirectoryMode(path: []const u8, mode: u32) !void {
+fn ensureDirectoryMode(path: []const u8, mode: std.posix.mode_t) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.Io.Dir.cwd().createDirPath(io, path);
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
