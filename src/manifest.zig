@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const scoped_file = @import("scoped_file.zig");
 const Allocator = std.mem.Allocator;
 // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
 // for on-disk format; not authentication.
@@ -411,7 +412,7 @@ pub const Manifest = struct {
         // graph directory via a crafted path.  exclusive is omitted because a
         // previous crashed write may have left a stale .tmp file behind that
         // is legitimately safe to overwrite on the retry path.
-        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
+        const tmp_file = try scoped_file.create(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
             .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
             .resolve_beneath = true,
         });

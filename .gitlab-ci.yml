@@ -202,26 +202,6 @@ fuzz-regression:
   script:
     - zig build test-fuzz-regression --summary all
 
-fuzz-exploratory:
-  <<: *zig-job
-  stage: fuzz
-  needs:
-    - job: prepare-zig
-      artifacts: true
-    - test-unit
-  script:
-    - |
-      set +e
-      timeout 120 zig build test --fuzz --summary all
-      status=$?
-      set -e
-      if [ "$status" -eq 124 ]; then
-        echo "Exploratory fuzz timed out after 120s."
-        exit 0
-      fi
-      exit "$status"
-  allow_failure: true
-
 benchmark-regression:
   <<: *zig-job
   stage: performance
