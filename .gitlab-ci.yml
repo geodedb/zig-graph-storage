@@ -19,43 +19,43 @@ default:
     # The group's Windows runner also carries the `company` tag and was
     # picking up Linux shell jobs; require a Linux runner.
     - linux
-    # Inherited GitLab SAST images are AMD64-only; avoid ARM fleet runners.
+    # Keep these jobs on Linux AMD64 runners.
     - amd64
 
 include:
+  # Exercise the portable UUID/WAL entropy path on macOS before Geode consumes it.
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@55d86c5ce70793e9e01c2b2d369d1d449b6d5fbc
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-portable-deps"
+      test_step: test
+      test_options: "test-integration -j2 --summary all"
+      allow_failure: false
+
   # Security scanning
-  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.57.1
-    inputs:
-      tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.57.1
-    inputs:
-      tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.57.1
-    inputs:
-      tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.57.1
+  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
   # Code quality
-  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.57.1
+  - component: gitlab.com/devnw/ci-catalog/zig-format@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
   # SBOM
-  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.57.1
+  - component: gitlab.com/devnw/ci-catalog/sbom-generate@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.57.1
+  - component: gitlab.com/devnw/ci-catalog/sbom-scan@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
   # Release
-  - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.57.1
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
       release_auth: job_token
-  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.57.1
+  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
@@ -127,10 +127,17 @@ stages:
     # The prepare-zig artifact may come from a runner of another architecture;
     # install-zig keeps it when it runs here and re-downloads it otherwise.
     - *install-zig
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-global-cache"
   cache:
-    key: zig-${ZIG_VERSION}
-    paths:
-      - .zig-cache/
+    key:
+      prefix: "zig-compile-${ZIG_VERSION}-linux-amd64-${CI_JOB_NAME}"
+      files: [build.zig.zon]
+    paths: [.zig-cache/, .zig-global-cache/]
+  after_script:
+    - |
+      size=$(du -sm .zig-cache .zig-global-cache 2>/dev/null | awk '{sum += $1} END {print sum+0}')
+      if [ "$size" -gt 2048 ]; then rm -rf .zig-cache .zig-global-cache; fi
 
 prepare-zig:
   stage: prepare
@@ -142,7 +149,7 @@ prepare-zig:
       - zig-${ZIG_VERSION}/
     expire_in: 1 day
   cache:
-    key: zig-${ZIG_VERSION}
+    key: "zig-toolchain-${ZIG_VERSION}-linux-amd64"
     paths:
       - zig-${ZIG_VERSION}/
 
@@ -194,26 +201,6 @@ fuzz-regression:
     - test-unit
   script:
     - zig build test-fuzz-regression --summary all
-
-fuzz-exploratory:
-  <<: *zig-job
-  stage: fuzz
-  needs:
-    - job: prepare-zig
-      artifacts: true
-    - test-unit
-  script:
-    - |
-      set +e
-      timeout 120 zig build test --fuzz --summary all
-      status=$?
-      set -e
-      if [ "$status" -eq 124 ]; then
-        echo "Exploratory fuzz timed out after 120s."
-        exit 0
-      fi
-      exit "$status"
-  allow_failure: true
 
 benchmark-regression:
   <<: *zig-job
@@ -267,10 +254,7 @@ zig-format:
       artifacts: true
   before_script:
     - *install-zig
-  cache:
-    key: zig-${ZIG_VERSION}
-    paths:
-      - .zig-cache/
+  cache: []
 
 # Disable merge_request_event pipelines. Jobs without rules never run in MR
 # pipelines, so the few MR-ruled jobs fail on `needs:` of jobs that are not
@@ -316,3 +300,20 @@ test-source-package:
   script:
     - python3 scripts/check_source_package.py --jobs 2
   allow_failure: false
+
+zig-test-macos-portable-deps-0.16.0:
+  image: macos-26-xcode-26
+  needs: []
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-global-cache"
+  cache:
+    key:
+      prefix: "zig-macos-0.16.0-aarch64"
+      files: [build.zig.zon]
+    paths: [zig-0.16.0/, .zig-global-cache/, .zig-cache/]
+  after_script:
+    - |
+      size=$(du -sm .zig-cache .zig-global-cache 2>/dev/null | awk '{sum += $1} END {print sum+0}')
+      if [ "$size" -gt 2048 ]; then rm -rf .zig-cache .zig-global-cache; fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'

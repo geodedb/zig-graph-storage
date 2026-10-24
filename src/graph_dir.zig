@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const scoped_file = @import("scoped_file.zig");
 const types = @import("types.zig");
 const file_manager = @import("file_manager.zig");
 
@@ -39,7 +40,7 @@ pub const GraphDir = struct {
             const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, file_name });
             defer allocator.free(file_path);
 
-            const file = try std.Io.Dir.cwd().createFile(io, file_path, .{
+            const file = try scoped_file.create(io, file_path, .{
                 .permissions = std.Io.File.Permissions.fromMode(0o600),
                 .exclusive = true,
                 .resolve_beneath = true,

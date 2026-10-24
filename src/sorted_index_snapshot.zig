@@ -80,6 +80,7 @@
 //! (recordAt reads payload bytes, dirEntry reads directory bytes).
 
 const std = @import("std");
+const scoped_file = @import("scoped_file.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -196,7 +197,7 @@ pub fn writeAtomicReplace(
     {
         // exclusive is omitted: a stale .tmp from a previous killed save may
         // exist and must simply be overwritten.
-        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{
+        const tmp_file = try scoped_file.create(io, tmp_path, .{
             .permissions = std.Io.File.Permissions.fromMode(0o600),
             .resolve_beneath = true,
         });

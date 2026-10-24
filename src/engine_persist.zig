@@ -6,6 +6,7 @@
 //! and free space rebuild from disk.
 
 const std = @import("std");
+const scoped_file = @import("scoped_file.zig");
 const Allocator = std.mem.Allocator;
 
 const types = @import("types.zig");
@@ -100,7 +101,7 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
     {
         // exclusive is omitted: a stale .tmp from a previous killed save may
         // exist and must simply be overwritten.
-        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{
+        const tmp_file = try scoped_file.create(io, tmp_path, .{
             .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
             .resolve_beneath = true,
         });

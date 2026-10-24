@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const scoped_file = @import("scoped_file.zig");
 const Allocator = std.mem.Allocator;
 // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
 // for on-disk format; not authentication.
@@ -96,7 +97,7 @@ pub const LabelDictionary = struct {
         // SEC-0052: resolve_beneath prevents symlink traversal out of the
         // label dictionary directory via a crafted path.  exclusive is omitted
         // because a stale .tmp file from a previous crashed write may exist.
-        const tmp_file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
+        const tmp_file = try scoped_file.create(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
             .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
             .resolve_beneath = true,
         });
