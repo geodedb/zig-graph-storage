@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-11-12
+
+### Changed
+
+- Converge thread_pool v0.2.10, which fixes data races in the pool's
+  work-stealing queues (SONNY-6375).
+
+### Fixed
+
+- `GraphEngine.getProperty` and `getPropertyNoDerived` count property reads
+  atomically. Concurrent readers raced on `metrics.properties_read` and lost
+  counts (SONNY-6375).
+- `test-engine-early-ready-tsan` and `test-parallel-shard-open-tsan` now build
+  with the LLVM backend. Zig 0.16's self-hosted x86_64 backend ignores
+  `sanitize_thread`, so both steps previously ran uninstrumented (SONNY-6375).
+
 ## [0.4.3] - 2026-09-15
 
 ### Changed
