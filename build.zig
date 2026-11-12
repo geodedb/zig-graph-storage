@@ -343,6 +343,9 @@ fn addIntegrationTests(
         .root_module = createModule(b, "tests/engine_early_ready.zig", target, .Debug, &.{
             .{ .name = "graph_storage", .module = graph_storage_mod },
         }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
     });
     early_ready_tsan_tests.root_module.sanitize_thread = true;
     const run_early_ready_tsan = b.addRunArtifact(early_ready_tsan_tests);
@@ -417,6 +420,9 @@ fn addIntegrationTests(
         .root_module = createModule(b, "tests/parallel_shard_open.zig", target, .Debug, &.{
             .{ .name = "graph_storage", .module = graph_storage_mod },
         }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
     });
     tsan_parallel_open_tests.root_module.sanitize_thread = true;
     const run_tsan_parallel_open = b.addRunArtifact(tsan_parallel_open_tests);
