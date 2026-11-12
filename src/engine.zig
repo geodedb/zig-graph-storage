@@ -2275,7 +2275,9 @@ pub const GraphEngine = struct {
         defer __obs_span.end(null);
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
-        self.metrics.properties_read += 1;
+        // Read paths run concurrently; a plain `+= 1` here is a data race that
+        // also loses counts. Same idiom as the buffer pool's lock-free hit path.
+        _ = @atomicRmw(u64, &self.metrics.properties_read, .Add, 1, .monotonic);
         if (prop_head == 0) {
             observability.endOperationSpan(__obs_span, true, "");
             return null;
@@ -2304,7 +2306,7 @@ pub const GraphEngine = struct {
     /// unhydrated) derived index — callers needing that optimization, or a
     /// hydrated-index guarantee, should use `getProperty` instead.
     pub fn getPropertyNoDerived(self: *GraphEngine, prop_head: u64, key: []const u8, alloc: Allocator) anyerror!?PropertyValue {
-        self.metrics.properties_read += 1;
+        _ = @atomicRmw(u64, &self.metrics.properties_read, .Add, 1, .monotonic);
         if (prop_head == 0) return null;
         return try self.prop_store.getProperty(prop_head, key, alloc);
     }
