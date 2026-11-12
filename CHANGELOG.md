@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `test-engine-early-ready-tsan` and `test-parallel-shard-open-tsan` now build
   with the LLVM backend. Zig 0.16's self-hosted x86_64 backend ignores
   `sanitize_thread`, so both steps previously ran uninstrumented (SONNY-6375).
+- Committed writes are no longer lost after a checkpoint that empties the
+  WAL, a process exit without `close`, a reopen and a crash. The inner WAL
+  restarted its numbering at 0 below `last_checkpoint_lsn` and recovery
+  skipped every record numbered at or below it. `WalManager.init` now writes
+  a durable `checkpoint_marker` anchor at the checkpoint LSN when the reopened
+  log is behind it, and recovery replays a record when either its WAL LSN or
+  its own LSN is after the checkpoint. Stores already written in that state
+  are recovered on first open (SONNY-6424).
 
 ## [0.4.3] - 2026-09-15
 

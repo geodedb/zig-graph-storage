@@ -80,8 +80,17 @@ pub const WalManager = struct {
     ///
     /// `wal_dir` — open directory handle where the WAL file will live.
     /// `graph_uuid` — unused for now (reserved for multi-graph partitioning).
-    /// `start_lsn` — the LSN to begin numbering from.
+    /// `start_lsn` — the durable checkpoint frontier
+    ///   (`manifest.last_checkpoint_lsn`); the next record is numbered above it.
     /// `config` — optional encryption key and other settings.
+    ///
+    /// SONNY-6424: an empty inner log keeps its sequence number only in the
+    /// wal library's `graph.wal.ckpt` sidecar, which `compact()` deletes and
+    /// only a clean `deinit` rewrites. After a checkpoint empties the log and
+    /// the process exits without closing, the inner log reopens at 0, below
+    /// `start_lsn`. Re-anchor it here with a durable `checkpoint_marker` record
+    /// at exactly `start_lsn`, so every later record is numbered above the
+    /// frontier and the anchor survives the next crash without the sidecar.
     pub fn init(
         allocator: Allocator,
         wal_dir: std.Io.Dir,
@@ -91,17 +100,53 @@ pub const WalManager = struct {
     ) !WalManager {
         try ensureGraphIdentity(wal_dir, graph_uuid, config.create_identity_if_missing);
 
-        const inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, "graph.wal", .{
+        var inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, "graph.wal", .{
             .encryption_key = config.encryption_key,
             .manual_sync = true,
             .checkpoint = true,
         });
+        errdefer inner.deinit();
+
+        if (inner.currentLsn() < start_lsn) {
+            try appendLsnAnchor(&inner, start_lsn);
+        }
 
         return WalManager{
             .allocator = allocator,
             .inner = inner,
-            .current_lsn = start_lsn,
+            .current_lsn = @max(start_lsn, inner.currentLsn()),
         };
+    }
+
+    /// Append and fsync a payload-free `checkpoint_marker` record numbered
+    /// `lsn` (SONNY-6424). Recovery never replays it: it carries no page image
+    /// and sits at the checkpoint frontier, which recovery starts after.
+    fn appendLsnAnchor(inner: *wal_lib.WriteAheadLog, lsn: u64) !void {
+        var anchor = WalRecord{
+            .lsn = lsn,
+            .txn_id = 0,
+            .record_type = .checkpoint_marker,
+            .file_id = 0,
+            .page_id = 0,
+            .payload = &.{},
+            .checksum = 0,
+        };
+        var buf: [64]u8 = undefined; // header + checksum, no payload
+        const n = try anchor.serializeInto(&buf);
+        _ = try inner.appendWithLsn(lsn, buf[0..n]);
+        try inner.sync();
+    }
+
+    /// SONNY-6424: whether a record read back from the inner log lies after
+    /// the checkpoint frontier `start_lsn`. Either numbering placing it there
+    /// is enough. The inner LSN alone is not: a store written by a binary
+    /// without the anchor above can hold post-checkpoint records whose inner
+    /// LSN restarted from 1, while their graph-storage LSN (seeded from the
+    /// frontier) is still above it. The record's own LSN alone is not either:
+    /// a record buffered in a batch is numbered before an interleaved direct
+    /// append but written after it.
+    fn isAtOrAfter(inner_lsn: u64, record_lsn: u64, start_lsn: u64) bool {
+        return inner_lsn >= start_lsn or record_lsn >= start_lsn;
     }
 
     /// Clean up resources.
@@ -276,10 +321,9 @@ pub const WalManager = struct {
             all_records.deinit(allocator);
         }
 
-        // The external library's iterator(lsn) is exclusive of the given LSN,
-        // so subtract 1 to make our readFrom inclusive of start_lsn.
-        const iter_from = if (start_lsn > 0) start_lsn - 1 else 0;
-        var iter = try self.inner.iterator(iter_from);
+        // Scan the whole inner log: whether a record is at or after start_lsn
+        // depends on both numberings (see isAtOrAfter, SONNY-6424).
+        var iter = try self.inner.iterator(0);
         defer iter.deinit();
 
         while (try iter.next()) |entry_val| {
@@ -288,7 +332,7 @@ pub const WalManager = struct {
 
             const result = WalRecord.deserialize(allocator, entry.payload) catch continue;
 
-            if (result.record.lsn >= start_lsn) {
+            if (isAtOrAfter(entry.lsn, result.record.lsn, start_lsn)) {
                 try all_records.append(allocator, result.record);
             } else {
                 result.record.deinit(allocator);
@@ -308,8 +352,7 @@ pub const WalManager = struct {
         ctx: anytype,
         comptime callback: fn (@TypeOf(ctx), *const WalRecord) anyerror!void,
     ) !void {
-        const iter_from = if (start_lsn > 0) start_lsn - 1 else 0;
-        var iter = try self.inner.iterator(iter_from);
+        var iter = try self.inner.iterator(0); // see isAtOrAfter (SONNY-6424)
         defer iter.deinit();
 
         while (try iter.next()) |entry_val| {
@@ -319,7 +362,7 @@ pub const WalManager = struct {
             const result = WalRecord.deserialize(allocator, entry.payload) catch continue;
             defer result.record.deinit(allocator);
 
-            if (result.record.lsn >= start_lsn) {
+            if (isAtOrAfter(entry.lsn, result.record.lsn, start_lsn)) {
                 try callback(ctx, &result.record);
             }
         }
@@ -338,8 +381,9 @@ pub const WalManager = struct {
     ) !void {
         failure.* = null;
 
-        const iter_from = if (start_lsn > 0) start_lsn - 1 else 0;
-        var iter = try self.inner.iterator(iter_from);
+        // Scan the whole inner log; see isAtOrAfter (SONNY-6424). Records
+        // before start_lsn are only validated as far as needed to place them.
+        var iter = try self.inner.iterator(0);
         defer iter.deinit();
 
         while (try iter.next()) |entry_val| {
@@ -347,6 +391,9 @@ pub const WalManager = struct {
             defer entry.deinit();
 
             const result = WalRecord.deserialize(allocator, entry.payload) catch {
+                // An undecodable record whose inner LSN is before the
+                // frontier was never visited before this scan started at 0.
+                if (entry.lsn < start_lsn) continue;
                 failure.* = .{
                     .lsn = entry.lsn,
                     .kind = .deserialize_failed,
@@ -354,6 +401,8 @@ pub const WalManager = struct {
                 return error.InvalidFormat;
             };
             defer result.record.deinit(allocator);
+
+            if (!isAtOrAfter(entry.lsn, result.record.lsn, start_lsn)) continue;
 
             if (result.record.checksum != result.record.computeChecksum()) {
                 failure.* = .{
@@ -363,9 +412,7 @@ pub const WalManager = struct {
                 return error.ChecksumMismatch;
             }
 
-            if (result.record.lsn >= start_lsn) {
-                try callback(ctx, &result.record);
-            }
+            try callback(ctx, &result.record);
         }
     }
 
@@ -545,6 +592,93 @@ test "truncate compacts old entries" {
         try std.testing.expect(rec.lsn >= 6);
     }
     try std.testing.expectEqual(@as(usize, 5), records.len);
+}
+
+test "SONNY-6424: init re-anchors an emptied log whose sidecar was lost" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const uuid = [_]u8{0xDE} ** 16;
+
+    // Fill, then compact everything away: the log is empty at LSN 10.
+    {
+        var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
+        defer mgr.deinit();
+        for (0..10) |_| {
+            var rec = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = 0, .page_id = 0, .payload = "data", .checksum = 0 };
+            _ = try mgr.appendRecord(&rec);
+        }
+        try mgr.sync();
+        try mgr.truncate(10);
+    }
+    // A process that died instead of closing left no sidecar.
+    tmp_dir.dir.deleteFile(io, "graph.wal.ckpt") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    {
+        var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 10, .{});
+        defer mgr.deinit();
+        try std.testing.expectEqual(@as(u64, 10), mgr.currentLsn());
+        var rec = WalRecord{ .lsn = 0, .txn_id = 2, .record_type = .page_update, .file_id = 0, .page_id = 0, .payload = "after", .checksum = 0 };
+        try std.testing.expectEqual(@as(u64, 11), try mgr.appendRecord(&rec));
+        try mgr.sync();
+    }
+    // Die again: the anchor record keeps the numbering without the sidecar.
+    try tmp_dir.dir.deleteFile(io, "graph.wal.ckpt");
+
+    var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 10, .{});
+    defer mgr.deinit();
+    try std.testing.expectEqual(@as(u64, 11), mgr.currentLsn());
+    const records = try mgr.readFrom(11, allocator);
+    defer {
+        for (records) |*r| r.deinit(allocator);
+        allocator.free(records);
+    }
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(u64, 11), records[0].lsn);
+    try std.testing.expectEqualStrings("after", records[0].payload);
+}
+
+test "SONNY-6424: records renumbered below the frontier are still read when their own LSN is after it" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const uuid = [_]u8{0xDF} ** 16;
+
+    // What a binary without the anchor wrote after reopening an emptied log
+    // at frontier 50: inner LSNs 1..3, graph-storage LSNs 51..53.
+    {
+        var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 0, .{});
+        defer mgr.deinit();
+        mgr.current_lsn = 50;
+        for (0..3) |_| {
+            var rec = WalRecord{ .lsn = 0, .txn_id = 7, .record_type = .page_update, .file_id = 0, .page_id = 0, .payload = "tail", .checksum = 0 };
+            _ = try mgr.appendRecord(&rec);
+        }
+        try mgr.sync();
+        try std.testing.expectEqual(@as(u64, 3), mgr.currentLsn());
+    }
+
+    var mgr = try WalManager.init(allocator, tmp_dir.dir, uuid, 50, .{});
+    defer mgr.deinit();
+    var failure: ?ReplayFailure = null;
+    const Ctx = struct {
+        lsns: [8]u64 = undefined,
+        n: usize = 0,
+        fn visit(ctx: *@This(), rec: *const WalRecord) !void {
+            ctx.lsns[ctx.n] = rec.lsn;
+            ctx.n += 1;
+        }
+    };
+    var ctx = Ctx{};
+    try mgr.forEachFromStrict(51, allocator, &failure, &ctx, Ctx.visit);
+    // The three tail records; the anchor written at 50 is not after the frontier.
+    try std.testing.expectEqual(@as(usize, 3), ctx.n);
+    try std.testing.expectEqualSlices(u64, &.{ 51, 52, 53 }, ctx.lsns[0..3]);
+    try std.testing.expectEqual(@as(u64, 50), mgr.currentLsn());
 }
 
 test "GAP-0032: init rejects a WAL directory bound to a different graph UUID" {
