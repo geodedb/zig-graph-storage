@@ -343,10 +343,39 @@ fn addIntegrationTests(
         .root_module = createModule(b, "tests/engine_early_ready.zig", target, .Debug, &.{
             .{ .name = "graph_storage", .module = graph_storage_mod },
         }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
     });
     early_ready_tsan_tests.root_module.sanitize_thread = true;
     const run_early_ready_tsan = b.addRunArtifact(early_ready_tsan_tests);
     early_ready_tsan_step.dependOn(&run_early_ready_tsan.step);
+
+    // SONNY-6375: concurrent readers bump read counters; the bump must not be
+    // a plain read-modify-write. The plain step proves no read is lost, the
+    // TSan step (LLVM backend, Debug) proves there is no data race.
+    const read_metrics_step = b.step("test-concurrent-read-metrics", "Run concurrent-reader metric counter regression (no lost reads)");
+    const read_metrics_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/concurrent_read_metrics.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_read_metrics = b.addRunArtifact(read_metrics_tests);
+    read_metrics_step.dependOn(&run_read_metrics.step);
+    integration_step.dependOn(&run_read_metrics.step);
+
+    const read_metrics_tsan_step = b.step("test-concurrent-read-metrics-tsan", "Run concurrent-reader metric counter regression under ThreadSanitizer (zero races expected)");
+    const read_metrics_tsan_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/concurrent_read_metrics.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
+    });
+    read_metrics_tsan_tests.root_module.sanitize_thread = true;
+    const run_read_metrics_tsan = b.addRunArtifact(read_metrics_tsan_tests);
+    read_metrics_tsan_step.dependOn(&run_read_metrics_tsan.step);
 
     // H3-P1 Task 3: crash-safe engine integration of the value-ordered index.
     // Own step so the load-on-clean / rebuild-on-crash proofs (mirroring Lever B)
@@ -417,6 +446,9 @@ fn addIntegrationTests(
         .root_module = createModule(b, "tests/parallel_shard_open.zig", target, .Debug, &.{
             .{ .name = "graph_storage", .module = graph_storage_mod },
         }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
     });
     tsan_parallel_open_tests.root_module.sanitize_thread = true;
     const run_tsan_parallel_open = b.addRunArtifact(tsan_parallel_open_tests);
@@ -642,6 +674,21 @@ fn addIntegrationTests(
     const run_wal_recovery_counters = b.addRunArtifact(wal_recovery_counters_tests);
     wal_recovery_counters_step.dependOn(&run_wal_recovery_counters.step);
 
+    // WAL sequence anchor (SONNY-6424) — a checkpoint that empties the WAL
+    // followed by a process exit without close used to restart the inner log
+    // numbering at 0 below last_checkpoint_lsn, so the next crash recovery
+    // skipped (or tore) every record written after the reopen. Crash tests,
+    // including an upgrade from a store already in that state on disk.
+    const wal_lsn_anchor_step = b.step("test-wal-lsn-anchor-crash", "Run WAL sequence-anchor crash tests: checkpoint empties the WAL, exit without close, reopen, write, crash — every committed write survives (incl. upgrade of an already-renumbered WAL)");
+    const wal_lsn_anchor_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/wal_lsn_anchor_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+            .{ .name = "wal", .module = deps.wal_mod },
+        }),
+    });
+    const run_wal_lsn_anchor = b.addRunArtifact(wal_lsn_anchor_tests);
+    wal_lsn_anchor_step.dependOn(&run_wal_lsn_anchor.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
@@ -754,6 +801,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_epoch_gate.step);
     // WAL-recovery counter healing is the same silent-corruption class.
     integration_step.dependOn(&run_wal_recovery_counters.step);
+    // The WAL sequence-anchor crash guards are the same silent-loss class.
+    integration_step.dependOn(&run_wal_lsn_anchor.step);
     // checkpoint_epoch recovery-invariance is the durability foundation the
     // WAL-aware derived-index contract rests on — gate it under integration.
     integration_step.dependOn(&run_checkpoint_epoch.step);

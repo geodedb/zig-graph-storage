@@ -318,6 +318,11 @@ pub const Recovery = struct {
 
         const start_lsn = if (m.last_checkpoint_lsn > 0) m.last_checkpoint_lsn + 1 else 1;
         var saw_records = false;
+        // SONNY-6424: highest graph-storage LSN among the records replayed.
+        // A store written before the WAL sequence anchor can hold replayed
+        // records whose inner LSN restarted below the frontier while their own
+        // LSN is above it; the advanced frontier must cover them too.
+        var max_record_lsn: u64 = 0;
         self.last_failure = null;
 
         // 4. Classify transactions. Any malformed or checksum-invalid record
@@ -329,9 +334,11 @@ pub const Recovery = struct {
             recovery: *Recovery,
             txn_states: *std.AutoHashMap(u64, TxnRecoveryState),
             saw_records: *bool,
+            max_record_lsn: *u64,
 
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 ctx.saw_records.* = true;
+                if (rec.lsn > ctx.max_record_lsn.*) ctx.max_record_lsn.* = rec.lsn;
 
                 // Counter healing: txn ids appear on EVERY record type, so
                 // the classify pass (which already reads them all) is the
@@ -357,6 +364,7 @@ pub const Recovery = struct {
             .recovery = self,
             .txn_states = &txn_states,
             .saw_records = &saw_records,
+            .max_record_lsn = &max_record_lsn,
         };
         try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &classify_ctx, ClassifyCtx.visit);
 
@@ -581,7 +589,10 @@ pub const Recovery = struct {
         }
 
         m.counter += 1;
-        m.last_checkpoint_lsn = wal.currentLsn();
+        // Everything replayed above is flushed and synced, so the frontier
+        // advances past every record seen under either numbering. The engine's
+        // WalManager then anchors the inner log at this value (SONNY-6424).
+        m.last_checkpoint_lsn = @max(wal.currentLsn(), max_record_lsn);
 
         // Write to both slots for a clean state after recovery
         const manifest_path_a = try graph_dir.manifestPath(self.allocator, .a);
