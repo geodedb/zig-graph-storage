@@ -351,6 +351,32 @@ fn addIntegrationTests(
     const run_early_ready_tsan = b.addRunArtifact(early_ready_tsan_tests);
     early_ready_tsan_step.dependOn(&run_early_ready_tsan.step);
 
+    // SONNY-6375: concurrent readers bump read counters; the bump must not be
+    // a plain read-modify-write. The plain step proves no read is lost, the
+    // TSan step (LLVM backend, Debug) proves there is no data race.
+    const read_metrics_step = b.step("test-concurrent-read-metrics", "Run concurrent-reader metric counter regression (no lost reads)");
+    const read_metrics_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/concurrent_read_metrics.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_read_metrics = b.addRunArtifact(read_metrics_tests);
+    read_metrics_step.dependOn(&run_read_metrics.step);
+    integration_step.dependOn(&run_read_metrics.step);
+
+    const read_metrics_tsan_step = b.step("test-concurrent-read-metrics-tsan", "Run concurrent-reader metric counter regression under ThreadSanitizer (zero races expected)");
+    const read_metrics_tsan_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/concurrent_read_metrics.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
+    });
+    read_metrics_tsan_tests.root_module.sanitize_thread = true;
+    const run_read_metrics_tsan = b.addRunArtifact(read_metrics_tsan_tests);
+    read_metrics_tsan_step.dependOn(&run_read_metrics_tsan.step);
+
     // H3-P1 Task 3: crash-safe engine integration of the value-ordered index.
     // Own step so the load-on-clean / rebuild-on-crash proofs (mirroring Lever B)
     // run in isolation and can be looped.
