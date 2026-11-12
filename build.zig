@@ -674,6 +674,21 @@ fn addIntegrationTests(
     const run_wal_recovery_counters = b.addRunArtifact(wal_recovery_counters_tests);
     wal_recovery_counters_step.dependOn(&run_wal_recovery_counters.step);
 
+    // WAL sequence anchor (SONNY-6424) — a checkpoint that empties the WAL
+    // followed by a process exit without close used to restart the inner log
+    // numbering at 0 below last_checkpoint_lsn, so the next crash recovery
+    // skipped (or tore) every record written after the reopen. Crash tests,
+    // including an upgrade from a store already in that state on disk.
+    const wal_lsn_anchor_step = b.step("test-wal-lsn-anchor-crash", "Run WAL sequence-anchor crash tests: checkpoint empties the WAL, exit without close, reopen, write, crash — every committed write survives (incl. upgrade of an already-renumbered WAL)");
+    const wal_lsn_anchor_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/wal_lsn_anchor_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+            .{ .name = "wal", .module = deps.wal_mod },
+        }),
+    });
+    const run_wal_lsn_anchor = b.addRunArtifact(wal_lsn_anchor_tests);
+    wal_lsn_anchor_step.dependOn(&run_wal_lsn_anchor.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
@@ -786,6 +801,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_epoch_gate.step);
     // WAL-recovery counter healing is the same silent-corruption class.
     integration_step.dependOn(&run_wal_recovery_counters.step);
+    // The WAL sequence-anchor crash guards are the same silent-loss class.
+    integration_step.dependOn(&run_wal_lsn_anchor.step);
     // checkpoint_epoch recovery-invariance is the durability foundation the
     // WAL-aware derived-index contract rests on — gate it under integration.
     integration_step.dependOn(&run_checkpoint_epoch.step);
