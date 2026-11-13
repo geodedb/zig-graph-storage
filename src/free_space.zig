@@ -597,3 +597,19 @@ test "GAP-0035: deserializeBounded rejects invalid next_free_hint" {
 test {
     std.testing.refAllDecls(@This());
 }
+
+test "SONNY-6470: free.store mask words are defined only for 64-bit little-endian hosts" {
+    // The masks are raw `usize` words; a host with another word size or byte
+    // order would misread a file written on a 64-bit little-endian host (and
+    // write one such a host would misread). Such hosts must refuse the
+    // layout, never reinterpret it.
+    try testing.expectError(error.UnsupportedHostLayout, checkHostLayout(.big, 8));
+    try testing.expectError(error.UnsupportedHostLayout, checkHostLayout(.little, 4));
+    try testing.expectError(error.UnsupportedHostLayout, checkHostLayout(.big, 4));
+    try checkHostLayout(.little, 8);
+    // This host's verdict is the one serialize/deserialize act on.
+    try testing.expectEqual(
+        host_layout_supported,
+        if (checkHostLayout(@import("builtin").cpu.arch.endian(), @sizeOf(usize))) |_| true else |_| false,
+    );
+}
