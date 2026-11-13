@@ -48,11 +48,59 @@ pub const PageEncryption = struct {
         return nonce;
     }
 
-    /// Encrypt page body in-place. The header is NOT encrypted (it contains
-    /// page_id needed for the nonce). The authentication tag is stored in the
-    /// last TAG_SIZE bytes of the body region, so usable body space is reduced
-    /// by TAG_SIZE when encryption is enabled. The header is included as
-    /// additional authenticated data, binding the ciphertext to its header.
+    /// Encrypt a page in the header-tag envelope (SONNY-6441), in place. The
+    /// WHOLE body is encrypted; the tag goes into header bytes 0..16 (the
+    /// `page_id`/`lsn` fields, which no store uses — the nonce takes the page
+    /// id from the pager, not the header). The rest of the header (16..32,
+    /// incl. `flags` with `PageFlags.encrypted` set and `write_count`) stays
+    /// plaintext and is the additional authenticated data. The caller sets
+    /// `flags` and `write_count` first.
+    ///
+    /// The legacy envelope (`encryptPage`) kept the tag in the last TAG_SIZE
+    /// body bytes, which fixed-record layouts used for data: those bytes were
+    /// lost on every write + reload.
+    pub fn encryptPageHeaderTag(self: *const PageEncryption, page_buf: []u8, page_id: u64, file_id: u8, write_count: u24) void {
+        std.debug.assert(page_buf.len > PAGE_HEADER_SIZE);
+
+        const body = page_buf[PAGE_HEADER_SIZE..];
+        var tag: [TAG_SIZE]u8 = undefined;
+        Aes256Gcm.encrypt(
+            body, // ciphertext output (in-place)
+            &tag,
+            body, // plaintext input
+            page_buf[TAG_SIZE..PAGE_HEADER_SIZE], // additional authenticated data
+            buildNonce(page_id, file_id, write_count),
+            self.key,
+        );
+        @memcpy(page_buf[0..TAG_SIZE], &tag);
+    }
+
+    /// Decrypt a header-tag envelope page in place (see
+    /// `encryptPageHeaderTag`). Returns error.DecryptionFailed if the tag
+    /// does not authenticate the body and header bytes 16..32 (wrong key,
+    /// wrong page_id/file_id/write_count, or corruption). Leaves the tag in
+    /// header bytes 0..16.
+    pub fn decryptPageHeaderTag(self: *const PageEncryption, page_buf: []u8, page_id: u64, file_id: u8, write_count: u24) !void {
+        std.debug.assert(page_buf.len > PAGE_HEADER_SIZE);
+
+        const body = page_buf[PAGE_HEADER_SIZE..];
+        const tag: [TAG_SIZE]u8 = page_buf[0..TAG_SIZE].*;
+        Aes256Gcm.decrypt(
+            body, // plaintext output (in-place)
+            body, // ciphertext input
+            tag,
+            page_buf[TAG_SIZE..PAGE_HEADER_SIZE], // additional authenticated data
+            buildNonce(page_id, file_id, write_count),
+            self.key,
+        ) catch return error.DecryptionFailed;
+    }
+
+    /// LEGACY envelope (pages written before SONNY-6441; the pager only
+    /// reads it now). Encrypt page body in-place. The header is NOT encrypted
+    /// (it contains page_id needed for the nonce). The authentication tag is
+    /// stored in the last TAG_SIZE bytes of the body region, so usable body
+    /// space is reduced by TAG_SIZE. The header is included as additional
+    /// authenticated data, binding the ciphertext to its header.
     pub fn encryptPage(self: *const PageEncryption, page_buf: []u8, page_id: u64, file_id: u8, write_count: u24) void {
         std.debug.assert(page_buf.len > PAGE_HEADER_SIZE + TAG_SIZE);
 
@@ -287,6 +335,50 @@ test "wrong write_count fails decryption" {
     // Decrypt with write_count=4 — must fail
     const result = enc.decryptPage(buf, page_id, file_id, 4);
     try testing.expectError(error.DecryptionFailed, result);
+}
+
+test "SONNY-6441: header-tag envelope round-trips the whole body and authenticates header bytes 16..32" {
+    const page_size: u32 = 8192;
+    const enc = PageEncryption.init([_]u8{0x07} ** KEY_SIZE);
+
+    const original = try testing.allocator.alloc(u8, page_size);
+    defer testing.allocator.free(original);
+    @memset(original, 0);
+    for (original[PAGE_HEADER_SIZE..], 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    original[page_mod.FLAGS_OFFSET] = page_mod.FLAG_HEADER_TAG;
+    page_mod.writeWriteCount(original, 9);
+
+    const buf = try testing.allocator.dupe(u8, original);
+    defer testing.allocator.free(buf);
+    enc.encryptPageHeaderTag(buf, 11, 3, 9);
+    // The last body bytes are ciphertext now, not a tag over plaintext.
+    try testing.expect(!std.mem.eql(u8, original[page_size - TAG_SIZE ..], buf[page_size - TAG_SIZE ..]));
+    try testing.expectEqualSlices(u8, original[TAG_SIZE..PAGE_HEADER_SIZE], buf[TAG_SIZE..PAGE_HEADER_SIZE]);
+
+    const plain = try testing.allocator.dupe(u8, buf);
+    defer testing.allocator.free(plain);
+    try enc.decryptPageHeaderTag(plain, 11, 3, 9);
+    try testing.expectEqualSlices(u8, original[PAGE_HEADER_SIZE..], plain[PAGE_HEADER_SIZE..]);
+
+    // Any change to the AAD half of the header, the tag, the body, or the
+    // nonce inputs fails authentication.
+    const offsets = [_]usize{ 0, 15, 16, page_mod.FLAGS_OFFSET, page_mod.WRITE_COUNT_OFFSET, PAGE_HEADER_SIZE, page_size - 1 };
+    for (offsets) |off| {
+        const tampered = try testing.allocator.dupe(u8, buf);
+        defer testing.allocator.free(tampered);
+        tampered[off] ^= 0x01;
+        try testing.expectError(error.DecryptionFailed, enc.decryptPageHeaderTag(tampered, 11, 3, 9));
+    }
+    const nonces = [_]struct { page_id: u64, file_id: u8, wc: u24 }{
+        .{ .page_id = 12, .file_id = 3, .wc = 9 },
+        .{ .page_id = 11, .file_id = 4, .wc = 9 },
+        .{ .page_id = 11, .file_id = 3, .wc = 10 },
+    };
+    for (nonces) |n| {
+        const again = try testing.allocator.dupe(u8, buf);
+        defer testing.allocator.free(again);
+        try testing.expectError(error.DecryptionFailed, enc.decryptPageHeaderTag(again, n.page_id, n.file_id, n.wc));
+    }
 }
 
 test "deinit zeros key memory" {

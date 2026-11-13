@@ -35,7 +35,11 @@ Each file is a JSON document with version, timestamp, system info, and per-tier 
 ## Naming Convention
 
 - `ci-baseline.json` -- authoritative merge-request and default-branch smoke baseline (`1K`)
-- `ci-10k-baseline.json` -- authoritative scheduled/manual larger-tier baseline (`1K` + `10K`)
+- `ci-10k-baseline.json` -- authoritative scheduled/manual larger-tier baseline (`1K` + `10K`).
+  Re-recorded at ff9d97f on a local ext4 NVMe disk (median-`mixed_ops_sec` run of
+  three). Seed, checkpoint and mixed numbers are fsync-bound: record baselines on
+  storage that really syncs, never on tmpfs or under eatmydata (the 2026-03-25
+  baseline was, and no real disk could meet it).
 - `baseline.json` -- local exploratory multi-tier baseline, not the CI source of truth
 - `<short-sha>.json` -- results saved per commit via `make bench-save`
 
@@ -48,4 +52,5 @@ make bench-baseline    # Save the 1K CI smoke baseline
 make bench-compare     # Compare the 1K CI smoke gate
 make bench-baseline-10k  # Save the scheduled/manual 10K CI baseline
 make bench-compare-10k   # Compare the scheduled/manual 10K CI gate
+# compare-bench gates on each measurement's median (p50); avg/p95/p99/stddev are info.
 ```

@@ -21,12 +21,14 @@ pub const PageFrame = struct {
     // eviction CAS-claims it 0 -> PIN_EVICTING. Because the pin and the eviction
     // claim are CAS operations on the SAME word, they are totally ordered by that
     // word's modification order (exactly one wins) — that is what makes pin-vs-
-    // evict exclusion correct WITHOUT any Dekker/StoreLoad fence. The plain
-    // (non-atomic) stores to this field happen only while the frame is NOT yet
-    // reachable by the fast path: a frame published with loading=true (slow-path
-    // load) or held under the PIN_EVICTING sentinel (eviction teardown), both of
-    // which the fast path's pre-CAS checks (`!loading`, sentinel-refusing CAS)
-    // exclude. See BufferPool.pin (fast path + slow path) / unpin / evictFrame.
+    // evict exclusion correct WITHOUT any Dekker/StoreLoad fence. NO access is
+    // a plain store (SONNY-6438): a fast-path reader that looked the frame up
+    // under its previous identity can CAS-pin it the moment eviction releases
+    // it (0), before the slow path republishes it, and then undoes that pin.
+    // The slow path therefore publishes its own pin with an atomic +1 (never
+    // `= 1`, which would swallow the reader's +1 so its undo steals ours) and
+    // eviction releases with an atomic store. See BufferPool.pin (fast path +
+    // slow path) / unpin / evictFrame.
     pin_count: u32 = 0,
     // PERF-0058 (pin-contention): clock/second-chance reference bit. The
     // cache-HIT pin path sets this to 1 with a single relaxed atomic store

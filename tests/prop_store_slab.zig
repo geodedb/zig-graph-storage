@@ -1324,15 +1324,21 @@ test "GAP-ENT-0020 P5 routing: owner-routed slab ops reach the owning shard (get
     try testing.expectError(error.SlabHeadRequiresOwnerRouting, eng.removeProperty(heads[2], "name"));
 }
 
-test "GAP-ENT-0020 P5 edge gate: edge properties never slab-encode (node-only slab)" {
-    // Edge prop_heads are packed as u32 in adjacency entries and the edge
-    // index; a slab head (tag bit 63) cannot survive that. Slab packing is
-    // therefore NODE-ONLY: the edge write path allocates legacy chains even
-    // with slab_packing enabled, while node puts on the same engine slab-pack.
+test "GAP-ENT-0020 P5 edge gate: with edge_prop_slab_packing off, edge properties never slab-encode" {
+    // Written when edge prop_heads were u32 in adjacency entries and the edge
+    // index, so a slab head (tag bit 63) could not survive and slab packing
+    // was node-only. GAP-0060 widened the edge head to u64 (v3 / slab-v3
+    // adjacency) and routes edge properties to the slab writer, gated on
+    // `edge_prop_slab_packing` (default ON since v0.2.35). The gate this test
+    // guards is that switch's OFF side — the rollback writer: edge properties
+    // stay legacy u32 chains in narrow adjacency (slab prop <=> wide
+    // adjacency), while node puts on the same engine still slab-pack.
     var td = try TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xE2} ** 16;
-    const eng = try GraphEngine.create(testing.allocator, td.path, uuid, gs.test_support.testConfig());
+    var cfg = gs.test_support.testConfig();
+    cfg.edge_prop_slab_packing = false;
+    const eng = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
     defer eng.close() catch {};
     eng.prop_store.slab_packing = true;
 
@@ -1390,7 +1396,7 @@ test "GAP-ENT-0020 P5 edge gate: edge properties never slab-encode (node-only sl
     var td2 = try TestDataDir.init(testing.allocator);
     defer td2.deinit();
     const uuid2 = [_]u8{0xE4} ** 16;
-    const seng = try ShardedGraphEngine.create(testing.allocator, td2.path, uuid2, gs.test_support.testConfig());
+    const seng = try ShardedGraphEngine.create(testing.allocator, td2.path, uuid2, cfg);
     defer seng.close() catch {};
     for (seng.shards) |sh| sh.prop_store.slab_packing = true;
 

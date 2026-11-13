@@ -29,7 +29,8 @@ Every data file is divided into fixed-size pages. The default page size is
 | 22     | 2    | `item_count` | u16    | Number of items stored in this page               |
 | 24     | 2    | `free_start` | u16    | Start of free space (slotted pages)               |
 | 26     | 2    | `free_end`   | u16    | End of free space (slotted pages)                 |
-| 28     | 4    | `_reserved`  | [4]u8  | Reserved padding, must be zero                    |
+| 28     | 3    | `write_count`| u24 LE | Per-page AES-GCM nonce counter (encrypted mode)   |
+| 31     | 1    | `_reserved`  | [1]u8  | Reserved padding, must be zero                    |
 
 **Compile-time assertion:** `@sizeOf(PageHeader) == 32`.
 
@@ -53,7 +54,7 @@ Every data file is divided into fixed-size pages. The default page size is
 | Bit | Name        | Description                       |
 |-----|-------------|-----------------------------------|
 | 0   | `dirty`     | Page has uncommitted modifications|
-| 1   | `encrypted` | Page body is encrypted            |
+| 1   | `encrypted` | On disk only: header-tag AES-GCM envelope (§1.5) |
 | 2   | `compressed`| Page body is compressed           |
 | 3-7 | `_reserved` | Reserved, must be zero            |
 
@@ -65,6 +66,34 @@ checksum = CRC32C(page_body)
 
 Where `page_body` is all bytes from offset 32 to `page_size - 1` (i.e., the
 entire page excluding the header). Computed via `std.hash.crc.Crc32Iscsi.hash()`.
+Plaintext mode only. A page whose 32 header bytes are all zero is a page that
+was never written only if its body is zero too (or, in plaintext mode, its
+body's CRC32C is 0); otherwise the read fails.
+
+### 1.5 Encrypted Pages (AES-256-GCM)
+
+With `GraphConfig.encryption_key` set, the pager encrypts every page it
+writes. The nonce is `page_id (u64 LE) | file_id (u8) | write_count (u24 LE)`,
+taken from the pager and the header's `write_count` (offset 28, u24 LE, plain
+text, incremented on every write). The CRC32C is not used.
+
+Current envelope (`flags.encrypted` = 1):
+
+| Bytes       | Content                                               |
+|-------------|-------------------------------------------------------|
+| 0..16       | AES-GCM tag (replaces `page_id`/`lsn`, which no store uses) |
+| 16..32      | Rest of the header, plain text: additional authenticated data |
+| 32..page end| The whole page body, encrypted                        |
+
+The pager zeroes bytes 0..16 and clears `flags.encrypted` when it reads a page
+into memory, so a cached page never carries the envelope.
+
+Legacy envelope (`flags.encrypted` = 0, written before SONNY-6441): the AAD is
+the whole 32-byte header and the tag occupies the LAST 16 body bytes; whatever
+a layout stored there was never persisted. These pages stay readable (their
+last 16 body bytes read as zero) and move to the current envelope on their
+next write. A binary that only knows the legacy envelope fails to
+authenticate current-envelope pages (`error.DecryptionFailed`).
 
 ---
 
@@ -200,14 +229,16 @@ for O(1) lookup.
 +---------------------+  offset page_size - tail_reserve - 2
 | dir_count (2 B)     |  u16 LE -- number of directory entries
 +---------------------+  offset page_size - tail_reserve
-| (AES-GCM auth tag)  |  tail_reserve bytes (encrypted mode only; 0 in plaintext)
+| (reserved)          |  tail_reserve bytes (encrypted mode only; 0 in plaintext)
 +---------------------+  offset page_size
 ```
 
 **Encrypted-mode tail reservation (`tail_reserve`):** When at-rest encryption
 is enabled (`GraphConfig.encryption_key != null`), `PropStore` reserves
-`tail_reserve` bytes at the physical end of every property page for the
-AES-GCM authentication tag written by the pager on flush. The slotted-page
+`tail_reserve` bytes at the physical end of every property page, where the
+legacy envelope (§1.5) stored the AES-GCM tag. The current envelope keeps the
+tag in the header, but the reservation stays part of the encrypted layout
+because existing stores' directories sit at that offset. The slotted-page
 directory (`dir_count` footer and all `DirEntry` records) therefore grows
 backward from the **logical** page end at `page_size - tail_reserve`, not
 from the physical end. In plaintext mode `tail_reserve == 0` and the layout

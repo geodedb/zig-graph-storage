@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-11-12
+
+### Changed
+
+- wal v0.1.23 (compaction keeps the LSN anchor when it empties the log,
+  SONNY-6424). On-disk note: encrypted (TDE) pages written by this version
+  use a new page format; older binaries fail with `DecryptionFailed` on them
+  (no downgrade for encrypted stores).
+
+### Fixed
+
+- Committed records are no longer lost on stores with at-rest encryption.
+  The pager wrote the 16-byte AES-GCM tag over the last 16 bytes of every
+  page body, and layouts that use the page end lost those bytes on every
+  write and reload (eviction, reopen, crash recovery), silently because the
+  page still authenticated: with the default 8 KiB page every node in slot
+  169 of 170 read back missing or with tag bytes in its flags; the last two
+  heads of every `adj_in_dir` page and, at 4 KiB, the last v3 adjacency entry
+  of a full block were damaged too. Encrypted pages are now written in a
+  header-tag envelope: the tag goes into header bytes 0..16 (`page_id`/`lsn`,
+  unused by every store), the rest of the header is the additional
+  authenticated data, `PageFlags.encrypted` marks the page, and the whole
+  body is the stores'. Pages written in the old envelope stay readable and
+  move to the new one on their next write; their last 16 body bytes, which
+  never reached the disk, read as zero. A binary without this fix cannot
+  read pages written in the new envelope (it fails with
+  `error.DecryptionFailed`, never with wrong data) (SONNY-6441).
+- An encrypted page with a zeroed header is an authentication error
+  (`error.DecryptionFailed`), and a plaintext page with a zeroed header must
+  pass its CRC32C. Both were taken for never-written pages, so damage read
+  back as missing nodes (SONNY-6441).
+- `test-prop-store-slab`, `test-edge-inline-public-id` and
+  `test-ordered-index-recovery` pass again and run under `test-integration`.
+  The first two still asserted pre-GAP-0060 behaviour (edge properties never
+  slab-packed, v2 adjacency blocks, the GSEIDX5 40-byte edge snapshot); they
+  now pin `edge_prop_slab_packing = false` where they test the legacy writer
+  and expect GSEIDX6 44-byte records. Ordered-index Test B and B2 expected a
+  committed post-checkpoint node to be lost in a crash; they now require it
+  to survive (SONNY-6438).
+- `BufferPool` publishes and releases `pin_count` with atomic operations
+  only. Eviction released a frame with a plain `pin_count = 0` and the slow
+  path republished it with a plain `pin_count = 1`; a lock-free reader that
+  had looked the frame up under its old identity could pin it in between,
+  lose its increment to the plain store, and its undo then removed the
+  loader's pin, leaving an in-use frame evictable. The lock-free lookup's
+  intentionally racy reads are now confined to `speculativeLookup`, ordered
+  before the seqlock re-check, and hidden from ThreadSanitizer with
+  `AnnotateIgnoreReadsBegin/End`: the new TSan step reproduces the 49
+  reports of that kind (geode's parallel-union step showed ~30) and now
+  reports none. New steps `test-buffer-pool-concurrent-readers` (also under
+  `test-integration`) and `test-buffer-pool-concurrent-readers-tsan`
+  (SONNY-6438).
+- `compare-bench` gates each measurement on its median (p50) and reports
+  avg/p95/p99/stddev for information. With scale-bench's three samples per
+  tier one slow sample failed identical code (HEAD against HEAD: 8-10
+  failing rows). `benchmarks/results/ci-10k-baseline.json` is re-recorded at
+  ff9d97f: the old one (2026-03-25) was recorded where fsync is free
+  (2,012,554 mixed ops/s with a WAL fsync on 15% of them); its own code
+  measures ~260 mixed ops/s on a real disk. The manual
+  `benchmark-regression-10k` CI job is advisory (`allow_failure: true`, like
+  `benchmark-regression`) and keeps its artifact on failure, so it no longer
+  leaves default-branch pipelines blocked or skips the security and SBOM
+  stages (SONNY-6438).
+
 ## [0.4.11] - 2026-11-12
 
 ### Changed

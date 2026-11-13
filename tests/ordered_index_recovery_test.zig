@@ -18,7 +18,8 @@
 //   fsynced WAL tail and bumps manifest.counter, so the snapshot is stale-by-
 //   counter; the load gate REJECTS it and forces a rebuild from the durable
 //   graph (ordered_index_rebuilds == 1). Proves the counter gate was not
-//   weakened.
+//   weakened, and that the rebuilt index holds the committed post-checkpoint
+//   node: a committed write must survive the crash (SONNY-6424/6438).
 
 const std = @import("std");
 const testing = std.testing;
@@ -173,17 +174,16 @@ test "Test B: crash restart REBUILDS the ordered index (stale snapshot rejected)
         // Commit an extra labelled+propertied node AFTER the snapshot.
         // sync_each_commit fsyncs it to the WAL so recovery replays it and bumps
         // manifest.counter PAST the snapshot stamp — that bump is what forces the
-        // rebuild. (Per leverb_clean_restart's note, the durability of this lone
-        // post-checkpoint WAL-tail write into the rebuilt scan is a recovery/
-        // free-space concern this test does not assert; the rebuild-forced proof
-        // below is the crash-safety invariant. So `values` keeps only the
-        // checkpointed set and verifyOrder asserts the rebuild reproduced it.)
+        // rebuild. The commit returned, so the node is durable: the rebuilt
+        // index must contain it. (This test used to leave it out of `values`,
+        // encoding the SONNY-6424 loss of post-checkpoint commits as expected.)
         const extra_value: i64 = 12345;
         const nid = try engine.allocNode();
         var rec = emptyNode();
         rec.prop_head = try engine.putProperty(rec.prop_head, KEY, .{ .int = extra_value });
         try engine.putNode(nid, rec);
         try engine.addLabel(nid, LABEL);
+        try values.append(testing.allocator, extra_value);
 
         // SIMULATED CRASH: no checkpoint(), no close() — abandon the engine.
         engine.deinit();
@@ -200,7 +200,8 @@ test "Test B: crash restart REBUILDS the ordered index (stale snapshot rejected)
         try testing.expectEqual(@as(u64, 1), engine.getMetrics().ordered_index_rebuilds);
         try testing.expectEqual(@as(u64, 0), engine.getMetrics().ordered_index_loads);
 
-        // The rebuilt index reflects the durable (checkpointed) graph, in order.
+        // The rebuilt index reflects the durable graph — the checkpointed set
+        // plus the committed post-checkpoint node — in order.
         try verifyOrder(engine, values.items);
     }
 }
@@ -362,6 +363,7 @@ test "Test B2: crash restart REBUILDS and the ORDER BY sort stays correct" {
         rec.prop_head = try engine.putProperty(rec.prop_head, KEY, .{ .int = 777 });
         try engine.putNode(nid, rec);
         try engine.addLabel(nid, LABEL);
+        try values.append(testing.allocator, 777);
 
         engine.deinit(); // CRASH: no checkpoint/close.
     }
@@ -374,8 +376,9 @@ test "Test B2: crash restart REBUILDS and the ORDER BY sort stays correct" {
         try testing.expectEqual(@as(u64, 1), engine.getMetrics().ordered_index_rebuilds);
         try testing.expectEqual(@as(u64, 0), engine.getMetrics().ordered_index_loads);
         // Paramount property: the rebuilt index yields a CORRECT sort (ASC
-        // ascending, DESC its exact reverse) over whatever durable set recovery
-        // produced — never a stale/mis-ordered result.
+        // ascending, DESC its exact reverse) — never a stale/mis-ordered
+        // result — over the exact committed set, incl. the post-checkpoint 777.
         try verifySortedConsistent(engine);
+        try verifyOrder(engine, values.items);
     }
 }

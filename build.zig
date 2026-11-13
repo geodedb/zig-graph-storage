@@ -212,6 +212,14 @@ fn addUnitTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: Optim
     if (deps.otel_mod) |m| unit_tests.root_module.addImport("otel", m);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
+
+    // The benchmark gate's comparison logic (benchmarks/compare.zig) is
+    // plain std code: unit-test it with the rest so CI's benchmark jobs
+    // cannot silently gate on noise again.
+    const compare_bench_tests = b.addTest(.{
+        .root_module = createModule(b, "benchmarks/compare.zig", target, optimize, &.{}),
+    });
+    test_step.dependOn(&b.addRunArtifact(compare_bench_tests).step);
 }
 
 fn addIntegrationTests(
@@ -528,6 +536,33 @@ fn addIntegrationTests(
     const run_recreate_uaf = b.addRunArtifact(recreate_uaf_tests);
     recreate_uaf_step.dependOn(&run_recreate_uaf.step);
 
+    // SONNY-6438: concurrent readers over a store far larger than the pool —
+    // the lock-free pin fast path racing slow-path page-table inserts and
+    // evictions (geode's parallel UNION shape). Every read is verified; the
+    // TSan variant must report nothing.
+    const concurrent_readers_step = b.step("test-buffer-pool-concurrent-readers", "Run concurrent readers over a store larger than the buffer pool (plaintext + encrypted), verifying every node and property read");
+    const concurrent_readers_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_concurrent_readers.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_concurrent_readers = b.addRunArtifact(concurrent_readers_tests);
+    concurrent_readers_step.dependOn(&run_concurrent_readers.step);
+    integration_step.dependOn(&run_concurrent_readers.step);
+
+    const concurrent_readers_tsan_step = b.step("test-buffer-pool-concurrent-readers-tsan", "Run the buffer-pool concurrent-readers suite under ThreadSanitizer (zero races expected)");
+    const concurrent_readers_tsan_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_concurrent_readers.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
+    });
+    concurrent_readers_tsan_tests.root_module.sanitize_thread = true;
+    const run_concurrent_readers_tsan = b.addRunArtifact(concurrent_readers_tsan_tests);
+    concurrent_readers_tsan_step.dependOn(&run_concurrent_readers_tsan.step);
+
     // GAP-ENT-0020 Phase P0: prop-store slab-packing FOUNDATION — props-store
     // efficiency metric (one-page-per-node baseline), property-set parity oracle,
     // and the read-both parity skeleton (legacy half passing; slab half TODO for
@@ -689,6 +724,19 @@ fn addIntegrationTests(
     const run_wal_lsn_anchor = b.addRunArtifact(wal_lsn_anchor_tests);
     wal_lsn_anchor_step.dependOn(&run_wal_lsn_anchor.step);
 
+    // At-rest encryption page tail (SONNY-6441) — the pager stores the AES-GCM
+    // tag in the last 16 bytes of every encrypted page; fixed-record layouts
+    // that reached the page end lost those bytes on every write + reload
+    // (eviction, reopen, crash recovery): committed nodes read back missing.
+    const tde_page_tail_step = b.step("test-tde-page-tail", "Run at-rest encryption page-tail tests: every committed node, property, incoming-edge head and adjacency entry survives eviction, reopen and crash recovery; a page failing authentication is an error, never a missing node");
+    const tde_page_tail_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/tde_page_tail.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_tde_page_tail = b.addRunArtifact(tde_page_tail_tests);
+    tde_page_tail_step.dependOn(&run_tde_page_tail.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
@@ -803,6 +851,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_wal_recovery_counters.step);
     // The WAL sequence-anchor crash guards are the same silent-loss class.
     integration_step.dependOn(&run_wal_lsn_anchor.step);
+    // The encrypted-page tail guards (SONNY-6441) likewise.
+    integration_step.dependOn(&run_tde_page_tail.step);
     // checkpoint_epoch recovery-invariance is the durability foundation the
     // WAL-aware derived-index contract rests on — gate it under integration.
     integration_step.dependOn(&run_checkpoint_epoch.step);
@@ -819,6 +869,12 @@ fn addIntegrationTests(
     // the release gate for the slab writer — gate both under the umbrella.
     integration_step.dependOn(&run_adjacency_slab_consumers.step);
     integration_step.dependOn(&run_adjacency_slab_crash.step);
+    // SONNY-6438: these three rotted outside every gate — two kept asserting
+    // pre-GAP-0060 formats, and ordered-index Test B asserted that a
+    // committed post-checkpoint write was LOST after a crash.
+    integration_step.dependOn(&run_prop_store_slab.step);
+    integration_step.dependOn(&run_edge_inline_pubid.step);
+    integration_step.dependOn(&run_ordered_recovery.step);
 }
 
 fn addExample(

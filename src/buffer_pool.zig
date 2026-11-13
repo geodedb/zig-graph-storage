@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tp = @import("thread_pool");
 const types = @import("types.zig");
 const page_mod = @import("page.zig");
@@ -29,6 +30,52 @@ pub const BufferPoolError = error{
 inline fn bpio() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
+
+/// PERF-0058 seqlock read side: order the speculative (plain) loads of the
+/// lock-free lookup BEFORE the validating `table_gen` re-load. An acquire load
+/// keeps LATER accesses after it but lets EARLIER plain loads sink below it,
+/// which would let a torn read pass validation. x86 never reorders loads with
+/// loads, so only the compiler needs fencing there; aarch64 needs `dmb ishld`
+/// (Linux `smp_rmb`). Any other target falls back to a release RMW, which
+/// orders every earlier access before it.
+inline fn seqlockReadFence(gen: *std.atomic.Value(u64)) u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64, .x86 => {
+            asm volatile ("" ::: .{ .memory = true });
+            return gen.load(.acquire);
+        },
+        .aarch64 => {
+            asm volatile ("dmb ishld" ::: .{ .memory = true });
+            return gen.load(.acquire);
+        },
+        else => return gen.fetchAdd(0, .acq_rel),
+    }
+}
+
+/// ThreadSanitizer annotations for the ONE intentionally racy region: the
+/// lock-free fast path's speculative page-table lookup and frame-identity
+/// pre-check in `BufferPool.pin`. Those plain reads race with the slow path's
+/// mutex-held page-table insert/remove and frame (re)publication BY DESIGN —
+/// a seqlock reader. Their result is never trusted unless (1) `table_gen` was
+/// even and unchanged across the lookup (no structural writer overlapped), and
+/// (2) after the pin CAS succeeds, `table_gen` is still unchanged and the frame
+/// still holds the requested page; otherwise the pin is undone and the slow
+/// path runs. Only READS of this thread inside the region are ignored: every
+/// write, and every read elsewhere (incl. the post-pin re-validation), stays
+/// instrumented. Proven by tests/buffer_pool_concurrent_readers.zig (every
+/// read checked; TSan step reports nothing) and buffer_pool_recreate_uaf.zig.
+const tsan = struct {
+    extern fn AnnotateIgnoreReadsBegin(file: [*:0]const u8, line: c_int) void;
+    extern fn AnnotateIgnoreReadsEnd(file: [*:0]const u8, line: c_int) void;
+
+    inline fn ignoreReadsBegin() void {
+        if (builtin.sanitize_thread) AnnotateIgnoreReadsBegin(@src().file, @src().line);
+    }
+
+    inline fn ignoreReadsEnd() void {
+        if (builtin.sanitize_thread) AnnotateIgnoreReadsEnd(@src().file, @src().line);
+    }
+};
 
 /// PERF-0058: sentinel `pin_count` value meaning "exclusively claimed by an
 /// eviction in progress" (flush + teardown). Eviction claims an UNPINNED frame
@@ -442,59 +489,47 @@ pub const BufferPool = struct {
         // A stable, EVEN `table_gen` ACROSS the lookup proves no page_table
         // insert/remove overlapped it (writers bracket every such mutation with
         // begin/endTableWrite -> odd/even), so the lock-free `get` observed a
-        // fully consistent, non-rehashing map. CRUCIAL ORDERING: the `frame_idx`
-        // returned by a `get` that raced a concurrent writer can be a TORN value
-        // (e.g. 0xAAAAAAAA), so we must NOT index `self.frames` with it until the
-        // post-get gen check (g1 == g0) has confirmed no writer overlapped — and
-        // even then bounds-check defensively. The second gen check after the pin
-        // bump closes the lookup->pin window against a writer that starts mid-pin.
+        // fully consistent, non-rehashing map. `speculativeLookup` does that
+        // lookup + the frame-identity pre-check (the only intentionally racy
+        // reads, hidden from TSan — see `tsan`); the second gen check after the
+        // pin bump closes the lookup->pin window against a writer that starts
+        // mid-pin.
         {
             const g0 = self.table_gen.load(.acquire);
             if (g0 & 1 == 0) {
-                const hit = self.page_table.get(key);
-                // Re-read gen BEFORE trusting / using `hit`: if it changed, a
-                // writer overlapped the get and `hit` may be a TORN value ->
-                // slow path without ever indexing the frames array with it.
-                const g1 = self.table_gen.load(.acquire);
-                if (g1 == g0) {
-                    if (hit) |frame_idx| {
-                        if (frame_idx < self.capacity) {
-                            const frame = &self.frames[frame_idx];
-                            if (frame.file_id == file_id and frame.page_id == page_id and
-                                frame.valid and !frame.loading and !frame.evicting)
-                            {
-                                // CAS-increment pin_count, REFUSING the eviction
-                                // sentinel. The claim (evict: CAS 0->PIN_EVICTING)
-                                // and this pin both CAS the SAME word, so they are
-                                // totally ordered and mutually exclusive WITHOUT a
-                                // Dekker fence: if eviction has claimed the frame we
-                                // see PIN_EVICTING and defer; otherwise our pin wins
-                                // and eviction's 0->sentinel CAS then fails.
-                                var c = @atomicLoad(u32, &frame.pin_count, .acquire);
-                                while (c != PIN_EVICTING) {
-                                    if (@cmpxchgWeak(u32, &frame.pin_count, c, c + 1, .acq_rel, .acquire)) |actual| {
-                                        c = actual; // contended; retry with fresh value
-                                        continue;
-                                    }
-                                    // Pinned. Re-validate that the frame still holds
-                                    // OUR page and no structural writer (re)claimed
-                                    // it after the lookup — a repurpose happens under
-                                    // a gen bracket, so a changed gen or identity
-                                    // means we pinned a frame that is being / has been
-                                    // reused: undo and defer.
-                                    if (self.table_gen.load(.acquire) == g0 and
-                                        frame.file_id == file_id and frame.page_id == page_id and
-                                        !frame.evicting and frame.valid)
-                                    {
-                                        @atomicStore(u8, &frame.referenced, 1, .monotonic);
-                                        if (self.metrics) |m| _ = @atomicRmw(u64, &m.buffer_hits, .Add, 1, .monotonic);
-                                        return frame;
-                                    }
-                                    _ = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
-                                    break;
-                                }
-                            }
+                tsan.ignoreReadsBegin();
+                const candidate = self.speculativeLookup(key, g0);
+                tsan.ignoreReadsEnd();
+                if (candidate) |frame| {
+                    // CAS-increment pin_count, REFUSING the eviction sentinel.
+                    // The claim (evict: CAS 0->PIN_EVICTING) and this pin both
+                    // CAS the SAME word, so they are totally ordered and mutually
+                    // exclusive WITHOUT a Dekker fence: if eviction has claimed the
+                    // frame we see PIN_EVICTING and defer; otherwise our pin wins
+                    // and eviction's 0->sentinel CAS then fails.
+                    var c = @atomicLoad(u32, &frame.pin_count, .acquire);
+                    while (c != PIN_EVICTING) {
+                        if (@cmpxchgWeak(u32, &frame.pin_count, c, c + 1, .acq_rel, .acquire)) |actual| {
+                            c = actual; // contended; retry with fresh value
+                            continue;
                         }
+                        // Pinned. Re-validate that the frame still holds OUR page
+                        // and no structural writer (re)claimed it after the lookup
+                        // — a repurpose happens under a gen bracket, so a changed
+                        // gen or identity means we pinned a frame that is being /
+                        // has been reused: undo and defer. The undo is safe
+                        // because every other pin_count change is an atomic RMW
+                        // too (see the slow path's publication).
+                        if (self.table_gen.load(.acquire) == g0 and
+                            frame.file_id == file_id and frame.page_id == page_id and
+                            !frame.evicting and frame.valid)
+                        {
+                            @atomicStore(u8, &frame.referenced, 1, .monotonic);
+                            if (self.metrics) |m| _ = @atomicRmw(u64, &m.buffer_hits, .Add, 1, .monotonic);
+                            return frame;
+                        }
+                        _ = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
+                        break;
                     }
                 }
             }
@@ -603,7 +638,13 @@ pub const BufferPool = struct {
             self.beginTableWrite();
             frame.file_id = file_id;
             frame.page_id = page_id;
-            frame.pin_count = 1;
+            // Publish OUR pin with an atomic +1, never a plain `= 1`: a stale
+            // fast-path reader that looked this frame up under its previous
+            // identity may have CAS-pinned it after eviction released it, and
+            // will undo that pin when its re-validation fails. A plain store
+            // would overwrite its +1 and its undo would then steal ours (the
+            // frame evicted while we use it).
+            _ = @atomicRmw(u32, &frame.pin_count, .Add, 1, .acq_rel);
             frame.referenced = 1;
             frame.dirty = false;
             frame.loading = true;
@@ -631,7 +672,8 @@ pub const BufferPool = struct {
             self.mutex.lockUncancelable(io);
             if (read_err) |err| {
                 self.beginTableWrite();
-                frame.pin_count = 0;
+                // Drop OUR pin only (see the publication above).
+                _ = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
                 frame.dirty = false;
                 frame.loading = false;
                 frame.evicting = false;
@@ -659,6 +701,24 @@ pub const BufferPool = struct {
             self.mutex.unlock(io);
             return frame;
         }
+    }
+
+    /// PERF-0058 fast path, speculative half: look `key` up in the page table
+    /// and pre-check the frame's identity WITHOUT the mutex. Plain reads racing
+    /// structural writers (see `tsan`); the result is only a CANDIDATE that
+    /// `pin` revalidates after pinning it. The `frame_idx` returned by a `get`
+    /// that raced a writer can be a TORN value (e.g. 0xAAAAAAAA), so it is not
+    /// used to index `frames` until the seqlock re-check has confirmed no
+    /// writer overlapped — and is bounds-checked even then.
+    fn speculativeLookup(self: *BufferPool, key: PageKey, g0: u64) ?*PageFrame {
+        const hit = self.page_table.get(key);
+        if (seqlockReadFence(&self.table_gen) != g0) return null;
+        const frame_idx = hit orelse return null;
+        if (frame_idx >= self.capacity) return null;
+        const frame = &self.frames[frame_idx];
+        if (frame.file_id != key.file_id or frame.page_id != key.page_id or
+            !frame.valid or frame.loading or frame.evicting) return null;
+        return frame;
     }
 
     /// Pin a new page without reading from disk. Used when creating a new page.
@@ -726,7 +786,8 @@ pub const BufferPool = struct {
             self.beginTableWrite();
             frame.file_id = file_id;
             frame.page_id = page_id;
-            frame.pin_count = 1;
+            // Atomic +1, as in `pin`'s load publication.
+            _ = @atomicRmw(u32, &frame.pin_count, .Add, 1, .acq_rel);
             frame.referenced = 1;
             frame.dirty = false;
             frame.loading = false;
@@ -1329,7 +1390,9 @@ pub const BufferPool = struct {
         self.decrResident(frame.file_id);
         self.removeFromLru(idx);
         frame.valid = false;
-        frame.pin_count = 0; // release the claim; frame is now free
+        // Release the claim; the frame is now free. Atomic: from here a stale
+        // fast-path reader can CAS-pin it (and will undo that).
+        @atomicStore(u32, &frame.pin_count, 0, .release);
         frame.referenced = 0;
         frame.dirty = false;
         frame.loading = false;
