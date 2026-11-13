@@ -717,6 +717,14 @@ pub const AdjStore = struct {
     /// not found (no page touched). GAP-ENT-0032: the caller must WAL-image
     /// exactly this page — imaging only the chain head lets older WAL images of
     /// a non-head block resurrect a committed delete on crash recovery.
+    ///
+    /// SONNY-6470: on a store encrypted by graph_storage <= 0.4.11 the last
+    /// slot of a full block can hold AES-GCM tag bytes (`edge.legacyTailLoss`).
+    /// The swap below moves that entry into slot `i` and the block stops being
+    /// full, after which `repairAdjTailEntries` (last slot of full blocks only)
+    /// and any scan can no longer recognise it. Run the repair before the first
+    /// write. A <= 0.4.11 binary that already removed an edge from such a block
+    /// left an unrecoverable entry (docs/operations.md).
     pub fn removeEdge(self: *AdjStore, head_page: PageId, edge_id: EdgeId) !?PageId {
         self.beginOp();
         // A tagged head is a slab-packed chain (regardless of the packing flag):

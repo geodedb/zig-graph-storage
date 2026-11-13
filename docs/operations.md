@@ -182,6 +182,18 @@ this order:
    from the edge's other-direction copy and reports what it cannot restore.
    A later `removeEdge` in a damaged block moves the damaged last entry to
    another slot, where it can no longer be recognised.
+
+   **Known unrecoverable case.** The same move already happened if the old
+   binary itself removed an edge from a damaged full block: it read the tag
+   bytes as the last entry's fields (pages read by <= 0.4.11 kept them;
+   0.4.12+ zero the legacy tail on read), swapped that entry into the freed
+   slot and wrote the block back with one entry fewer. The block is no
+   longer full and the damaged entry is no longer in the last slot, so the
+   repair, which only inspects the last slot of full blocks, does not see it,
+   and a scan cannot tell tag bytes from a real `rel_type` / `prop_head` /
+   `public_id`. Such an entry reads back with wrong fields; only a comparison
+   of every entry with its other-direction copy could find it, and the
+   repair does not do one.
 3. Re-attach incoming chains whose `adj_in_dir` head was lost with
    `migrateColocateInEdges` (after step 2, so it copies repaired entries).
 4. A node record that lost its tail (8 KiB pages, slot 169) can be given its

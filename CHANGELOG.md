@@ -323,7 +323,13 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.2.1...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.13...HEAD
+[0.4.13]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.12...v0.4.13
+[0.4.12]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.11...v0.4.12
+[0.4.11]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.10...v0.4.11
+[0.4.3]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.2...v0.4.3
+[0.4.2]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.1...v0.4.2
+[0.4.1]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.0...v0.4.1
 [0.2.1]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.2.0...v0.2.1
 [0.2.0]: https://gitlab.com/devnw/zig/graph-storage/-/releases/v0.2.0
 [0.1.0]: https://gitlab.com/devnw/zig/graph-storage/-/releases/v0.1.0
