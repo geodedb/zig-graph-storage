@@ -60,6 +60,12 @@ fn baselineConfig() gs.GraphConfig {
         // writer here to keep testing this path. Slab + inline-public-id parity
         // is covered separately in tests/adjacency_slab.zig (slabConfig).
         .adjacency_slab_packing = false,
+        // Same for GAP-0060 (default ON since v0.2.35): it slab-packs edge
+        // properties and makes the adjacency writer emit wide v3 (40 B)
+        // blocks. This suite's legacy id-PROPERTY baseline and v1/v2 block
+        // tests need the legacy edge-property writer and v2 blocks; the v3 /
+        // slab edge-property path is covered in src/engine_test.zig (GAP-0060).
+        .edge_prop_slab_packing = false,
     };
 }
 
@@ -897,6 +903,8 @@ test "P2 crash: fresh v2 block linked into a v1 chain replays via WAL page-image
     // page; adjacency slab packing (default ON since P7) makes out_head a slab
     // head instead, so pin the legacy block writer for this legacy scenario.
     cfg.adjacency_slab_packing = false;
+    // Likewise the v2 block writer: GAP-0060's wide-head writer emits v3.
+    cfg.edge_prop_slab_packing = false;
 
     const pid: u64 = 0xCAFE_F00D_0000_0001;
     var node_a: u64 = 0;
@@ -1099,8 +1107,10 @@ test "P2 crash: plain v2 appends (multi-block chain) replay with exact public_id
 const OLD_EDGE_SNAPSHOT_MAGIC = "GSEIDX2\x00"; // pre-P3 (32 B records)
 // The edge snapshots use the SORTED mmap container (sorted_index_snapshot.zig)
 // under bumped magics. WAL-aware durability grew the header a second stamp
-// field, bumping GSEIDX4 -> GSEIDX5 / GSXIDX2 -> GSXIDX3.
-const NEW_EDGE_SNAPSHOT_MAGIC = "GSEIDX5\x00"; // sorted 40 B records
+// field, bumping GSEIDX4 -> GSEIDX5 / GSXIDX2 -> GSXIDX3; GAP-0060 widened the
+// edge record's prop_head u32 -> u64 (40 B -> 44 B), bumping GSEIDX5 -> GSEIDX6.
+const NEW_EDGE_SNAPSHOT_MAGIC = "GSEIDX6\x00"; // sorted 44 B records
+const EDGE_RECORD_SIZE: u32 = gs.edge_index_map.RECORD_SIZE;
 const NEW_EXIST_SNAPSHOT_MAGIC = "GSXIDX3\x00"; // sorted 28 B records
 const SNAPSHOT_CRC = std.hash.crc.Crc32Iscsi;
 /// LEGACY container header: magic(8) + checkpoint_counter(8) + item_count(8).
@@ -1143,10 +1153,11 @@ fn writeFileBytes(path: []const u8, bytes: []const u8) !void {
     try f.writePositionalAll(io, bytes, 0);
 }
 
-/// Downgrade a NEW-format (GSEIDX4 sorted-container, 40 B records) edges.idx
+/// Downgrade a NEW-format (GSEIDX6 sorted-container, 44 B records) edges.idx
 /// file on disk into a byte-exact OLD-format (GSEIDX2 legacy container, 32 B
-/// records) snapshot: same counter, same item_count, public_id column
-/// dropped, legacy whole-file CRC32 appended. This is exactly what a pre-P3
+/// records) snapshot: same counter, same item_count, prop_head narrowed to
+/// its low 32 bits and the public_id column dropped, legacy whole-file CRC32
+/// appended. This is exactly what a pre-P3
 /// binary would have written for the same edge set.
 fn downgradeEdgeSnapshotToV2(allocator: Allocator, path: []const u8) !void {
     const data = try readFileBytes(allocator, path);
@@ -1156,9 +1167,9 @@ fn downgradeEdgeSnapshotToV2(allocator: Allocator, path: []const u8) !void {
     try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
     // New sorted layout: epoch@8, covered_lsn@16, record_count@24, size@32.
     const item_count = std.mem.readInt(u64, data[24..32], .little);
-    try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[32..36], .little));
-    try testing.expectEqual(sortedSnapshotSize(@intCast(item_count), 40), data.len);
-    const payload = data[SORTED_HEADER..][0 .. item_count * 40];
+    try testing.expectEqual(EDGE_RECORD_SIZE, std.mem.readInt(u32, data[32..36], .little));
+    try testing.expectEqual(sortedSnapshotSize(@intCast(item_count), EDGE_RECORD_SIZE), data.len);
+    const payload = data[SORTED_HEADER..][0 .. item_count * EDGE_RECORD_SIZE];
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -1172,8 +1183,10 @@ fn downgradeEdgeSnapshotToV2(allocator: Allocator, path: []const u8) !void {
     try out.appendSlice(allocator, &ic_buf);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
-        const rec = payload[i * 40 ..][0..40];
-        try out.appendSlice(allocator, rec[0..32]); // drop trailing public_id u64
+        const rec = payload[i * EDGE_RECORD_SIZE ..][0..EDGE_RECORD_SIZE];
+        // edge_id|from|neighbor|rel_type|prop_head low 32 (LE): drop the
+        // prop_head high half and the trailing public_id u64.
+        try out.appendSlice(allocator, rec[0..32]);
     }
     const crc = SNAPSHOT_CRC.hash(out.items);
     var crc_buf: [4]u8 = undefined;
@@ -1274,7 +1287,7 @@ fn p3Populate(eng: *GraphEngine, ids: *[P3_N]u64) !void {
     try p3Edges(eng, n, ids);
 }
 
-test "P3 snapshot round-trip: clean reopen LOADS the 40 B-record snapshot (no rebuild), ids intact" {
+test "P3 snapshot round-trip: clean reopen LOADS the 44 B-record snapshot (no rebuild), ids intact" {
     var td = try test_support.TestDataDir.init(testing.allocator);
     defer td.deinit();
     const uuid = [_]u8{0xE7} ** 16;
@@ -1291,7 +1304,7 @@ test "P3 snapshot round-trip: clean reopen LOADS the 40 B-record snapshot (no re
     }
     defer testing.allocator.free(idx_path);
 
-    // On-disk snapshot shape: sorted container — header + P3_N 40 B records
+    // On-disk snapshot shape: sorted container — header + P3_N 44 B records
     // (sorted by edge_id) + block-CRC dir + meta CRC, new magic.
     {
         const data = try readFileBytes(testing.allocator, idx_path);
@@ -1299,13 +1312,13 @@ test "P3 snapshot round-trip: clean reopen LOADS the 40 B-record snapshot (no re
         try testing.expectEqualStrings(NEW_EDGE_SNAPSHOT_MAGIC, data[0..8]);
         // record_count@24, record_size@32 under the two-stamp sorted header.
         try testing.expectEqual(@as(u64, P3_N), std.mem.readInt(u64, data[24..32], .little));
-        try testing.expectEqual(@as(u32, 40), std.mem.readInt(u32, data[32..36], .little));
-        try testing.expectEqual(sortedSnapshotSize(P3_N, 40), data.len);
+        try testing.expectEqual(EDGE_RECORD_SIZE, std.mem.readInt(u32, data[32..36], .little));
+        try testing.expectEqual(sortedSnapshotSize(P3_N, EDGE_RECORD_SIZE), data.len);
         // Records are sorted by edge_id (the binary-search invariant).
         var prev: u64 = 0;
         var ri: usize = 0;
         while (ri < P3_N) : (ri += 1) {
-            const id = std.mem.readInt(u64, data[SORTED_HEADER + ri * 40 ..][0..8], .little);
+            const id = std.mem.readInt(u64, data[SORTED_HEADER + ri * EDGE_RECORD_SIZE ..][0..8], .little);
             try testing.expect(id > prev);
             prev = id;
         }

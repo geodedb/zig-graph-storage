@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`error.DecryptionFailed`), and a plaintext page with a zeroed header must
   pass its CRC32C. Both were taken for never-written pages, so damage read
   back as missing nodes (SONNY-6441).
+- `test-prop-store-slab`, `test-edge-inline-public-id` and
+  `test-ordered-index-recovery` pass again and run under `test-integration`.
+  The first two still asserted pre-GAP-0060 behaviour (edge properties never
+  slab-packed, v2 adjacency blocks, the GSEIDX5 40-byte edge snapshot); they
+  now pin `edge_prop_slab_packing = false` where they test the legacy writer
+  and expect GSEIDX6 44-byte records. Ordered-index Test B and B2 expected a
+  committed post-checkpoint node to be lost in a crash; they now require it
+  to survive (SONNY-6438).
 
 ## [0.4.11] - 2026-11-12
 

@@ -834,6 +834,12 @@ fn addIntegrationTests(
     // the release gate for the slab writer — gate both under the umbrella.
     integration_step.dependOn(&run_adjacency_slab_consumers.step);
     integration_step.dependOn(&run_adjacency_slab_crash.step);
+    // SONNY-6438: these three rotted outside every gate — two kept asserting
+    // pre-GAP-0060 formats, and ordered-index Test B asserted that a
+    // committed post-checkpoint write was LOST after a crash.
+    integration_step.dependOn(&run_prop_store_slab.step);
+    integration_step.dependOn(&run_edge_inline_pubid.step);
+    integration_step.dependOn(&run_ordered_recovery.step);
 }
 
 fn addExample(
