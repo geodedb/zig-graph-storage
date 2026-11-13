@@ -748,6 +748,17 @@ fn addIntegrationTests(
     const run_adj_tail_repair = b.addRunArtifact(adj_tail_repair_tests);
     adj_tail_repair_step.dependOn(&run_adj_tail_repair.step);
 
+    // SONNY-6461: page checksum on the CPU's CRC32C instruction, bit-identical
+    // to the table implementation.
+    const page_checksum_step = b.step("test-page-checksum", "Run page checksum tests: CRC32C uses the CPU instruction where present and stays bit-identical to the table");
+    const page_checksum_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/page_checksum.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_page_checksum = b.addRunArtifact(page_checksum_tests);
+    page_checksum_step.dependOn(&run_page_checksum.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
@@ -943,6 +954,17 @@ fn addBenchmarks(
     const run_load_bench = b.addRunArtifact(load_bench_exe);
     if (b.args) |args| run_load_bench.addArgs(args);
     load_bench_step.dependOn(&run_load_bench.step);
+
+    // SONNY-6461: page checksum (CRC32C) and plaintext vs encrypted readPage.
+    const checksum_bench_step = b.step("bench-checksum", "SONNY-6461 page checksum micro-benchmark: CRC32C per 8 KiB page and plaintext vs encrypted readPage (use -Doptimize=ReleaseFast)");
+    const checksum_bench_exe = b.addExecutable(.{
+        .name = "checksum-bench",
+        .root_module = createModule(b, "benchmarks/checksum_bench.zig", target, bench_optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_checksum_bench = b.addRunArtifact(checksum_bench_exe);
+    checksum_bench_step.dependOn(&run_checksum_bench.step);
 
     // GAP-0900: WAL-batch A/B microbench (deferred multi-page txns).
     const wal_batch_ab_step = b.step("bench-wal-batch-ab", "GAP-0900 WAL-batch A/B: deferred multi-page txn throughput + syscall count");
