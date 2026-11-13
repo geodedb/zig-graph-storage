@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory-fsynced inside the checkpoint before the manifest, the manifest
   rename is directory-fsynced before the WAL truncate, and
   `getOrAssignLabel` makes a new name durable before returning its id
-  (checkpoints no longer write `labels.dict`). `close()` uses the same
+  (checkpoints no longer write `labels.dict`; `create` writes the empty
+  dictionary). `close()` uses the same
   sequence and now also records the per-store page counts in the manifest.
   Opening a store that crashed in that window under <= 0.4.13 detects a
   bitmap with fewer allocated pages than the manifest recorded, or an
