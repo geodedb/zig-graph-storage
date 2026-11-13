@@ -403,6 +403,10 @@ pub const GraphEngine = struct {
         // that run afterwards (e.g. initThreadPool) so they cannot leak the
         // subsystems and the WAL directory handle.
         errdefer self.cleanupSubsystems();
+        // SONNY-6491: checkpoints no longer write labels.dict (new names are
+        // made durable when assigned), so create it here: every store has
+        // one, as backups and verify expect.
+        try engine_persist.saveLabelDictionaryDurable(self);
 
         // 7. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
@@ -667,6 +671,13 @@ pub const GraphEngine = struct {
             error.FileNotFound => {}, // Expected on fresh graphs
             else => return err,
         };
+        // SONNY-6491: graph_storage <= 0.4.13 saved labels.dict after the
+        // manifest; a crash in between leaves fewer names than the manifest
+        // counted. The lost names cannot be re-derived (label blocks hold only
+        // ids), so report it; ids without a name read back as unnamed.
+        if (self.label_dict.count() < self.manifest.label_count) {
+            std.log.warn("labels.dict holds {d} label names but the manifest recorded {d}: names assigned before a crash during a <= 0.4.13 checkpoint are lost", .{ self.label_dict.count(), self.manifest.label_count });
+        }
 
         // 7. Phase A (engine early-ready): the O(nodes+edges) derived-index
         // build (label/property-chain/edge/edge-existence) is DEFERRED out of
@@ -1084,10 +1095,6 @@ pub const GraphEngine = struct {
         return engine_index.saveDerivedIndexes(self, covered_lsn);
     }
 
-    fn saveLabelDictionary(self: *GraphEngine) !void {
-        return engine_persist.saveLabelDictionary(self);
-    }
-
     /// Initializes `thread_pool` to either the caller-supplied pool (when
     /// `cfg.external_thread_pool` is set — borrowed) or a fresh
     /// `default_owned_pool_max_threads`-worker pool stored in
@@ -1197,15 +1204,12 @@ pub const GraphEngine = struct {
             // Run a final synchronous checkpoint only when there are writes
             // that have not already been durably persisted.
             self.ensureSubmitterRegistered();
-            self.checkpointer.doCheckpoint() catch |err| {
+            // SONNY-6491: free.store is made durable inside the checkpoint,
+            // before the manifest (engine_persist.checkpointSideFiles).
+            engine_persist.refreshManifestCounters(self);
+            self.checkpointer.doCheckpointWith(engine_persist.preManifestStep(self)) catch |err| {
                 close_err = err;
             };
-
-            if (close_err == null) {
-                self.saveFreeStore() catch |err| {
-                    if (close_err == null) close_err = err;
-                };
-            }
             // Phase A: only persist the derived-index snapshots when they were
             // materialized this session. If never hydrated, the resident indexes
             // are EMPTY and saving them would stamp empty snapshots at the
@@ -1222,11 +1226,11 @@ pub const GraphEngine = struct {
                 self.saveDerivedIndexes(self.manifest.last_checkpoint_lsn) catch |err| {
                     if (close_err == null) close_err = err;
                 };
-            }
-            if (close_err == null) {
-                self.saveLabelDictionary() catch |err| {
-                    if (close_err == null) close_err = err;
-                };
+                if (close_err == null) {
+                    self.checkpointer.faultPoint(.post_derived) catch |err| {
+                        close_err = err;
+                    };
+                }
             }
             if (close_err == null) {
                 // GAP-0027: persist catalog + B+tree property indexes on close.
@@ -2756,8 +2760,15 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         try self.ensureWritable();
+        const is_new = self.label_dict.getId(label) == null;
         const id = try self.label_dict.getOrAssign(label);
         self.markDirty();
+        // SONNY-6491: label assignment is not WAL-logged and labels.dict is the
+        // only record of a name, so a new name is made durable (file fsync,
+        // rename, directory fsync) before the id is returned and can reach a
+        // committed record. A crash at any later point then finds the name.
+        // New names are rare (schema-level); existing names cost nothing.
+        if (is_new) try engine_persist.saveLabelDictionaryDurable(self);
         observability.endOperationSpan(__obs_span, true, "");
         return id;
     }

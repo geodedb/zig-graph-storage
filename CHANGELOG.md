@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.14] - 2026-11-13
+
+### Changed
+
+- The WAL record checksum (CRC32C over the record header and payload,
+  computed while a record is serialized and again when replay checks it)
+  uses the CPU's CRC32C instruction through the new streaming
+  `crc32c.Hasher` (`init` / `update` / `final`), with the table as fallback,
+  as the page checksum does since 0.4.13. Values are unchanged.
+  `zig build bench-checksum -Doptimize=ReleaseFast` on an x86_64 host:
+  `WalRecord.serializeInto` of an 8 KiB page image 16000 to 770 ns
+  (SONNY-6470).
+
+### Fixed
+
+- Crash recovery applies, for each page, only the committed page image with
+  the highest LSN. A GAP-0900 WAL batch numbers its page images when they are
+  made but writes them at its transaction's commit, so a second transaction
+  on the same `TxnManager` that overlapped it logged a newer image of a shared
+  page first, and recovery, which applied images in log order, overwrote it
+  with the batched transaction's older one: committed writes were lost after
+  a crash (geode SONNY-2978: 64 of 64 property removals came back). WAL logs
+  of that shape written by 0.4.12 and 0.4.13 recover correctly with this
+  release. The write path, the WAL format and batching are unchanged. A
+  superseded image still feeds the id-counter heal (its ids were committed)
+  but not the node/edge count heal. The GAP-0900 comments that said batching
+  does not change durability are corrected (SONNY-6473).
+- A crash during a checkpoint could lose data. The checkpoint wrote the
+  manifest and truncated the WAL before saving `free.store`, so a crash in
+  between left the new manifest next to the previous bitmap and the next
+  open handed pages allocated since then to new writers (committed
+  properties overwritten); the manifest rename itself was never
+  directory-fsynced before the WAL truncate. `labels.dict` was saved only at
+  checkpoint time, so a crash before that lost every label name assigned
+  since the previous checkpoint. Now `free.store` is written and
+  directory-fsynced inside the checkpoint before the manifest, the manifest
+  rename is directory-fsynced before the WAL truncate, and
+  `getOrAssignLabel` makes a new name durable before returning its id
+  (checkpoints no longer write `labels.dict`; `create` writes the empty
+  dictionary). `close()` uses the same
+  sequence and now also records the per-store page counts in the manifest.
+  Opening a store that crashed in that window under <= 0.4.13 detects a
+  bitmap with fewer allocated pages than the manifest recorded, or an
+  unallocated written node page below the highest issued node id, and
+  rebuilds the bitmaps; lost label names are reported with a warning (they
+  cannot be re-derived). `test-checkpoint-side-file-crash` crashes at every
+  step of light, full and close checkpoints, plaintext and TDE, single and
+  sharded. Per checkpoint the fsync count is unchanged (the manifest's new
+  directory fsync replaces the dropped `labels.dict` write) and one rename
+  fewer per engine; a new label name costs two fsyncs and one rename per
+  engine once (strace of a 16-shard store: light 208 fsyncs both before and
+  after, full 304 / 304, close 336 / 336) (SONNY-6491).
+- `free.store` stores the bitmap's `usize` words byte for byte and records
+  no writer layout, so a big-endian or 32-bit host misread files from a
+  64-bit little-endian host (and wrote files such a host would misread).
+  Those hosts now refuse the layout (`error.UnsupportedHostLayout` from
+  `FreeSpaceManager.serialize` / `deserializeBounded` and `FreeStore`), and
+  the engine writes an empty `free.store` there and rebuilds the bitmaps at
+  open. 64-bit little-endian hosts read and write the same bytes as before.
+  `docs/format-spec.md` §10.3 documents the layout and the limitation; the
+  stale NodeRec layout in §2.1 (40 bytes, `label_set`) is corrected to the
+  48-byte record, and the unrecoverable `removeEdge` case of <= 0.4.11
+  encrypted stores is documented (SONNY-6470).
+- CI runs `test-leverb-clean-restart` (Lever B: derived indexes load on a
+  clean restart, are reconciled or rebuilt after a crash) in its own job; it
+  was in no CI job. The advisory `benchmark-regression` job compares against
+  the last successful default-branch run's `current-ci.json` artifact
+  instead of the committed `ci-baseline.json`, whose workstation numbers
+  (1K `label_scan_ns` p50 0.146 ns, `mixed_ops_sec` 486) fail any CI build;
+  that file is now only the fallback, and `benchmarks/results/README.md`
+  says how to regenerate it (SONNY-6470).
+
 ## [0.4.13] - 2026-11-13
 
 ### Changed
@@ -308,7 +380,14 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.2.1...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.14...HEAD
+[0.4.14]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.13...v0.4.14
+[0.4.13]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.12...v0.4.13
+[0.4.12]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.11...v0.4.12
+[0.4.11]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.10...v0.4.11
+[0.4.3]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.2...v0.4.3
+[0.4.2]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.1...v0.4.2
+[0.4.1]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.0...v0.4.1
 [0.2.1]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.2.0...v0.2.1
 [0.2.0]: https://gitlab.com/devnw/zig/graph-storage/-/releases/v0.2.0
 [0.1.0]: https://gitlab.com/devnw/zig/graph-storage/-/releases/v0.1.0

@@ -10,6 +10,22 @@ const BufferPool = buffer_pool_mod.BufferPool;
 const FileId = types.FileId;
 const PageId = types.PageId;
 
+/// SONNY-6470: the persisted bitmap (`serialize`, `free.store`) stores the
+/// in-memory `usize` mask words byte for byte. Every file in existence was
+/// written as 64-bit little-endian words; another host would read them with
+/// the wrong byte order or word count and write files a 64-bit
+/// little-endian host would misread. The format does not record the writer's
+/// layout, so such hosts refuse it (`error.UnsupportedHostLayout`) instead of
+/// reinterpreting it, and the engine rebuilds the bitmap from the store files.
+pub const host_layout_supported: bool = blk: {
+    checkHostLayout(@import("builtin").cpu.arch.endian(), @sizeOf(usize)) catch break :blk false;
+    break :blk true;
+};
+
+pub fn checkHostLayout(endian: std.builtin.Endian, usize_bytes: usize) error{UnsupportedHostLayout}!void {
+    if (endian != .little or usize_bytes != 8) return error.UnsupportedHostLayout;
+}
+
 /// Page-level free space tracking using an in-memory bitmap.
 /// Page 0 is always reserved (bitmap metadata page).
 /// The bitmap is rebuilt from store files on startup.
@@ -165,7 +181,8 @@ pub const FreeSpaceManager = struct {
     }
 
     /// Serialize bitmap state into `buf`. Returns the number of bytes written.
-    pub fn serialize(self: *const FreeSpaceManager, buf: []u8) error{BufferTooSmall}!usize {
+    pub fn serialize(self: *const FreeSpaceManager, buf: []u8) error{ BufferTooSmall, UnsupportedHostLayout }!usize {
+        if (!host_layout_supported) return error.UnsupportedHostLayout;
         const needed = self.serializedSize();
         if (buf.len < needed) return error.BufferTooSmall;
 
@@ -189,6 +206,7 @@ pub const FreeSpaceManager = struct {
     /// Deserialize bitmap state from `buf`, rejecting metadata that would
     /// expand the in-memory bitmap beyond `max_total_pages`.
     pub fn deserializeBounded(self: *FreeSpaceManager, buf: []const u8, max_total_pages: u64) !usize {
+        if (!host_layout_supported) return error.UnsupportedHostLayout;
         if (buf.len < header_size) return error.UnexpectedEof;
 
         const total_pages = std.mem.readInt(u64, buf[0..8], .little);
@@ -222,8 +240,9 @@ pub const FreeSpaceManager = struct {
 ///
 /// Format: one serialized `FreeSpaceManager` bitmap per paged store, in
 /// `store_order`, each `total_pages: u64 LE`, `next_free_hint: u64 LE`, then
-/// `ceil(total_pages / bits_per_usize)` native `usize` mask words (bit set =
-/// page allocated; page 0 is always set). Files written before edge
+/// `ceil(total_pages / 64)` 64-bit little-endian mask words (bit set = page
+/// allocated; page 0 is always set). Reading on any other host fails with
+/// `error.UnsupportedHostLayout` (see `host_layout_supported`). Files written before edge
 /// co-location end after the fifth bitmap (`in_idx` and `in_dir` absent).
 ///
 /// What it says: the allocation state as of the last checkpoint (the engine
@@ -596,4 +615,20 @@ test "GAP-0035: deserializeBounded rejects invalid next_free_hint" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "SONNY-6470: free.store mask words are defined only for 64-bit little-endian hosts" {
+    // The masks are raw `usize` words; a host with another word size or byte
+    // order would misread a file written on a 64-bit little-endian host (and
+    // write one such a host would misread). Such hosts must refuse the
+    // layout, never reinterpret it.
+    try testing.expectError(error.UnsupportedHostLayout, checkHostLayout(.big, 8));
+    try testing.expectError(error.UnsupportedHostLayout, checkHostLayout(.little, 4));
+    try testing.expectError(error.UnsupportedHostLayout, checkHostLayout(.big, 4));
+    try checkHostLayout(.little, 8);
+    // This host's verdict is the one serialize/deserialize act on.
+    try testing.expectEqual(
+        host_layout_supported,
+        if (checkHostLayout(@import("builtin").cpu.arch.endian(), @sizeOf(usize))) |_| true else |_| false,
+    );
 }

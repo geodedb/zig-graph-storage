@@ -82,13 +82,15 @@ pub const TxnManager = struct {
         // GAP-0900: open a WAL record batch for this txn AFTER its begin_txn
         // record is written. Subsequent page-update records for this txn are
         // collected and flushed in one syscall at commit (see `commit`),
-        // preserving LSN order: begin_txn, page_update*, commit_txn.
+        // preserving this txn's own order: begin_txn, page_update*, commit_txn.
         //
         // The WalManager carries a single batch buffer, so only ONE txn can
-        // batch at a time. If another txn already holds the batch (rare —
-        // concurrent/nested txns on the same engine), this txn silently uses
-        // the per-record write path; correctness and durability are unchanged,
-        // only the syscall amortisation is skipped for the overlapping txn.
+        // batch at a time. If another txn already holds the batch (concurrent
+        // or spanning txns on the same engine), this txn uses the per-record
+        // write path. Its records are then written BEFORE the batched txn's
+        // earlier-numbered ones, so the log is not in LSN order across the two
+        // txns; recovery orders page images by LSN (SONNY-6473), which keeps
+        // the overlap durable.
         self.wal.beginBatch(txn_id) catch |err| switch (err) {
             error.BatchAlreadyOpen => {},
         };

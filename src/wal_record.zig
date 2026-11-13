@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const crc32c = @import("crc32c.zig");
 
 /// WAL record types for the write-ahead log.
 pub const WalRecordType = enum(u8) {
@@ -56,7 +57,9 @@ pub const WalRecord = struct {
         if (buf.len < total_size) return error.BufferTooSmall;
 
         // fips-exempt: non-security — WAL record CRC32C corruption check.
-        var hasher = std.hash.crc.Crc32Iscsi.init();
+        // SONNY-6470: the CPU's CRC32C instruction where present (crc32c.zig),
+        // bit-identical to the table.
+        var hasher = crc32c.Hasher.init();
         var offset: usize = 0;
 
         // lsn (8 bytes, little-endian)
@@ -177,7 +180,7 @@ pub const WalRecord = struct {
     /// The checksum covers: lsn + txn_id + record_type + file_id + page_id + payload_len + payload.
     pub fn computeChecksum(self: *const WalRecord) u32 {
         // fips-exempt: non-security — WAL record CRC32C corruption check.
-        var hasher = std.hash.crc.Crc32Iscsi.init();
+        var hasher = crc32c.Hasher.init();
         hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.lsn)));
         hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.txn_id)));
         hasher.update(&[_]u8{@intFromEnum(self.record_type)});
@@ -516,4 +519,25 @@ test "cross_shard_commit and cross_shard_abort record types round-trip" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "SONNY-6470: the record checksum is CRC32C of the serialized header and payload" {
+    var payload: [8192]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x6470);
+    prng.random().bytes(&payload);
+    var rec = WalRecord{
+        .lsn = 0x0102_0304_0506_0708,
+        .txn_id = 99,
+        .record_type = .page_update,
+        .file_id = 3,
+        .page_id = 1234,
+        .payload = &payload,
+        .checksum = 0,
+    };
+    var buf: [8192 + 64]u8 = undefined;
+    const n = try rec.serializeInto(&buf);
+    const want = std.hash.crc.Crc32Iscsi.hash(buf[0 .. n - CHECKSUM_SIZE]);
+    try std.testing.expectEqual(want, rec.checksum);
+    try std.testing.expectEqual(want, rec.computeChecksum());
+    try std.testing.expectEqual(want, std.mem.readInt(u32, buf[n - CHECKSUM_SIZE ..][0..4], .little));
 }

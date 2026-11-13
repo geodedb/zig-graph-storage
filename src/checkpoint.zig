@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const buffer_pool_mod = @import("buffer_pool.zig");
@@ -16,6 +17,26 @@ const WalManager = wal_mod.WalManager;
 const Manifest = manifest_mod.Manifest;
 const FileManager = file_manager_mod.FileManager;
 const GraphDir = graph_dir_mod.GraphDir;
+
+/// SONNY-6491: TEST-ONLY crash points of the checkpoint sequence. A test sets
+/// `Checkpointer.test_fault`; the checkpoint then stops with
+/// `error.TestCrashInjected` right after the named step, leaving on disk
+/// exactly what a process killed at that moment leaves. Outside test builds
+/// the field is `void` and every check compiles to nothing.
+pub const FaultPoint = enum {
+    /// Pages flushed and fsynced; manifest not yet written.
+    pre_manifest,
+    /// Manifest written; WAL not yet truncated.
+    post_manifest,
+    /// WAL truncated up to the checkpoint LSN.
+    post_wal_truncate,
+    /// `free.store` saved.
+    post_free_store,
+    /// `labels.dict` saved.
+    post_label_dict,
+    /// Derived-index snapshots saved (full checkpoint and close only).
+    post_derived,
+};
 
 /// Incremental checkpointer that flushes dirty pages and updates the manifest.
 ///
@@ -36,6 +57,16 @@ pub const Checkpointer = struct {
     encryption_key: ?[32]u8 = null,
     /// Optional log callback for structured event emission.
     log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
+    /// SONNY-6491: see `FaultPoint`. `void` outside test builds.
+    test_fault: if (builtin.is_test) ?FaultPoint else void = if (builtin.is_test) null else {},
+
+    /// SONNY-6491: stop here when a test asked to crash after step `p`.
+    pub fn faultPoint(self: *const Checkpointer, p: FaultPoint) error{TestCrashInjected}!void {
+        if (comptime !builtin.is_test) return;
+        if (self.test_fault) |f| {
+            if (f == p) return error.TestCrashInjected;
+        }
+    }
 
     pub fn init(
         allocator: Allocator,
@@ -55,8 +86,27 @@ pub const Checkpointer = struct {
         };
     }
 
-    /// Run a checkpoint:
+    /// SONNY-6491: work that must be durable BEFORE the manifest that depends
+    /// on it (the engine's `free.store`). Runs after the pages are flushed and
+    /// fsynced, so it sees the state the manifest is about to cover.
+    pub const PreManifest = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque) anyerror!void,
+    };
+
+    /// Run a checkpoint with no pre-manifest step.
     pub fn doCheckpoint(self: *Checkpointer) !void {
+        return self.doCheckpointWith(null);
+    }
+
+    /// Run a checkpoint:
+    ///   1. record the WAL LSN, 2. flush dirty pages, 3. fsync dirty store
+    ///   files, 4. `pre` (side files, made durable by the caller), 5. write
+    ///   the manifest and fsync the graph directory, 6. truncate the WAL.
+    /// Each step is durable before the next starts, so a crash anywhere
+    /// leaves either the previous manifest with an untruncated WAL (recovery
+    /// replays it) or the new manifest with side files at least as new.
+    pub fn doCheckpointWith(self: *Checkpointer, pre: ?PreManifest) !void {
         config_mod.emitEvent(self.log_fn, .checkpoint_start);
         errdefer config_mod.emitEvent(self.log_fn, .checkpoint_end);
 
@@ -80,6 +130,8 @@ pub const Checkpointer = struct {
         // could skip a file whose data is not yet durable.
         errdefer self.buffer_pool.restoreDirtyFiles(dirty_files);
         try self.file_manager.syncDirty(dirty_files);
+        if (pre) |step| try step.run(step.ctx);
+        try self.faultPoint(.pre_manifest);
 
         // 4. Update manifest
         self.manifest.last_checkpoint_lsn = checkpoint_lsn;
@@ -102,16 +154,31 @@ pub const Checkpointer = struct {
         defer self.allocator.free(manifest_path);
 
         try self.manifest.writeToFileWithKey(self.allocator, manifest_path, self.encryption_key);
+        // SONNY-6491: the manifest rename must be durable before the WAL is
+        // truncated below; otherwise power loss can leave the previous
+        // manifest next to a WAL that no longer holds what it needs.
+        try syncDir(self.graph_dir.path);
 
         // 6. Update last_slot tracker
         self.last_slot = next_slot;
+        try self.faultPoint(.post_manifest);
 
         // 7. Truncate WAL up to checkpoint_lsn
         if (checkpoint_lsn > 0) {
             try self.wal.truncate(checkpoint_lsn);
         }
+        try self.faultPoint(.post_wal_truncate);
 
         config_mod.emitEvent(self.log_fn, .checkpoint_end);
+    }
+
+    fn syncDir(path: []const u8) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        // `.iterate = true`: a real O_RDONLY|O_DIRECTORY fd (O_PATH cannot fsync).
+        var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        const dir_file = std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+        try dir_file.sync(io);
     }
 
     /// Check if checkpoint is needed based on WAL size.

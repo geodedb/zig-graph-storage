@@ -91,6 +91,34 @@ pub fn hash(bytes: []const u8) u32 {
     return Software.hash(bytes);
 }
 
+/// Streaming CRC32C: `init`, any number of `update`s, `final`. Gives the same
+/// value as `hash` over the concatenated input, however it is split, and the
+/// same as `std.hash.crc.Crc32Iscsi` (SONNY-6470: the WAL record checksum is
+/// computed over a header written field by field and then the payload).
+pub const Hasher = struct {
+    /// Reflected CRC register; `Software` keeps the same register, so the
+    /// instruction and the table can continue each other's state.
+    sw: Software,
+
+    pub fn init() Hasher {
+        return .{ .sw = Software.init() };
+    }
+
+    pub fn update(self: *Hasher, bytes: []const u8) void {
+        if (comptime comptime_hw or runtime_hw_possible) {
+            if (hardwareAccelerated()) {
+                self.sw.crc = hardwareUpdate(self.sw.crc, bytes);
+                return;
+            }
+        }
+        self.sw.update(bytes);
+    }
+
+    pub fn final(self: *Hasher) u32 {
+        return self.sw.final();
+    }
+};
+
 /// The table implementation, exposed for tests and benchmarks.
 pub fn hashSoftware(bytes: []const u8) u32 {
     return Software.hash(bytes);
@@ -198,4 +226,34 @@ test "crc32c reports whether the instruction is in use" {
     // this pins that the fast path is actually taken there.
     if (comptime_hw) try testing.expect(hardwareAccelerated());
     _ = hardwareAccelerated();
+}
+
+test "SONNY-6470: streaming Hasher equals one-shot hash for every split of the input" {
+    var prng = std.Random.DefaultPrng.init(0x6470_C32C);
+    const r = prng.random();
+    var buf: [9000]u8 = undefined;
+    r.bytes(&buf);
+    for ([_]usize{ 0, 1, 7, 8, 9, 30, 64, 4096, 8192 + 34 }) |len| {
+        const s = buf[0..len];
+        const want = hashSoftware(s);
+        // Every two-way split, then random multi-way splits (the WAL record
+        // checksum feeds 8+8+1+1+8+4 header bytes, then the payload).
+        var cut: usize = 0;
+        while (cut <= len) : (cut += if (len > 300) 97 else 1) {
+            var h = Hasher.init();
+            h.update(s[0..cut]);
+            h.update(s[cut..]);
+            try testing.expectEqual(want, h.final());
+        }
+        for (0..50) |_| {
+            var h = Hasher.init();
+            var off: usize = 0;
+            while (off < len) {
+                const n = @min(len - off, r.uintAtMost(usize, 40));
+                h.update(s[off..][0..n]);
+                off += n;
+            }
+            try testing.expectEqual(want, h.final());
+        }
+    }
 }

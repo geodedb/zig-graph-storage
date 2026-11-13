@@ -724,6 +724,31 @@ fn addIntegrationTests(
     const run_wal_lsn_anchor = b.addRunArtifact(wal_lsn_anchor_tests);
     wal_lsn_anchor_step.dependOn(&run_wal_lsn_anchor.step);
 
+    // SONNY-6473: recovery must apply page images in LSN order. A GAP-0900
+    // batch numbers its records when they are made but writes them at commit,
+    // so an overlapping txn on the same TxnManager can log a NEWER image of a
+    // page before the batched txn's OLDER one.
+    const batch_replay_order_step = b.step("test-batch-replay-order-crash", "Run batched-txn replay-order crash tests: an older batched page image logged after a newer committed one never wins at recovery");
+    const batch_replay_order_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/batch_replay_order_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_batch_replay_order = b.addRunArtifact(batch_replay_order_tests);
+    batch_replay_order_step.dependOn(&run_batch_replay_order.step);
+
+    // SONNY-6491: a crash at any step of a checkpoint (light, full, close;
+    // plaintext and TDE; single and sharded) loses no committed page
+    // allocation and no label name.
+    const ckpt_side_crash_step = b.step("test-checkpoint-side-file-crash", "Run checkpoint crash-point tests: free.store and labels.dict are durable before the manifest that depends on them, at every step of light/full/close checkpoints");
+    const ckpt_side_crash_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/checkpoint_side_file_crash.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_ckpt_side_crash = b.addRunArtifact(ckpt_side_crash_tests);
+    ckpt_side_crash_step.dependOn(&run_ckpt_side_crash.step);
+
     // At-rest encryption page tail (SONNY-6441) — the pager stores the AES-GCM
     // tag in the last 16 bytes of every encrypted page; fixed-record layouts
     // that reached the page end lost those bytes on every write + reload
@@ -883,6 +908,10 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_wal_recovery_counters.step);
     // The WAL sequence-anchor crash guards are the same silent-loss class.
     integration_step.dependOn(&run_wal_lsn_anchor.step);
+    // Batched-txn replay order (SONNY-6473) is the same silent-loss class.
+    integration_step.dependOn(&run_batch_replay_order.step);
+    // Checkpoint crash points (SONNY-6491) are the same silent-loss class.
+    integration_step.dependOn(&run_ckpt_side_crash.step);
     // The encrypted-page tail guards (SONNY-6441) likewise.
     integration_step.dependOn(&run_tde_page_tail.step);
     integration_step.dependOn(&run_adj_tail_repair.step);

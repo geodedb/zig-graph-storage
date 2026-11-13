@@ -213,8 +213,23 @@ benchmark-regression:
   script:
     - mkdir -p benchmarks/results
     - zig build scale-bench -- 1K > benchmarks/results/current-ci.json
-    - zig build compare-bench -- benchmarks/results/ci-baseline.json benchmarks/results/current-ci.json
+    # SONNY-6470: compare against the 1K run of the last successful
+    # default-branch pipeline, which ran on the same runner class, instead of
+    # the committed workstation baseline (its numbers do not transfer to CI
+    # runners). The committed file is only the fallback for a first run or an
+    # expired artifact.
+    - |
+      baseline=benchmarks/results/ci-baseline.json
+      url="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/jobs/artifacts/${CI_DEFAULT_BRANCH}/raw/benchmarks/results/current-ci.json?job=${CI_JOB_NAME}"
+      if curl -fsS --header "JOB-TOKEN: ${CI_JOB_TOKEN}" -o benchmarks/results/default-branch-ci.json "$url"; then
+        baseline=benchmarks/results/default-branch-ci.json
+        echo "baseline: ${CI_DEFAULT_BRANCH} artifact of ${CI_JOB_NAME}"
+      else
+        echo "baseline: no ${CI_DEFAULT_BRANCH} artifact; using the committed ci-baseline.json (workstation numbers, not representative of CI runners)"
+      fi
+      zig build compare-bench -- "$baseline" benchmarks/results/current-ci.json
   artifacts:
+    when: always
     paths:
       - benchmarks/results/current-ci.json
     expire_in: 30 days
@@ -252,6 +267,21 @@ benchmark-regression-10k:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
       allow_failure: true
+
+# SONNY-6470: the Lever B clean-restart tests (derived indexes load on a
+# clean restart and are reconciled or rebuilt after a crash) stay out of
+# test-integration because they take about 7 minutes, in Debug and in
+# ReleaseSafe alike (the time is the checkpoints' disk syncs, not codegen).
+# Their own job runs them in parallel with test-integration instead.
+test-leverb-clean-restart:
+  <<: *zig-job
+  stage: test
+  needs:
+    - job: prepare-zig
+      artifacts: true
+    - build
+  script:
+    - zig build test-leverb-clean-restart --summary all
 
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.

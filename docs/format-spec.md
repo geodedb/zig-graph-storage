@@ -117,7 +117,11 @@ legacy `addEdge` path), so `GraphEngine.repairAdjTailEntries` restores a lost
 entry from its other-direction copy and reports the entries it cannot
 restore. A node delete is recorded only in `NodeRec.flags` (there is no other
 durable record of it), so whether a damaged 8 KiB slot-169 node had been
-deleted cannot be derived from the store.
+deleted cannot be derived from the store. An edge removed by a <= 0.4.11
+binary from a damaged full block moved the damaged last entry, tag bytes
+included, into a non-tail slot of a block that is no longer full; neither the
+repair nor a scan can recognise that entry (`docs/operations.md`, "Upgrading
+an encrypted store written by graph_storage <= 0.4.11").
 
 ---
 
@@ -129,19 +133,24 @@ Node records are stored in pages of type `node_data` (PageType = 1).
 Records are packed contiguously after the 32-byte page header with no
 inter-record gaps.
 
-### 2.1 NodeRec (40 bytes, `extern struct`)
+### 2.1 NodeRec (48 bytes, `extern struct`)
 
-| Offset | Size | Field       | Type | Description                                        |
-|--------|------|-------------|------|----------------------------------------------------|
-| 0      | 8    | `out_head`  | u64  | PageId of first outgoing adjacency block (0 = none)|
-| 8      | 8    | `in_head`   | u64  | PageId of first incoming adjacency block (0 = none)|
-| 16     | 8    | `prop_head` | u64  | Property page/slot reference                       |
-| 24     | 4    | `label_set` | u32  | Label bitmap or dictionary reference (LabelId)     |
-| 28     | 2    | `flags`     | u16  | Bit field (see below)                              |
-| 30     | 2    | `_pad`      | u16  | Alignment padding, must be zero                    |
-| 32     | 8    | `txn_stamp` | u64  | Transaction stamp (creation TxnId, MVCC reserved)  |
+The 40-byte layout with a `label_set` field was format version 1
+(`MANIFEST_VERSION_V1`); this binary refuses a V1 store unless
+`legacy_policy = .read_only`.
 
-**Compile-time assertion:** `@sizeOf(NodeRec) == 40`.
+| Offset | Size | Field         | Type    | Description                                                                 |
+|--------|------|---------------|---------|-----------------------------------------------------------------------------|
+| 0      | 8    | `out_head`    | u64     | Head of the outgoing adjacency chain in `adj_out` (0 = none); a page id, or a tagged slab reference (§3, `adj_store.zig`) |
+| 8      | 8    | `in_head`     | u64     | Head of the legacy incoming adjacency chain in `adj_in` (0 = none). Co-located edges keep their in-entries in `in_idx`, reached through `in_dir`, not through this field |
+| 16     | 8    | `prop_head`   | u64     | Property chain reference in `props.store` (0 = none)                        |
+| 24     | 8    | `label_head`  | u64     | Reference to the node's label block in `var.store` (0 = no labels)          |
+| 32     | 2    | `label_count` | u16     | Number of labels in that block                                              |
+| 34     | 2    | `flags`       | u16     | Bit field (see below)                                                       |
+| 36     | 4    | `_pad`        | [4]u8   | Alignment padding, must be zero                                             |
+| 40     | 8    | `txn_stamp`   | u64     | Transaction stamp (creation TxnId, MVCC reserved)                           |
+
+**Compile-time assertion:** `@sizeOf(NodeRec) == 48`.
 
 ### 2.2 Node Flags (u16 bit field)
 
@@ -154,12 +163,13 @@ inter-record gaps.
 ### 2.3 Nodes Per Page
 
 ```text
-nodes_per_page = (page_size - 32) / 40
+nodes_per_page = (page_size - 32) / 48
 ```
 
-For the default 8192-byte page: `(8192 - 32) / 40 = 204` nodes per page.
+For the default 8192-byte page: `(8192 - 32) / 48 = 170` nodes per page
+(4096-byte page: 84).
 
-An all-zero 40-byte record indicates an unallocated (empty) slot.
+An all-zero 48-byte record indicates an unallocated (empty) slot.
 
 ---
 
@@ -847,10 +857,24 @@ before edge co-location ends after `var` (no `in_idx`/`in_dir`). Each bitmap:
 |--------|------|-------|-------------|
 | 0 | 8 | `total_pages` | u64 LE, >= 64 |
 | 8 | 8 | `next_free_hint` | u64 LE, 1..`total_pages` |
-| 16 | `ceil(total_pages / 64) * 8` | masks | native-endian `usize` words; bit set = allocated, page 0 always set |
+| 16 | `ceil(total_pages / 64) * 8` | masks | 64-bit little-endian words; bit set = allocated, page 0 always set |
 
-The file is replaced atomically (temp file, fsync, rename, directory fsync).
-A page beyond `total_pages` was never allocated. Offline tools read it with
+The masks are the in-memory `usize` words copied byte for byte, so every
+file in existence holds 64-bit little-endian words, and the file does not
+record the writer's layout. A big-endian or 32-bit host would misread such a
+file and write one a 64-bit little-endian host would misread, so since 0.4.14
+such a host refuses the layout: `FreeSpaceManager.serialize` /
+`deserializeBounded` and `FreeStore` fail with `error.UnsupportedHostLayout`,
+and the engine writes an empty `free.store` and rebuilds the bitmaps from the
+store files at open (freed pages then read as allocated until reused: no
+corruption, some space not reclaimed). A file written by an older release on
+such a host cannot be recognised on a 64-bit little-endian host; delete it
+(the engine rebuilds it) before moving a store to a different host type.
+
+The file is replaced atomically (temp file, fsync, rename, directory fsync),
+inside each checkpoint before the manifest is written (since 0.4.14,
+SONNY-6491; `docs/operations.md`, Checkpoint). A page beyond `total_pages`
+was never allocated. Offline tools read it with
 `free_space.FreeStore.readFromFile` (no engine or buffer pool) to skip freed
 pages, whose old contents stay in the store file. After a crash the file can
 trail the store until the engine has been opened once.

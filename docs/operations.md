@@ -59,6 +59,37 @@ manifest to the alternate A/B slot:
 try engine.checkpoint();
 ```
 
+Each step is durable before the next one starts (SONNY-6491):
+
+1. Flush dirty pages and fsync the store files they went to.
+2. Write `free.store` (temp file, fsync, rename) and fsync the graph
+   directory.
+3. Write the manifest to the alternate slot (temp file, fsync, rename) and
+   fsync the graph directory.
+4. Truncate the WAL up to the checkpoint LSN.
+5. Full checkpoints only: save the derived-index snapshots, each stamped with
+   the new `(checkpoint_epoch, covered_lsn)`; then the catalog and ordered
+   indexes, then restamp the clean snapshots.
+
+A crash before step 3 completes leaves the previous manifest and a WAL that
+still covers everything (recovery replays it and discards a `free.store`
+newer than the manifest whenever it applies a committed page). A crash after
+it leaves the new manifest with a `free.store` at least as new. Snapshots
+that a crash leaves behind the manifest are rejected by their stamp and
+rebuilt. `labels.dict` is not written by a checkpoint: label assignment is
+not WAL-logged, so `getOrAssignLabel` makes every new name durable (file
+fsync, rename, directory fsync) before it returns its id.
+
+Releases up to 0.4.13 wrote the manifest and truncated the WAL before saving
+`free.store` and `labels.dict`. A store that crashed in that window opens
+with a bitmap older than its manifest; the open detects it when a store has
+fewer allocated pages than the manifest recorded or a written node page below
+the highest issued node id is unallocated, and then rebuilds the bitmaps from
+the store files (freed pages read as allocated until reused). A bitmap that
+is stale only in which pages it marks is not detected. Label names lost in
+that window cannot be recovered: the open logs a warning when `labels.dict`
+holds fewer names than the manifest counted.
+
 Automatic checkpointing can be triggered by monitoring
 `GraphConfig.checkpoint_byte_threshold` and
 `GraphConfig.checkpoint_time_threshold_ms`. The engine does not run an
@@ -182,6 +213,18 @@ this order:
    from the edge's other-direction copy and reports what it cannot restore.
    A later `removeEdge` in a damaged block moves the damaged last entry to
    another slot, where it can no longer be recognised.
+
+   **Known unrecoverable case.** The same move already happened if the old
+   binary itself removed an edge from a damaged full block: it read the tag
+   bytes as the last entry's fields (pages read by <= 0.4.11 kept them;
+   0.4.12+ zero the legacy tail on read), swapped that entry into the freed
+   slot and wrote the block back with one entry fewer. The block is no
+   longer full and the damaged entry is no longer in the last slot, so the
+   repair, which only inspects the last slot of full blocks, does not see it,
+   and a scan cannot tell tag bytes from a real `rel_type` / `prop_head` /
+   `public_id`. Such an entry reads back with wrong fields; only a comparison
+   of every entry with its other-direction copy could find it, and the
+   repair does not do one.
 3. Re-attach incoming chains whose `adj_in_dir` head was lost with
    `migrateColocateInEdges` (after step 2, so it copies repaired entries).
 4. A node record that lost its tail (8 KiB pages, slot 169) can be given its

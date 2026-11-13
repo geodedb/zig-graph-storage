@@ -45,14 +45,22 @@ pub const WalManager = struct {
     // SINGLE `inner.appendBatch` — byte-identical on-disk output to N
     // `inner.append` calls, same LSN scheme — right before the commit
     // record + fsync decision. This drops the writev syscall count from
-    // O(pages) to O(1) per coordinator batch WITHOUT changing durability:
-    // every record still reaches the OS page cache before the batch is
-    // acknowledged (the buffer never survives the commit/abort boundary).
+    // O(pages) to O(1) per coordinator batch. Every record still reaches
+    // the OS page cache before its txn's commit record (the buffer never
+    // survives the commit/abort boundary).
     //
     // Buffering is scoped to a single txn id (`batch_txn_id`). Records for
     // any OTHER txn — or any caller that never opened a batch — fall
-    // straight through to the per-record `inner.append` path, so recovery,
-    // addLabel, auto-commit, and concurrent txns are unaffected.
+    // straight through to the per-record `inner.append` path.
+    //
+    // SONNY-6473: batching DOES change the log when transactions overlap. A
+    // batched record is numbered (and its page image taken) in
+    // `appendRecord`, but written only at flush; a record of another txn
+    // appended meanwhile is numbered later and written earlier. The log is
+    // then not in LSN order, and an older image of a page can follow a
+    // newer one. Recovery therefore applies, per (file, page), only the
+    // highest-LSN committed image (recovery.zig, `applied_lsn`); it must
+    // never rely on log order between transactions.
     /// True while a batch is open and collecting records for `batch_txn_id`.
     batch_active: bool = false,
     /// The txn id whose page-update records are collected into the arena.
@@ -225,7 +233,9 @@ pub const WalManager = struct {
     /// and the inner log's LSN advancement are identical to having issued
     /// one `inner.append` per record. Idempotent for an empty batch (just
     /// closes it). After this returns every record has reached the OS page
-    /// cache — the same point-in-time durability as the per-record path.
+    /// cache. The records keep the LSNs assigned when they were collected, so
+    /// they can follow records with higher LSNs in the log (see the GAP-0900
+    /// note on the struct, SONNY-6473).
     ///
     /// On a write error the records are dropped and the batch is closed
     /// (the inner log already truncated any partial write, SEC-0030); the
