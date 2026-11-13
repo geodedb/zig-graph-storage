@@ -34,7 +34,16 @@ Each file is a JSON document with version, timestamp, system info, and per-tier 
 
 ## Naming Convention
 
-- `ci-baseline.json` -- authoritative merge-request and default-branch smoke baseline (`1K`)
+- `ci-baseline.json` -- fallback for the advisory `benchmark-regression` job (`1K`) only.
+  The job compares against the `current-ci.json` artifact of the last successful
+  default-branch run of the same job, so both sides ran on the CI runner class; this
+  file is used when that artifact does not exist (first run, expired artifact). It was
+  recorded on a workstation on 2026-04-07 and is not representative of CI runners: its
+  `label_scan_ns` p50 of 0.146 ns is not a plausible measurement (the 10K baseline's
+  1K tier records about 119 ns), and its `mixed_ops_sec` p50 (486) is about twice
+  what that tier records (about 250). Regenerate it only from a CI runner: download the
+  `current-ci.json` artifact of a default-branch `benchmark-regression` job and commit
+  it here (SONNY-6470). Do not record it on a developer machine.
 - `ci-10k-baseline.json` -- authoritative scheduled/manual larger-tier baseline (`1K` + `10K`).
   Re-recorded at ff9d97f on a local ext4 NVMe disk (median-`mixed_ops_sec` run of
   three). Seed, checkpoint and mixed numbers are fsync-bound: record baselines on

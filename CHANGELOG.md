@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale NodeRec layout in §2.1 (40 bytes, `label_set`) is corrected to the
   48-byte record, and the unrecoverable `removeEdge` case of <= 0.4.11
   encrypted stores is documented (SONNY-6470).
+- CI runs `test-leverb-clean-restart` (Lever B: derived indexes load on a
+  clean restart, are reconciled or rebuilt after a crash) in its own job; it
+  was in no CI job. The advisory `benchmark-regression` job compares against
+  the last successful default-branch run's `current-ci.json` artifact
+  instead of the committed `ci-baseline.json`, whose workstation numbers
+  (1K `label_scan_ns` p50 0.146 ns, `mixed_ops_sec` 486) fail any CI build;
+  that file is now only the fallback, and `benchmarks/results/README.md`
+  says how to regenerate it (SONNY-6470).
 
 ## [0.4.13] - 2026-11-13
 
