@@ -689,6 +689,19 @@ fn addIntegrationTests(
     const run_wal_lsn_anchor = b.addRunArtifact(wal_lsn_anchor_tests);
     wal_lsn_anchor_step.dependOn(&run_wal_lsn_anchor.step);
 
+    // At-rest encryption page tail (SONNY-6441) — the pager stores the AES-GCM
+    // tag in the last 16 bytes of every encrypted page; fixed-record layouts
+    // that reached the page end lost those bytes on every write + reload
+    // (eviction, reopen, crash recovery): committed nodes read back missing.
+    const tde_page_tail_step = b.step("test-tde-page-tail", "Run at-rest encryption page-tail tests: every committed node, property, incoming-edge head and adjacency entry survives eviction, reopen and crash recovery; a page failing authentication is an error, never a missing node");
+    const tde_page_tail_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/tde_page_tail.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_tde_page_tail = b.addRunArtifact(tde_page_tail_tests);
+    tde_page_tail_step.dependOn(&run_tde_page_tail.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
