@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-11-13
+
 ### Changed
 
 - The plaintext page checksum (CRC32C, on every buffer-pool miss and flush)

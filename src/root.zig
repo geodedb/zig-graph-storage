@@ -155,7 +155,7 @@ pub const GraphConfig = config.GraphConfig;
 pub const SyncMode = config.SyncMode;
 pub const Metrics = metrics.Metrics;
 
-pub const version = "0.4.12";
+pub const version = "0.4.13";
 
 // ============================================================================
 // Unit Tests
@@ -176,7 +176,7 @@ test "re-exported types match source types" {
 }
 
 test "version is set" {
-    try std.testing.expectEqualStrings("0.4.12", version);
+    try std.testing.expectEqualStrings("0.4.13", version);
 }
 
 test {
