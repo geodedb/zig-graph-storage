@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The WAL record checksum (CRC32C over the record header and payload,
+  computed while a record is serialized and again when replay checks it)
+  uses the CPU's CRC32C instruction through the new streaming
+  `crc32c.Hasher` (`init` / `update` / `final`), with the table as fallback,
+  as the page checksum does since 0.4.13. Values are unchanged.
+  `zig build bench-checksum -Doptimize=ReleaseFast` on an x86_64 host:
+  `WalRecord.serializeInto` of an 8 KiB page image 16000 to 770 ns
+  (SONNY-6470).
+
 ### Fixed
 
 - Crash recovery applies, for each page, only the committed page image with

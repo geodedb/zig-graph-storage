@@ -91,6 +91,34 @@ pub fn hash(bytes: []const u8) u32 {
     return Software.hash(bytes);
 }
 
+/// Streaming CRC32C: `init`, any number of `update`s, `final`. Gives the same
+/// value as `hash` over the concatenated input, however it is split, and the
+/// same as `std.hash.crc.Crc32Iscsi` (SONNY-6470: the WAL record checksum is
+/// computed over a header written field by field and then the payload).
+pub const Hasher = struct {
+    /// Reflected CRC register; `Software` keeps the same register, so the
+    /// instruction and the table can continue each other's state.
+    sw: Software,
+
+    pub fn init() Hasher {
+        return .{ .sw = Software.init() };
+    }
+
+    pub fn update(self: *Hasher, bytes: []const u8) void {
+        if (comptime comptime_hw or runtime_hw_possible) {
+            if (hardwareAccelerated()) {
+                self.sw.crc = hardwareUpdate(self.sw.crc, bytes);
+                return;
+            }
+        }
+        self.sw.update(bytes);
+    }
+
+    pub fn final(self: *Hasher) u32 {
+        return self.sw.final();
+    }
+};
+
 /// The table implementation, exposed for tests and benchmarks.
 pub fn hashSoftware(bytes: []const u8) u32 {
     return Software.hash(bytes);

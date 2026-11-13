@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const crc32c = @import("crc32c.zig");
 
 /// WAL record types for the write-ahead log.
 pub const WalRecordType = enum(u8) {
@@ -56,7 +57,9 @@ pub const WalRecord = struct {
         if (buf.len < total_size) return error.BufferTooSmall;
 
         // fips-exempt: non-security — WAL record CRC32C corruption check.
-        var hasher = std.hash.crc.Crc32Iscsi.init();
+        // SONNY-6470: the CPU's CRC32C instruction where present (crc32c.zig),
+        // bit-identical to the table.
+        var hasher = crc32c.Hasher.init();
         var offset: usize = 0;
 
         // lsn (8 bytes, little-endian)
@@ -177,7 +180,7 @@ pub const WalRecord = struct {
     /// The checksum covers: lsn + txn_id + record_type + file_id + page_id + payload_len + payload.
     pub fn computeChecksum(self: *const WalRecord) u32 {
         // fips-exempt: non-security — WAL record CRC32C corruption check.
-        var hasher = std.hash.crc.Crc32Iscsi.init();
+        var hasher = crc32c.Hasher.init();
         hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.lsn)));
         hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.txn_id)));
         hasher.update(&[_]u8{@intFromEnum(self.record_type)});
