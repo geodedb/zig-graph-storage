@@ -4,8 +4,10 @@
 //! Benchmark comparison tool for graph-storage.
 //!
 //! Reads two JSON result files (baseline and current), compares every tier and
-//! every tracked percentile/variance field, and exits non-zero when a tier is
-//! missing, skipped, or regressed beyond the configured threshold.
+//! every tracked measurement, and exits non-zero when a tier is missing,
+//! skipped, or a measurement's median (p50) regressed beyond the configured
+//! threshold. avg/p95/p99/stddev are printed for information only: with the
+//! three samples scale-bench takes they move with a single outlier.
 
 const std = @import("std");
 
@@ -57,6 +59,11 @@ const Metric = struct {
     name: []const u8,
     kind: MetricKind,
     get: *const fn (TierData) f64,
+    /// Only gating metrics fail the comparison. scale-bench takes three
+    /// samples per tier, so p95 == p99 == the slowest sample and one outlier
+    /// moves avg and stddev arbitrarily far; only the median is stable enough
+    /// to gate on. The rest are reported for information.
+    gating: bool = false,
 };
 
 fn resolvedStats(flat: f64, maybe_stats: ?MetricStats) MetricStats {
@@ -84,6 +91,9 @@ fn resolvedStats(flat: f64, maybe_stats: ?MetricStats) MetricStats {
 fn getSeedAvg(t: TierData) f64 {
     return resolvedStats(t.seed_ops_sec, t.seed_ops_sec_stats).avg;
 }
+fn getSeedP50(t: TierData) f64 {
+    return resolvedStats(t.seed_ops_sec, t.seed_ops_sec_stats).p50;
+}
 fn getSeedP95(t: TierData) f64 {
     return resolvedStats(t.seed_ops_sec, t.seed_ops_sec_stats).p95;
 }
@@ -95,6 +105,9 @@ fn getSeedStdDev(t: TierData) f64 {
 }
 fn getPointLookupAvg(t: TierData) f64 {
     return resolvedStats(t.point_lookup_ns, t.point_lookup_ns_stats).avg;
+}
+fn getPointLookupP50(t: TierData) f64 {
+    return resolvedStats(t.point_lookup_ns, t.point_lookup_ns_stats).p50;
 }
 fn getPointLookupP95(t: TierData) f64 {
     return resolvedStats(t.point_lookup_ns, t.point_lookup_ns_stats).p95;
@@ -108,6 +121,9 @@ fn getPointLookupStdDev(t: TierData) f64 {
 fn getPropReadAvg(t: TierData) f64 {
     return resolvedStats(t.prop_read_ns, t.prop_read_ns_stats).avg;
 }
+fn getPropReadP50(t: TierData) f64 {
+    return resolvedStats(t.prop_read_ns, t.prop_read_ns_stats).p50;
+}
 fn getPropReadP95(t: TierData) f64 {
     return resolvedStats(t.prop_read_ns, t.prop_read_ns_stats).p95;
 }
@@ -119,6 +135,9 @@ fn getPropReadStdDev(t: TierData) f64 {
 }
 fn getExpandOutAvg(t: TierData) f64 {
     return resolvedStats(t.expand_out_ns, t.expand_out_ns_stats).avg;
+}
+fn getExpandOutP50(t: TierData) f64 {
+    return resolvedStats(t.expand_out_ns, t.expand_out_ns_stats).p50;
 }
 fn getExpandOutP95(t: TierData) f64 {
     return resolvedStats(t.expand_out_ns, t.expand_out_ns_stats).p95;
@@ -132,6 +151,9 @@ fn getExpandOutStdDev(t: TierData) f64 {
 fn getLabelScanAvg(t: TierData) f64 {
     return resolvedStats(t.label_scan_ns, t.label_scan_ns_stats).avg;
 }
+fn getLabelScanP50(t: TierData) f64 {
+    return resolvedStats(t.label_scan_ns, t.label_scan_ns_stats).p50;
+}
 fn getLabelScanP95(t: TierData) f64 {
     return resolvedStats(t.label_scan_ns, t.label_scan_ns_stats).p95;
 }
@@ -143,6 +165,9 @@ fn getLabelScanStdDev(t: TierData) f64 {
 }
 fn getCheckpointAvg(t: TierData) f64 {
     return resolvedStats(t.checkpoint_ms, t.checkpoint_ms_stats).avg;
+}
+fn getCheckpointP50(t: TierData) f64 {
+    return resolvedStats(t.checkpoint_ms, t.checkpoint_ms_stats).p50;
 }
 fn getCheckpointP95(t: TierData) f64 {
     return resolvedStats(t.checkpoint_ms, t.checkpoint_ms_stats).p95;
@@ -156,6 +181,9 @@ fn getCheckpointStdDev(t: TierData) f64 {
 fn getOpenAvg(t: TierData) f64 {
     return resolvedStats(t.open_ms, t.open_ms_stats).avg;
 }
+fn getOpenP50(t: TierData) f64 {
+    return resolvedStats(t.open_ms, t.open_ms_stats).p50;
+}
 fn getOpenP95(t: TierData) f64 {
     return resolvedStats(t.open_ms, t.open_ms_stats).p95;
 }
@@ -168,6 +196,9 @@ fn getOpenStdDev(t: TierData) f64 {
 fn getMixedAvg(t: TierData) f64 {
     return resolvedStats(t.mixed_ops_sec, t.mixed_ops_sec_stats).avg;
 }
+fn getMixedP50(t: TierData) f64 {
+    return resolvedStats(t.mixed_ops_sec, t.mixed_ops_sec_stats).p50;
+}
 fn getMixedP95(t: TierData) f64 {
     return resolvedStats(t.mixed_ops_sec, t.mixed_ops_sec_stats).p95;
 }
@@ -179,34 +210,42 @@ fn getMixedStdDev(t: TierData) f64 {
 }
 
 const metrics = [_]Metric{
+    .{ .name = "seed.p50", .kind = .higher_is_better, .get = getSeedP50, .gating = true },
     .{ .name = "seed.avg", .kind = .higher_is_better, .get = getSeedAvg },
     .{ .name = "seed.p95", .kind = .higher_is_better, .get = getSeedP95 },
     .{ .name = "seed.p99", .kind = .higher_is_better, .get = getSeedP99 },
     .{ .name = "seed.stddev", .kind = .lower_is_better, .get = getSeedStdDev },
+    .{ .name = "lookup.p50", .kind = .lower_is_better, .get = getPointLookupP50, .gating = true },
     .{ .name = "lookup.avg", .kind = .lower_is_better, .get = getPointLookupAvg },
     .{ .name = "lookup.p95", .kind = .lower_is_better, .get = getPointLookupP95 },
     .{ .name = "lookup.p99", .kind = .lower_is_better, .get = getPointLookupP99 },
     .{ .name = "lookup.stddev", .kind = .lower_is_better, .get = getPointLookupStdDev },
+    .{ .name = "prop.p50", .kind = .lower_is_better, .get = getPropReadP50, .gating = true },
     .{ .name = "prop.avg", .kind = .lower_is_better, .get = getPropReadAvg },
     .{ .name = "prop.p95", .kind = .lower_is_better, .get = getPropReadP95 },
     .{ .name = "prop.p99", .kind = .lower_is_better, .get = getPropReadP99 },
     .{ .name = "prop.stddev", .kind = .lower_is_better, .get = getPropReadStdDev },
+    .{ .name = "expand.p50", .kind = .lower_is_better, .get = getExpandOutP50, .gating = true },
     .{ .name = "expand.avg", .kind = .lower_is_better, .get = getExpandOutAvg },
     .{ .name = "expand.p95", .kind = .lower_is_better, .get = getExpandOutP95 },
     .{ .name = "expand.p99", .kind = .lower_is_better, .get = getExpandOutP99 },
     .{ .name = "expand.stddev", .kind = .lower_is_better, .get = getExpandOutStdDev },
+    .{ .name = "label.p50", .kind = .lower_is_better, .get = getLabelScanP50, .gating = true },
     .{ .name = "label.avg", .kind = .lower_is_better, .get = getLabelScanAvg },
     .{ .name = "label.p95", .kind = .lower_is_better, .get = getLabelScanP95 },
     .{ .name = "label.p99", .kind = .lower_is_better, .get = getLabelScanP99 },
     .{ .name = "label.stddev", .kind = .lower_is_better, .get = getLabelScanStdDev },
+    .{ .name = "checkpoint.p50", .kind = .lower_is_better, .get = getCheckpointP50, .gating = true },
     .{ .name = "checkpoint.avg", .kind = .lower_is_better, .get = getCheckpointAvg },
     .{ .name = "checkpoint.p95", .kind = .lower_is_better, .get = getCheckpointP95 },
     .{ .name = "checkpoint.p99", .kind = .lower_is_better, .get = getCheckpointP99 },
     .{ .name = "checkpoint.stddev", .kind = .lower_is_better, .get = getCheckpointStdDev },
+    .{ .name = "open.p50", .kind = .lower_is_better, .get = getOpenP50, .gating = true },
     .{ .name = "open.avg", .kind = .lower_is_better, .get = getOpenAvg },
     .{ .name = "open.p95", .kind = .lower_is_better, .get = getOpenP95 },
     .{ .name = "open.p99", .kind = .lower_is_better, .get = getOpenP99 },
     .{ .name = "open.stddev", .kind = .lower_is_better, .get = getOpenStdDev },
+    .{ .name = "mixed.p50", .kind = .higher_is_better, .get = getMixedP50, .gating = true },
     .{ .name = "mixed.avg", .kind = .higher_is_better, .get = getMixedAvg },
     .{ .name = "mixed.p95", .kind = .higher_is_better, .get = getMixedP95 },
     .{ .name = "mixed.p99", .kind = .higher_is_better, .get = getMixedP99 },
@@ -259,7 +298,7 @@ fn compareTier(base_tier: TierData, cur_tier: TierData, threshold: f64, report: 
         const base_val = metric.get(base_tier);
         const cur_val = metric.get(cur_tier);
         const delta = computeDeltaPct(base_val, cur_val);
-        const regressed = isRegression(delta, metric.kind, threshold);
+        const regressed = metric.gating and isRegression(delta, metric.kind, threshold);
         if (regressed) regressions += 1;
 
         if (report) {
@@ -271,7 +310,7 @@ fn compareTier(base_tier: TierData, cur_tier: TierData, threshold: f64, report: 
                 cur_val,
                 sign,
                 delta,
-                if (regressed) "FAIL" else "PASS",
+                if (!metric.gating) "info" else if (regressed) "FAIL" else "PASS",
             });
         }
     }
@@ -342,7 +381,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     print("  Benchmark Comparison\n", .{});
     print("  Baseline: {s}\n", .{baseline_path});
     print("  Current:  {s}\n", .{current_path});
-    print("  Threshold: {d:.0}%\n", .{threshold});
+    print("  Threshold: {d:.0}% on the median (p50); avg/p95/p99/stddev are info\n", .{threshold});
     print("{s}\n\n", .{"=" ** 96});
 
     print("  {s:<6} {s:<20} {s:>12} {s:>12} {s:>10} {s:>6}\n", .{
