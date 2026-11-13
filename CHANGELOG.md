@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Committed records are no longer lost on stores with at-rest encryption.
+  The pager wrote the 16-byte AES-GCM tag over the last 16 bytes of every
+  page body, and layouts that use the page end lost those bytes on every
+  write and reload (eviction, reopen, crash recovery), silently because the
+  page still authenticated: with the default 8 KiB page every node in slot
+  169 of 170 read back missing or with tag bytes in its flags; the last two
+  heads of every `adj_in_dir` page and, at 4 KiB, the last v3 adjacency entry
+  of a full block were damaged too. Encrypted pages are now written in a
+  header-tag envelope: the tag goes into header bytes 0..16 (`page_id`/`lsn`,
+  unused by every store), the rest of the header is the additional
+  authenticated data, `PageFlags.encrypted` marks the page, and the whole
+  body is the stores'. Pages written in the old envelope stay readable and
+  move to the new one on their next write; their last 16 body bytes, which
+  never reached the disk, read as zero. A binary without this fix cannot
+  read pages written in the new envelope (it fails with
+  `error.DecryptionFailed`, never with wrong data) (SONNY-6441).
+- An encrypted page with a zeroed header is an authentication error
+  (`error.DecryptionFailed`), and a plaintext page with a zeroed header must
+  pass its CRC32C. Both were taken for never-written pages, so damage read
+  back as missing nodes (SONNY-6441).
+
 ## [0.4.11] - 2026-11-12
 
 ### Changed

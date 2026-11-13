@@ -291,12 +291,12 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.in_head_dir = InHeadDir.init(&self.buffer_pool, &self.free_space_in_dir, .in_dir, cfg.page_size);
     self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
     self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
-    // SEC: when at-rest encryption is enabled the pager writes the per-page
-    // AES-GCM tag into the final TAG_SIZE bytes of the page on flush. Reserve
-    // that tail in the prop_store's slotted-page layout so the per-page key
-    // directory (which grows backward from the page end) never collides with
-    // the tag — otherwise dir_count is overwritten by tag bytes and the page
-    // fails to read back after a restart (integer-overflow panic).
+    // SEC: before SONNY-6441 the pager wrote the per-page AES-GCM tag into the
+    // final TAG_SIZE bytes of an encrypted page, so the backward-growing
+    // directories below reserve that tail. The pager now keeps the tag in the
+    // page header, but the reservation stays: it fixes WHERE an existing
+    // encrypted store's directories sit (dir_count at page end - TAG_SIZE),
+    // so it is part of the on-disk layout of every encrypted store.
     // Property-value OVERFLOW: the configured sanity cap on a single property
     // value's encoded size (bounds WAL volume and per-op memory — see
     // GraphConfig.max_property_value_bytes).

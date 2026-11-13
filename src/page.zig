@@ -25,10 +25,21 @@ pub const PageType = enum(u8) {
 
 pub const PageFlags = packed struct(u8) {
     dirty: bool = false,
+    /// Set by the pager on an encrypted page stored in the header-tag
+    /// envelope (see `encryption.encryptPageHeaderTag`). Clear on plaintext
+    /// pages, and on encrypted pages written before SONNY-6441 (tag in the
+    /// last TAG_SIZE body bytes). Only ever set on disk: the pager clears it
+    /// again when it reads the page into a frame.
     encrypted: bool = false,
     compressed: bool = false,
     _reserved: u5 = 0,
 };
+
+/// Byte offset of `flags` within the page header.
+pub const FLAGS_OFFSET: usize = 21;
+
+/// `PageFlags.encrypted` as a raw `flags` byte mask.
+pub const FLAG_HEADER_TAG: u8 = @bitCast(PageFlags{ .encrypted = true });
 
 pub const PageHeader = extern struct {
     page_id: u64, // 8 bytes
@@ -45,6 +56,8 @@ pub const PageHeader = extern struct {
 
 comptime {
     if (@sizeOf(PageHeader) != 32) @compileError("PageHeader must be exactly 32 bytes");
+    if (@offsetOf(PageHeader, "flags") != FLAGS_OFFSET) @compileError("FLAGS_OFFSET out of sync with PageHeader");
+    if (@offsetOf(PageHeader, "checksum") != 16) @compileError("the header-tag envelope stores the tag in page_id/lsn (bytes 0..16)");
 }
 
 /// Compute CRC32C checksum over body bytes.

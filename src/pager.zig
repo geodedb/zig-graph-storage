@@ -70,19 +70,48 @@ pub const Pager = struct {
 
         if (bytes_read < self.page_size) return error.PageNotFound;
 
-        // Check if the header is all zeros (fresh/uninitialized page).
-        if (std.mem.readInt(u128, buf[0..16], .little) == 0 and
-            std.mem.readInt(u128, buf[16..32], .little) == 0) return;
+        // An all-zero header is a page that was never written (a hole or the
+        // zero-filled tail of the file) — but only if the body is zero too.
+        // Every page writePage stores has a nonzero header when encrypted
+        // (write_count >= 1, tag), so an encrypted page with a zeroed header
+        // and a nonzero body is damaged or tampered with: authenticating
+        // nothing and handing the ciphertext to the stores as records is how
+        // a damaged page used to read back as "missing nodes" (SONNY-6441).
+        // A plaintext page's header is zero only if its CRC32C is 0, so check
+        // the body against that.
+        if (std.mem.allEqual(u8, buf[0..PAGE_HEADER_SIZE], 0)) {
+            const body = buf[PAGE_HEADER_SIZE..];
+            if (std.mem.allEqual(u8, body, 0)) return;
+            if (self.encryption != null) return error.DecryptionFailed;
+            if (page_mod.computeChecksum(body) != 0) return error.ChecksumMismatch;
+            return;
+        }
 
         // Decrypt page body if encryption is enabled.
         // AES-GCM provides authenticated integrity, so CRC32C is redundant
-        // when encryption is active -- skip it to avoid false mismatches
-        // (the auth tag occupies body tail bytes that differ after round-trip).
+        // when encryption is active -- skip it.
         if (self.encryption) |enc| {
             const write_count = page_mod.readWriteCount(buf);
-            enc.decryptPage(buf, page_id, @intFromEnum(self.file_id), write_count) catch {
-                return error.DecryptionFailed;
-            };
+            const file_id: u8 = @intFromEnum(self.file_id);
+            if (buf[page_mod.FLAGS_OFFSET] & page_mod.FLAG_HEADER_TAG != 0) {
+                enc.decryptPageHeaderTag(buf, page_id, file_id, write_count) catch {
+                    return error.DecryptionFailed;
+                };
+                // The frame never carries the envelope: page_id/lsn read as
+                // zero and the flag is clear, exactly as before it was written.
+                @memset(buf[0..encryption_mod.TAG_SIZE], 0);
+                buf[page_mod.FLAGS_OFFSET] &= ~page_mod.FLAG_HEADER_TAG;
+            } else {
+                // SONNY-6441: legacy envelope (written before the fix) — the
+                // tag occupies the last TAG_SIZE body bytes. Whatever a layout
+                // stored there was never persisted; zero it rather than hand
+                // tag bytes to the stores as record data (a phantom node,
+                // a garbage chain-head page id).
+                enc.decryptPage(buf, page_id, file_id, write_count) catch {
+                    return error.DecryptionFailed;
+                };
+                @memset(buf[buf.len - encryption_mod.TAG_SIZE ..], 0);
+            }
         } else {
             // Plaintext mode: validate CRC32C checksum
             const body = buf[PAGE_HEADER_SIZE..];
@@ -108,7 +137,10 @@ pub const Pager = struct {
             if (current_wc == std.math.maxInt(u24)) return error.WriteCountExhausted;
             const new_wc = current_wc + 1;
             page_mod.writeWriteCount(buf, new_wc);
-            enc.encryptPage(buf, page_id, @intFromEnum(self.file_id), new_wc);
+            // SONNY-6441: header-tag envelope — the whole body is the stores'
+            // and the tag lives in the header (see encryptPageHeaderTag).
+            buf[page_mod.FLAGS_OFFSET] |= page_mod.FLAG_HEADER_TAG;
+            enc.encryptPageHeaderTag(buf, page_id, @intFromEnum(self.file_id), new_wc);
         } else {
             // Plaintext mode: compute CRC32C over body and write into header
             const body = buf[PAGE_HEADER_SIZE..];
