@@ -5,9 +5,10 @@
 //!
 //! Reads two JSON result files (baseline and current), compares every tier and
 //! every tracked measurement, and exits non-zero when a tier is missing,
-//! skipped, or a measurement's median (p50) regressed beyond the configured
-//! threshold. avg/p95/p99/stddev are printed for information only: with the
-//! three samples scale-bench takes they move with a single outlier.
+//! skipped, a measurement's median (p50) regressed beyond the configured
+//! threshold, or a median has no baseline or no current value. avg/p95/p99/
+//! stddev are printed for information only: with the three samples
+//! scale-bench takes they move with a single outlier.
 
 const std = @import("std");
 
@@ -278,8 +279,12 @@ fn findTier(result: BenchResult, name: []const u8) ?TierData {
     return null;
 }
 
-fn computeDeltaPct(baseline_val: f64, current_val: f64) f64 {
-    if (baseline_val == 0) return 0;
+/// Percent change from baseline to current, or null when either side has no
+/// measurement. Every tracked metric is a positive time or rate, so 0 (also
+/// what a missing JSON field parses to) means "not measured", never a value
+/// to compare against (SONNY-6461: a 0 baseline used to give 0% and PASS).
+fn computeDeltaPct(baseline_val: f64, current_val: f64) ?f64 {
+    if (baseline_val == 0 or current_val == 0) return null;
     return ((current_val - baseline_val) / baseline_val) * 100.0;
 }
 
@@ -291,27 +296,27 @@ fn isRegression(delta_pct: f64, kind: MetricKind, threshold: f64) bool {
 }
 
 /// Compare one tier against its baseline; print a row per metric when
-/// `report` is set. Returns the number of regressions that fail the gate.
+/// `report` is set. Returns the number of gating metrics that fail: those that
+/// regressed beyond the threshold, and those with no baseline or no current
+/// measurement (a gate with nothing to compare against cannot pass).
+/// Informational metrics never fail.
 fn compareTier(base_tier: TierData, cur_tier: TierData, threshold: f64, report: bool) usize {
     var regressions: usize = 0;
     for (metrics) |metric| {
         const base_val = metric.get(base_tier);
         const cur_val = metric.get(cur_tier);
-        const delta = computeDeltaPct(base_val, cur_val);
-        const regressed = metric.gating and isRegression(delta, metric.kind, threshold);
-        if (regressed) regressions += 1;
+        const maybe_delta = computeDeltaPct(base_val, cur_val);
+        const failed = metric.gating and if (maybe_delta) |delta| isRegression(delta, metric.kind, threshold) else true;
+        if (failed) regressions += 1;
 
-        if (report) {
+        if (!report) continue;
+        const status = if (!metric.gating) "info" else if (failed) "FAIL" else "PASS";
+        if (maybe_delta) |delta| {
             const sign = if (delta >= 0) "+" else "";
-            print("  {s:<6} {s:<20} {d:>12.2} {d:>12.2} {s}{d:>8.1}% {s:>6}\n", .{
-                base_tier.name,
-                metric.name,
-                base_val,
-                cur_val,
-                sign,
-                delta,
-                if (!metric.gating) "info" else if (regressed) "FAIL" else "PASS",
-            });
+            print("  {s:<6} {s:<20} {d:>12.2} {d:>12.2} {s}{d:>8.1}% {s:>6}\n", .{ base_tier.name, metric.name, base_val, cur_val, sign, delta, status });
+        } else {
+            const why = if (base_val == 0) "no baseline" else "no current";
+            print("  {s:<6} {s:<20} {d:>12.2} {d:>12.2} {s:>10} {s:>6}\n", .{ base_tier.name, metric.name, base_val, cur_val, why, status });
         }
     }
     return regressions;
@@ -401,7 +406,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     print("{s}\n", .{"=" ** 96});
     if (any_regression) {
-        print("  RESULT: FAIL -- regression(s) detected above threshold\n\n", .{});
+        print("  RESULT: FAIL -- a gating median regressed above threshold or has no baseline/current value\n\n", .{});
         std.process.exit(1);
     }
     print("  RESULT: PASS -- all metrics within threshold\n\n", .{});

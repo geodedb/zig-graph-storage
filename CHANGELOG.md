@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of `prop_head`; at 64 KiB the v3 entry 1636 lost the high half of
   `prop_head`. The 0.4.12 entry is corrected and `docs/format-spec.md` lists
   every store (SONNY-6461).
+- `compare-bench` fails a gating median (p50) that has no baseline or no
+  current value and prints "no baseline" / "no current" for it. A zero or
+  missing baseline used to give a 0% delta and PASS, so any current value
+  passed; a zero current value of a lower-is-better metric read as a gain.
+  Informational metrics still never fail, and the benchmark CI jobs stay
+  advisory (SONNY-6461).
 - `docs/operations.md` documents the upgrade of an encrypted store written by
   <= 0.4.11: close the old binary cleanly first. Crash recovery under a newer
   binary replays the old binary's page images verbatim, tag bytes in their
