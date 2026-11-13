@@ -53,7 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilds the bitmaps; lost label names are reported with a warning (they
   cannot be re-derived). `test-checkpoint-side-file-crash` crashes at every
   step of light, full and close checkpoints, plaintext and TDE, single and
-  sharded (SONNY-6491).
+  sharded. Per checkpoint the fsync count is unchanged (the manifest's new
+  directory fsync replaces the dropped `labels.dict` write) and one rename
+  fewer per engine; a new label name costs two fsyncs and one rename per
+  engine once (strace of a 16-shard store: light 208 fsyncs both before and
+  after, full 304 / 304, close 336 / 336) (SONNY-6491).
 - `free.store` stores the bitmap's `usize` words byte for byte and records
   no writer layout, so a big-endian or 32-bit host misread files from a
   64-bit little-endian host (and wrote files such a host would misread).
