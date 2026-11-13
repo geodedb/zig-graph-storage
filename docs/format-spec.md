@@ -814,8 +814,9 @@ Each entry:
 **Source:** `src/free_space.zig`
 
 Free space tracking uses an **in-memory `DynamicBitSet`** (from the Zig
-standard library). The bitmap is not directly persisted as a binary file
-format -- it is rebuilt from store files on startup.
+standard library) per paged store. The bitmaps are persisted to `free.store`
+at every checkpoint and after crash recovery (format in §10.3); without that
+file they are rebuilt from the store file sizes on open.
 
 ### 10.1 Design
 
@@ -835,6 +836,29 @@ format -- it is rebuilt from store files on startup.
    newly available range.
 4. When a page is freed and its index is before `next_free_hint`, the hint
    is moved back to enable immediate reuse.
+
+### 10.3 `free.store`
+
+One serialized bitmap per paged store, back to back, in this order: `nodes`,
+`adj_out`, `adj_in`, `props`, `var`, `in_idx`, `in_dir`. A file written
+before edge co-location ends after `var` (no `in_idx`/`in_dir`). Each bitmap:
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 8 | `total_pages` | u64 LE, >= 64 |
+| 8 | 8 | `next_free_hint` | u64 LE, 1..`total_pages` |
+| 16 | `ceil(total_pages / 64) * 8` | masks | native-endian `usize` words; bit set = allocated, page 0 always set |
+
+The file is replaced atomically (temp file, fsync, rename, directory fsync).
+A page beyond `total_pages` was never allocated. Offline tools read it with
+`free_space.FreeStore.readFromFile` (no engine or buffer pool) to skip freed
+pages, whose old contents stay in the store file. After a crash the file can
+trail the store until the engine has been opened once.
+
+A node delete is recorded only in `NodeRec.flags` (`NODE_FLAG_DELETED`):
+`deleteNode` keeps the record's heads and labels, and nothing outside the
+node page records the delete once the WAL is checkpointed. A record whose
+`flags` were lost cannot have its liveness derived from the store.
 
 ---
 

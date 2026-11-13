@@ -192,7 +192,9 @@ this order:
 
 Pages move to the current envelope on their next write; until then an
 offline tool can recognise an old page without the key (flag clear, header
-checksum not matching the body).
+checksum not matching the body). It should skip pages `free.store` marks free
+(`free_space.FreeStore`, no engine needed): their stale contents are not
+records.
 
 ---
 

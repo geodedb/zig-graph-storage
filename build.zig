@@ -887,6 +887,7 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_tde_page_tail.step);
     integration_step.dependOn(&run_adj_tail_repair.step);
     integration_step.dependOn(&run_page_checksum.step);
+    integration_step.dependOn(&run_free_store_offline.step);
     // checkpoint_epoch recovery-invariance is the durability foundation the
     // WAL-aware derived-index contract rests on — gate it under integration.
     integration_step.dependOn(&run_checkpoint_epoch.step);

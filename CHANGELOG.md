@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot restore with the reason (`no_mirror`, `mirror_in_tail`,
   `prop_head_not_mirrored`, `wide_head_in_narrow_entry`). The layout
   knowledge is public as `edge.legacyTailLoss` (SONNY-6461).
+- `free_space.FreeStore` reads a graph's `free.store` without an engine or
+  buffer pool, so offline tools can skip freed pages, and
+  `FreeSpaceManager.initDetached` builds a manager without a buffer pool
+  (`FreeSpaceManager.buffer_pool` is now optional; it was never read).
+  `docs/format-spec.md` §10.3 documents the file and that a node delete is
+  recorded only in `NodeRec.flags` (SONNY-6461).
 
 ### Fixed
 
