@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-11-12
+
+### Changed
+
+- wal v0.1.23 (compaction keeps the LSN anchor when it empties the log,
+  SONNY-6424). On-disk note: encrypted (TDE) pages written by this version
+  use a new page format; older binaries fail with `DecryptionFailed` on them
+  (no downgrade for encrypted stores).
+
 ### Fixed
 
 - Committed records are no longer lost on stores with at-rest encryption.
