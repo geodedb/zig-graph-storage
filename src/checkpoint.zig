@@ -86,8 +86,27 @@ pub const Checkpointer = struct {
         };
     }
 
-    /// Run a checkpoint:
+    /// SONNY-6491: work that must be durable BEFORE the manifest that depends
+    /// on it (the engine's `free.store`). Runs after the pages are flushed and
+    /// fsynced, so it sees the state the manifest is about to cover.
+    pub const PreManifest = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque) anyerror!void,
+    };
+
+    /// Run a checkpoint with no pre-manifest step.
     pub fn doCheckpoint(self: *Checkpointer) !void {
+        return self.doCheckpointWith(null);
+    }
+
+    /// Run a checkpoint:
+    ///   1. record the WAL LSN, 2. flush dirty pages, 3. fsync dirty store
+    ///   files, 4. `pre` (side files, made durable by the caller), 5. write
+    ///   the manifest and fsync the graph directory, 6. truncate the WAL.
+    /// Each step is durable before the next starts, so a crash anywhere
+    /// leaves either the previous manifest with an untruncated WAL (recovery
+    /// replays it) or the new manifest with side files at least as new.
+    pub fn doCheckpointWith(self: *Checkpointer, pre: ?PreManifest) !void {
         config_mod.emitEvent(self.log_fn, .checkpoint_start);
         errdefer config_mod.emitEvent(self.log_fn, .checkpoint_end);
 
@@ -111,6 +130,7 @@ pub const Checkpointer = struct {
         // could skip a file whose data is not yet durable.
         errdefer self.buffer_pool.restoreDirtyFiles(dirty_files);
         try self.file_manager.syncDirty(dirty_files);
+        if (pre) |step| try step.run(step.ctx);
         try self.faultPoint(.pre_manifest);
 
         // 4. Update manifest
@@ -134,6 +154,10 @@ pub const Checkpointer = struct {
         defer self.allocator.free(manifest_path);
 
         try self.manifest.writeToFileWithKey(self.allocator, manifest_path, self.encryption_key);
+        // SONNY-6491: the manifest rename must be durable before the WAL is
+        // truncated below; otherwise power loss can leave the previous
+        // manifest next to a WAL that no longer holds what it needs.
+        try syncDir(self.graph_dir.path);
 
         // 6. Update last_slot tracker
         self.last_slot = next_slot;
@@ -146,6 +170,15 @@ pub const Checkpointer = struct {
         try self.faultPoint(.post_wal_truncate);
 
         config_mod.emitEvent(self.log_fn, .checkpoint_end);
+    }
+
+    fn syncDir(path: []const u8) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        // `.iterate = true`: a real O_RDONLY|O_DIRECTORY fd (O_PATH cannot fsync).
+        var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        const dir_file = std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+        try dir_file.sync(io);
     }
 
     /// Check if checkpoint is needed based on WAL size.

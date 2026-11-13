@@ -667,6 +667,13 @@ pub const GraphEngine = struct {
             error.FileNotFound => {}, // Expected on fresh graphs
             else => return err,
         };
+        // SONNY-6491: graph_storage <= 0.4.13 saved labels.dict after the
+        // manifest; a crash in between leaves fewer names than the manifest
+        // counted. The lost names cannot be re-derived (label blocks hold only
+        // ids), so report it; ids without a name read back as unnamed.
+        if (self.label_dict.count() < self.manifest.label_count) {
+            std.log.warn("labels.dict holds {d} label names but the manifest recorded {d}: names assigned before a crash during a <= 0.4.13 checkpoint are lost", .{ self.label_dict.count(), self.manifest.label_count });
+        }
 
         // 7. Phase A (engine early-ready): the O(nodes+edges) derived-index
         // build (label/property-chain/edge/edge-existence) is DEFERRED out of
@@ -1193,20 +1200,12 @@ pub const GraphEngine = struct {
             // Run a final synchronous checkpoint only when there are writes
             // that have not already been durably persisted.
             self.ensureSubmitterRegistered();
-            self.checkpointer.doCheckpoint() catch |err| {
+            // SONNY-6491: free.store is made durable inside the checkpoint,
+            // before the manifest (engine_persist.checkpointSideFiles).
+            engine_persist.refreshManifestCounters(self);
+            self.checkpointer.doCheckpointWith(engine_persist.preManifestStep(self)) catch |err| {
                 close_err = err;
             };
-
-            if (close_err == null) {
-                self.saveFreeStore() catch |err| {
-                    if (close_err == null) close_err = err;
-                };
-            }
-            if (close_err == null) {
-                self.checkpointer.faultPoint(.post_free_store) catch |err| {
-                    close_err = err;
-                };
-            }
             // Phase A: only persist the derived-index snapshots when they were
             // materialized this session. If never hydrated, the resident indexes
             // are EMPTY and saving them would stamp empty snapshots at the

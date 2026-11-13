@@ -53,19 +53,22 @@ fn Ops(comptime E: type) type {
             return E.open(alloc, path, uuid, cfg);
         }
 
-        fn engines(eng: *E) []const *GraphEngine {
-            if (sharded) return &eng.shards;
-            const one: *const [1]*GraphEngine = @ptrCast(&eng);
+        /// Every underlying GraphEngine. Takes the caller's pointer by
+        /// reference so the single-engine slice points at the caller's
+        /// variable, not at a parameter of this function.
+        fn engines(eng: *const *E) []const *GraphEngine {
+            if (sharded) return &eng.*.shards;
+            const one: *const [1]*GraphEngine = eng;
             return one;
         }
 
         fn setFault(eng: *E, p: ?FaultPoint) void {
-            for (engines(eng)) |g| g.checkpointer.test_fault = p;
+            for (engines(&eng)) |g| g.checkpointer.test_fault = p;
         }
 
         /// Owned copies of every engine's WAL directory path.
         fn walDirs(alloc: Allocator, eng: *E) ![][]u8 {
-            const gs_list = engines(eng);
+            const gs_list = engines(&eng);
             const out = try alloc.alloc([]u8, gs_list.len);
             for (gs_list, 0..) |g, i| out[i] = try std.fmt.allocPrint(alloc, "{s}/wal", .{g.graph_dir.path});
             return out;
@@ -258,4 +261,70 @@ test "SONNY-6491: ShardedGraphEngine close, crash at every step" {
 }
 test "SONNY-6491: ShardedGraphEngine TDE full checkpoint, crash at every step" {
     try runMatrix(ShardedGraphEngine, .full, true);
+}
+
+/// A store left by graph_storage <= 0.4.13 crashing after its checkpoint
+/// wrote the manifest and truncated the WAL but before it saved free.store:
+/// new manifest, empty WAL tail, the PREVIOUS checkpoint's free.store. Built
+/// here by restoring each engine's free.store as it was before that
+/// checkpoint. The open must detect the stale bitmap and rebuild it.
+fn runLegacyStaleFreeStore(comptime E: type, tde: bool) !void {
+    const O = Ops(E);
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{ 0x64, 0x91, 0xEE, @intFromBool(tde) } ++ [_]u8{0x32} ** 12;
+    const cfg = config(tde);
+    const n = if (E == ShardedGraphEngine) 32 else 12;
+
+    var a: [n]u64 = undefined;
+    var b: [n]u64 = undefined;
+    var c: [n]u64 = undefined;
+    var la: gs.LabelId = 0;
+    var lb: gs.LabelId = 0;
+    {
+        const eng = try O.create(alloc, td.path, uuid, cfg);
+        la = try O.writeBatch(alloc, eng, &a, "A");
+        try eng.checkpoint();
+        const gl = O.engines(&eng);
+        var saved: std.ArrayList([]u8) = .empty;
+        defer {
+            for (saved.items) |x| alloc.free(x);
+            saved.deinit(alloc);
+        }
+        for (gl) |g| {
+            const path = try std.fmt.allocPrint(alloc, "{s}/free.store", .{g.graph_dir.path});
+            defer alloc.free(path);
+            try saved.append(alloc, try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited));
+        }
+        lb = try O.writeBatch(alloc, eng, &b, "B");
+        try eng.checkpoint();
+        for (gl, saved.items) |g, old| {
+            const path = try std.fmt.allocPrint(alloc, "{s}/free.store", .{g.graph_dir.path});
+            defer alloc.free(path);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = old });
+        }
+        const dirs = try O.walDirs(alloc, eng);
+        eng.deinit();
+        try O.dropSidecars(alloc, dirs);
+    }
+    {
+        const eng = try O.open(alloc, td.path, uuid, cfg);
+        errdefer eng.deinit();
+        const lc = try O.writeBatch(alloc, eng, &c, "C");
+        try O.expectBatch(alloc, eng, &a, la, "A", "legacy stale free.store");
+        try O.expectBatch(alloc, eng, &b, lb, "B", "legacy stale free.store");
+        try O.expectBatch(alloc, eng, &c, lc, "C", "legacy stale free.store");
+        try eng.close();
+    }
+}
+
+test "SONNY-6491: GraphEngine opens a <= 0.4.13 store whose free.store trails the manifest" {
+    try runLegacyStaleFreeStore(GraphEngine, false);
+}
+test "SONNY-6491: GraphEngine TDE opens a <= 0.4.13 store whose free.store trails the manifest" {
+    try runLegacyStaleFreeStore(GraphEngine, true);
+}
+test "SONNY-6491: ShardedGraphEngine opens a <= 0.4.13 store whose free.store trails the manifest" {
+    try runLegacyStaleFreeStore(ShardedGraphEngine, false);
 }

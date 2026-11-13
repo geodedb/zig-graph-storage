@@ -47,9 +47,9 @@ const GraphEngine = engine_mod.GraphEngine;
 const EdgeIndexEntry = engine_mod.EdgeIndexEntry;
 const owner_only_file_mode = 0o600;
 
-/// Persist the 5 free space bitmaps to a `free.store` file so that
-/// freed pages are correctly tracked across restarts.
-pub fn saveFreeStore(engine: *GraphEngine) !void {
+/// Write the free space bitmaps to `free.store` (temp file, fsync, rename;
+/// no directory fsync — see `saveFreeStore` / `checkpointSideFiles`).
+fn writeFreeStoreFile(engine: *GraphEngine) !void {
     const path = try std.fmt.allocPrint(engine.allocator, "{s}/free.store", .{engine.graph_dir.path});
     defer engine.allocator.free(path);
 
@@ -120,15 +120,50 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
     }
 
     try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
+}
 
-    // fsync the graph directory so the rename itself is durable (the recovery
-    // path relies on the renamed file surviving power loss, not just process
-    // crash). `.iterate = true` forces a real O_RDONLY|O_DIRECTORY fd — the
-    // default openDir uses O_PATH, on which fsync fails with EBADF.
-    var gdir = try std.Io.Dir.cwd().openDir(io, engine.graph_dir.path, .{ .iterate = true });
-    defer gdir.close(io);
-    const gdir_file = std.Io.File{ .handle = gdir.handle, .flags = .{ .nonblocking = false } };
-    try gdir_file.sync(io);
+/// Persist the free space bitmaps durably: `writeFreeStoreFile`, then fsync
+/// the graph directory so the rename itself survives power loss (the
+/// recovery path relies on that, not just on surviving a process crash).
+pub fn saveFreeStore(engine: *GraphEngine) !void {
+    try writeFreeStoreFile(engine);
+    try syncGraphDir(engine);
+}
+
+/// SONNY-6491: the checkpoint's pre-manifest step. `free.store` must be
+/// durable BEFORE the manifest that advances the frontier: written after it,
+/// a crash in between left the new manifest (and a truncated or covered WAL)
+/// next to the previous bitmap, and the next clean open handed pages
+/// allocated since then to new writers. Written before it, a crash in between
+/// leaves a bitmap NEWER than the manifest, which is safe: when the WAL tail
+/// holds committed records recovery discards the file and rebuilds it from
+/// the store files (recovery.zig, GAP-ENT-0011); when it holds none, the
+/// pages the bitmap describes were flushed and fsynced just before it.
+fn checkpointSideFiles(ctx: *anyopaque) anyerror!void {
+    const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
+    try writeFreeStoreFile(engine);
+    try engine.checkpointer.faultPoint(.post_free_store);
+    try syncGraphDir(engine);
+}
+
+pub fn preManifestStep(engine: *GraphEngine) Checkpointer.PreManifest {
+    return .{ .ctx = engine, .run = checkpointSideFiles };
+}
+
+/// Copy the in-memory counters the manifest records into it before a
+/// checkpoint writes it (shared by checkpointEx and close).
+pub fn refreshManifestCounters(engine: *GraphEngine) void {
+    engine.manifest.next_txn_id = engine.txn_manager.next_txn_id;
+    engine.manifest.label_count = engine.label_dict.count();
+    // Per-store page counts: on-disk metadata reflects allocation state, and
+    // loadFreeStore checks a loaded bitmap against them (SONNY-6491).
+    engine.manifest.nodes_pages = engine.free_space_nodes.allocatedCount();
+    engine.manifest.adj_out_pages = engine.free_space_adj_out.allocatedCount();
+    engine.manifest.adj_in_pages = engine.free_space_adj_in.allocatedCount();
+    engine.manifest.in_idx_pages = engine.free_space_in_idx.allocatedCount();
+    engine.manifest.in_dir_pages = engine.free_space_in_dir.allocatedCount();
+    engine.manifest.props_pages = engine.free_space_props.allocatedCount();
+    engine.manifest.var_pages = engine.free_space_var.allocatedCount();
 }
 
 /// Try to load free space bitmaps from a persisted `free.store` file.
@@ -193,7 +228,61 @@ pub fn loadFreeStore(engine: *GraphEngine) !bool {
         offset += consumed;
     }
 
+    // SONNY-6491: graph_storage <= 0.4.13 saved free.store AFTER the
+    // manifest and the WAL truncate. A store that crashed in between holds the
+    // new manifest, an empty WAL tail and the previous bitmap, which would
+    // hand pages allocated since then to new writers. Detect what can be
+    // detected cheaply and rebuild from the store files instead (safe; freed
+    // pages then read as allocated until reused).
+    if (try freeStoreTrailsManifest(engine)) {
+        std.log.warn("free.store is older than the manifest (crash during a <= 0.4.13 checkpoint); rebuilding the free-space bitmaps from the store files", .{});
+        return false;
+    }
     return true;
+}
+
+/// SONNY-6491: true when the loaded bitmaps cannot be the ones the manifest's
+/// checkpoint saw. Two checks, both O(bitmap):
+///   * a store has fewer allocated pages than the manifest's per-store page
+///     count (`*_pages`, recorded from the same bitmaps at that checkpoint);
+///   * a node page that exists in `nodes.store` and lies at or below the
+///     page of the highest node id the manifest issued is not allocated (node
+///     pages are never freed).
+/// Limits: a bitmap that is stale only in WHICH pages it marks (as many pages
+/// freed as allocated since its save) passes both checks; manifests written by
+/// `close()` before 0.4.14 carry the page counts of the last `checkpoint()`,
+/// so the count check only sees growth since then; the node check can fire for
+/// a page whose ids were all issued and never written (aborted), costing a
+/// harmless rebuild.
+fn freeStoreTrailsManifest(engine: *GraphEngine) !bool {
+    const m = &engine.manifest;
+    const pairs = [_]struct { fsm: *const FreeSpaceManager, pages: u64 }{
+        .{ .fsm = &engine.free_space_nodes, .pages = m.nodes_pages },
+        .{ .fsm = &engine.free_space_adj_out, .pages = m.adj_out_pages },
+        .{ .fsm = &engine.free_space_adj_in, .pages = m.adj_in_pages },
+        .{ .fsm = &engine.free_space_in_idx, .pages = m.in_idx_pages },
+        .{ .fsm = &engine.free_space_in_dir, .pages = m.in_dir_pages },
+        .{ .fsm = &engine.free_space_props, .pages = m.props_pages },
+        .{ .fsm = &engine.free_space_var, .pages = m.var_pages },
+    };
+    for (pairs) |pr| {
+        if (pr.fsm.allocatedCount() < pr.pages) return true;
+    }
+
+    const stride: u64 = if (engine.config.base_shard_index != null)
+        @intCast(@import("sharded_store.zig").SHARD_COUNT)
+    else
+        1;
+    if (m.next_node_id < stride) return false;
+    const npp: u64 = @import("node.zig").nodesPerPage(engine.config.page_size);
+    const last_page = (m.next_node_id - stride) / npp;
+    const pager = engine.file_manager.getPager(.nodes) orelse return error.StorePagerUnavailable;
+    const page_count = try pager.pageCount();
+    var p: u64 = 0;
+    while (p <= last_page and p < page_count) : (p += 1) {
+        if (!engine.free_space_nodes.isAllocated(p)) return true;
+    }
+    return false;
 }
 
 /// Rebuild free space bitmaps by scanning on-disk file sizes.
@@ -468,29 +557,16 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     }
 
     // Update manifest counters before checkpoint
-    engine.manifest.next_txn_id = engine.txn_manager.next_txn_id;
-    engine.manifest.label_count = engine.label_dict.count();
-
-    // Sync per-store page counts into the manifest so on-disk metadata
-    // reflects actual allocation state.
-    engine.manifest.nodes_pages = engine.free_space_nodes.allocatedCount();
-    engine.manifest.adj_out_pages = engine.free_space_adj_out.allocatedCount();
-    engine.manifest.adj_in_pages = engine.free_space_adj_in.allocatedCount();
-    engine.manifest.in_idx_pages = engine.free_space_in_idx.allocatedCount();
-    engine.manifest.in_dir_pages = engine.free_space_in_dir.allocatedCount();
-    engine.manifest.props_pages = engine.free_space_props.allocatedCount();
-    engine.manifest.var_pages = engine.free_space_var.allocatedCount();
+    refreshManifestCounters(engine);
 
     // Synchronous checkpoint: flush dirty pages, sync files, write
     // manifest.  Previous versions spawned a detached background thread
     // which could silently lose writes and made the timer meaningless.
     const start_ts = std.Io.Clock.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
     engine.ensureSubmitterRegistered();
-    try engine.checkpointer.doCheckpoint();
-
-    // Persist free space bitmaps so freed pages survive restart.
-    try saveFreeStore(engine);
-    try engine.checkpointer.faultPoint(.post_free_store);
+    // free.store is made durable inside the checkpoint, before the manifest
+    // (SONNY-6491, see checkpointSideFiles).
+    try engine.checkpointer.doCheckpointWith(preManifestStep(engine));
     // GAP-0900 L2: the derived-index snapshot save is the only O(graph-size)
     // step here. The light path skips it (recovery rebuilds from pages) and
     // leaves the dirty flags set so a later full checkpoint still persists them.

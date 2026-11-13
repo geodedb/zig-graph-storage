@@ -34,6 +34,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   superseded image still feeds the id-counter heal (its ids were committed)
   but not the node/edge count heal. The GAP-0900 comments that said batching
   does not change durability are corrected (SONNY-6473).
+- A crash during a checkpoint could lose data. The checkpoint wrote the
+  manifest and truncated the WAL before saving `free.store`, so a crash in
+  between left the new manifest next to the previous bitmap and the next
+  open handed pages allocated since then to new writers (committed
+  properties overwritten); the manifest rename itself was never
+  directory-fsynced before the WAL truncate. `labels.dict` was saved only at
+  checkpoint time, so a crash before that lost every label name assigned
+  since the previous checkpoint. Now `free.store` is written and
+  directory-fsynced inside the checkpoint before the manifest, the manifest
+  rename is directory-fsynced before the WAL truncate, and
+  `getOrAssignLabel` makes a new name durable before returning its id
+  (checkpoints no longer write `labels.dict`). `close()` uses the same
+  sequence and now also records the per-store page counts in the manifest.
+  Opening a store that crashed in that window under <= 0.4.13 detects a
+  bitmap with fewer allocated pages than the manifest recorded, or an
+  unallocated written node page below the highest issued node id, and
+  rebuilds the bitmaps; lost label names are reported with a warning (they
+  cannot be re-derived). `test-checkpoint-side-file-crash` crashes at every
+  step of light, full and close checkpoints, plaintext and TDE, single and
+  sharded (SONNY-6491).
 - `free.store` stores the bitmap's `usize` words byte for byte and records
   no writer layout, so a big-endian or 32-bit host misread files from a
   64-bit little-endian host (and wrote files such a host would misread).

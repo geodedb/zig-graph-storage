@@ -871,8 +871,10 @@ corruption, some space not reclaimed). A file written by an older release on
 such a host cannot be recognised on a 64-bit little-endian host; delete it
 (the engine rebuilds it) before moving a store to a different host type.
 
-The file is replaced atomically (temp file, fsync, rename, directory fsync).
-A page beyond `total_pages` was never allocated. Offline tools read it with
+The file is replaced atomically (temp file, fsync, rename, directory fsync),
+inside each checkpoint before the manifest is written (since 0.4.14,
+SONNY-6491; `docs/operations.md`, Checkpoint). A page beyond `total_pages`
+was never allocated. Offline tools read it with
 `free_space.FreeStore.readFromFile` (no engine or buffer pool) to skip freed
 pages, whose old contents stay in the store file. After a crash the file can
 trail the store until the engine has been opened once.
