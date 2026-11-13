@@ -237,11 +237,82 @@ test "Lever B Test B: crash restart LOADS the epoch-matched snapshot + RECONCILE
         try testing.expectEqual(@as(u64, 1), engine.getMetrics().derived_index_reconciles);
         try testing.expectEqual(@as(u64, 0), engine.getMetrics().derived_index_rebuilds);
 
-        // NOTE: the durability of the single post-checkpoint WAL-tail write
-        // itself (getNode survival of the crash-tail mutation) is a recovery/
-        // replay + free-space concern that Lever B does not touch — Lever B only
-        // changes the checkpoint SAVE path, never recovery. It is intentionally
-        // not asserted here; the rebuild-forced assertion above already proves
-        // recovery observed and replayed the tail.
+        // SONNY-6461: the post-checkpoint WAL-tail write itself survived the
+        // crash. The marker sets NODE_FLAG_DELETED (bit 0 of 0x7), so getNode
+        // reports the hub as deleted (null) exactly when the write survived;
+        // the raw slot carries the marker with the rest of the record intact.
+        const hub_id: NodeId = 1; // asserted when the hub was created
+        const raw = (try engine.node_store.getRawSlot(hub_id)).?;
+        try testing.expectEqual(@as(u16, tail_flags), raw.flags);
+        try testing.expect(raw.out_head != 0);
+        try testing.expectEqual(@as(?NodeRec, null), try engine.getNode(hub_id));
+    }
+}
+
+test "Lever B Test B3: nodes, labels and properties written after the full checkpoint survive a crash (SONNY-6461)" {
+    var td = try TestDataDir.init(testing.allocator);
+    defer td.deinit();
+
+    const uuid = [_]u8{0xB3} ** 16;
+    var cfg = graph_storage.test_support.testConfig();
+    cfg.buffer_pool_pages = 64;
+
+    const N: usize = 2000;
+    const label_a: u32 = 11;
+    const label_b: u32 = 22;
+    const label_tail: u32 = 33;
+    const tail_n: usize = 300; // spans node pages the checkpoint never saw
+
+    var tail_ids: [tail_n]NodeId = undefined;
+    var hub: NodeId = 0;
+    var tail_hub: NodeId = 0;
+    {
+        const engine = try GraphEngine.create(testing.allocator, td.path, uuid, cfg);
+        hub = try bulkLoad(engine, N, label_a, label_b);
+        try engine.checkpoint();
+
+        // Committed after the last checkpoint: new nodes (new node pages, new
+        // property and label blocks), each with a label, a property and an
+        // edge from a new node. sync_each_commit puts them in the WAL.
+        tail_hub = try engine.allocNode();
+        try engine.putNode(tail_hub, emptyNode());
+        for (&tail_ids, 0..) |*id, i| {
+            id.* = try engine.allocNode();
+            try engine.putNode(id.*, emptyNode());
+            try engine.addLabel(id.*, label_tail);
+            var rec = (try engine.getNode(id.*)).?;
+            rec.prop_head = try engine.putProperty(rec.prop_head, "tail", .{ .int = @intCast(i) });
+            try engine.putNode(id.*, rec);
+            _ = try engine.addEdge(tail_hub, id.*, 9);
+        }
+        engine.deinit(); // crash
+    }
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+        for (tail_ids, 0..) |id, i| {
+            const rec = (try engine.getNode(id)) orelse {
+                std.debug.print("post-checkpoint node {d} (#{d}) lost in the crash\n", .{ id, i });
+                return error.PostCheckpointNodeLost;
+            };
+            const v = (try engine.getProperty(rec.prop_head, "tail", testing.allocator)).?;
+            try testing.expectEqual(@as(i64, @intCast(i)), v.int);
+        }
+        const tail_nodes = try engine.scanLabel(label_tail, testing.allocator);
+        defer testing.allocator.free(tail_nodes);
+        try testing.expectEqual(tail_n, tail_nodes.len);
+        const typed = try engine.expandOut(tail_hub, 9, testing.allocator);
+        defer testing.allocator.free(typed);
+        try testing.expectEqual(tail_n, typed.len);
+        // The pre-checkpoint graph is intact too.
+        try verifyData(engine, N, hub, label_a, label_b);
+
+        // And everything survives the next clean restart.
+        try engine.checkpoint();
+    }
+    {
+        const engine = try GraphEngine.open(testing.allocator, td.path, uuid, cfg);
+        defer engine.close() catch {};
+        for (tail_ids) |id| try testing.expect((try engine.getNode(id)) != null);
     }
 }
