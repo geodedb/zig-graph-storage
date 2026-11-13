@@ -464,3 +464,29 @@ test "a stats-less baseline (flat values only) still compares by value" {
     try testing.expectEqual(@as(usize, 0), compareTier(base, tierWith(105, 130, 200, 40), 20.0, false));
     try testing.expectEqual(@as(usize, 6), compareTier(base, tierWith(150, 150, 150, 0), 20.0, false));
 }
+
+test "SONNY-6461: a zero or missing baseline fails every gating metric instead of passing" {
+    // A baseline recorded without a measurement (0, or the field absent) gave
+    // a 0% delta and PASS, so any current value passed the gate.
+    const empty: TierData = .{ .name = "10K" };
+    try testing.expectEqual(@as(usize, 8), compareTier(empty, tierWith(100, 100, 110, 5), 20.0, false));
+    // One gating metric without a baseline fails on its own; the rest compare.
+    var base = tierWith(100, 100, 110, 5);
+    base.open_ms = 0;
+    base.open_ms_stats = null;
+    try testing.expectEqual(@as(usize, 1), compareTier(base, tierWith(100, 100, 110, 5), 20.0, false));
+}
+
+test "SONNY-6461: a zero or missing current measurement fails its gating metric" {
+    // A lower-is-better metric that measured nothing read as a -100% "gain".
+    var cur = tierWith(100, 100, 110, 5);
+    cur.point_lookup_ns = 0;
+    cur.point_lookup_ns_stats = null;
+    try testing.expectEqual(@as(usize, 1), compareTier(tierWith(100, 100, 110, 5), cur, 20.0, false));
+}
+
+test "SONNY-6461: informational metrics without a baseline never fail" {
+    // stddev is legitimately 0 with identical samples; it is reported only.
+    const base = tierWith(100, 100, 100, 0);
+    try testing.expectEqual(@as(usize, 0), compareTier(base, tierWith(100, 100, 100, 3), 20.0, false));
+}
