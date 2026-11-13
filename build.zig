@@ -759,6 +759,16 @@ fn addIntegrationTests(
     const run_page_checksum = b.addRunArtifact(page_checksum_tests);
     page_checksum_step.dependOn(&run_page_checksum.step);
 
+    // SONNY-6461: offline (engine-less) reader for a graph's free.store.
+    const free_store_offline_step = b.step("test-free-store-offline", "Run offline free.store reader tests: an engine-less tool reads every store's free-page bitmap, matching the engine's");
+    const free_store_offline_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/free_store_offline.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_free_store_offline = b.addRunArtifact(free_store_offline_tests);
+    free_store_offline_step.dependOn(&run_free_store_offline.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
