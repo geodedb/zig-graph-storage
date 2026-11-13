@@ -199,3 +199,33 @@ test "crc32c reports whether the instruction is in use" {
     if (comptime_hw) try testing.expect(hardwareAccelerated());
     _ = hardwareAccelerated();
 }
+
+test "SONNY-6470: streaming Hasher equals one-shot hash for every split of the input" {
+    var prng = std.Random.DefaultPrng.init(0x6470_C32C);
+    const r = prng.random();
+    var buf: [9000]u8 = undefined;
+    r.bytes(&buf);
+    for ([_]usize{ 0, 1, 7, 8, 9, 30, 64, 4096, 8192 + 34 }) |len| {
+        const s = buf[0..len];
+        const want = hashSoftware(s);
+        // Every two-way split, then random multi-way splits (the WAL record
+        // checksum feeds 8+8+1+1+8+4 header bytes, then the payload).
+        var cut: usize = 0;
+        while (cut <= len) : (cut += if (len > 300) 97 else 1) {
+            var h = Hasher.init();
+            h.update(s[0..cut]);
+            h.update(s[cut..]);
+            try testing.expectEqual(want, h.final());
+        }
+        for (0..50) |_| {
+            var h = Hasher.init();
+            var off: usize = 0;
+            while (off < len) {
+                const n = @min(len - off, r.uintAtMost(usize, 40));
+                h.update(s[off..][0..n]);
+                off += n;
+            }
+            try testing.expectEqual(want, h.final());
+        }
+    }
+}

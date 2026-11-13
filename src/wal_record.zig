@@ -517,3 +517,24 @@ test "cross_shard_commit and cross_shard_abort record types round-trip" {
 test {
     std.testing.refAllDecls(@This());
 }
+
+test "SONNY-6470: the record checksum is CRC32C of the serialized header and payload" {
+    var payload: [8192]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x6470);
+    prng.random().bytes(&payload);
+    var rec = WalRecord{
+        .lsn = 0x0102_0304_0506_0708,
+        .txn_id = 99,
+        .record_type = .page_update,
+        .file_id = 3,
+        .page_id = 1234,
+        .payload = &payload,
+        .checksum = 0,
+    };
+    var buf: [8192 + 64]u8 = undefined;
+    const n = try rec.serializeInto(&buf);
+    const want = std.hash.crc.Crc32Iscsi.hash(buf[0 .. n - CHECKSUM_SIZE]);
+    try std.testing.expectEqual(want, rec.checksum);
+    try std.testing.expectEqual(want, rec.computeChecksum());
+    try std.testing.expectEqual(want, std.mem.readInt(u32, buf[n - CHECKSUM_SIZE ..][0..4], .little));
+}

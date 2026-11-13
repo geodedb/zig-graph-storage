@@ -8,6 +8,10 @@
 // for reference, and `Pager.readPage` of a plaintext and an encrypted page
 // (the file is in the page cache, so the difference is CPU: CRC32C versus
 // AES-GCM). Run with `zig build bench-checksum -Doptimize=ReleaseFast`.
+//
+// SONNY-6470: also times `WalRecord.serializeInto` of a page_update record
+// carrying an 8 KiB page image (the WAL record checksum is computed while the
+// record is serialized, once per logged page).
 
 const std = @import("std");
 const gs = @import("graph_storage");
@@ -43,6 +47,23 @@ fn tableChecksum(body: []const u8) u32 {
     return std.hash.crc.Crc32Iscsi.hash(body);
 }
 
+var wal_payload: [PAGE]u8 = undefined;
+var wal_buf: [PAGE + 64]u8 = undefined;
+
+fn walSerialize(lsn: u64) u32 {
+    var rec = gs.wal_record.WalRecord{
+        .lsn = lsn,
+        .txn_id = 7,
+        .record_type = .page_update,
+        .file_id = 1,
+        .page_id = 42,
+        .payload = &wal_payload,
+        .checksum = 0,
+    };
+    _ = rec.serializeInto(&wal_buf) catch unreachable;
+    return rec.checksum;
+}
+
 const ReadArg = struct { pager: *const gs.pager.Pager, buf: []u8, pages: u64 };
 var next_page: u64 = 0;
 
@@ -61,6 +82,8 @@ pub fn main() !void {
     const iters: usize = 20_000;
     const page_ns = medianNs(pageChecksum, @as([]const u8, &body), iters);
     const table_ns = medianNs(tableChecksum, @as([]const u8, &body), iters);
+    prng.random().bytes(&wal_payload);
+    const wal_ns = medianNs(walSerialize, @as(u64, 1), iters);
 
     const tmp_name = "checksum-bench.tmp";
     const cwd = std.Io.Dir.cwd();
@@ -87,7 +110,7 @@ pub fn main() !void {
     }
 
     std.debug.print(
-        \\{{"page_size":{d},"page_checksum_ns":{d:.0},"page_checksum_gbps":{d:.2},"std_table_crc32c_ns":{d:.0},"read_page_plaintext_ns":{d:.0},"read_page_encrypted_ns":{d:.0}}}
+        \\{{"page_size":{d},"page_checksum_ns":{d:.0},"page_checksum_gbps":{d:.2},"std_table_crc32c_ns":{d:.0},"read_page_plaintext_ns":{d:.0},"read_page_encrypted_ns":{d:.0},"wal_record_serialize_8k_ns":{d:.0}}}
         \\
     , .{
         PAGE,
@@ -96,5 +119,6 @@ pub fn main() !void {
         table_ns,
         results[0],
         results[1],
+        wal_ns,
     });
 }
