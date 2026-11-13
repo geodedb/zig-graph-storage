@@ -864,6 +864,7 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_wal_lsn_anchor.step);
     // The encrypted-page tail guards (SONNY-6441) likewise.
     integration_step.dependOn(&run_tde_page_tail.step);
+    integration_step.dependOn(&run_adj_tail_repair.step);
     // checkpoint_epoch recovery-invariance is the durability foundation the
     // WAL-aware derived-index contract rests on — gate it under integration.
     integration_step.dependOn(&run_checkpoint_epoch.step);

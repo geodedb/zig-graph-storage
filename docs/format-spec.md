@@ -95,6 +95,28 @@ last 16 body bytes read as zero) and move to the current envelope on their
 next write. A binary that only knows the legacy envelope fails to
 authenticate current-envelope pages (`error.DecryptionFailed`).
 
+What the legacy tail held, per store (SONNY-6461). Prop, var and slab
+adjacency blocks reserve the tail (`tail_reserve`), so they lost nothing.
+
+| Store | Page size | Lost |
+|-------|-----------|------|
+| `nodes` | 8 KiB | slot 169 of 170: `label_count`, `flags`, `_pad`, `txn_stamp` |
+| `nodes` | 4, 16, 32, 64 KiB | nothing (records end at or before the tail) |
+| `adj_in_dir` | every size | the last two heads of each page |
+| v1 chain block (24 B) | 8 KiB, 32 KiB | last slot of a full block (338 / 1362): entry bytes 16..24, `rel_type` and `prop_head` |
+| v2 chain block (32 B) | every size | nothing (a full block ends exactly at the tail) |
+| v3 chain block (40 B) | 4 KiB, 64 KiB | last slot of a full block (100 / 1636): bytes 32..40, high half of `prop_head` |
+| v3 chain block (40 B) | 32 KiB | last slot of a full block (817): bytes 24..40, `public_id` and high half of `prop_head` |
+
+`edge.legacyTailLoss(page_size, entry_format)` computes the adjacency rows.
+`neighbor` and `edge_id` are never lost, and every edge is stored in both
+directions (`adj_out` and `in_idx`, or `adj_in` for edges written by the
+legacy `addEdge` path), so `GraphEngine.repairAdjTailEntries` restores a lost
+entry from its other-direction copy and reports the entries it cannot
+restore. A node delete is recorded only in `NodeRec.flags` (there is no other
+durable record of it), so whether a damaged 8 KiB slot-169 node had been
+deleted cannot be derived from the store.
+
 ---
 
 ## 2. Node Record

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `GraphEngine.repairAdjTailEntries(allocator)` restores the adjacency
+  entries that stores encrypted by graph_storage <= 0.4.11 lost to the
+  AES-GCM tag tail (SONNY-6441): the last slot of every full chain block
+  whose format reaches the tail at the store's page size. Each such entry is
+  matched by edge id to the same edge in the other direction (`in_idx`, or
+  the legacy `adj_in`), its lost fields are copied back and WAL-logged, and
+  the derived edge indexes are rebuilt when outgoing entries change. It is
+  idempotent, returns at once on a plaintext store, and lists every entry it
+  cannot restore with the reason (`no_mirror`, `mirror_in_tail`,
+  `prop_head_not_mirrored`, `wide_head_in_narrow_entry`). The layout
+  knowledge is public as `edge.legacyTailLoss` (SONNY-6461).
+
+### Fixed
+
+- The 0.4.12 entry and its commit named only the v3 adjacency entry at
+  4 KiB. A full v1 chain block at 8 KiB (geode's page size) also reached the
+  tail: entry 338 lost `rel_type` and `prop_head`. At 32 KiB the v1 entry
+  1362 lost the same and the v3 entry 817 lost `public_id` and the high half
+  of `prop_head`; at 64 KiB the v3 entry 1636 lost the high half of
+  `prop_head`. The 0.4.12 entry is corrected and `docs/format-spec.md` lists
+  every store (SONNY-6461).
+
 ## [0.4.12] - 2026-11-12
 
 ### Changed
@@ -24,8 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write and reload (eviction, reopen, crash recovery), silently because the
   page still authenticated: with the default 8 KiB page every node in slot
   169 of 170 read back missing or with tag bytes in its flags; the last two
-  heads of every `adj_in_dir` page and, at 4 KiB, the last v3 adjacency entry
-  of a full block were damaged too. Encrypted pages are now written in a
+  heads of every `adj_in_dir` page and the last entry of a full adjacency
+  chain block were damaged too (v1 at 8 and 32 KiB, v3 at 4, 32 and 64 KiB;
+  corrected by SONNY-6461, which first listed only v3 at 4 KiB). Encrypted pages are now written in a
   header-tag envelope: the tag goes into header bytes 0..16 (`page_id`/`lsn`,
   unused by every store), the rest of the header is the additional
   authenticated data, `PageFlags.encrypted` marks the page, and the whole

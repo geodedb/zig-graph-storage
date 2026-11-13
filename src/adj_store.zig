@@ -978,6 +978,129 @@ pub const AdjStore = struct {
         return count;
     }
 
+    /// SONNY-6461: where one entry of a chain lives.
+    pub const EntryLocation = struct {
+        page: PageId,
+        /// Slot within a chain block, or entry index within a slab run.
+        slot: u32,
+        /// The block's entry format (v1/v2/v3, or slab / slab-v3).
+        entry_format: u8,
+        entry: EdgeEntry,
+        /// Set when the entry is the last slot of a full chain block whose
+        /// bytes `lost_from..` reached the legacy tag tail (see
+        /// `edge.legacyTailLoss`). Never set for slab runs.
+        tail_lost_from: ?u32,
+    };
+
+    /// SONNY-6461: find the entry with `edge_id` in the chain at `head`
+    /// (legacy chain or slab run). Read-only.
+    pub fn locateEntry(self: *AdjStore, head: PageId, edge_id: EdgeId) !?EntryLocation {
+        if (head == 0) return null;
+        if (isSlabHead(head)) {
+            const page = slabHeadPageId(head);
+            if (page == 0) return error.DataCorruption;
+            const frame = try self.buffer_pool.pin(self.file_id, page);
+            defer self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
+            const data = frame.dataSlice();
+            const run = try self.resolveSlabRun(data, slabHeadSlot(head));
+            var i: u32 = 0;
+            while (i < run.entry_count) : (i += 1) {
+                const e = readSlabRunEntry(data, run.offset, i, run.fmt);
+                if (e.edge_id == edge_id) return .{ .page = page, .slot = i, .entry_format = run.fmt, .entry = e, .tail_lost_from = null };
+            }
+            return null;
+        }
+        var current_page = head;
+        var hops: u32 = 0;
+        while (current_page != 0) : (hops += 1) {
+            if (hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
+            const frame = try self.buffer_pool.pin(self.file_id, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+            const bh = self.readBlockHeader(data) catch |err| {
+                self.buffer_pool.unpin(frame_idx, false);
+                return err;
+            };
+            var i: u16 = 0;
+            while (i < bh.count) : (i += 1) {
+                const e = self.readEntry(data, i, bh.entry_format);
+                if (e.edge_id == edge_id) {
+                    self.buffer_pool.unpin(frame_idx, false);
+                    return .{ .page = current_page, .slot = i, .entry_format = bh.entry_format, .entry = e, .tail_lost_from = self.tailLostFrom(bh, i) };
+                }
+            }
+            const next = bh.next_block;
+            self.buffer_pool.unpin(frame_idx, false);
+            current_page = next;
+        }
+        return null;
+    }
+
+    /// SONNY-6461: append to `out` every entry of the chain at `head` that
+    /// sits in a legacy-tail slot (the last slot of a full chain block of a
+    /// format that reaches the tail at this page size). Slab runs never do.
+    pub fn collectTailEntries(self: *AdjStore, head: PageId, allocator: Allocator, out: *std.ArrayList(EntryLocation)) !void {
+        if (head == 0 or isSlabHead(head)) return;
+        var current_page = head;
+        var hops: u32 = 0;
+        while (current_page != 0) : (hops += 1) {
+            if (hops >= MAX_CHAIN_HOPS) return error.CircularChainDetected;
+            const frame = try self.buffer_pool.pin(self.file_id, current_page);
+            const frame_idx = self.buffer_pool.frameIndex(frame);
+            const data = frame.dataSlice();
+            const bh = self.readBlockHeader(data) catch |err| {
+                self.buffer_pool.unpin(frame_idx, false);
+                return err;
+            };
+            if (edge_mod.legacyTailLoss(self.page_size, bh.entry_format)) |loss| {
+                if (bh.count == loss.slot + 1) {
+                    const slot: u16 = @intCast(loss.slot);
+                    out.append(allocator, .{
+                        .page = current_page,
+                        .slot = slot,
+                        .entry_format = bh.entry_format,
+                        .entry = self.readEntry(data, slot, bh.entry_format),
+                        .tail_lost_from = loss.lost_from,
+                    }) catch |err| {
+                        self.buffer_pool.unpin(frame_idx, false);
+                        return err;
+                    };
+                }
+            }
+            const next = bh.next_block;
+            self.buffer_pool.unpin(frame_idx, false);
+            current_page = next;
+        }
+    }
+
+    /// SONNY-6461: overwrite the chain-block entry at (`page`, `slot`) with
+    /// `entry`, in the block's own format. Refuses (DataCorruption) unless the
+    /// block still has that format, the slot is live and the entry there still
+    /// carries `entry.edge_id` and `entry.neighbor`. The caller WAL-images
+    /// `page` under its txn (it is also recorded in `touchedPages`).
+    pub fn rewriteChainEntry(self: *AdjStore, page: PageId, slot: u32, entry_format: u8, entry: EdgeEntry) !void {
+        self.beginOp();
+        const frame = try self.buffer_pool.pin(self.file_id, page);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        var dirty = false;
+        defer self.buffer_pool.unpin(frame_idx, dirty);
+        const data = frame.dataSlice();
+        const bh = try self.readBlockHeader(data);
+        if (bh.entry_format != entry_format or slot >= bh.count) return error.DataCorruption;
+        const cur = self.readEntry(data, @intCast(slot), entry_format);
+        if (cur.edge_id != entry.edge_id or cur.neighbor != entry.neighbor) return error.DataCorruption;
+        if (!edge_mod.formatHasWideHead(entry_format) and (entry.prop_head >> 32) != 0) return error.WideHeadInLegacyChainBlock;
+        try self.recordTouched(page);
+        self.writeEntry(data, @intCast(slot), entry, entry_format);
+        dirty = true;
+    }
+
+    fn tailLostFrom(self: *const AdjStore, bh: EdgeBlockHeader, slot: u16) ?u32 {
+        const loss = edge_mod.legacyTailLoss(self.page_size, bh.entry_format) orelse return null;
+        if (bh.count != loss.slot + 1 or slot != loss.slot) return null;
+        return loss.lost_from;
+    }
+
     // Internal helpers
 
     fn blockHeaderOffset(_: *const AdjStore) u32 {
