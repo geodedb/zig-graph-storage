@@ -401,6 +401,19 @@ pub const Recovery = struct {
         const census_scratch = try self.allocator.alloc(u8, buffer_pool.page_size);
         defer self.allocator.free(census_scratch);
 
+        // SONNY-6473: LSN of the image last applied to each (file_id, page_id).
+        // Log order is not LSN order: a GAP-0900 batch numbers its page images
+        // when they are made but writes them at its txn's commit, so a txn
+        // overlapping it on the same TxnManager can log a NEWER image of a page
+        // before the batched txn's OLDER one. Each image is a full page taken
+        // at the moment its LSN was assigned, so the highest-LSN committed
+        // image is the page's latest committed state; replay applies an image
+        // only when its LSN is above the one already applied to that page.
+        // Logs of this shape already exist on disk (0.4.12/0.4.13), so the
+        // ordering has to be enforced here, not only by the writer.
+        var applied_lsn = std.AutoHashMap(u128, u64).init(self.allocator);
+        defer applied_lsn.deinit();
+
         // 5. Replay committed page_update records into buffer pool.
         const ReplayCtx = struct {
             txn_states: *const std.AutoHashMap(u64, TxnRecoveryState),
@@ -413,6 +426,8 @@ pub const Recovery = struct {
             /// GAP-ENT-0025: see above.
             census_prev: *std.AutoHashMap(u128, u64),
             census_scratch: []u8,
+            /// SONNY-6473: see `applied_lsn` above.
+            applied_lsn: *std.AutoHashMap(u128, u64),
 
             fn visit(ctx: *@This(), rec: *const WalRecord) !void {
                 if (rec.record_type != .page_update) return;
@@ -427,6 +442,23 @@ pub const Recovery = struct {
                 // so the engine can reconcile ONLY the tail-touched pages into
                 // the loaded derived-index snapshot at first-access hydration.
                 ctx.recovery.recordAffectedPage(file_id, rec.page_id);
+
+                // SONNY-6473: never let an older image overwrite a newer one.
+                // Fallible on purpose: without the map replay cannot order
+                // images, so an OOM fails recovery instead of losing writes.
+                const key: u128 = (@as(u128, @intFromEnum(file_id)) << 64) | rec.page_id;
+                const gop = try ctx.applied_lsn.getOrPut(key);
+                if (gop.found_existing and gop.value_ptr.* >= rec.lsn) {
+                    // Superseded. Its ids were still durably committed once,
+                    // so the counter heal sees them (it must never re-issue a
+                    // committed id); the stats census follows the page as it
+                    // ends up and skips this image.
+                    if (rec.payload.len == ctx.buffer_pool.page_size) {
+                        ctx.recovery.trackReplayedIdMaxima(file_id, rec.page_id, rec.payload);
+                    }
+                    return;
+                }
+                gop.value_ptr.* = rec.lsn;
 
                 const frame = try ctx.buffer_pool.pinNew(file_id, rec.page_id);
                 const frame_idx = ctx.buffer_pool.frameIndex(frame);
@@ -492,6 +524,7 @@ pub const Recovery = struct {
             .applied_committed_pages = &self.applied_committed_pages,
             .census_prev = &census_prev,
             .census_scratch = census_scratch,
+            .applied_lsn = &applied_lsn,
         };
         try wal.forEachFromStrict(start_lsn, self.allocator, &self.last_failure, &replay_ctx, ReplayCtx.visit);
 

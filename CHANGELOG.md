@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Crash recovery applies, for each page, only the committed page image with
+  the highest LSN. A GAP-0900 WAL batch numbers its page images when they are
+  made but writes them at its transaction's commit, so a second transaction
+  on the same `TxnManager` that overlapped it logged a newer image of a shared
+  page first, and recovery, which applied images in log order, overwrote it
+  with the batched transaction's older one: committed writes were lost after
+  a crash (geode SONNY-2978: 64 of 64 property removals came back). WAL logs
+  of that shape written by 0.4.12 and 0.4.13 recover correctly with this
+  release. The write path, the WAL format and batching are unchanged. A
+  superseded image still feeds the id-counter heal (its ids were committed)
+  but not the node/edge count heal. The GAP-0900 comments that said batching
+  does not change durability are corrected (SONNY-6473).
+
 ## [0.4.13] - 2026-11-13
 
 ### Changed
