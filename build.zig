@@ -737,6 +737,17 @@ fn addIntegrationTests(
     const run_tde_page_tail = b.addRunArtifact(tde_page_tail_tests);
     tde_page_tail_step.dependOn(&run_tde_page_tail.step);
 
+    // SONNY-6461: restore the adjacency entries a <= 0.4.11 encrypted store
+    // lost to the AES-GCM tag tail, from the same edge's other-direction copy.
+    const adj_tail_repair_step = b.step("test-adj-tail-repair", "Run legacy TDE page-tail adjacency repair tests: entries lost by <= 0.4.11 encrypted stores (v3 at 4 KiB, v1 at 8 KiB) are restored from their mirror; unrepairable ones are reported");
+    const adj_tail_repair_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adj_tail_repair.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adj_tail_repair = b.addRunArtifact(adj_tail_repair_tests);
+    adj_tail_repair_step.dependOn(&run_adj_tail_repair.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
