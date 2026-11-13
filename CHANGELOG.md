@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The plaintext page checksum (CRC32C, on every buffer-pool miss and flush)
+  uses the CPU's CRC32C instruction: SSE4.2 `crc32` on x86_64, `crc32c*` on
+  aarch64 with the CRC extension. It is chosen at compile time when the
+  target CPU has it and otherwise after a run-time check (CPUID; AT_HWCAP on
+  aarch64 Linux); Debug builds of a target without SSE4.2 (Zig's self-hosted
+  x86_64 backend cannot assemble it) and other CPUs keep the table. Values
+  are unchanged. `zig build bench-checksum -Doptimize=ReleaseFast` on an
+  x86_64 host: 15583 to 751 ns per 8 KiB page; a cached plaintext
+  `Pager.readPage` 16773 to 2020 ns (encrypted: about 4000 ns)
+  (SONNY-6461).
+
 ### Added
 
 - `GraphEngine.repairAdjTailEntries(allocator)` restores the adjacency

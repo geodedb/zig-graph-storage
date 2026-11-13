@@ -65,7 +65,9 @@ checksum = CRC32C(page_body)
 ```
 
 Where `page_body` is all bytes from offset 32 to `page_size - 1` (i.e., the
-entire page excluding the header). Computed via `std.hash.crc.Crc32Iscsi.hash()`.
+entire page excluding the header). Computed by `crc32c.hash()`: the CPU's
+CRC32C instruction (x86_64 SSE4.2, aarch64 CRC) where present, otherwise
+`std.hash.crc.Crc32Iscsi.hash()`; both give the same value.
 Plaintext mode only. A page whose 32 header bytes are all zero is a page that
 was never written only if its body is zero too (or, in plaintext mode, its
 body's CRC32C is 0); otherwise the read fails.
