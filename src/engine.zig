@@ -1206,6 +1206,11 @@ pub const GraphEngine = struct {
                     if (close_err == null) close_err = err;
                 };
             }
+            if (close_err == null) {
+                self.checkpointer.faultPoint(.post_free_store) catch |err| {
+                    close_err = err;
+                };
+            }
             // Phase A: only persist the derived-index snapshots when they were
             // materialized this session. If never hydrated, the resident indexes
             // are EMPTY and saving them would stamp empty snapshots at the
@@ -1222,10 +1227,20 @@ pub const GraphEngine = struct {
                 self.saveDerivedIndexes(self.manifest.last_checkpoint_lsn) catch |err| {
                     if (close_err == null) close_err = err;
                 };
+                if (close_err == null) {
+                    self.checkpointer.faultPoint(.post_derived) catch |err| {
+                        close_err = err;
+                    };
+                }
             }
             if (close_err == null) {
                 self.saveLabelDictionary() catch |err| {
                     if (close_err == null) close_err = err;
+                };
+            }
+            if (close_err == null) {
+                self.checkpointer.faultPoint(.post_label_dict) catch |err| {
+                    close_err = err;
                 };
             }
             if (close_err == null) {

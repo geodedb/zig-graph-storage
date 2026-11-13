@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const buffer_pool_mod = @import("buffer_pool.zig");
@@ -16,6 +17,26 @@ const WalManager = wal_mod.WalManager;
 const Manifest = manifest_mod.Manifest;
 const FileManager = file_manager_mod.FileManager;
 const GraphDir = graph_dir_mod.GraphDir;
+
+/// SONNY-6491: TEST-ONLY crash points of the checkpoint sequence. A test sets
+/// `Checkpointer.test_fault`; the checkpoint then stops with
+/// `error.TestCrashInjected` right after the named step, leaving on disk
+/// exactly what a process killed at that moment leaves. Outside test builds
+/// the field is `void` and every check compiles to nothing.
+pub const FaultPoint = enum {
+    /// Pages flushed and fsynced; manifest not yet written.
+    pre_manifest,
+    /// Manifest written; WAL not yet truncated.
+    post_manifest,
+    /// WAL truncated up to the checkpoint LSN.
+    post_wal_truncate,
+    /// `free.store` saved.
+    post_free_store,
+    /// `labels.dict` saved.
+    post_label_dict,
+    /// Derived-index snapshots saved (full checkpoint and close only).
+    post_derived,
+};
 
 /// Incremental checkpointer that flushes dirty pages and updates the manifest.
 ///
@@ -36,6 +57,16 @@ pub const Checkpointer = struct {
     encryption_key: ?[32]u8 = null,
     /// Optional log callback for structured event emission.
     log_fn: ?*const fn (level: config_mod.LogLevel, msg: []const u8) void = null,
+    /// SONNY-6491: see `FaultPoint`. `void` outside test builds.
+    test_fault: if (builtin.is_test) ?FaultPoint else void = if (builtin.is_test) null else {},
+
+    /// SONNY-6491: stop here when a test asked to crash after step `p`.
+    pub fn faultPoint(self: *const Checkpointer, p: FaultPoint) error{TestCrashInjected}!void {
+        if (comptime !builtin.is_test) return;
+        if (self.test_fault) |f| {
+            if (f == p) return error.TestCrashInjected;
+        }
+    }
 
     pub fn init(
         allocator: Allocator,
@@ -80,6 +111,7 @@ pub const Checkpointer = struct {
         // could skip a file whose data is not yet durable.
         errdefer self.buffer_pool.restoreDirtyFiles(dirty_files);
         try self.file_manager.syncDirty(dirty_files);
+        try self.faultPoint(.pre_manifest);
 
         // 4. Update manifest
         self.manifest.last_checkpoint_lsn = checkpoint_lsn;
@@ -105,11 +137,13 @@ pub const Checkpointer = struct {
 
         // 6. Update last_slot tracker
         self.last_slot = next_slot;
+        try self.faultPoint(.post_manifest);
 
         // 7. Truncate WAL up to checkpoint_lsn
         if (checkpoint_lsn > 0) {
             try self.wal.truncate(checkpoint_lsn);
         }
+        try self.faultPoint(.post_wal_truncate);
 
         config_mod.emitEvent(self.log_fn, .checkpoint_end);
     }

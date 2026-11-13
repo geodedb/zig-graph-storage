@@ -471,6 +471,7 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
 
     // Persist free space bitmaps so freed pages survive restart.
     try saveFreeStore(engine);
+    try engine.checkpointer.faultPoint(.post_free_store);
     // GAP-0900 L2: the derived-index snapshot save is the only O(graph-size)
     // step here. The light path skips it (recovery rebuilds from pages) and
     // leaves the dirty flags set so a later full checkpoint still persists them.
@@ -516,10 +517,12 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
         engine.edge_exist_index_dirty = false;
         engine.prop_rev_index_dirty = false;
         engine.metrics.derived_index_saves += 1;
+        try engine.checkpointer.faultPoint(.post_derived);
     }
     // Label dictionary is O(labels) and is NOT rebuildable from pages (it maps
     // name<->id), so it is persisted on every checkpoint, light or full.
     try saveLabelDictionary(engine);
+    try engine.checkpointer.faultPoint(.post_label_dict);
     // GAP-0027: persist the index catalog + declared B+tree property indexes.
     // No-op when no index is declared (opt-in / backward compat).
     try engine_property_index.save(engine);
