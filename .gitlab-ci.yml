@@ -237,13 +237,21 @@ benchmark-regression-10k:
     - zig build scale-bench -- 10K > benchmarks/results/current-ci-10k.json
     - zig build compare-bench -- benchmarks/results/ci-10k-baseline.json benchmarks/results/current-ci-10k.json
   artifacts:
+    when: always
     paths:
       - benchmarks/results/current-ci-10k.json
     expire_in: 30 days
+  # Advisory, like benchmark-regression above and thread-pool's benchmark
+  # jobs. A manual job without allow_failure leaves every default-branch
+  # pipeline "blocked" and never complete, and a failing job in the
+  # performance stage skips the security (gitleaks) and sbom stages after it.
+  # The comparison stays visible in the job log and artifact.
+  allow_failure: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
+      allow_failure: true
 
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.

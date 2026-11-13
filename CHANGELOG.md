@@ -45,10 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loader's pin, leaving an in-use frame evictable. The lock-free lookup's
   intentionally racy reads are now confined to `speculativeLookup`, ordered
   before the seqlock re-check, and hidden from ThreadSanitizer with
-  `AnnotateIgnoreReadsBegin/End`; geode's parallel-union TSan reports in
-  `pin` are gone. New steps `test-buffer-pool-concurrent-readers` (also under
+  `AnnotateIgnoreReadsBegin/End`: the new TSan step reproduces the 49
+  reports of that kind (geode's parallel-union step showed ~30) and now
+  reports none. New steps `test-buffer-pool-concurrent-readers` (also under
   `test-integration`) and `test-buffer-pool-concurrent-readers-tsan`
   (SONNY-6438).
+- `compare-bench` gates each measurement on its median (p50) and reports
+  avg/p95/p99/stddev for information. With scale-bench's three samples per
+  tier one slow sample failed identical code (HEAD against HEAD: 8-10
+  failing rows). `benchmarks/results/ci-10k-baseline.json` is re-recorded at
+  ff9d97f: the old one (2026-03-25) was recorded where fsync is free
+  (2,012,554 mixed ops/s with a WAL fsync on 15% of them); its own code
+  measures ~260 mixed ops/s on a real disk. The manual
+  `benchmark-regression-10k` CI job is advisory (`allow_failure: true`, like
+  `benchmark-regression`) and keeps its artifact on failure, so it no longer
+  leaves default-branch pipelines blocked or skips the security and SBOM
+  stages (SONNY-6438).
 
 ## [0.4.11] - 2026-11-12
 
