@@ -212,6 +212,14 @@ fn addUnitTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: Optim
     if (deps.otel_mod) |m| unit_tests.root_module.addImport("otel", m);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
+
+    // The benchmark gate's comparison logic (benchmarks/compare.zig) is
+    // plain std code: unit-test it with the rest so CI's benchmark jobs
+    // cannot silently gate on noise again.
+    const compare_bench_tests = b.addTest(.{
+        .root_module = createModule(b, "benchmarks/compare.zig", target, optimize, &.{}),
+    });
+    test_step.dependOn(&b.addRunArtifact(compare_bench_tests).step);
 }
 
 fn addIntegrationTests(

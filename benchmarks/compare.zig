@@ -251,6 +251,33 @@ fn isRegression(delta_pct: f64, kind: MetricKind, threshold: f64) bool {
     };
 }
 
+/// Compare one tier against its baseline; print a row per metric when
+/// `report` is set. Returns the number of regressions that fail the gate.
+fn compareTier(base_tier: TierData, cur_tier: TierData, threshold: f64, report: bool) usize {
+    var regressions: usize = 0;
+    for (metrics) |metric| {
+        const base_val = metric.get(base_tier);
+        const cur_val = metric.get(cur_tier);
+        const delta = computeDeltaPct(base_val, cur_val);
+        const regressed = isRegression(delta, metric.kind, threshold);
+        if (regressed) regressions += 1;
+
+        if (report) {
+            const sign = if (delta >= 0) "+" else "";
+            print("  {s:<6} {s:<20} {d:>12.2} {d:>12.2} {s}{d:>8.1}% {s:>6}\n", .{
+                base_tier.name,
+                metric.name,
+                base_val,
+                cur_val,
+                sign,
+                delta,
+                if (regressed) "FAIL" else "PASS",
+            });
+        }
+    }
+    return regressions;
+}
+
 fn validateTierSets(baseline: BenchResult, current: BenchResult) bool {
     var ok = true;
 
@@ -329,26 +356,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     for (baseline.tiers) |base_tier| {
         const cur_tier = findTier(current, base_tier.name) orelse continue;
-
-        for (metrics) |metric| {
-            const base_val = metric.get(base_tier);
-            const cur_val = metric.get(cur_tier);
-            const delta = computeDeltaPct(base_val, cur_val);
-            const regressed = isRegression(delta, metric.kind, threshold);
-            if (regressed) any_regression = true;
-
-            const sign = if (delta >= 0) "+" else "";
-            print("  {s:<6} {s:<20} {d:>12.2} {d:>12.2} {s}{d:>8.1}% {s:>6}\n", .{
-                base_tier.name,
-                metric.name,
-                base_val,
-                cur_val,
-                sign,
-                delta,
-                if (regressed) "FAIL" else "PASS",
-            });
-        }
-
+        if (compareTier(base_tier, cur_tier, threshold, true) > 0) any_regression = true;
         print("\n", .{});
     }
 
@@ -358,4 +366,62 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.process.exit(1);
     }
     print("  RESULT: PASS -- all metrics within threshold\n\n", .{});
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+/// A tier whose every measurement has median `p50` and the given spread:
+/// `avg`/`p95`/`p99`/`stddev` model what three noisy samples report.
+fn tierWith(p50: f64, avg: f64, p95: f64, stddev: f64) TierData {
+    const s: MetricStats = .{ .samples = 3, .avg = avg, .p50 = p50, .p95 = p95, .p99 = p95, .stddev = stddev };
+    return .{
+        .name = "10K",
+        .seed_ops_sec = avg,
+        .seed_ops_sec_stats = s,
+        .point_lookup_ns = avg,
+        .point_lookup_ns_stats = s,
+        .prop_read_ns = avg,
+        .prop_read_ns_stats = s,
+        .expand_out_ns = avg,
+        .expand_out_ns_stats = s,
+        .label_scan_ns = avg,
+        .label_scan_ns_stats = s,
+        .checkpoint_ms = avg,
+        .checkpoint_ms_stats = s,
+        .open_ms = avg,
+        .open_ms_stats = s,
+        .mixed_ops_sec = avg,
+        .mixed_ops_sec_stats = s,
+    };
+}
+
+test "same code, one slow sample out of three: not a regression" {
+    // Measured (SONNY-6438): HEAD against HEAD failed on open_ms avg +84%,
+    // p95/p99 +239% (with 3 samples p95 == p99 == the slowest) and stddev
+    // +62..+1966%, while the medians agreed. A 3-sample gate must key on
+    // the median.
+    const base = tierWith(40, 40, 44, 2.5);
+    const cur = tierWith(41, 74, 148, 52.6);
+    try testing.expectEqual(@as(usize, 0), compareTier(base, cur, 20.0, false));
+}
+
+test "a real shift of the median is a regression, in either direction of better" {
+    const base = tierWith(100, 100, 110, 5);
+    // Every metric's median moves 50% up: lower-is-better metrics regress,
+    // higher-is-better ones (seed, mixed) improve.
+    const up = tierWith(150, 150, 165, 5);
+    try testing.expectEqual(@as(usize, 6), compareTier(base, up, 20.0, false));
+    // 50% down: only seed and mixed (higher is better) regress.
+    const down = tierWith(50, 50, 55, 5);
+    try testing.expectEqual(@as(usize, 2), compareTier(base, down, 20.0, false));
+}
+
+test "a stats-less baseline (flat values only) still compares by value" {
+    const base: TierData = .{ .name = "10K", .seed_ops_sec = 100, .point_lookup_ns = 100, .prop_read_ns = 100, .expand_out_ns = 100, .label_scan_ns = 100, .checkpoint_ms = 100, .open_ms = 100, .mixed_ops_sec = 100 };
+    try testing.expectEqual(@as(usize, 0), compareTier(base, tierWith(105, 130, 200, 40), 20.0, false));
+    try testing.expectEqual(@as(usize, 6), compareTier(base, tierWith(150, 150, 150, 0), 20.0, false));
 }
