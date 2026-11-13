@@ -1084,10 +1084,6 @@ pub const GraphEngine = struct {
         return engine_index.saveDerivedIndexes(self, covered_lsn);
     }
 
-    fn saveLabelDictionary(self: *GraphEngine) !void {
-        return engine_persist.saveLabelDictionary(self);
-    }
-
     /// Initializes `thread_pool` to either the caller-supplied pool (when
     /// `cfg.external_thread_pool` is set — borrowed) or a fresh
     /// `default_owned_pool_max_threads`-worker pool stored in
@@ -1232,16 +1228,6 @@ pub const GraphEngine = struct {
                         close_err = err;
                     };
                 }
-            }
-            if (close_err == null) {
-                self.saveLabelDictionary() catch |err| {
-                    if (close_err == null) close_err = err;
-                };
-            }
-            if (close_err == null) {
-                self.checkpointer.faultPoint(.post_label_dict) catch |err| {
-                    close_err = err;
-                };
             }
             if (close_err == null) {
                 // GAP-0027: persist catalog + B+tree property indexes on close.
@@ -2771,8 +2757,15 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         try self.ensureWritable();
+        const is_new = self.label_dict.getId(label) == null;
         const id = try self.label_dict.getOrAssign(label);
         self.markDirty();
+        // SONNY-6491: label assignment is not WAL-logged and labels.dict is the
+        // only record of a name, so a new name is made durable (file fsync,
+        // rename, directory fsync) before the id is returned and can reach a
+        // committed record. A crash at any later point then finds the name.
+        // New names are rare (schema-level); existing names cost nothing.
+        if (is_new) try engine_persist.saveLabelDictionaryDurable(self);
         observability.endOperationSpan(__obs_span, true, "");
         return id;
     }

@@ -243,6 +243,25 @@ pub fn saveLabelDictionary(engine: *GraphEngine) !void {
     try engine.label_dict.saveToFile(labels_path);
 }
 
+/// SONNY-6491: `saveLabelDictionary` (temp file, fsync, rename) followed by a
+/// directory fsync, so the rename itself survives power loss.
+pub fn saveLabelDictionaryDurable(engine: *GraphEngine) !void {
+    try saveLabelDictionary(engine);
+    try engine.checkpointer.faultPoint(.post_label_dict);
+    try syncGraphDir(engine);
+}
+
+/// fsync the graph directory so renames into it are durable. `.iterate =
+/// true` forces a real O_RDONLY|O_DIRECTORY fd — the default openDir uses
+/// O_PATH, on which fsync fails with EBADF.
+pub fn syncGraphDir(engine: *GraphEngine) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var gdir = try std.Io.Dir.cwd().openDir(io, engine.graph_dir.path, .{ .iterate = true });
+    defer gdir.close(io);
+    const gdir_file = std.Io.File{ .handle = gdir.handle, .flags = .{ .nonblocking = false } };
+    try gdir_file.sync(io);
+}
+
 /// Initialize all subsystems shared between create() and open().
 ///
 /// This covers: free space managers, WAL, transaction manager, data stores,
@@ -519,10 +538,10 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
         engine.metrics.derived_index_saves += 1;
         try engine.checkpointer.faultPoint(.post_derived);
     }
-    // Label dictionary is O(labels) and is NOT rebuildable from pages (it maps
-    // name<->id), so it is persisted on every checkpoint, light or full.
-    try saveLabelDictionary(engine);
-    try engine.checkpointer.faultPoint(.post_label_dict);
+    // Label dictionary: NOT rebuildable from pages (it maps name<->id) and not
+    // WAL-logged, so every new name is made durable when it is assigned
+    // (GraphEngine.getOrAssignLabel, SONNY-6491); a checkpoint has nothing to
+    // add.
     // GAP-0027: persist the index catalog + declared B+tree property indexes.
     // No-op when no index is declared (opt-in / backward compat).
     try engine_property_index.save(engine);
