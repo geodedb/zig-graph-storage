@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of `prop_head`; at 64 KiB the v3 entry 1636 lost the high half of
   `prop_head`. The 0.4.12 entry is corrected and `docs/format-spec.md` lists
   every store (SONNY-6461).
+- `docs/operations.md` documents the upgrade of an encrypted store written by
+  <= 0.4.11: close the old binary cleanly first. Crash recovery under a newer
+  binary replays the old binary's page images verbatim, tag bytes in their
+  last 16 bytes included, and cannot tell them from images logged by 0.4.12+
+  (no writer version in the page, the WAL record or the manifest), whose
+  last 16 bytes may hold a committed record, so it does not zero them
+  (SONNY-6461).
 
 ## [0.4.12] - 2026-11-12
 
