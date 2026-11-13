@@ -528,6 +528,33 @@ fn addIntegrationTests(
     const run_recreate_uaf = b.addRunArtifact(recreate_uaf_tests);
     recreate_uaf_step.dependOn(&run_recreate_uaf.step);
 
+    // SONNY-6438: concurrent readers over a store far larger than the pool —
+    // the lock-free pin fast path racing slow-path page-table inserts and
+    // evictions (geode's parallel UNION shape). Every read is verified; the
+    // TSan variant must report nothing.
+    const concurrent_readers_step = b.step("test-buffer-pool-concurrent-readers", "Run concurrent readers over a store larger than the buffer pool (plaintext + encrypted), verifying every node and property read");
+    const concurrent_readers_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_concurrent_readers.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_concurrent_readers = b.addRunArtifact(concurrent_readers_tests);
+    concurrent_readers_step.dependOn(&run_concurrent_readers.step);
+    integration_step.dependOn(&run_concurrent_readers.step);
+
+    const concurrent_readers_tsan_step = b.step("test-buffer-pool-concurrent-readers-tsan", "Run the buffer-pool concurrent-readers suite under ThreadSanitizer (zero races expected)");
+    const concurrent_readers_tsan_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/buffer_pool_concurrent_readers.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+        // Zig 0.16's self-hosted x86_64 backend (the Debug default) ignores
+        // sanitize_thread, so without LLVM this step runs uninstrumented.
+        .use_llvm = true,
+    });
+    concurrent_readers_tsan_tests.root_module.sanitize_thread = true;
+    const run_concurrent_readers_tsan = b.addRunArtifact(concurrent_readers_tsan_tests);
+    concurrent_readers_tsan_step.dependOn(&run_concurrent_readers_tsan.step);
+
     // GAP-ENT-0020 Phase P0: prop-store slab-packing FOUNDATION — props-store
     // efficiency metric (one-page-per-node baseline), property-set parity oracle,
     // and the read-both parity skeleton (legacy half passing; slab half TODO for

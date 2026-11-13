@@ -37,6 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and expect GSEIDX6 44-byte records. Ordered-index Test B and B2 expected a
   committed post-checkpoint node to be lost in a crash; they now require it
   to survive (SONNY-6438).
+- `BufferPool` publishes and releases `pin_count` with atomic operations
+  only. Eviction released a frame with a plain `pin_count = 0` and the slow
+  path republished it with a plain `pin_count = 1`; a lock-free reader that
+  had looked the frame up under its old identity could pin it in between,
+  lose its increment to the plain store, and its undo then removed the
+  loader's pin, leaving an in-use frame evictable. The lock-free lookup's
+  intentionally racy reads are now confined to `speculativeLookup`, ordered
+  before the seqlock re-check, and hidden from ThreadSanitizer with
+  `AnnotateIgnoreReadsBegin/End`; geode's parallel-union TSan reports in
+  `pin` are gone. New steps `test-buffer-pool-concurrent-readers` (also under
+  `test-integration`) and `test-buffer-pool-concurrent-readers-tsan`
+  (SONNY-6438).
 
 ## [0.4.11] - 2026-11-12
 
