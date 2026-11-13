@@ -2848,6 +2848,110 @@ test "0025 x adjacency slab: edge census counts slab-run entries exactly as the 
     try testing.expectEqual(@as(u64, 0), rec.liveRecordCensus(.adj_out, img));
 }
 
+test "SONNY-6473: replay keeps the highest-LSN committed image when an older one is logged after it" {
+    // GAP-0900 batching numbers a record when it is made but writes it at the
+    // owning txn's commit. Txn 1 batches an image of nodes page 3 (LSN n);
+    // txn 2 then images the same page directly (LSN n+2) and commits; txn 1
+    // flushes and commits last. The log holds the newer image FIRST. Logs of
+    // this shape are already on disk from 0.4.12/0.4.13, so recovery itself
+    // must order images by LSN.
+    const allocator = testing.allocator;
+    var setup = try setupTestGraph(allocator);
+    defer {
+        setup.graph_dir.deinit();
+        setup.tmp_dir.cleanup();
+    }
+
+    const initial = Manifest{
+        .graph_uuid = [_]u8{0xBB} ** 16,
+        .page_size = 4096,
+        .counter = 1,
+        .last_checkpoint_lsn = 0,
+    };
+    const path_a = try setup.graph_dir.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try initial.writeToFile(allocator, path_a);
+
+    const wal_dir_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{setup.graph_dir.path});
+    defer allocator.free(wal_dir_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), wal_dir_path, .{});
+    defer wal_dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    const live = node_mod.NodeRec{
+        .out_head = 0,
+        .in_head = 0,
+        .prop_head = 0,
+        .label_head = 0,
+        .label_count = 0,
+        .flags = 0,
+        ._pad = .{ 0, 0, 0, 0 },
+        .txn_stamp = 1,
+    };
+    const body_off = node_mod.PAGE_HEADER_SIZE;
+    const rec_size = @sizeOf(node_mod.NodeRec);
+    const npp = node_mod.nodesPerPage(4096);
+
+    // Older image (txn 1): slots 0 and 5 live, slot 0 with prop_head 111.
+    var old_img: [4096]u8 = undefined;
+    @memset(&old_img, 0);
+    var old_rec = live;
+    old_rec.prop_head = 111;
+    @memcpy(old_img[body_off..][0..rec_size], std.mem.asBytes(&old_rec));
+    @memcpy(old_img[body_off + 5 * rec_size ..][0..rec_size], std.mem.asBytes(&live));
+    // Newer image (txn 2): slot 0 only, prop_head 222.
+    var new_img: [4096]u8 = undefined;
+    @memset(&new_img, 0);
+    var new_rec = live;
+    new_rec.prop_head = 222;
+    @memcpy(new_img[body_off..][0..rec_size], std.mem.asBytes(&new_rec));
+
+    {
+        var wal = try WalManager.init(allocator, wal_dir, [_]u8{0xBB} ** 16, 0, .{});
+        defer wal.deinit();
+
+        var b1 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &.{}, .checksum = 0 };
+        _ = try wal.appendRecord(&b1);
+        try wal.beginBatch(1);
+        var upd1 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .page_update, .file_id = @intFromEnum(FileId.nodes), .page_id = 3, .payload = &old_img, .checksum = 0 };
+        const old_lsn = try wal.appendRecord(&upd1);
+
+        var b2 = WalRecord{ .lsn = 0, .txn_id = 2, .record_type = .begin_txn, .file_id = 0, .page_id = 0, .payload = &.{}, .checksum = 0 };
+        _ = try wal.appendRecord(&b2);
+        var upd2 = WalRecord{ .lsn = 0, .txn_id = 2, .record_type = .page_update, .file_id = @intFromEnum(FileId.nodes), .page_id = 3, .payload = &new_img, .checksum = 0 };
+        const new_lsn = try wal.appendRecord(&upd2);
+        var c2 = WalRecord{ .lsn = 0, .txn_id = 2, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &.{}, .checksum = 0 };
+        _ = try wal.appendRecord(&c2);
+        try testing.expect(new_lsn > old_lsn);
+
+        try wal.flushBatchFor(1);
+        var c1 = WalRecord{ .lsn = 0, .txn_id = 1, .record_type = .commit_txn, .file_id = 0, .page_id = 0, .payload = &.{}, .checksum = 0 };
+        _ = try wal.appendRecord(&c1);
+        try wal.sync();
+    }
+
+    var fm = FileManager.init(allocator, setup.graph_dir.path, 4096);
+    defer fm.deinit();
+    var pool = try BufferPool.init(allocator, 4096, 32);
+    defer pool.deinit();
+
+    var recovery = Recovery.init(allocator, null);
+    defer recovery.deinit();
+    const recovered = try recovery.recover(&setup.graph_dir, &pool, &fm);
+
+    var read_buf: [4096]u8 = undefined;
+    try fm.getPager(.nodes).?.readPage(3, &read_buf);
+    const slot0 = std.mem.bytesToValue(node_mod.NodeRec, read_buf[body_off..][0..rec_size]);
+    const slot5 = std.mem.bytesToValue(node_mod.NodeRec, read_buf[body_off + 5 * rec_size ..][0..rec_size]);
+    try testing.expectEqual(@as(u64, 222), slot0.prop_head);
+    try testing.expect(node_mod.isEmpty(&slot5));
+
+    // The stats heal censuses the page as it ends up (one live slot).
+    try testing.expectEqual(@as(u64, 1), recovered.node_count);
+    // Slot 5's id appears only in the superseded image, but it was durably
+    // committed once: the id-counter heal must still never re-issue it.
+    try testing.expect(recovered.next_node_id > 3 * npp + 5);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
