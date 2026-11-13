@@ -38,6 +38,7 @@ pub const config = @import("config.zig");
 
 // Page I/O
 pub const page = @import("page.zig");
+pub const crc32c = @import("crc32c.zig");
 pub const pager = @import("pager.zig");
 pub const page_frame = @import("page_frame.zig");
 pub const buffer_pool = @import("buffer_pool.zig");
@@ -154,7 +155,7 @@ pub const GraphConfig = config.GraphConfig;
 pub const SyncMode = config.SyncMode;
 pub const Metrics = metrics.Metrics;
 
-pub const version = "0.4.12";
+pub const version = "0.4.13";
 
 // ============================================================================
 // Unit Tests
@@ -175,7 +176,7 @@ test "re-exported types match source types" {
 }
 
 test "version is set" {
-    try std.testing.expectEqualStrings("0.4.12", version);
+    try std.testing.expectEqualStrings("0.4.13", version);
 }
 
 test {

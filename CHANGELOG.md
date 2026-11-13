@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-11-13
+
+### Changed
+
+- The plaintext page checksum (CRC32C, on every buffer-pool miss and flush)
+  uses the CPU's CRC32C instruction: SSE4.2 `crc32` on x86_64, `crc32c*` on
+  aarch64 with the CRC extension. It is chosen at compile time when the
+  target CPU has it and otherwise after a run-time check (CPUID; AT_HWCAP on
+  aarch64 Linux); Debug builds of a target without SSE4.2 (Zig's self-hosted
+  x86_64 backend cannot assemble it) and other CPUs keep the table. Values
+  are unchanged. `zig build bench-checksum -Doptimize=ReleaseFast` on an
+  x86_64 host: 15583 to 751 ns per 8 KiB page; a cached plaintext
+  `Pager.readPage` 16773 to 2020 ns (encrypted: about 4000 ns)
+  (SONNY-6461).
+
+### Added
+
+- `GraphEngine.repairAdjTailEntries(allocator)` restores the adjacency
+  entries that stores encrypted by graph_storage <= 0.4.11 lost to the
+  AES-GCM tag tail (SONNY-6441): the last slot of every full chain block
+  whose format reaches the tail at the store's page size. Each such entry is
+  matched by edge id to the same edge in the other direction (`in_idx`, or
+  the legacy `adj_in`), its lost fields are copied back and WAL-logged, and
+  the derived edge indexes are rebuilt when outgoing entries change. It is
+  idempotent, returns at once on a plaintext store, and lists every entry it
+  cannot restore with the reason (`no_mirror`, `mirror_in_tail`,
+  `prop_head_not_mirrored`, `wide_head_in_narrow_entry`). The layout
+  knowledge is public as `edge.legacyTailLoss` (SONNY-6461).
+- `free_space.FreeStore` reads a graph's `free.store` without an engine or
+  buffer pool, so offline tools can skip freed pages, and
+  `FreeSpaceManager.initDetached` builds a manager without a buffer pool
+  (`FreeSpaceManager.buffer_pool` is now optional; it was never read).
+  `docs/format-spec.md` §10.3 documents the file and that a node delete is
+  recorded only in `NodeRec.flags` (SONNY-6461).
+
+### Fixed
+
+- The 0.4.12 entry and its commit named only the v3 adjacency entry at
+  4 KiB. A full v1 chain block at 8 KiB (geode's page size) also reached the
+  tail: entry 338 lost `rel_type` and `prop_head`. At 32 KiB the v1 entry
+  1362 lost the same and the v3 entry 817 lost `public_id` and the high half
+  of `prop_head`; at 64 KiB the v3 entry 1636 lost the high half of
+  `prop_head`. The 0.4.12 entry is corrected and `docs/format-spec.md` lists
+  every store (SONNY-6461).
+- `compare-bench` fails a gating median (p50) that has no baseline or no
+  current value and prints "no baseline" / "no current" for it. A zero or
+  missing baseline used to give a 0% delta and PASS, so any current value
+  passed; a zero current value of a lower-is-better metric read as a gain.
+  Informational metrics still never fail, and the benchmark CI jobs stay
+  advisory (SONNY-6461).
+- `docs/operations.md` documents the upgrade of an encrypted store written by
+  <= 0.4.11: close the old binary cleanly first. Crash recovery under a newer
+  binary replays the old binary's page images verbatim, tag bytes in their
+  last 16 bytes included, and cannot tell them from images logged by 0.4.12+
+  (no writer version in the page, the WAL record or the manifest), whose
+  last 16 bytes may hold a committed record, so it does not zero them
+  (SONNY-6461).
+
 ## [0.4.12] - 2026-11-12
 
 ### Changed
@@ -24,8 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write and reload (eviction, reopen, crash recovery), silently because the
   page still authenticated: with the default 8 KiB page every node in slot
   169 of 170 read back missing or with tag bytes in its flags; the last two
-  heads of every `adj_in_dir` page and, at 4 KiB, the last v3 adjacency entry
-  of a full block were damaged too. Encrypted pages are now written in a
+  heads of every `adj_in_dir` page and the last entry of a full adjacency
+  chain block were damaged too (v1 at 8 and 32 KiB, v3 at 4, 32 and 64 KiB;
+  corrected by SONNY-6461, which first listed only v3 at 4 KiB). Encrypted pages are now written in a
   header-tag envelope: the tag goes into header bytes 0..16 (`page_id`/`lsn`,
   unused by every store), the rest of the header is the additional
   authenticated data, `PageFlags.encrypted` marks the page, and the whole

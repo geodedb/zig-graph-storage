@@ -15,7 +15,8 @@ const PageId = types.PageId;
 /// The bitmap is rebuilt from store files on startup.
 pub const FreeSpaceManager = struct {
     allocator: Allocator,
-    buffer_pool: *BufferPool,
+    /// Unused by the manager itself; null for a detached (offline) bitmap.
+    buffer_pool: ?*BufferPool,
     file_id: FileId,
     bitmap: std.DynamicBitSet,
     total_pages: u64,
@@ -31,6 +32,21 @@ pub const FreeSpaceManager = struct {
         return FreeSpaceManager{
             .allocator = allocator,
             .buffer_pool = buffer_pool,
+            .file_id = file_id,
+            .bitmap = bitmap,
+            .total_pages = 64,
+            .next_free_hint = 1,
+        };
+    }
+
+    /// SONNY-6461: a manager with no buffer pool, for reading a persisted
+    /// bitmap offline (see `FreeStore`). Same initial state as `init`.
+    pub fn initDetached(allocator: Allocator, file_id: FileId) !FreeSpaceManager {
+        var bitmap = try std.DynamicBitSet.initEmpty(allocator, 64);
+        bitmap.set(0);
+        return .{
+            .allocator = allocator,
+            .buffer_pool = null,
             .file_id = file_id,
             .bitmap = bitmap,
             .total_pages = 64,
@@ -197,6 +213,76 @@ pub const FreeSpaceManager = struct {
         }
         if (!self.bitmap.isSet(0)) return error.InvalidData;
         return needed;
+    }
+};
+
+/// SONNY-6461: read-only view of a graph's persisted `free.store`, for offline
+/// tools that read store files without opening the engine (no buffer pool, no
+/// WAL, nothing written).
+///
+/// Format: one serialized `FreeSpaceManager` bitmap per paged store, in
+/// `store_order`, each `total_pages: u64 LE`, `next_free_hint: u64 LE`, then
+/// `ceil(total_pages / bits_per_usize)` native `usize` mask words (bit set =
+/// page allocated; page 0 is always set). Files written before edge
+/// co-location end after the fifth bitmap (`in_idx` and `in_dir` absent).
+///
+/// What it says: the allocation state as of the last checkpoint (the engine
+/// rewrites the file at every checkpoint and after crash recovery). A page
+/// beyond a bitmap's `total_pages` was never allocated. After a crash the
+/// file can trail the store until the engine has been opened once (recovery
+/// rebuilds it), so offline tools should read a cleanly closed store.
+pub const FreeStore = struct {
+    pub const store_order = [_]FileId{ .nodes, .adj_out, .adj_in, .props, .var_store, .in_idx, .in_dir };
+
+    bitmaps: [store_order.len]?FreeSpaceManager = [_]?FreeSpaceManager{null} ** store_order.len,
+
+    /// Parse `path`. Returns error.UnexpectedEof / error.InvalidData on a
+    /// truncated or malformed file (never a partial view).
+    pub fn readFromFile(allocator: Allocator, io: std.Io, path: []const u8) !FreeStore {
+        const buf = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
+        defer allocator.free(buf);
+        return parse(allocator, buf);
+    }
+
+    pub fn parse(allocator: Allocator, buf: []const u8) !FreeStore {
+        var self: FreeStore = .{};
+        errdefer self.deinit();
+        var offset: usize = 0;
+        for (store_order, 0..) |fid, i| {
+            // The first five are mandatory; the co-location pair is optional.
+            if (i >= 5 and offset == buf.len) break;
+            var fsm = try FreeSpaceManager.initDetached(allocator, fid);
+            errdefer fsm.deinit();
+            // A bitmap cannot describe more pages than the file has bits.
+            const rest = buf[offset..];
+            const max_pages: u64 = @as(u64, rest.len) * 8;
+            offset += try fsm.deserializeBounded(rest, max_pages);
+            self.bitmaps[i] = fsm;
+        }
+        if (offset != buf.len) return error.InvalidData;
+        return self;
+    }
+
+    pub fn deinit(self: *FreeStore) void {
+        for (&self.bitmaps) |*b| {
+            if (b.*) |*fsm| fsm.deinit();
+            b.* = null;
+        }
+    }
+
+    /// The bitmap of `file`, or null when the file holds none for it.
+    pub fn get(self: *const FreeStore, file: FileId) ?*const FreeSpaceManager {
+        for (store_order, 0..) |fid, i| {
+            if (fid == file) return if (self.bitmaps[i]) |*fsm| fsm else null;
+        }
+        return null;
+    }
+
+    /// Whether `page` of `file` is allocated; null when the file holds no
+    /// bitmap for that store.
+    pub fn isAllocated(self: *const FreeStore, file: FileId, page: PageId) ?bool {
+        const fsm = self.get(file) orelse return null;
+        return fsm.isAllocated(page);
     }
 };
 

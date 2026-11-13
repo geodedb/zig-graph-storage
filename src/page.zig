@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const crc32c = @import("crc32c.zig");
 
 pub const PageId = types.PageId;
 pub const Lsn = types.Lsn;
@@ -60,10 +61,17 @@ comptime {
     if (@offsetOf(PageHeader, "checksum") != 16) @compileError("the header-tag envelope stores the tag in page_id/lsn (bytes 0..16)");
 }
 
-/// Compute CRC32C checksum over body bytes.
+/// Compute CRC32C checksum over body bytes. Uses the CPU's CRC32C instruction
+/// where there is one (SONNY-6461); the value is identical to
+/// `std.hash.crc.Crc32Iscsi`.
 pub fn computeChecksum(body: []const u8) u32 {
     // fips-exempt: non-security — page-body CRC32C corruption check.
-    return std.hash.crc.Crc32Iscsi.hash(body);
+    return crc32c.hash(body);
+}
+
+/// True when `computeChecksum` runs on the CPU's CRC32C instruction here.
+pub fn checksumHardwareAccelerated() bool {
+    return crc32c.hardwareAccelerated();
 }
 
 /// Create a zeroed header with the given page_id and page_type.

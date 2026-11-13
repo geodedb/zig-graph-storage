@@ -737,6 +737,38 @@ fn addIntegrationTests(
     const run_tde_page_tail = b.addRunArtifact(tde_page_tail_tests);
     tde_page_tail_step.dependOn(&run_tde_page_tail.step);
 
+    // SONNY-6461: restore the adjacency entries a <= 0.4.11 encrypted store
+    // lost to the AES-GCM tag tail, from the same edge's other-direction copy.
+    const adj_tail_repair_step = b.step("test-adj-tail-repair", "Run legacy TDE page-tail adjacency repair tests: entries lost by <= 0.4.11 encrypted stores (v3 at 4 KiB, v1 at 8 KiB) are restored from their mirror; unrepairable ones are reported");
+    const adj_tail_repair_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/adj_tail_repair.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_adj_tail_repair = b.addRunArtifact(adj_tail_repair_tests);
+    adj_tail_repair_step.dependOn(&run_adj_tail_repair.step);
+
+    // SONNY-6461: page checksum on the CPU's CRC32C instruction, bit-identical
+    // to the table implementation.
+    const page_checksum_step = b.step("test-page-checksum", "Run page checksum tests: CRC32C uses the CPU instruction where present and stays bit-identical to the table");
+    const page_checksum_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/page_checksum.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_page_checksum = b.addRunArtifact(page_checksum_tests);
+    page_checksum_step.dependOn(&run_page_checksum.step);
+
+    // SONNY-6461: offline (engine-less) reader for a graph's free.store.
+    const free_store_offline_step = b.step("test-free-store-offline", "Run offline free.store reader tests: an engine-less tool reads every store's free-page bitmap, matching the engine's");
+    const free_store_offline_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/free_store_offline.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_free_store_offline = b.addRunArtifact(free_store_offline_tests);
+    free_store_offline_step.dependOn(&run_free_store_offline.step);
+
     // checkpoint_epoch invariant — the durable derived-index freshness token
     // must advance ONLY at checkpoint and stay UNCHANGED across a pure WAL-tail
     // recovery (unlike manifest.counter, which recovery bumps for A/B
@@ -853,6 +885,9 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_wal_lsn_anchor.step);
     // The encrypted-page tail guards (SONNY-6441) likewise.
     integration_step.dependOn(&run_tde_page_tail.step);
+    integration_step.dependOn(&run_adj_tail_repair.step);
+    integration_step.dependOn(&run_page_checksum.step);
+    integration_step.dependOn(&run_free_store_offline.step);
     // checkpoint_epoch recovery-invariance is the durability foundation the
     // WAL-aware derived-index contract rests on — gate it under integration.
     integration_step.dependOn(&run_checkpoint_epoch.step);
@@ -931,6 +966,17 @@ fn addBenchmarks(
     const run_load_bench = b.addRunArtifact(load_bench_exe);
     if (b.args) |args| run_load_bench.addArgs(args);
     load_bench_step.dependOn(&run_load_bench.step);
+
+    // SONNY-6461: page checksum (CRC32C) and plaintext vs encrypted readPage.
+    const checksum_bench_step = b.step("bench-checksum", "SONNY-6461 page checksum micro-benchmark: CRC32C per 8 KiB page and plaintext vs encrypted readPage (use -Doptimize=ReleaseFast)");
+    const checksum_bench_exe = b.addExecutable(.{
+        .name = "checksum-bench",
+        .root_module = createModule(b, "benchmarks/checksum_bench.zig", target, bench_optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_checksum_bench = b.addRunArtifact(checksum_bench_exe);
+    checksum_bench_step.dependOn(&run_checksum_bench.step);
 
     // GAP-0900: WAL-batch A/B microbench (deferred multi-page txns).
     const wal_batch_ab_step = b.step("bench-wal-batch-ab", "GAP-0900 WAL-batch A/B: deferred multi-page txn throughput + syscall count");

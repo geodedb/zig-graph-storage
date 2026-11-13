@@ -37,6 +37,7 @@ const engine_integrity = @import("engine_integrity.zig");
 const engine_index = @import("engine_index.zig");
 const engine_persist = @import("engine_persist.zig");
 const engine_property_index = @import("engine_property_index.zig");
+const engine_adj_repair = @import("engine_adj_repair.zig");
 const edge_exist_index_mod = @import("edge_exist_index.zig");
 const edge_index_map_mod = @import("edge_index_map.zig");
 const ordered_property_index_mod = @import("ordered_property_index.zig");
@@ -78,6 +79,8 @@ const OrderedPropertyIndex = ordered_property_index_mod.OrderedPropertyIndex;
 /// GAP warm-reopen P1: definition moved to edge_index_map.zig (re-exported
 /// here so every existing `engine_mod.EdgeIndexEntry` reference keeps working).
 pub const EdgeIndexEntry = edge_index_map_mod.EdgeIndexEntry;
+pub const AdjTailRepairReport = engine_adj_repair.AdjTailRepairReport;
+pub const AdjTailIssue = engine_adj_repair.AdjTailIssue;
 
 /// WAL-aware derived-index durability Phase 3: one tail-affected primary page,
 /// captured by recovery and consumed by the first-access tail reconcile.
@@ -1651,6 +1654,34 @@ pub const GraphEngine = struct {
         return engine_index.migrateColocateInEdges(self);
     }
 
+    /// SONNY-6461: restore the adjacency entries graph_storage <= 0.4.11 lost
+    /// to the AES-GCM tag of its page-encryption envelope (SONNY-6441, fixed in
+    /// 0.4.12). The library owns the layout knowledge: which slot of which
+    /// chain-block format lost which bytes at this page size
+    /// (`edge.legacyTailLoss`). Every chain reachable from a node record or the
+    /// co-located in-edge directory is walked; each entry in such a slot is
+    /// matched by edge id to the same edge in the other direction (`in_idx`
+    /// for an outgoing entry, else the destination's `adj_in`; the source's
+    /// `adj_out` for an incoming entry) and, when that copy is intact and
+    /// differs, the lost fields are copied back and WAL-logged. When outgoing
+    /// entries change the derived edge indexes are rebuilt.
+    ///
+    /// Idempotent: a second call finds every entry consistent. A plaintext
+    /// store returns at once (`encrypted == false`; nothing was lost). Entries
+    /// it cannot restore are listed with the reason; nothing is guessed. The
+    /// caller owns the report (`deinit`).
+    ///
+    /// Run it with the engine otherwise idle (no concurrent writers), right
+    /// after opening a store last written by <= 0.4.11 and BEFORE any other
+    /// write: a later `removeEdge` in the same block moves the damaged last
+    /// entry into another slot, where it is no longer recognisable. It does
+    /// not re-attach an incoming chain whose `in_dir` head was itself lost
+    /// (`migrateColocateInEdges` rebuilds those from `adj_out`; run it after
+    /// this repair so the rebuild copies repaired entries). Checkpoint after.
+    pub fn repairAdjTailEntries(self: *GraphEngine, allocator: Allocator) anyerror!AdjTailRepairReport {
+        return engine_adj_repair.repairAdjTailEntries(self, allocator);
+    }
+
     /// Compute the page ID for a given node ID.
     fn nodePageId(self: *const GraphEngine, node_id: NodeId) u64 {
         return node_id / self.node_store.nodes_per_page;
@@ -3001,4 +3032,5 @@ test {
     _ = @import("engine_index.zig");
     _ = @import("engine_persist.zig");
     _ = @import("engine_property_index.zig");
+    _ = @import("engine_adj_repair.zig");
 }

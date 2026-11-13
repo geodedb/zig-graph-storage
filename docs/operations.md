@@ -155,6 +155,47 @@ Key rotation is not yet supported as a built-in operation. To rotate:
 
 A future migration utility may automate this process.
 
+### Upgrading an encrypted store written by graph_storage <= 0.4.11
+
+Versions up to 0.4.11 wrote the AES-GCM tag over the last 16 bytes of every
+encrypted page, so some records were never persisted (SONNY-6441, fixed in
+0.4.12; `docs/format-spec.md` §1.5 lists what each store lost). Upgrade in
+this order:
+
+1. **Stop the old binary cleanly** (`close()`, which checkpoints and empties
+   the WAL). Do not let a store written by <= 0.4.11 go through crash
+   recovery under a newer binary. A WAL page image is a verbatim copy of the
+   in-memory page, and the old binary's in-memory copy of a page it had read
+   from disk held the tag bytes in its last 16 bytes; replaying it installs
+   them as record data (node `flags`/`label_count`/`txn_stamp`, chain heads,
+   adjacency fields). Recovery cannot tell those images apart: no version of
+   the library stamps the page id, LSN, flags or checksum into a cached
+   page, the WAL record carries no writer version, the manifest format did
+   not change in 0.4.12, and a page logged by 0.4.12 or later may hold a
+   committed record in those same bytes (a node created in slot 169 after
+   the upgrade), which zeroing on replay would delete. If a store already
+   crashed under <= 0.4.11, recover it once with the old binary and close it
+   cleanly before upgrading.
+2. **Open it with >= 0.4.13 and, before any other write, call
+   `GraphEngine.repairAdjTailEntries`** on each engine (each shard of a
+   `ShardedGraphEngine`), then `checkpoint()`. It restores adjacency entries
+   from the edge's other-direction copy and reports what it cannot restore.
+   A later `removeEdge` in a damaged block moves the damaged last entry to
+   another slot, where it can no longer be recognised.
+3. Re-attach incoming chains whose `adj_in_dir` head was lost with
+   `migrateColocateInEdges` (after step 2, so it copies repaired entries).
+4. A node record that lost its tail (8 KiB pages, slot 169) can be given its
+   `label_count` back from its label block, but whether it had been deleted
+   cannot be derived: a delete is recorded only in `NodeRec.flags` (the label
+   index keeps deleted nodes' postings, `deleteNode` keeps the heads, and no
+   log of deletes outlives a checkpoint).
+
+Pages move to the current envelope on their next write; until then an
+offline tool can recognise an old page without the key (flag clear, header
+checksum not matching the body). It should skip pages `free.store` marks free
+(`free_space.FreeStore`, no engine needed): their stale contents are not
+records.
+
 ---
 
 ## Upgrading from V1 to V2 Format

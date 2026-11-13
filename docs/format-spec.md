@@ -65,7 +65,9 @@ checksum = CRC32C(page_body)
 ```
 
 Where `page_body` is all bytes from offset 32 to `page_size - 1` (i.e., the
-entire page excluding the header). Computed via `std.hash.crc.Crc32Iscsi.hash()`.
+entire page excluding the header). Computed by `crc32c.hash()`: the CPU's
+CRC32C instruction (x86_64 SSE4.2, aarch64 CRC) where present, otherwise
+`std.hash.crc.Crc32Iscsi.hash()`; both give the same value.
 Plaintext mode only. A page whose 32 header bytes are all zero is a page that
 was never written only if its body is zero too (or, in plaintext mode, its
 body's CRC32C is 0); otherwise the read fails.
@@ -94,6 +96,28 @@ a layout stored there was never persisted. These pages stay readable (their
 last 16 body bytes read as zero) and move to the current envelope on their
 next write. A binary that only knows the legacy envelope fails to
 authenticate current-envelope pages (`error.DecryptionFailed`).
+
+What the legacy tail held, per store (SONNY-6461). Prop, var and slab
+adjacency blocks reserve the tail (`tail_reserve`), so they lost nothing.
+
+| Store | Page size | Lost |
+|-------|-----------|------|
+| `nodes` | 8 KiB | slot 169 of 170: `label_count`, `flags`, `_pad`, `txn_stamp` |
+| `nodes` | 4, 16, 32, 64 KiB | nothing (records end at or before the tail) |
+| `adj_in_dir` | every size | the last two heads of each page |
+| v1 chain block (24 B) | 8 KiB, 32 KiB | last slot of a full block (338 / 1362): entry bytes 16..24, `rel_type` and `prop_head` |
+| v2 chain block (32 B) | every size | nothing (a full block ends exactly at the tail) |
+| v3 chain block (40 B) | 4 KiB, 64 KiB | last slot of a full block (100 / 1636): bytes 32..40, high half of `prop_head` |
+| v3 chain block (40 B) | 32 KiB | last slot of a full block (817): bytes 24..40, `public_id` and high half of `prop_head` |
+
+`edge.legacyTailLoss(page_size, entry_format)` computes the adjacency rows.
+`neighbor` and `edge_id` are never lost, and every edge is stored in both
+directions (`adj_out` and `in_idx`, or `adj_in` for edges written by the
+legacy `addEdge` path), so `GraphEngine.repairAdjTailEntries` restores a lost
+entry from its other-direction copy and reports the entries it cannot
+restore. A node delete is recorded only in `NodeRec.flags` (there is no other
+durable record of it), so whether a damaged 8 KiB slot-169 node had been
+deleted cannot be derived from the store.
 
 ---
 
@@ -790,8 +814,9 @@ Each entry:
 **Source:** `src/free_space.zig`
 
 Free space tracking uses an **in-memory `DynamicBitSet`** (from the Zig
-standard library). The bitmap is not directly persisted as a binary file
-format -- it is rebuilt from store files on startup.
+standard library) per paged store. The bitmaps are persisted to `free.store`
+at every checkpoint and after crash recovery (format in §10.3); without that
+file they are rebuilt from the store file sizes on open.
 
 ### 10.1 Design
 
@@ -811,6 +836,29 @@ format -- it is rebuilt from store files on startup.
    newly available range.
 4. When a page is freed and its index is before `next_free_hint`, the hint
    is moved back to enable immediate reuse.
+
+### 10.3 `free.store`
+
+One serialized bitmap per paged store, back to back, in this order: `nodes`,
+`adj_out`, `adj_in`, `props`, `var`, `in_idx`, `in_dir`. A file written
+before edge co-location ends after `var` (no `in_idx`/`in_dir`). Each bitmap:
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 8 | `total_pages` | u64 LE, >= 64 |
+| 8 | 8 | `next_free_hint` | u64 LE, 1..`total_pages` |
+| 16 | `ceil(total_pages / 64) * 8` | masks | native-endian `usize` words; bit set = allocated, page 0 always set |
+
+The file is replaced atomically (temp file, fsync, rename, directory fsync).
+A page beyond `total_pages` was never allocated. Offline tools read it with
+`free_space.FreeStore.readFromFile` (no engine or buffer pool) to skip freed
+pages, whose old contents stay in the store file. After a crash the file can
+trail the store until the engine has been opened once.
+
+A node delete is recorded only in `NodeRec.flags` (`NODE_FLAG_DELETED`):
+`deleteNode` keeps the record's heads and labels, and nothing outside the
+node page records the delete once the WAL is checkpointed. A record whose
+`flags` were lost cannot have its liveness derived from the store.
 
 ---
 

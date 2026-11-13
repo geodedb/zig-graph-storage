@@ -432,6 +432,14 @@ pub const Recovery = struct {
                 const frame_idx = ctx.buffer_pool.frameIndex(frame);
                 const data = frame.dataSlice();
 
+                // SONNY-6461: the image is applied verbatim, its last 16 bytes
+                // included. An image logged by graph_storage <= 0.4.11 of a
+                // page it had read from an encrypted store holds AES-GCM tag
+                // bytes there, but nothing in the image or the record tells
+                // it from an image logged by 0.4.12+, where those bytes may be
+                // a committed record (test-tde-page-tail's crash test), so the
+                // tail is never zeroed here. Upgrading such a store requires a
+                // clean shutdown of the old binary (docs/operations.md).
                 const copy_len = @min(rec.payload.len, data.len);
                 if (copy_len > 0) {
                     @memcpy(data[0..copy_len], rec.payload[0..copy_len]);

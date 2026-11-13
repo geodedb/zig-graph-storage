@@ -164,6 +164,124 @@ pub fn entriesPerBlock(page_size: u32, entry_format: u8) u32 {
 }
 
 // ============================================================================
+// SONNY-6461: entries lost to the pre-0.4.12 page-encryption tail.
+//
+// graph_storage <= 0.4.11 wrote the 16-byte AES-GCM tag over the LAST 16 bytes
+// of every encrypted page (the "legacy envelope"); whatever a layout kept there
+// never reached the disk, and 0.4.12+ reads those bytes back as zero. A chain
+// block fills forward from byte 48, so only the LAST slot of a FULL block can
+// reach the tail, and only for some (page size, format) pairs. Slab blocks
+// reserve the tail (`AdjStore.tail_reserve`) and never lose an entry.
+//
+// Entry byte layout (see `encodeEntry`): neighbor 0..8, edge_id 8..16,
+// rel_type 16..20, prop_head low half 20..24, public_id 24..32, prop_head high
+// half 32..36, reserved 36..40. Lost bytes per page size (powers of two):
+//
+//   page   v1 (24 B)                 v2 (32 B)  v3 (40 B)
+//   4 KiB  none (168 ends at -16)    none       slot 100: 32..40 (prop hi)
+//   8 KiB  slot 338: 16..24          none       none (203 ends at -24)
+//          (rel_type, prop_head)
+//   16 KiB none                      none       none
+//   32 KiB slot 1362: 16..24         none       slot 817: 24..40
+//          (rel_type, prop_head)                (public_id, prop hi)
+//   64 KiB none                      none       slot 1636: 32..40 (prop hi)
+//
+// `neighbor` and `edge_id` are never lost (the tail is 16 bytes and every
+// format's entry is at least 24), so a damaged entry can always be matched to
+// its mirror in the other direction's chain by edge id.
+// ============================================================================
+
+/// Size of the page tail the legacy (pre-0.4.12) encryption envelope
+/// overwrote with the AES-GCM tag. Equal to `encryption.TAG_SIZE`.
+pub const LEGACY_TAG_TAIL: u32 = 16;
+
+/// The one chain-block slot whose bytes reached the legacy tag tail, and the
+/// entry-relative byte offset from which its bytes were lost.
+pub const LegacyTailLoss = struct {
+    /// Slot index (always `entriesPerBlock - 1`); exposed only when the block
+    /// is full (`count == entriesPerBlock`).
+    slot: u32,
+    /// First lost byte, relative to the entry start, rounded down to the start
+    /// of the field it falls in. Bytes `lost_from..entrySize` were lost.
+    lost_from: u32,
+};
+
+/// Start offsets of the wire fields of a chain entry (superset layout).
+const entry_field_starts = [_]u32{ 0, 8, 16, 20, 24, 32, 36 };
+
+/// SONNY-6461: which entry of a full chain block of `entry_format` (v1/v2/v3)
+/// lost bytes to the legacy tag tail at `page_size`, or null when the format
+/// keeps clear of the tail at that size.
+pub fn legacyTailLoss(page_size: u32, entry_format: u8) ?LegacyTailLoss {
+    if (entry_format != ENTRY_FORMAT_V1 and entry_format != ENTRY_FORMAT_V2 and
+        entry_format != ENTRY_FORMAT_V3) return null;
+    if (page_size <= PAGE_HEADER_SIZE + @sizeOf(EdgeBlockHeader) + LEGACY_TAG_TAIL) return null;
+    const cap = entriesPerBlock(page_size, entry_format);
+    if (cap == 0) return null;
+    const esz = entrySize(entry_format);
+    const tail_start = page_size - LEGACY_TAG_TAIL;
+    const last_off = PAGE_HEADER_SIZE + @sizeOf(EdgeBlockHeader) + (cap - 1) * esz;
+    if (last_off + esz <= tail_start) return null;
+    const raw = tail_start - last_off;
+    var lost_from: u32 = 0;
+    for (entry_field_starts) |s| {
+        if (s <= raw) lost_from = s;
+    }
+    return .{ .slot = cap - 1, .lost_from = lost_from };
+}
+
+/// SONNY-6461: rebuild an entry whose bytes `lost_from..` were lost, taking
+/// exactly those fields from `mirror` (the same edge's entry in the other
+/// direction's chain) and keeping the intact prefix of `damaged`. Fields the
+/// format does not store (public_id for v1, the high half of prop_head for
+/// v1/v2) are dropped as `encodeEntry` drops them. Returns
+/// error.WideHeadInLegacyChainBlock when the restored prop_head does not fit
+/// a v1/v2 record.
+pub fn restoreLostFields(damaged: EdgeEntry, mirror: EdgeEntry, lost_from: u32, entry_format: u8) error{WideHeadInLegacyChainBlock}!EdgeEntry {
+    var out = damaged;
+    if (lost_from <= 16) out.rel_type = mirror.rel_type;
+    var lo: u64 = damaged.prop_head & 0xFFFF_FFFF;
+    var hi: u64 = damaged.prop_head >> 32;
+    if (lost_from <= 20) lo = mirror.prop_head & 0xFFFF_FFFF;
+    if (lost_from <= 32) hi = mirror.prop_head >> 32;
+    if (lost_from <= 24) out.public_id = mirror.public_id;
+    if (!formatHasWideHead(entry_format)) {
+        if (hi != 0) return error.WideHeadInLegacyChainBlock;
+        if (entry_format == ENTRY_FORMAT_V1) out.public_id = 0;
+    }
+    out.prop_head = lo | (hi << 32);
+    return out;
+}
+
+/// SONNY-6461: true when the fields `lost_from..` of `a` and `b` agree, as
+/// stored by `entry_format` (fields the format does not store are ignored).
+pub fn lostFieldsEqual(a: EdgeEntry, b: EdgeEntry, lost_from: u32, entry_format: u8) bool {
+    var buf_a: [ENTRY_SIZE_V3]u8 = undefined;
+    var buf_b: [ENTRY_SIZE_V3]u8 = undefined;
+    const esz = entrySize(entry_format);
+    var na = a;
+    var nb = b;
+    if (!formatHasWideHead(entry_format)) {
+        na.prop_head &= 0xFFFF_FFFF;
+        nb.prop_head &= 0xFFFF_FFFF;
+    }
+    encodeEntry(buf_a[0..esz], na, entry_format);
+    encodeEntry(buf_b[0..esz], nb, entry_format);
+    return std.mem.eql(u8, buf_a[lost_from..esz], buf_b[lost_from..esz]);
+}
+
+/// SONNY-6461: true when the fields `lost_from..` of `e`, as stored by
+/// `entry_format`, are all zero — what a legacy-envelope tail reads back as.
+pub fn lostFieldsZero(e: EdgeEntry, lost_from: u32, entry_format: u8) bool {
+    var buf: [ENTRY_SIZE_V3]u8 = undefined;
+    const esz = entrySize(entry_format);
+    var n = e;
+    if (!formatHasWideHead(entry_format)) n.prop_head &= 0xFFFF_FFFF;
+    encodeEntry(buf[0..esz], n, entry_format);
+    return std.mem.allEqual(u8, buf[lost_from..esz], 0);
+}
+
+// ============================================================================
 // GAP adjacency slab packing — SLAB block layout (entry_format = 2).
 //
 //   [page header 32 B][EdgeBlockHeader 16 B][runs →   ...gap...   ← slot dir][tail_reserve]
@@ -294,6 +412,37 @@ test "EdgeEntry.public_id has NO default — every literal site states it (F5)" 
             }
         }
     }
+}
+
+test "SONNY-6461: restoreLostFields copies exactly the lost fields" {
+    const mirror = EdgeEntry{ .neighbor = 9, .edge_id = 4, .rel_type = 7, .prop_head = (@as(u64, 1) << 63) | 0x1234, .public_id = 55 };
+    // v3 at 4 KiB: only the high half of prop_head was lost.
+    var damaged = mirror;
+    damaged.prop_head = 0x1234;
+    damaged.neighbor = 1; // an intact field is never taken from the mirror
+    const r3 = try restoreLostFields(damaged, mirror, 32, ENTRY_FORMAT_V3);
+    try std.testing.expectEqual(mirror.prop_head, r3.prop_head);
+    try std.testing.expectEqual(@as(u64, 1), r3.neighbor);
+    try std.testing.expect(!lostFieldsEqual(damaged, mirror, 32, ENTRY_FORMAT_V3));
+    try std.testing.expect(lostFieldsEqual(r3, mirror, 32, ENTRY_FORMAT_V3));
+    try std.testing.expect(lostFieldsZero(damaged, 32, ENTRY_FORMAT_V3));
+
+    // v1 at 8 KiB: rel_type and the (narrow) prop_head were lost.
+    const narrow = EdgeEntry{ .neighbor = 9, .edge_id = 4, .rel_type = 7, .prop_head = 0x99, .public_id = 55 };
+    const d1 = EdgeEntry{ .neighbor = 9, .edge_id = 4, .rel_type = 0, .prop_head = 0, .public_id = 0 };
+    const r1 = try restoreLostFields(d1, narrow, 16, ENTRY_FORMAT_V1);
+    try std.testing.expectEqual(@as(u32, 7), r1.rel_type);
+    try std.testing.expectEqual(@as(u64, 0x99), r1.prop_head);
+    try std.testing.expectEqual(@as(u64, 0), r1.public_id); // v1 stores none
+    // A 64-bit head cannot go into a v1 record.
+    try std.testing.expectError(error.WideHeadInLegacyChainBlock, restoreLostFields(d1, mirror, 16, ENTRY_FORMAT_V1));
+
+    // v3 at 32 KiB: public_id and the high half.
+    var d32 = mirror;
+    d32.public_id = 0;
+    d32.prop_head = 0x1234;
+    const r32 = try restoreLostFields(d32, mirror, 24, ENTRY_FORMAT_V3);
+    try std.testing.expectEqual(mirror, r32);
 }
 
 test "EdgeBlockHeader is 16 bytes" {
