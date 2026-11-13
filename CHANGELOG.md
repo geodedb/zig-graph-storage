@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   superseded image still feeds the id-counter heal (its ids were committed)
   but not the node/edge count heal. The GAP-0900 comments that said batching
   does not change durability are corrected (SONNY-6473).
+- `free.store` stores the bitmap's `usize` words byte for byte and records
+  no writer layout, so a big-endian or 32-bit host misread files from a
+  64-bit little-endian host (and wrote files such a host would misread).
+  Those hosts now refuse the layout (`error.UnsupportedHostLayout` from
+  `FreeSpaceManager.serialize` / `deserializeBounded` and `FreeStore`), and
+  the engine writes an empty `free.store` there and rebuilds the bitmaps at
+  open. 64-bit little-endian hosts read and write the same bytes as before.
+  `docs/format-spec.md` §10.3 documents the layout and the limitation; the
+  stale NodeRec layout in §2.1 (40 bytes, `label_set`) is corrected to the
+  48-byte record, and the unrecoverable `removeEdge` case of <= 0.4.11
+  encrypted stores is documented (SONNY-6470).
 
 ## [0.4.13] - 2026-11-13
 

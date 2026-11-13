@@ -78,9 +78,18 @@ pub fn saveFreeStore(engine: *GraphEngine) !void {
         &engine.free_space_in_idx,
         &engine.free_space_in_dir,
     };
-    for (managers) |fsm| {
-        const written = fsm.serialize(buf[offset..]) catch return error.BufferTooSmall;
-        offset += written;
+    // SONNY-6470: a host that cannot write the defined layout (64-bit
+    // little-endian mask words) persists an EMPTY file, which every reader
+    // treats as "no bitmap" (rebuild from the store files), never one that a
+    // 64-bit little-endian host would misread.
+    if (free_space_mod.host_layout_supported) {
+        for (managers) |fsm| {
+            const written = fsm.serialize(buf[offset..]) catch |err| switch (err) {
+                error.BufferTooSmall => return error.BufferTooSmall,
+                error.UnsupportedHostLayout => unreachable,
+            };
+            offset += written;
+        }
     }
 
     // GAP-ENT-0011 (review F-2): write ATOMICALLY — tmp + fsync + rename +
@@ -137,6 +146,8 @@ pub fn loadFreeStore(engine: *GraphEngine) !bool {
 
     const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
     if (stat.size == 0) return false;
+    // SONNY-6470: see free_space.host_layout_supported — rebuild instead.
+    if (!free_space_mod.host_layout_supported) return false;
     const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
     const buf = try engine.allocator.alloc(u8, file_size);
     defer engine.allocator.free(buf);

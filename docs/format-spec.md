@@ -857,7 +857,19 @@ before edge co-location ends after `var` (no `in_idx`/`in_dir`). Each bitmap:
 |--------|------|-------|-------------|
 | 0 | 8 | `total_pages` | u64 LE, >= 64 |
 | 8 | 8 | `next_free_hint` | u64 LE, 1..`total_pages` |
-| 16 | `ceil(total_pages / 64) * 8` | masks | native-endian `usize` words; bit set = allocated, page 0 always set |
+| 16 | `ceil(total_pages / 64) * 8` | masks | 64-bit little-endian words; bit set = allocated, page 0 always set |
+
+The masks are the in-memory `usize` words copied byte for byte, so every
+file in existence holds 64-bit little-endian words, and the file does not
+record the writer's layout. A big-endian or 32-bit host would misread such a
+file and write one a 64-bit little-endian host would misread, so since 0.4.14
+such a host refuses the layout: `FreeSpaceManager.serialize` /
+`deserializeBounded` and `FreeStore` fail with `error.UnsupportedHostLayout`,
+and the engine writes an empty `free.store` and rebuilds the bitmaps from the
+store files at open (freed pages then read as allocated until reused: no
+corruption, some space not reclaimed). A file written by an older release on
+such a host cannot be recognised on a 64-bit little-endian host; delete it
+(the engine rebuilds it) before moving a store to a different host type.
 
 The file is replaced atomically (temp file, fsync, rename, directory fsync).
 A page beyond `total_pages` was never allocated. Offline tools read it with
