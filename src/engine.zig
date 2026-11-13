@@ -403,6 +403,10 @@ pub const GraphEngine = struct {
         // that run afterwards (e.g. initThreadPool) so they cannot leak the
         // subsystems and the WAL directory handle.
         errdefer self.cleanupSubsystems();
+        // SONNY-6491: checkpoints no longer write labels.dict (new names are
+        // made durable when assigned), so create it here: every store has
+        // one, as backups and verify expect.
+        try engine_persist.saveLabelDictionaryDurable(self);
 
         // 7. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
