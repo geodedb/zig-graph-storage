@@ -110,6 +110,15 @@ before anything else writes:
   came from shard 0 (`ShardedGraphEngine.getOrAssignLabel`, or names read
   from shard 0's dictionary), as in geode.
 
+Every one of these findings, and a `getOrAssignLabel` refused because a
+shard holds the name under another id or gives shard 0's id to another
+name, is also handed to `GraphConfig.label_dict_report` when it is set: one
+`LabelDictDiagnostic` per finding (kind, action, shard, id, the shard's and
+shard 0's names, the node/edge/index counts, the name counts of a rewrite),
+on the calling thread, before the call returns. The warnings go through
+`std.log.warn`, which a release build's `log_level` can filter out; log the
+diagnostics at the level the deployment needs (geode: ERROR for `refused`).
+
 Releases up to 0.4.13 wrote the manifest and truncated the WAL before saving
 `free.store` and `labels.dict`. A store that crashed in that window opens
 with a bitmap older than its manifest; the open detects it when a store has

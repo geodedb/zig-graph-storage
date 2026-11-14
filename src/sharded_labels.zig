@@ -66,6 +66,14 @@ pub fn getOrAssignLabel(self: *ShardedGraphEngine, name: []const u8) !LabelId {
         if (eng.label_dict.getId(name)) |have| {
             if (have != id) {
                 std.log.warn("graph-storage: label '{s}' has id {d} on shard 0 but {d} on shard {d}; refusing to assign it (SONNY-6524)", .{ name, id, have, k });
+                if (self.shards[0].config.label_dict_report) |r| r.emit(.{
+                    .kind = .name_id_conflict,
+                    .action = .refused,
+                    .shard = @intCast(k),
+                    .label_id = id,
+                    .shard_label_id = have,
+                    .label = name,
+                });
                 return error.LabelDictionaryDiverged;
             }
             continue;
@@ -102,6 +110,15 @@ pub fn getOrAssignLabel(self: *ShardedGraphEngine, name: []const u8) !LabelId {
             // names a different label there.
             const other = w.shard.label_dict.getName(id) orelse "<no name>";
             std.log.warn("graph-storage: label '{s}' has id {d} on shard 0, but shard {d} gives id {d} to '{s}'; refusing to assign it (SONNY-6524)", .{ name, id, w.index, id, other });
+            if (self.shards[0].config.label_dict_report) |r| r.emit(.{
+                .kind = .id_name_conflict,
+                .action = .refused,
+                .shard = @intCast(w.index),
+                .label_id = id,
+                .shard_label_id = id,
+                .label = name,
+                .shard_label = w.shard.label_dict.getName(id),
+            });
             return error.LabelDictionaryDiverged;
         }
         return e;
@@ -172,7 +189,15 @@ fn sameDict(a: *const LabelDictionary, b: *const LabelDictionary) bool {
 /// dictionary. If one does, renaming would change what that record says, so
 /// the open is refused (`.reject`, default) or the caller's assertion that
 /// shard 0's name is the right one is taken (`.adopt_shard0`).
-pub fn reconcileAtOpen(self: *ShardedGraphEngine, policy: config_mod.LabelDictDivergencePolicy) !void {
+///
+/// SONNY-6527: every finding also goes to `report` (when set) as a
+/// `LabelDictDiagnostic`, so a consumer whose release build filters
+/// `std.log.warn` still gets the shard, id, both names and record counts.
+pub fn reconcileAtOpen(
+    self: *ShardedGraphEngine,
+    policy: config_mod.LabelDictDivergencePolicy,
+    report: ?config_mod.LabelDictReport,
+) !void {
     const d0 = &self.shards[0].label_dict;
     var repair = [_]bool{false} ** SHARD_COUNT;
     var refused = false;
@@ -198,6 +223,21 @@ pub fn reconcileAtOpen(self: *ShardedGraphEngine, policy: config_mod.LabelDictDi
             std.log.warn("graph-storage: shard {d} labels.dict names label id {d} '{s}' but shard 0 names it '{s}', and {d} node(s), {d} edge(s) and {d} index(es) on shard {d} use id {d}: {s} (SONNY-6524)", .{
                 k, id, name_k, name_0 orelse "<no name>", uses.nodes, uses.edges, uses.indexes, k, id, action,
             });
+            if (report) |r| r.emit(.{
+                .kind = .id_in_use_diverged,
+                .action = switch (policy) {
+                    .reject => .refused,
+                    .adopt_shard0 => .renamed_from_shard0,
+                },
+                .shard = @intCast(k),
+                .label_id = id,
+                .shard_label_id = id,
+                .label = name_k,
+                .shard0_label = name_0,
+                .nodes = uses.nodes,
+                .edges = uses.edges,
+                .indexes = uses.indexes,
+            });
             if (policy == .reject) refused = true;
         }
     }
@@ -219,6 +259,15 @@ pub fn reconcileAtOpen(self: *ShardedGraphEngine, policy: config_mod.LabelDictDi
         copy.deinit();
         std.log.warn("graph-storage: shard {d} labels.dict disagreed with shard 0 ({d} names vs {d}); rewrote it from shard 0{s} (SONNY-6524)", .{
             k, before, d0.count(), if (eng.read_only) " in memory only (read-only open)" else "",
+        });
+        if (report) |r| r.emit(.{
+            .kind = .rewritten,
+            .action = if (eng.read_only) .rewritten_in_memory else .rewritten,
+            .shard = @intCast(k),
+            .label_id = 0,
+            .shard_label_id = 0,
+            .shard_names = before,
+            .shard0_names = d0.count(),
         });
     }
 }

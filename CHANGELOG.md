@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `GraphConfig.label_dict_report` (`LabelDictReport`: ctx + callback) and
+  `LabelDictDiagnostic`: `ShardedGraphEngine.open` and `getOrAssignLabel`
+  hand every shard label-dictionary finding to the caller as a structured
+  value — kind (`id_in_use_diverged`, `rewritten`, `name_id_conflict`,
+  `id_name_conflict`), action (`refused`, `renamed_from_shard0`,
+  `rewritten`, `rewritten_in_memory`), shard, id, the shard's and shard 0's
+  names, node/edge/index counts and name counts — so the detail survives a
+  release build whose `log_level` drops `std.log.warn`. Default null; the
+  warnings are unchanged (SONNY-6527).
+
 ### Changed
 
 - `GraphEngine.persistence_dirty` is a `std.atomic.Value(bool)` (was

@@ -155,6 +155,8 @@ pub const StorageError = errors.StorageError;
 pub const GraphConfig = config.GraphConfig;
 pub const SyncMode = config.SyncMode;
 pub const LabelDictDivergencePolicy = config.LabelDictDivergencePolicy;
+pub const LabelDictDiagnostic = config.LabelDictDiagnostic;
+pub const LabelDictReport = config.LabelDictReport;
 pub const Metrics = metrics.Metrics;
 
 pub const version = "0.4.15";
