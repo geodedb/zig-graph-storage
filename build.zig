@@ -749,6 +749,19 @@ fn addIntegrationTests(
     const run_ckpt_side_crash = b.addRunArtifact(ckpt_side_crash_tests);
     ckpt_side_crash_step.dependOn(&run_ckpt_side_crash.step);
 
+    // SONNY-6529: abortTxn undoes the transaction's writes (node create /
+    // update / delete, labels, properties on new chains, edge add / remove /
+    // first property) in memory and across checkpoint + reopen and crash +
+    // reopen, and fails closed on a write it cannot undo.
+    const txn_abort_undo_step = b.step("test-txn-abort-undo", "Run abort-undo tests: an aborted transaction's writes are gone in memory, after checkpoint + reopen and after a crash, counts/ids/derived indexes consistent; an abort that cannot undo fails closed");
+    const txn_abort_undo_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/txn_abort_undo.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_txn_abort_undo = b.addRunArtifact(txn_abort_undo_tests);
+    txn_abort_undo_step.dependOn(&run_txn_abort_undo.step);
+
     // SONNY-6524: shard label dictionaries — a failed labels.dict write is
     // undone in memory, a new name reaches shards 1..N-1 in parallel, a crash
     // mid-broadcast reopens consistent, and a split store is repaired at open
@@ -939,6 +952,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_ckpt_side_crash.step);
     // Shard label dictionaries (SONNY-6524) are the same lost-name class.
     integration_step.dependOn(&run_label_dict_shards.step);
+    // Aborted writes made durable (SONNY-6529) are the same silent-corruption class.
+    integration_step.dependOn(&run_txn_abort_undo.step);
     // The encrypted-page tail guards (SONNY-6441) likewise.
     integration_step.dependOn(&run_tde_page_tail.step);
     integration_step.dependOn(&run_adj_tail_repair.step);
