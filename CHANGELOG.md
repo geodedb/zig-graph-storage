@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `LabelDictionary.getOrAssign` computed `next_id = id + 1` without a
+  bound: at `maxInt(u32)` a safe build panicked and a release build wrapped
+  to 0 and handed out ids already in use. A new name now fails with
+  `error.LabelIdSpaceExhausted` once ids 0..maxInt(u32)-1 are used (the
+  range `assignId` already enforced) and the dictionary is unchanged; it
+  reaches callers through `GraphEngine.getOrAssignLabel` and
+  `ShardedGraphEngine.getOrAssignLabel`. `loadFromFile` overflowed the same
+  way on a stored id of `maxInt(u32)`; it now loads such a file and assigns
+  no further ids (SONNY-6527).
+
 ## [0.4.15] - 2026-11-13
 
 ### Added

@@ -35,12 +35,16 @@ pub const LabelDictionary = struct {
 
     /// Get or assign a LabelId for the given label string.
     /// If the label already has an ID, returns it. Otherwise assigns the next ID.
+    /// SONNY-6527: ids run 0..maxInt(u32)-1 (`assignId` refuses the top one
+    /// too); once `next_id` reaches maxInt(u32) a NEW name fails with
+    /// `error.LabelIdSpaceExhausted` and the dictionary is unchanged.
     pub fn getOrAssign(self: *LabelDictionary, label: []const u8) !u32 {
         if (self.name_to_id.get(label)) |id| {
             return id;
         }
 
         const id = self.next_id;
+        if (id == std.math.maxInt(u32)) return error.LabelIdSpaceExhausted;
         try self.insert(label, id);
         self.next_id = id + 1;
         return id;
@@ -202,7 +206,10 @@ pub const LabelDictionary = struct {
             // value in id_to_name; deinit frees only name_to_id keys, which
             // covers both pointers because they alias the same allocation.
 
-            if (id >= max_id) max_id = id + 1;
+            // SONNY-6527: saturate — an id of maxInt(u32) (a release build
+            // that wrapped past the top) leaves no id to assign, it is not
+            // corruption of the file.
+            if (id >= max_id) max_id = std.math.add(u32, id, 1) catch std.math.maxInt(u32);
         }
 
         if (remaining != 0) return error.InvalidData;
