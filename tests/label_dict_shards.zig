@@ -527,3 +527,58 @@ test "SONNY-6524: open refuses a split whose disagreeing id an edge on that shar
     try splitLikeOrderBy(alloc, &paths);
     try expectRefusedUntouched(alloc, &td, uuid, &paths);
 }
+
+// ---------------------------------------------------------------------------
+// SONNY-6527 item 1: the persistence dirty flag is shared by the label
+// broadcast workers and the shard's own writer
+// ---------------------------------------------------------------------------
+
+/// Writes nodes on one shard engine directly (the way geode writes a shard
+/// under that shard's lock) until told to stop.
+const ShardWriter = struct {
+    shard: *GraphEngine,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    written: u32 = 0,
+    err: ?anyerror = null,
+
+    fn run(w: *ShardWriter) void {
+        while (!w.stop.load(.acquire) or w.written < 4) {
+            const id = w.shard.allocNode() catch |e| {
+                w.err = e;
+                return;
+            };
+            w.shard.putNode(id, test_support.emptyNode(1)) catch |e| {
+                w.err = e;
+                return;
+            };
+            w.written += 1;
+        }
+    }
+};
+
+test "SONNY-6527: a new label name and writes on a shard from another thread do not race on the shard's dirty flag" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const eng = try ShardedGraphEngine.create(alloc, td.path, uuidFor(12), test_support.testConfig());
+    defer eng.close() catch {};
+
+    // Shard 3 is written by its own thread while the caller names labels;
+    // the broadcast records each name on shard 3 from a worker thread.
+    var writer = ShardWriter{ .shard = eng.shards[3] };
+    const t = try std.Thread.spawn(.{}, ShardWriter.run, .{&writer});
+    var names_err: ?anyerror = null;
+    for ([_][]const u8{ "R0", "R1", "R2", "R3" }) |name| {
+        _ = eng.getOrAssignLabel(name) catch |e| {
+            names_err = e;
+            break;
+        };
+    }
+    writer.stop.store(true, .release);
+    t.join();
+    if (names_err) |e| return e;
+    if (writer.err) |e| return e;
+
+    try expectShardsAgree(alloc, eng, "after names assigned during shard writes");
+    try testing.expect(writer.written >= 4);
+}
