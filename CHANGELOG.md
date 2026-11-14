@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `GraphEngine.persistence_dirty` is a `std.atomic.Value(bool)` (was
+  `bool`); read it with the new `GraphEngine.isPersistenceDirty()`. A
+  checkpoint now takes the flag when it starts and puts it back when it
+  fails, so a write that lands during a checkpoint is persisted by the next
+  one instead of being forgotten (SONNY-6527).
+
 ### Fixed
+
+- Data race: `ShardedGraphEngine.getOrAssignLabel` records a new name on
+  shards 1..N-1 from worker threads, and each shard set its plain-`bool`
+  `persistence_dirty` there while the caller's writers could be setting it
+  on the same shard under per-shard locks (TSan:
+  `markDirty` from `assignLabelId` vs `putNodeTxn`). The flag is atomic
+  now; `test-label-dict-shards-tsan` covers it (SONNY-6527).
 
 - `LabelDictionary.getOrAssign` computed `next_id = id + 1` without a
   bound: at `maxInt(u32)` a safe build panicked and a release build wrapped

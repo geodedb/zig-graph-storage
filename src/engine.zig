@@ -196,7 +196,14 @@ pub const GraphEngine = struct {
     submitter_slot: ?usize = null,
     metrics: Metrics = .{},
     read_only: bool = false,
-    persistence_dirty: bool = false,
+    /// Set by every write (and by naming a label) so the next checkpoint or
+    /// close persists; cleared by a successful checkpoint. SONNY-6527: atomic
+    /// because it is written from more than one thread without a common lock
+    /// — `ShardedGraphEngine.getOrAssignLabel` records a new name on shards
+    /// 1..N-1 from worker threads while the caller's own writers may be
+    /// writing those shards under per-shard locks. Write with `markDirty`,
+    /// read with `isPersistenceDirty`.
+    persistence_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     /// PHASE G reverse map: set when a record write moved/added/removed a
@@ -309,7 +316,7 @@ pub const GraphEngine = struct {
         self.config = cfg;
         self.graph_uuid = graph_uuid;
         self.read_only = false;
-        self.persistence_dirty = false;
+        self.persistence_dirty.store(false, .release);
         self.label_index_dirty = true;
         self.property_index_dirty = true;
         self.edge_index_dirty = true;
@@ -415,7 +422,7 @@ pub const GraphEngine = struct {
         // Initialize owned-or-borrowed thread pool (see initThreadPool).
         try self.initThreadPool(allocator, cfg);
         self.buffer_pool.setThreadPool(self.thread_pool);
-        self.persistence_dirty = false;
+        self.persistence_dirty.store(false, .release);
 
         return self;
     }
@@ -459,7 +466,7 @@ pub const GraphEngine = struct {
         self.config = cfg;
         self.graph_uuid = graph_uuid;
         self.read_only = false;
-        self.persistence_dirty = false;
+        self.persistence_dirty.store(false, .release);
         self.label_index_dirty = false;
         self.property_index_dirty = false;
         self.edge_index_dirty = false;
@@ -746,7 +753,7 @@ pub const GraphEngine = struct {
         // Initialize owned-or-borrowed thread pool (see initThreadPool).
         try self.initThreadPool(allocator, cfg);
         self.buffer_pool.setThreadPool(self.thread_pool);
-        self.persistence_dirty = false;
+        self.persistence_dirty.store(false, .release);
 
         return self;
     }
@@ -821,18 +828,20 @@ pub const GraphEngine = struct {
     }
 
     fn markDirty(self: *GraphEngine) void {
-        self.persistence_dirty = true;
+        self.persistence_dirty.store(true, .release);
     }
 
     /// GAP-0027: public alias of markDirty used by the property-index module so
     /// that declaring/building/dropping a B+tree property index makes the next
     /// checkpoint persist the catalog and tree snapshots.
     pub fn markPersistenceDirty(self: *GraphEngine) void {
-        self.persistence_dirty = true;
+        self.persistence_dirty.store(true, .release);
     }
 
-    fn markClean(self: *GraphEngine) void {
-        self.persistence_dirty = false;
+    /// True when a write since the last successful checkpoint is not yet
+    /// persisted (see `persistence_dirty`).
+    pub fn isPersistenceDirty(self: *const GraphEngine) bool {
+        return self.persistence_dirty.load(.acquire);
     }
 
     // ── Persistence helpers (delegated to engine_persist.zig) ─────────
@@ -1200,7 +1209,7 @@ pub const GraphEngine = struct {
         // Track the first error encountered during close
         var close_err: ?anyerror = null;
 
-        if (self.persistence_dirty) {
+        if (self.isPersistenceDirty()) {
             // Run a final synchronous checkpoint only when there are writes
             // that have not already been durably persisted.
             self.ensureSubmitterRegistered();
