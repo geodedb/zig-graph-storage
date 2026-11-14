@@ -203,3 +203,94 @@ test "edge prop_head: setEdgeProperty in the same WAL tail as the edge adds is n
     defer eng.close() catch {};
     try assertScenario(eng, alloc, source, sink, &edge_ids, "same-tail chain");
 }
+
+// ---------------------------------------------------------------------------
+// SONNY-6529 item 2: the tail reconcile must re-derive an edge whose
+// prop_head changed in an adjacency page that was imaged WITHOUT its source
+// node's page. geode's adapter (publishEdgePropHead) images the source's
+// unchanged 8 KiB node page on every head-moving relationship-property SET
+// only to put the source in recovery's tail-affected node set; this is the
+// shape it writes once that image is dropped.
+// ---------------------------------------------------------------------------
+
+/// Set edge property `key` the way a consumer that joins its own txn does
+/// (geode's adapter): property write, both adjacency copies and the edge
+/// index pointed at the new head, every rewritten ADJACENCY page imaged —
+/// and the source's node page NOT imaged.
+fn setEdgePropNoNodeImage(eng: *GraphEngine, from: u64, to: u64, edge_id: u64, key: []const u8, value: gs.PropertyValue) !void {
+    const entry = (try eng.getEdge(edge_id)) orelse return error.EdgeNotFound;
+    const from_rec = (try eng.getNode(from)) orelse return error.NodeNotFound;
+    const txn = try eng.beginTxn();
+    errdefer eng.abortTxn(txn) catch {};
+    const new_head = try eng.putPropertyTxn(entry.prop_head, key, value, txn);
+    if (new_head != entry.prop_head) {
+        if (try eng.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head)) |page|
+            try eng.logPagePublic(txn, .adj_out, page);
+        const in_head = try eng.in_head_dir.getHead(to);
+        if (try eng.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head)) |page|
+            try eng.logPagePublic(txn, .in_idx, page);
+        try eng.edge_index.updatePropHead(edge_id, new_head);
+        eng.edge_index_dirty = true;
+    }
+    try eng.commitTxn(txn);
+}
+
+fn adjOnlyImageScenario(sync_mode: gs.SyncMode, tag: u8, comptime same_tail: bool) !void {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{ 0x65, 0x29, tag } ++ [_]u8{0x29} ** 13;
+    var cfg = test_support.testConfig();
+    cfg.sync_mode = sync_mode;
+
+    var source: u64 = 0;
+    var sink: u64 = 0;
+    var edge_ids: [N_EDGES]u64 = undefined;
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.close() catch {};
+        source = try eng.allocNode();
+        try eng.putNode(source, emptyNode());
+        sink = try eng.allocNode();
+        try eng.putNode(sink, emptyNode());
+        if (same_tail) try eng.checkpoint();
+        for (&edge_ids, 0..) |*id, i| {
+            id.* = try eng.addEdgeColocatedWithPublicId(source, sink, REL, pid(i));
+        }
+        // Full checkpoint: the derived snapshots (edge index with prop_head
+        // 0 for every edge) are saved and stamped; the WAL tail after it is
+        // what the next open reconciles.
+        if (!same_tail) try eng.checkpoint();
+
+        try setEdgePropNoNodeImage(eng, source, sink, edge_ids[0], "w", .{ .int = 41 });
+        try setEdgePropNoNodeImage(eng, source, sink, edge_ids[N_EDGES - 1], "w", .{ .int = 42 });
+
+        // SIMULATED CRASH: WAL-only durability, no checkpoint, no close.
+        eng.deinit();
+    }
+
+    const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    try assertScenario(eng, alloc, source, sink, &edge_ids, if (same_tail) "adj-only image, same tail" else "adj-only image");
+    // The bounded reconcile served this open (no full rebuild), and it is
+    // key-for-key what a rebuild over the same pages gives.
+    const reconciled = try eng.debugDerivedDigests();
+    if (!same_tail) {
+        try testing.expectEqual(@as(u64, 1), eng.metrics.derived_index_reconciles);
+        try testing.expectEqual(@as(u64, 0), eng.metrics.derived_index_rebuilds);
+    }
+    try eng.rebuildDerivedForTest();
+    try testing.expect(reconciled.eql(try eng.debugDerivedDigests()));
+}
+
+test "SONNY-6529: an edge property set whose txn imaged only the adjacency pages survives a crash (sync each commit)" {
+    try adjOnlyImageScenario(.sync_each_commit, 1, false);
+}
+
+test "SONNY-6529: an edge property set whose txn imaged only the adjacency pages survives a crash (deferred sync)" {
+    try adjOnlyImageScenario(.deferred, 2, false);
+}
+
+test "SONNY-6529: adjacency-only edge property images in the same tail as the edge adds survive a crash" {
+    try adjOnlyImageScenario(.deferred, 3, true);
+}

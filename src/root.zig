@@ -72,6 +72,7 @@ pub const label_store = @import("label_store.zig");
 pub const wal_record = @import("wal_record.zig");
 pub const wal = @import("wal.zig");
 pub const txn = @import("txn.zig");
+pub const txn_undo = @import("txn_undo.zig");
 
 // Checkpoint and recovery
 pub const checkpoint = @import("checkpoint.zig");
@@ -155,9 +156,12 @@ pub const StorageError = errors.StorageError;
 pub const GraphConfig = config.GraphConfig;
 pub const SyncMode = config.SyncMode;
 pub const LabelDictDivergencePolicy = config.LabelDictDivergencePolicy;
+pub const LabelDictDiagnostic = config.LabelDictDiagnostic;
+pub const LabelDictReport = config.LabelDictReport;
+pub const AbortUndoPolicy = config.AbortUndoPolicy;
 pub const Metrics = metrics.Metrics;
 
-pub const version = "0.4.15";
+pub const version = "0.4.16";
 
 // ============================================================================
 // Unit Tests
@@ -178,7 +182,7 @@ test "re-exported types match source types" {
 }
 
 test "version is set" {
-    try std.testing.expectEqualStrings("0.4.15", version);
+    try std.testing.expectEqualStrings("0.4.16", version);
 }
 
 test {

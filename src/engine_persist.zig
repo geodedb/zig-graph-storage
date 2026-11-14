@@ -552,9 +552,15 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
         (engine.label_index_dirty or engine.property_index_dirty or
             engine.edge_index_dirty or engine.edge_exist_index_dirty or
             engine.prop_rev_index_dirty or engine.ordered_index_dirty);
-    if (!engine.persistence_dirty and !derived_pending) {
+    // SONNY-6527: take the flag at the START. A set that lands while this
+    // checkpoint runs (a label named from a broadcast worker thread) then
+    // stays set for the next one instead of being cleared after the fact;
+    // a failed checkpoint puts it back.
+    const was_dirty = engine.persistence_dirty.swap(false, .acq_rel);
+    if (!was_dirty and !derived_pending) {
         return;
     }
+    errdefer engine.persistence_dirty.store(true, .release);
 
     // Update manifest counters before checkpoint
     refreshManifestCounters(engine);
@@ -710,5 +716,4 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     const elapsed = start_ts.durationTo(end_ts);
     engine.metrics.last_checkpoint_duration_ns = @intCast(elapsed.raw.toNanoseconds());
     engine.metrics.checkpoints_completed += 1;
-    engine.persistence_dirty = false;
 }

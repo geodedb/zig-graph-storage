@@ -1044,6 +1044,51 @@ pub const AdjStore = struct {
         return null;
     }
 
+    /// SONNY-6529: call `f(ctx, edge_id)` for every entry stored on page
+    /// `page_id`, whatever chain(s) it belongs to: each of the `count`
+    /// entries of a chain block (v1/v2/v3), or every entry of every live run
+    /// of a slab block. Read-only. An unallocated page yields nothing. A page
+    /// whose block cannot be parsed fails with `error.NotAdjPage` (the
+    /// caller decides; the tail reconcile then rebuilds). Used by the WAL
+    /// tail reconcile to find the owners of an adjacency page that was
+    /// imaged without its owner's node page (an in-place prop_head rewrite).
+    pub fn forEachEdgeIdOnPage(
+        self: *AdjStore,
+        page_id: PageId,
+        ctx: anytype,
+        comptime f: fn (@TypeOf(ctx), edge_id: EdgeId) anyerror!void,
+    ) !void {
+        if (page_id == 0 or !self.free_space.isAllocated(page_id)) return;
+        const frame = try self.buffer_pool.pin(self.file_id, page_id);
+        defer self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
+        const data = frame.dataSlice();
+        const off = self.blockHeaderOffset();
+        const bh: EdgeBlockHeader = @bitCast(data[off..][0..BLOCK_HEADER_SIZE].*);
+        switch (bh.entry_format) {
+            edge_mod.ENTRY_FORMAT_V1, edge_mod.ENTRY_FORMAT_V2, edge_mod.ENTRY_FORMAT_V3 => {
+                const checked = self.readBlockHeader(data) catch return error.NotAdjPage;
+                var i: u16 = 0;
+                while (i < checked.count) : (i += 1) {
+                    try f(ctx, self.readEntry(data, i, checked.entry_format).edge_id);
+                }
+            },
+            edge_mod.ENTRY_FORMAT_SLAB, edge_mod.ENTRY_FORMAT_SLAB_V3 => {
+                const sb = self.readSlabBlockHeader(data) catch return error.NotAdjPage;
+                var slot: u32 = 0;
+                while (slot < sb.count) : (slot += 1) {
+                    const s = edge_mod.readSlabSlot(data, self.tail_reserve, slot);
+                    if (s.offset == edge_mod.SLAB_SLOT_TOMBSTONE) continue;
+                    const run = self.resolveSlabRun(data, slot) catch return error.NotAdjPage;
+                    var i: u32 = 0;
+                    while (i < run.entry_count) : (i += 1) {
+                        try f(ctx, readSlabRunEntry(data, run.offset, i, run.fmt).edge_id);
+                    }
+                }
+            },
+            else => return error.NotAdjPage,
+        }
+    }
+
     /// SONNY-6461: append to `out` every entry of the chain at `head` that
     /// sits in a legacy-tail slot (the last slot of a full chain block of a
     /// format that reaches the tail at this page size). Slab runs never do.

@@ -58,6 +58,99 @@ pub const LegacyPolicy = enum {
     read_only,
 };
 
+/// SONNY-6529: what `GraphEngine.abortTxn` does with a transaction it cannot
+/// undo exactly. The engine undoes node creates / updates (properties on new
+/// chains, flags) / deletes, label adds and removes, edge creates and
+/// removes and first edge properties; a property change on a chain that
+/// existed before the transaction, a `putNodeTxn` that moves a chain pointer
+/// of an existing node, or a page the caller imaged itself
+/// (`logPagePublic` / `zeroPageLogged`) cannot be.
+pub const AbortUndoPolicy = enum {
+    /// `abortTxn` fails with `error.AbortNotUndone`, and the engine refuses
+    /// every later write, commit and checkpoint (`error.AbortNotUndone`), and
+    /// `close` skips its checkpoint (it still syncs the WAL) and returns the
+    /// error. The aborted writes are never checkpointed; reopen the store to
+    /// continue from its committed state (default).
+    fail_closed,
+    /// The pre-SONNY-6529 behaviour: such an abort drops the transaction's
+    /// WAL records and leaves its writes in place, visible and checkpointed
+    /// with the next checkpoint. Only for a consumer that compensates
+    /// aborted writes itself.
+    keep_writes,
+};
+
+/// SONNY-6527: one shard label-dictionary finding of a `ShardedGraphEngine`,
+/// handed to `GraphConfig.label_dict_report` as it is found. The same detail
+/// still goes to `std.log.warn`, which a consumer's release `log_level` may
+/// filter out; this callback is the place to log it at the level the
+/// consumer chooses. Strings are borrowed: valid only during the call.
+pub const LabelDictDiagnostic = struct {
+    pub const Kind = enum {
+        /// Open: shard `shard` names `label_id` as `label` while shard 0
+        /// names it `shard0_label` (null: shard 0 does not name it), and
+        /// `nodes`/`edges`/`indexes` records on that shard use the id.
+        id_in_use_diverged,
+        /// Open: shard `shard`'s dictionary differed from shard 0's
+        /// (`shard_names` vs `shard0_names` names) and was rewritten from
+        /// shard 0's.
+        rewritten,
+        /// `getOrAssignLabel`: shard `shard` already holds `label` under
+        /// `shard_label_id`, shard 0 under `label_id`.
+        name_id_conflict,
+        /// `getOrAssignLabel`: shard `shard` gives shard 0's `label_id` for
+        /// `label` to another name, `shard_label`.
+        id_name_conflict,
+    };
+    pub const Action = enum {
+        /// The open or the assignment failed with
+        /// `error.LabelDictionaryDiverged`; nothing was changed.
+        refused,
+        /// `label_dict_divergence = .adopt_shard0`: the shard's name for the
+        /// id is replaced by shard 0's.
+        renamed_from_shard0,
+        /// The shard's `labels.dict` was rewritten from shard 0's.
+        rewritten,
+        /// As `rewritten`, in memory only (read-only open).
+        rewritten_in_memory,
+    };
+
+    kind: Kind,
+    action: Action,
+    /// Shard index (1..SHARD_COUNT-1).
+    shard: u32,
+    /// The id as shard 0 has it.
+    label_id: u32,
+    /// The id the shard has for `label` (== `label_id` except for
+    /// `name_id_conflict`).
+    shard_label_id: u32,
+    /// The name in question: the shard's name for `label_id`
+    /// (`id_in_use_diverged`), or the name being assigned.
+    label: []const u8 = "",
+    /// Shard 0's name for `label_id` (`id_in_use_diverged`).
+    shard0_label: ?[]const u8 = null,
+    /// The other name the shard gives `label_id` (`id_name_conflict`).
+    shard_label: ?[]const u8 = null,
+    /// Records on the shard that use `label_id` (`id_in_use_diverged`).
+    nodes: u64 = 0,
+    edges: u64 = 0,
+    indexes: u64 = 0,
+    /// Name counts of the shard's and shard 0's dictionaries (`rewritten`).
+    shard_names: u32 = 0,
+    shard0_names: u32 = 0,
+};
+
+/// SONNY-6527: receiver for `LabelDictDiagnostic`s. Called on the thread
+/// that runs `ShardedGraphEngine.open` / `getOrAssignLabel`, once per
+/// finding, before the call returns (also when it then fails).
+pub const LabelDictReport = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, diagnostic: *const LabelDictDiagnostic) void,
+
+    pub fn emit(self: LabelDictReport, d: LabelDictDiagnostic) void {
+        self.func(self.ctx, &d);
+    }
+};
+
 /// SONNY-6524: what `ShardedGraphEngine.open` does when a shard's label
 /// dictionary disagrees with shard 0's in a way that changes what an id
 /// means on that shard, AND a record on that shard (a node label, an edge
@@ -188,6 +281,12 @@ pub const GraphConfig = struct {
     /// SONNY-6524: see `LabelDictDivergencePolicy`. Read by
     /// `ShardedGraphEngine.open` only.
     label_dict_divergence: LabelDictDivergencePolicy = .reject,
+    /// SONNY-6527: optional receiver of the shard label-dictionary findings
+    /// (`LabelDictDiagnostic`) of `ShardedGraphEngine.open` and
+    /// `getOrAssignLabel`. Null (default): only `std.log.warn` reports them.
+    label_dict_report: ?LabelDictReport = null,
+    /// SONNY-6529: see `AbortUndoPolicy`.
+    abort_undo: AbortUndoPolicy = .fail_closed,
 
     /// Compute the effective buffer pool size, applying auto-sizing when enabled.
     ///

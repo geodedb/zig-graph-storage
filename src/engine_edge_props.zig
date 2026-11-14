@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const prop_store_mod = @import("prop_store.zig");
 const engine_mod = @import("engine.zig");
+const engine_undo = @import("engine_undo.zig");
 
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -31,27 +32,37 @@ fn edgeIndexEntry(engine: *GraphEngine, from: NodeId, edge_id: EdgeId) !engine_m
 
 /// Set (or overwrite) a property on an edge identified by (from, to, edge_id).
 /// Updates the prop_head in both the outgoing and incoming adjacency lists.
+/// Auto-commit wrapper of `setEdgePropertyTxn`.
 pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue) anyerror!void {
+    // Edge-prop-head WAL imaging: ONE txn spans the property write AND the
+    // in-place adjacency prop_head rewrites. The old shape committed the
+    // property pages in their own auto-commit txn and then mutated the
+    // adjacency blocks with NO WAL imaging at all — on crash replay the
+    // property chain came back but nothing referenced it, silently losing
+    // the committed property. Image exactly the page each rewrite mutated,
+    // in the SAME txn, so replay is all-or-nothing.
+    const txn = try engine.txn_manager.begin();
+    errdefer engine_undo.abortFailedWrite(engine, txn);
+    try setEdgePropertyTxn(engine, from, to, edge_id, key, value, txn);
+    try engine.txn_manager.commit(txn);
+}
+
+/// SONNY-6529: `setEdgeProperty` inside the caller's transaction `txn`: the
+/// property write, both adjacency copies' prop_head and the edge index,
+/// every rewritten page imaged under `txn`. Undone by `abortTxn` when the
+/// edge had no properties before the transaction (its first property; a
+/// change to an existing chain makes the abort fail closed, see
+/// `GraphConfig.abort_undo`). This is the call for a consumer that joins its
+/// own transaction (geode's adapter) instead of rewriting the adjacency with
+/// `AdjStore.updateEdgePropHead` + `logPagePublic`.
+pub fn setEdgePropertyTxn(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue, txn: u64) anyerror!void {
     const edge_entry = try edgeIndexEntry(engine, from, edge_id);
     if (edge_entry.neighbor != to) return error.EdgeNotFound;
 
     const from_rec = (try engine.node_store.getNode(from)) orelse return error.NodeNotFound;
     const found_prop_head = edge_entry.prop_head;
 
-    // Edge-prop-head WAL imaging: ONE txn spans the property write AND the
-    // in-place adjacency prop_head rewrites below. The old shape committed
-    // the property pages in their own auto-commit txn and then mutated the
-    // adjacency blocks with NO WAL imaging at all — on crash replay the
-    // property chain came back but nothing referenced it (the entry's
-    // prop_head replayed from the checkpoint image, or from an OLDER image
-    // of the same block written when the edge was added), silently losing
-    // the committed property. Same under-logging class as the edge-remove
-    // non-head fix: image exactly the page each rewrite mutated, in the
-    // SAME txn, so replay is all-or-nothing.
-    const txn = try engine.txn_manager.begin();
-    errdefer engine.txn_manager.abort(txn) catch {};
-
-    // 3. Write property, get new prop_head.
+    // Write property, get new prop_head.
     //    GAP-0060: edge property chains slab-pack exactly like node props when
     //    `edge_prop_slab_packing` is on — the head is a full u64 (a prop-store
     //    slab head, bit 63) stored durably in the WIDE (v3 / slab-v3) adjacency
@@ -60,38 +71,37 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
     //    store whose adjacency can hold it (else a legacy v2 run can't take the
     //    wide head — the exact invariant `updateEdgePropHead*` enforces loudly).
     //    When off, edges keep the legacy one-page-per-edge writer (u32 head).
+    //    putProperty*Txn also refreshes the property-chain index (and drops
+    //    the old chain's entries when the head moved).
     const new_head: u64 = if (engine.config.edge_prop_slab_packing)
         try engine.putPropertyTxn(@as(u64, found_prop_head), key, value, txn)
     else
         try engine.putPropertyLegacyTxn(@as(u64, found_prop_head), key, value, txn);
 
-    // 4. If prop_head changed, update BOTH adjacency copies and edge index.
-    //    Edge co-location (Phase A): the incoming copy now lives in THIS shard's
+    // If prop_head changed, update BOTH adjacency copies and edge index.
+    //    Edge co-location (Phase A): the incoming copy lives in THIS shard's
     //    `adj_in_remote`, keyed by `to` via `in_head_dir` — NOT in `to.in_head`
-    //    on the dst shard (which may not even be this engine). Both the out-chain
-    //    and the in-chain are therefore on the source shard, so this single-engine
-    //    update is correct (it was BROKEN for cross-shard edges before co-location,
-    //    which only ever touched one engine). `to` is not resident here, so we do
-    //    NOT read its NodeRec.
+    //    on the dst shard (which may not even be this engine). `to` is not
+    //    resident here, so we do NOT read its NodeRec.
     if (new_head != found_prop_head) {
+        // SONNY-6529: recorded before the rewrites, so a failure half-way is
+        // undone too (the inverse rewrites both copies back to the old head).
+        try engine_undo.reserve(engine, txn);
+        engine_undo.recordEdgePropHead(engine, txn, from, to, edge_id, found_prop_head);
         // The entry may live in ANY block of either chain (not just the
         // head); AdjStore reports the exact PageId it mutated and that page
-        // is WAL-imaged under the spanning txn.
+        // is WAL-imaged under the spanning txn. SONNY-6529: only the
+        // adjacency pages are imaged. `from`'s node record does not change,
+        // and the first-access tail reconcile finds the owner of every tail
+        // `.adj_out` page through the edge index
+        // (engine_index.reconcileDerivedIndexesFromTail, pass 3), so the
+        // node-page image this used to add is not needed.
         if (try engine.adj_out.updateEdgePropHead(from_rec.out_head, edge_id, new_head)) |p| {
-            try engine.logPagePublic(txn, .adj_out, p);
-            // Also image `from`'s (unchanged) node page, exactly as removeEdge
-            // does: it puts `from` in recovery's tail-affected NODE set, which
-            // is what the first-access tail reconcile scans to re-derive the
-            // node's out-edges. The adj_out page alone has no back-pointer to
-            // its owner, and a slab-packed props page only refreshes the
-            // property chain — so without this a crash after a committed
-            // setEdgeProperty reloads the edge_index snapshot with the OLD
-            // prop_head and the property is unreachable.
-            try engine.logPagePublic(txn, .nodes, from / engine.node_store.nodes_per_page);
+            try engine.logPage(txn, .adj_out, p);
         }
         const in_head = try engine.in_head_dir.getHead(to);
         if (try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, new_head)) |p| {
-            try engine.logPagePublic(txn, .in_idx, p);
+            try engine.logPage(txn, .in_idx, p);
         }
 
         // Keep edge index prop_head in sync (no-op if the edge is absent).
@@ -106,13 +116,6 @@ pub fn setEdgeProperty(engine: *GraphEngine, from: NodeId, to: NodeId, edge_id: 
         // (blessed-stale, the 0018-class silent-loss shape).
         engine.edge_index_dirty = true;
     }
-
-    try engine.txn_manager.commit(txn);
-
-    if (found_prop_head != 0 and found_prop_head != new_head) {
-        engine.property_index.removeChain(found_prop_head);
-    }
-    try engine.refreshPropertyChainIndex(new_head);
 }
 
 /// Remove a property from an edge. The removal is in-place so the prop_head

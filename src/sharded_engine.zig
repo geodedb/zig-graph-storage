@@ -388,7 +388,7 @@ pub const ShardedGraphEngine = struct {
         // SONNY-6524: before anything else writes, bring every shard's label
         // dictionary to shard 0's, or refuse a disagreement that records on
         // the disagreeing shard depend on.
-        try sharded_labels.reconcileAtOpen(self, cfg.label_dict_divergence);
+        try sharded_labels.reconcileAtOpen(self, cfg.label_dict_divergence, cfg.label_dict_report);
 
         _ = try sharded_recovery.reconcilePendingPrepares(self);
 

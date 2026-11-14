@@ -540,13 +540,21 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !LoadOutcome {
 /// holds exactly the derived state as of `covered_lsn`.
 ///
 /// The tail touched only these primary files (others are irrelevant to the four
-/// out-derived indexes and are ignored): `.nodes` and `.props`. `.adj_out`
-/// changes always co-occur with a `.nodes` write of the owning node (addEdge
-/// putNodes `from`; removeEdge is made to log `from`'s node page too), so the
-/// node set drives the edge reconcile; label mutations always putNode; and a
-/// node-page delete is a tombstoned slot. IN-PLACE property mutations rewrite
-/// only the props page (never the node record), so they are reached via the
-/// props-page slab-slot pass.
+/// out-derived indexes and are ignored): `.nodes`, `.props` and `.adj_out`.
+/// Adding or removing an edge always co-occurs with a `.nodes` write of the
+/// owning node (addEdge putNodes `from`; removeEdge logs `from`'s node page
+/// too, because a removed entry leaves nothing on the adjacency page to find
+/// its owner by), so the node set drives those; label mutations always
+/// putNode; and a node-page delete is a tombstoned slot. IN-PLACE property
+/// mutations rewrite only the props page (never the node record), so they are
+/// reached via the props-page slab-slot pass. SONNY-6529: an IN-PLACE
+/// prop_head rewrite of an adjacency entry (setEdgeProperty, or a consumer's
+/// `AdjStore.updateEdgePropHead` + `logPagePublic(.adj_out)`) need not image
+/// the owner's node page: every entry on a tail `.adj_out` page is resolved
+/// to its source node through the loaded edge index and that node is
+/// re-derived (pass 3). The entry is still on the page after such a rewrite,
+/// and the edge it names predates the snapshot or was added in the tail
+/// (then its owner is already in the node set), so the owner is always found.
 ///
 /// Per affected node: remove its OLD out-edges (enumerated from the immutable
 /// edge-existence base by `from`) and its OLD label memberships, then EITHER
@@ -578,18 +586,53 @@ pub fn reconcileDerivedIndexesFromTail(engine: *GraphEngine, pages: []const engi
         };
     }
 
-    // Pass 2 — node pages: un-derive then re-derive each affected node.
+    // SONNY-6529: the owners of every tail adjacency page, resolved through
+    // the edge index BEFORE pass 2 changes it (a node pass 2 re-derives keeps
+    // its edges' `from`, so resolving first or after gives the same owners).
+    // A superset is harmless (re-deriving an unchanged node is a no-op).
     const npp = engine.node_store.nodes_per_page;
     const max_node = engine.manifest.next_node_id;
+    var owners: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
+    defer owners.deinit(engine.allocator);
+    for (pages) |p| {
+        if (p.file_id != .adj_out) continue;
+        const OwnerCtx = struct {
+            engine: *GraphEngine,
+            owners: *std.AutoHashMapUnmanaged(NodeId, void),
+        };
+        var oc = OwnerCtx{ .engine = engine, .owners = &owners };
+        engine.adj_out.forEachEdgeIdOnPage(p.page_id, &oc, struct {
+            fn f(c: *OwnerCtx, edge_id: u64) anyerror!void {
+                const e = (try c.engine.edge_index.get(edge_id)) orelse return;
+                try c.owners.put(c.engine.allocator, e.from, {});
+            }
+        }.f) catch |e| switch (e) {
+            error.NotAdjPage => return fallbackRebuild(engine),
+            else => return e,
+        };
+    }
+
+    // Pass 2 — node pages: un-derive then re-derive each affected node.
     for (pages) |p| {
         if (p.file_id != .nodes) continue;
         var slot: u64 = 0;
         while (slot < npp) : (slot += 1) {
             const node_id = p.page_id * npp + slot;
             if (node_id >= max_node) break;
+            // Re-derived here; pass 3 need not run it again.
+            _ = owners.remove(node_id);
             const rec = (try engine.node_store.getRawSlot(node_id)) orelse continue;
             try reconcileOneNode(engine, node_id, rec);
         }
+    }
+
+    // Pass 3 — owners of tail adjacency pages whose node page is not in the
+    // tail (SONNY-6529).
+    var oit = owners.keyIterator();
+    while (oit.next()) |node_id| {
+        if (node_id.* >= max_node) continue;
+        const rec = (try engine.node_store.getRawSlot(node_id.*)) orelse continue;
+        try reconcileOneNode(engine, node_id.*, rec);
     }
 
     return .reconciled;
