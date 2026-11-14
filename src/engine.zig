@@ -38,6 +38,8 @@ const engine_index = @import("engine_index.zig");
 const engine_persist = @import("engine_persist.zig");
 const engine_property_index = @import("engine_property_index.zig");
 const engine_adj_repair = @import("engine_adj_repair.zig");
+const engine_undo = @import("engine_undo.zig");
+const txn_undo = @import("txn_undo.zig");
 const edge_exist_index_mod = @import("edge_exist_index.zig");
 const edge_index_map_mod = @import("edge_index_map.zig");
 const ordered_property_index_mod = @import("ordered_property_index.zig");
@@ -204,6 +206,16 @@ pub const GraphEngine = struct {
     /// writing those shards under per-shard locks. Write with `markDirty`,
     /// read with `isPersistenceDirty`.
     persistence_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// SONNY-6529: set while `abortTxn` applies a transaction's inverses
+    /// (engine_undo.zig), so those writes are not journaled themselves.
+    undo_applying: bool = false,
+    /// SONNY-6529: set while `engine_undo.abortFailedWrite` applies inverses
+    /// in memory only; `logPage` logs nothing then.
+    undo_no_log: bool = false,
+    /// SONNY-6529: set when an abort could not undo its transaction under
+    /// `abort_undo = .fail_closed`; every later write, commit and checkpoint
+    /// then fails with `error.AbortNotUndone` (the store must be reopened).
+    abort_not_undone: ?txn_undo.Reason = null,
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     /// PHASE G reverse map: set when a record write moved/added/removed a
@@ -317,6 +329,9 @@ pub const GraphEngine = struct {
         self.graph_uuid = graph_uuid;
         self.read_only = false;
         self.persistence_dirty.store(false, .release);
+        self.undo_applying = false;
+        self.undo_no_log = false;
+        self.abort_not_undone = null;
         self.label_index_dirty = true;
         self.property_index_dirty = true;
         self.edge_index_dirty = true;
@@ -467,6 +482,9 @@ pub const GraphEngine = struct {
         self.graph_uuid = graph_uuid;
         self.read_only = false;
         self.persistence_dirty.store(false, .release);
+        self.undo_applying = false;
+        self.undo_no_log = false;
+        self.abort_not_undone = null;
         self.label_index_dirty = false;
         self.property_index_dirty = false;
         self.edge_index_dirty = false;
@@ -825,9 +843,20 @@ pub const GraphEngine = struct {
 
     fn ensureWritable(self: *const GraphEngine) !void {
         if (self.read_only) return error.ReadOnlyMode;
+        if (self.abort_not_undone != null) return error.AbortNotUndone;
     }
 
-    fn markDirty(self: *GraphEngine) void {
+    /// Node/edge id stride: SHARD_COUNT for a shard of a ShardedGraphEngine,
+    /// else 1.
+    pub fn idStride(self: *const GraphEngine) u64 {
+        return if (self.config.base_shard_index != null)
+            @intCast(@import("sharded_store.zig").SHARD_COUNT)
+        else
+            1;
+    }
+
+    /// Engine-internal (also used by engine_undo.zig).
+    pub fn markDirty(self: *GraphEngine) void {
         self.persistence_dirty.store(true, .release);
     }
 
@@ -1209,6 +1238,18 @@ pub const GraphEngine = struct {
         // Track the first error encountered during close
         var close_err: ?anyerror = null;
 
+        // SONNY-6529: an abort could not undo its writes (`abort_undo =
+        // .fail_closed`). They are in the buffer pool, so no checkpoint may
+        // run: make the committed WAL durable, release everything, and let the
+        // next open recover the committed state.
+        if (self.abort_not_undone != null) {
+            self.wal.sync() catch |err| {
+                close_err = err;
+            };
+            self.cleanupResources(allocator);
+            return close_err orelse error.AbortNotUndone;
+        }
+
         if (self.isPersistenceDirty()) {
             // Run a final synchronous checkpoint only when there are writes
             // that have not already been durably persisted.
@@ -1587,7 +1628,10 @@ pub const GraphEngine = struct {
     // ========================================================================
 
     /// Pin a page, log its current contents to the WAL, and unpin it.
-    fn logPage(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
+    /// Engine-internal (also used by sibling engine modules). Consumers use
+    /// `logPagePublic`, which also marks the transaction not undoable.
+    pub fn logPage(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
+        if (self.undo_no_log) return;
         const frame = try self.buffer_pool.pin(file_id, page_id);
         const frame_idx = self.buffer_pool.frameIndex(frame);
         defer self.buffer_pool.unpin(frame_idx, false);
@@ -1603,7 +1647,7 @@ pub const GraphEngine = struct {
     /// (slab) or under-log (multi-page). The store records the exact dirtied
     /// set; with slab packing off it is exactly the one block a legacy
     /// head-insert touched (== the returned head), so imaging is unchanged.
-    fn logTouchedAdj(self: *GraphEngine, txn_id: u64, file_id: FileId, store: *const AdjStore) anyerror!void {
+    pub fn logTouchedAdj(self: *GraphEngine, txn_id: u64, file_id: FileId, store: *const AdjStore) anyerror!void {
         for (store.touchedPages()) |p| try self.logPage(txn_id, file_id, p);
     }
 
@@ -1641,7 +1685,12 @@ pub const GraphEngine = struct {
     /// (`engine_index.migrateColocateInEdges`), which lives in a sibling module
     /// but must log dirty in-index pages under the migration txn exactly like the
     /// hot write path.
+    ///
+    /// SONNY-6529: the engine cannot undo a page the caller changed itself, so
+    /// this marks `txn_id` not undoable (its abort fails closed, see
+    /// `GraphConfig.abort_undo`).
     pub fn logPagePublic(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
+        engine_undo.markNotUndoable(self, txn_id, .caller_page_image);
         return self.logPage(txn_id, file_id, page_id);
     }
 
@@ -1650,6 +1699,7 @@ pub const GraphEngine = struct {
     /// directory pages so a crashed prior migration cannot leave a stale
     /// dst->head mapping. Crash-durable because the zeroed image is WAL-logged.
     pub fn zeroPageLogged(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
+        engine_undo.markNotUndoable(self, txn_id, .caller_page_image);
         const frame = try self.buffer_pool.pin(file_id, page_id);
         const frame_idx = self.buffer_pool.frameIndex(frame);
         @memset(frame.dataSlice(), 0);
@@ -1696,7 +1746,7 @@ pub const GraphEngine = struct {
     }
 
     /// Compute the page ID for a given node ID.
-    fn nodePageId(self: *const GraphEngine, node_id: NodeId) u64 {
+    pub fn nodePageId(self: *const GraphEngine, node_id: NodeId) u64 {
         return node_id / self.node_store.nodes_per_page;
     }
 
@@ -1716,7 +1766,11 @@ pub const GraphEngine = struct {
     /// Put a node within an existing transaction (no auto-commit).
     pub fn putNodeTxn(self: *GraphEngine, id: NodeId, rec: NodeRec, txn: TxnId) anyerror!void {
         try self.ensureWritable();
+        // SONNY-6529: the slot as it was, for the undo record.
+        try engine_undo.reserve(self, txn);
+        const before = try self.node_store.getRawSlot(id);
         try self.node_store.putNode(id, rec);
+        engine_undo.recordNodePut(self, txn, id, before, rec);
         try self.logPage(txn, .nodes, self.nodePageId(id));
         // PHASE G reverse map: record this node's current prop_head -> id when the
         // derived indexes are hydrated (a fresh graph is hydrated from creation;
@@ -1738,7 +1792,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         try self.putNodeTxn(id, rec, txn);
 
@@ -1790,11 +1844,14 @@ pub const GraphEngine = struct {
                 }
             }
         }
+        try engine_undo.reserve(self, txn);
         try self.node_store.deleteNode(id);
+        const undo_idx = engine_undo.recordNodeDelete(self, txn, id);
         try self.logPage(txn, .nodes, self.nodePageId(id));
 
         if (self.manifest.node_count > 0) {
             self.manifest.node_count -= 1;
+            engine_undo.markNodeDeleteCounted(self, txn, undo_idx);
         }
         self.metrics.nodes_deleted += 1;
         self.markDirty();
@@ -1807,7 +1864,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         try self.deleteNodeTxn(id, txn);
 
@@ -1943,12 +2000,14 @@ pub const GraphEngine = struct {
         // Phase A: this mutates edge_index + edge_exist_index — materialize them
         // first so the write lands on the fully-populated resident index.
         try self.ensureDerivedHydrated();
+        try engine_undo.reserve(self, txn);
         const edge_id = self.manifest.next_edge_id;
         const stride: u64 = if (self.config.base_shard_index != null)
             @intCast(@import("sharded_store.zig").SHARD_COUNT)
         else
             1;
         self.manifest.next_edge_id += stride;
+        const undo_idx = engine_undo.recordEdgeAdd(self, txn, from, to, edge_id, false);
 
         const entry = EdgeEntry{
             .neighbor = to,
@@ -2018,6 +2077,7 @@ pub const GraphEngine = struct {
         self.edge_exist_index_dirty = true;
 
         self.manifest.edge_count += 1;
+        engine_undo.markEdgeAddCounted(self, txn, undo_idx);
         self.metrics.edges_created += 1;
         self.markDirty();
 
@@ -2031,7 +2091,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         const edge_id = try self.addEdgeTxn(from, to, rel_type, txn);
 
@@ -2114,12 +2174,14 @@ pub const GraphEngine = struct {
                 }
             }
         }
+        try engine_undo.reserve(self, txn);
         const edge_id = self.manifest.next_edge_id;
         const stride: u64 = if (self.config.base_shard_index != null)
             @intCast(@import("sharded_store.zig").SHARD_COUNT)
         else
             1;
         self.manifest.next_edge_id += stride;
+        const undo_idx = engine_undo.recordEdgeAdd(self, txn, from, to, edge_id, true);
 
         // 1. Source out-adjacency + source node record (from IS resident here).
         const out_entry = EdgeEntry{
@@ -2176,6 +2238,7 @@ pub const GraphEngine = struct {
         self.edge_exist_index_dirty = true;
 
         self.manifest.edge_count += 1;
+        engine_undo.markEdgeAddCounted(self, txn, undo_idx);
         self.metrics.edges_created += 1;
         self.markDirty();
 
@@ -2201,7 +2264,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         const edge_id = try self.addEdgeColocatedTxnWithPublicId(from, to, rel_type, txn, public_id);
 
@@ -2240,12 +2303,18 @@ pub const GraphEngine = struct {
         try self.ensureDerivedHydrated();
         // Remove from source node's out adjacency list (from IS resident here).
         const from_rec = try self.node_store.getNode(from) orelse return error.NodeNotFound;
+        // SONNY-6529: what the removal takes out, for the undo record.
+        const idx_entry_opt = try self.edge_index.get(edge_id);
+        try engine_undo.reserve(self, txn);
+        const undo_idx = engine_undo.recordEdgeRemove(self, txn, from, to, edge_id, idx_entry_opt);
         const out_mutated = try self.adj_out.removeEdge(from_rec.out_head, edge_id);
+        if (out_mutated != null) engine_undo.markEdgeRemove(self, txn, undo_idx, idx_entry_opt != null, .out_removed);
 
         // Remove from THIS shard's co-located incoming adjacency, keyed by `to`
         // via the page-backed directory. We do NOT read `to`'s NodeRec.
         const in_head = try self.in_head_dir.getHead(to);
         const in_mutated = try self.adj_in_remote.removeEdge(in_head, edge_id);
+        if (in_mutated != null) engine_undo.markEdgeRemove(self, txn, undo_idx, idx_entry_opt != null, .in_removed);
 
         // GAP-ENT-0032: WAL-image exactly the block each removal MUTATED.
         // The entry may live in ANY block of the chain (removeEdge is a
@@ -2275,7 +2344,6 @@ pub const GraphEngine = struct {
         // record (we need its rel_type to form the key). No-op if absent.
         // `edge_present` gates the edge_count decrement so a no-op re-remove of
         // an already-deleted edge does NOT corrupt the count (idempotency).
-        const idx_entry_opt = try self.edge_index.get(edge_id);
         const edge_present = idx_entry_opt != null;
         if (idx_entry_opt) |idx_entry| {
             try self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
@@ -2288,6 +2356,7 @@ pub const GraphEngine = struct {
 
         if (edge_present and self.manifest.edge_count > 0) {
             self.manifest.edge_count -= 1;
+            engine_undo.markEdgeRemove(self, txn, undo_idx, true, .counted);
         }
         self.metrics.edges_removed += 1;
         self.markDirty();
@@ -2300,7 +2369,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         try self.removeEdgeTxn(from, to, edge_id, txn);
 
@@ -2384,7 +2453,7 @@ pub const GraphEngine = struct {
     /// Auto-commit wrapper for `putPropertyLegacyTxn` (edge-prop chains).
     pub fn putPropertyLegacy(self: *GraphEngine, owner: u64, key: []const u8, val: PropertyValue) anyerror!u64 {
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
         const new_head = try self.putPropertyLegacyTxn(owner, key, val, txn);
         try self.txn_manager.commit(txn);
         return new_head;
@@ -2394,10 +2463,16 @@ pub const GraphEngine = struct {
         try self.ensureWritable();
         // Phase A: reads/mutates the property_index chain — materialize first.
         try self.ensureDerivedHydrated();
-        const new_head = if (allow_slab)
-            try self.prop_store.putProperty(owner, key, val)
+        // SONNY-6529: the chain as it was, for the undo record.
+        const pre = try engine_undo.capturePropertyChain(self, txn, owner);
+        const new_head = (if (allow_slab)
+            self.prop_store.putProperty(owner, key, val)
         else
-            try self.prop_store.putPropertyLegacyOnly(owner, key, val);
+            self.prop_store.putPropertyLegacyOnly(owner, key, val)) catch |err| {
+            if (pre) |b| self.allocator.free(b);
+            return err;
+        };
+        engine_undo.notePropertyWrite(self, txn, owner, new_head, pre);
 
         // GAP-ENT-0022(b): if anything below fails, this call reports an
         // error and OUR caller keeps the OLD head — but a slab relocation /
@@ -2489,7 +2564,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         const new_head = try self.putPropertyTxn(owner, key, val, txn);
 
@@ -2514,9 +2589,15 @@ pub const GraphEngine = struct {
         // Phase A: reads/mutates the property_index chain — materialize first.
         try self.ensureDerivedHydrated();
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
-        try self.prop_store.removeProperty(owner, key);
+        // SONNY-6529: the chain as it was, for the undo record.
+        const pre = try engine_undo.capturePropertyChain(self, txn, owner);
+        {
+            errdefer if (pre) |b| self.allocator.free(b);
+            try self.prop_store.removeProperty(owner, key);
+        }
+        engine_undo.notePropertyWrite(self, txn, owner, owner, pre);
 
         // P4 (GAP prop-store slab packing): WAL-image every props page the
         // remove dirtied (see putPropertyTxn) — `owner` may be a slab head
@@ -2558,7 +2639,9 @@ pub const GraphEngine = struct {
         // GAP-ENT-0022(b): forget any prior op's tombstone before the label
         // store may write a new one below.
         self.var_store.resetSlabUndo();
+        try engine_undo.reserve(self, txn);
         const result = try self.label_store.addLabel(rec.label_head, label, self.allocator);
+        if (result.count != rec.label_count) engine_undo.recordLabel(self, txn, node_id, label, true);
         // GAP-ENT-0022(b): the label store writes the NEW block, then
         // tombstones the OLD slab slot (tombstone LAST). If anything below
         // fails, our caller keeps the OLD head — so revive that tombstoned slot
@@ -2600,7 +2683,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         try self.addLabelTxn(node_id, label, txn);
 
@@ -2624,7 +2707,9 @@ pub const GraphEngine = struct {
         // GAP-ENT-0022(b): forget any prior op's tombstone before removeLabel
         // may write a new one.
         self.var_store.resetSlabUndo();
+        try engine_undo.reserve(self, txn);
         const result = try self.label_store.removeLabel(rec.label_head, label, self.allocator);
+        if (result.count != rec.label_count) engine_undo.recordLabel(self, txn, node_id, label, false);
         // GAP-ENT-0022(b): revive the old slab slot if a later step fails (see
         // addLabelTxn).
         errdefer self.var_store.undoLastSlabTombstone() catch {};
@@ -2658,7 +2743,7 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         const txn = try self.txn_manager.begin();
-        errdefer self.txn_manager.abort(txn) catch {};
+        errdefer engine_undo.abortFailedWrite(self, txn);
 
         try self.removeLabelTxn(node_id, label, txn);
 
@@ -2713,6 +2798,9 @@ pub const GraphEngine = struct {
         defer __obs_span.end(null);
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
+        // SONNY-6529: after an abort that could not be undone, a commit could
+        // carry the aborted writes to disk in a shared page's image.
+        if (self.abort_not_undone != null) return error.AbortNotUndone;
         try self.txn_manager.commit(txn);
         self.metrics.txn_committed += 1;
         observability.endOperationSpan(__obs_span, true, "");
@@ -2723,7 +2811,7 @@ pub const GraphEngine = struct {
         defer __obs_span.end(null);
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
-        try self.txn_manager.abort(txn);
+        try engine_undo.abort(self, txn);
         self.metrics.txn_aborted += 1;
         observability.endOperationSpan(__obs_span, true, "");
     }
@@ -3035,6 +3123,13 @@ pub const GraphEngine = struct {
         try self.ensureWritable();
         try engine_edge_props.setEdgeProperty(self, from, to, edge_id, key, value);
         observability.endOperationSpan(__obs_span, true, "");
+    }
+
+    /// SONNY-6529: `setEdgeProperty` inside the caller's transaction (see
+    /// `engine_edge_props.setEdgePropertyTxn`).
+    pub fn setEdgePropertyTxn(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, key: []const u8, value: PropertyValue, txn: TxnId) anyerror!void {
+        try self.ensureWritable();
+        try engine_edge_props.setEdgePropertyTxn(self, from, to, edge_id, key, value, txn);
     }
 
     pub fn removeEdgeProperty(self: *GraphEngine, from: NodeId, edge_id: EdgeId, key: []const u8) anyerror!void {

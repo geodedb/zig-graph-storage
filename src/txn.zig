@@ -6,10 +6,12 @@ const Allocator = std.mem.Allocator;
 const wal_mod = @import("wal.zig");
 const wal_record = @import("wal_record.zig");
 const config_mod = @import("config.zig");
+const txn_undo = @import("txn_undo.zig");
 const WalManager = wal_mod.WalManager;
 const WalRecord = wal_record.WalRecord;
 const WalRecordType = wal_record.WalRecordType;
 const SyncMode = config_mod.SyncMode;
+pub const UndoJournal = txn_undo.UndoJournal;
 
 /// State of a transaction.
 pub const TxnState = enum {
@@ -30,6 +32,13 @@ pub const TxnManager = struct {
     /// durability — see `config.SyncMode`). Wired from `GraphConfig.sync_mode`
     /// at engine init.
     sync_mode: SyncMode = .sync_each_commit,
+    /// SONNY-6529: the undo journal of every active transaction (see
+    /// txn_undo.zig). Created at `begin`, freed at `commit` / `abort`;
+    /// `takeJournal` hands it to the engine's undoing abort.
+    journals: std.AutoHashMapUnmanaged(u64, UndoJournal) = .empty,
+    /// One emptied journal kept for the next `begin`, so a transaction's
+    /// journaling allocates nothing in the steady state.
+    spare_journal: ?UndoJournal = null,
 
     /// Initialize the transaction manager. Defaults to `sync_each_commit`
     /// (per-commit fsync). Callers that opt into a relaxed policy should set
@@ -57,7 +66,41 @@ pub const TxnManager = struct {
 
     /// Clean up resources.
     pub fn deinit(self: *TxnManager) void {
+        var it = self.journals.valueIterator();
+        while (it.next()) |j| j.deinit(self.allocator);
+        self.journals.deinit(self.allocator);
+        if (self.spare_journal) |*j| j.deinit(self.allocator);
+        self.spare_journal = null;
         self.active_txns.deinit();
+    }
+
+    /// SONNY-6529: the undo journal of active transaction `txn_id`, or null
+    /// when it is not active.
+    pub fn journal(self: *TxnManager, txn_id: u64) ?*UndoJournal {
+        return self.journals.getPtr(txn_id);
+    }
+
+    /// SONNY-6529: remove and return `txn_id`'s journal (the caller owns it
+    /// and must `deinit` it). The transaction stays active.
+    pub fn takeJournal(self: *TxnManager, txn_id: u64) ?UndoJournal {
+        const kv = self.journals.fetchRemove(txn_id) orelse return null;
+        return kv.value;
+    }
+
+    fn dropJournal(self: *TxnManager, txn_id: u64) void {
+        if (self.journals.fetchRemove(txn_id)) |kv| self.recycleJournal(kv.value);
+    }
+
+    /// SONNY-6529: give back a journal taken with `takeJournal` (or ended);
+    /// it is emptied and kept for the next `begin`, or freed.
+    pub fn recycleJournal(self: *TxnManager, journal_in: UndoJournal) void {
+        var j = journal_in;
+        if (self.spare_journal == null and !j.oversized()) {
+            j.reset(self.allocator);
+            self.spare_journal = j;
+        } else {
+            j.deinit(self.allocator);
+        }
     }
 
     /// Begin a new transaction. Writes a BEGIN record to the WAL.
@@ -96,6 +139,13 @@ pub const TxnManager = struct {
         };
         errdefer self.wal.abortBatchFor(txn_id);
 
+        const fresh = self.spare_journal orelse UndoJournal{};
+        self.spare_journal = null;
+        self.journals.put(self.allocator, txn_id, fresh) catch |err| {
+            self.spare_journal = fresh;
+            return err;
+        };
+        errdefer if (self.journals.fetchRemove(txn_id)) |kv| self.recycleJournal(kv.value);
         try self.active_txns.put(txn_id, .active);
         return txn_id;
     }
@@ -140,9 +190,15 @@ pub const TxnManager = struct {
         }
 
         _ = self.active_txns.remove(txn_id);
+        self.dropJournal(txn_id);
     }
 
     /// Abort a transaction. Writes an ABORT record to the WAL.
+    ///
+    /// This only discards the transaction's WAL records; the pages it wrote
+    /// stay as they are. `GraphEngine.abortTxn` undoes them first (SONNY-6529)
+    /// — engine code ends a transaction that wrote through the engine with
+    /// that, not with this.
     pub fn abort(self: *TxnManager, txn_id: u64) !void {
         const state = self.active_txns.get(txn_id) orelse return error.TxnNotFound;
         if (state == .committed) return error.TxnAlreadyCommitted;
@@ -164,6 +220,7 @@ pub const TxnManager = struct {
         _ = try self.wal.appendRecord(&rec);
 
         _ = self.active_txns.remove(txn_id);
+        self.dropJournal(txn_id);
     }
 
     /// Check if a transaction is currently active.

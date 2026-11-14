@@ -1055,6 +1055,84 @@ pub const PropStore = struct {
         self.last_slab_tombstone = .{ .page_id = page_id, .slot = slot, .offset = span.offset, .len = span.len };
     }
 
+    /// SONNY-6529: a copy (on `allocator`) of the live blob of slab chain
+    /// `prop_head`, or null for a legacy chain / head 0.
+    pub fn slabBlobCopy(self: *PropStore, allocator: Allocator, prop_head: u64) !?[]u8 {
+        if (prop_head == 0 or !isSlabHead(prop_head)) return null;
+        const frame = try self.buffer_pool.pin(.props, slabPageId(prop_head));
+        defer self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
+        const data = self.logical(frame.dataSlice());
+        const span = try self.slabBlobSpan(data, slabSlot(prop_head));
+        if (span.len < 4) return error.DataCorruption; // tombstoned / dangling
+        return try allocator.dupe(u8, data[span.offset..][0..span.len]);
+    }
+
+    /// SONNY-6529: make slab chain `prop_head`'s slot hold exactly `blob`
+    /// again (the blob it held before an aborted write rewrote it in place,
+    /// shrank it, or tombstoned it on a relocation). The slot keeps its
+    /// offset; the bytes [offset, offset+blob.len) are rewritten only when
+    /// no OTHER live slot overlaps them and they end below the slot
+    /// directory — otherwise `error.SlabRestoreConflict` and nothing is
+    /// changed. Returns the page to WAL-image (null when it already held
+    /// exactly `blob`).
+    pub fn restoreSlabBlob(self: *PropStore, prop_head: u64, blob: []const u8) !?PageId {
+        if (!isSlabHead(prop_head)) return error.SlabRestoreConflict;
+        const page_id = slabPageId(prop_head);
+        const slot = slabSlot(prop_head);
+        const frame = try self.buffer_pool.pin(.props, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        var dirty = false;
+        defer self.buffer_pool.unpin(frame_idx, dirty);
+        const data = self.logical(frame.dataSlice());
+        const span = try self.slabBlobSpan(data, slot);
+        const end = @as(u64, span.offset) + blob.len;
+        if (span.len == blob.len and std.mem.eql(u8, data[span.offset..][0..span.len], blob)) return null;
+        const state = try self.slabPageState(data);
+        const dir_bytes: u64 = @as(u64, SLAB_SLOT_COUNT_SIZE) + @as(u64, state.slot_count) * SLAB_SLOT_SIZE;
+        if (end > @as(u64, data.len) - dir_bytes) return error.SlabRestoreConflict;
+        var i: u32 = 0;
+        while (i < state.slot_count) : (i += 1) {
+            if (i == slot) continue;
+            const o = readSlabSlot(data, i);
+            if (o.len == 0) continue; // dead
+            const o_end = @as(u64, o.offset) + o.len;
+            if (o.offset < end and o_end > span.offset) return error.SlabRestoreConflict;
+        }
+        @memcpy(data[span.offset..][0..blob.len], blob);
+        if (blob.len < span.len) @memset(data[span.offset + blob.len ..][0 .. span.len - blob.len], 0);
+        writeSlabSlot(data, slot, span.offset, @intCast(blob.len));
+        dirty = true;
+        return page_id;
+    }
+
+    /// SONNY-6529: retire the chain at `prop_head` that nothing references
+    /// any more (an aborted transaction's own chain): a slab slot is
+    /// tombstoned, so the tail reconcile and the owner resolution never see
+    /// it as a live chain. Returns the page to WAL-image, or null when there
+    /// is nothing to retire (head 0, a legacy chain — whose pages are left
+    /// to compaction — or a slot already dead). Does not arm
+    /// `undoLastSlabTombstone`.
+    pub fn retireSlabChain(self: *PropStore, prop_head: u64) !?PageId {
+        if (prop_head == 0 or !isSlabHead(prop_head)) return null;
+        const page_id = slabPageId(prop_head);
+        const slot = slabSlot(prop_head);
+        if (!self.free_space.isAllocated(page_id)) return null;
+        const frame = try self.buffer_pool.pin(.props, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        const data = self.logical(frame.dataSlice());
+        const span = self.slabBlobSpan(data, slot) catch |err| {
+            self.buffer_pool.unpin(frame_idx, false);
+            return err;
+        };
+        if (span.len == 0) {
+            self.buffer_pool.unpin(frame_idx, false);
+            return null;
+        }
+        writeSlabSlot(data, slot, span.offset, 0);
+        self.buffer_pool.unpin(frame_idx, true);
+        return page_id;
+    }
+
     /// GAP-ENT-0022(b): best-effort rollback of the slab-slot tombstone
     /// written by the MOST RECENT mutating op on this store. The engine's
     /// put paths call this from an errdefer when they fail AFTER

@@ -18,12 +18,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names, node/edge/index counts and name counts — so the detail survives a
   release build whose `log_level` drops `std.log.warn`. Default null; the
   warnings are unchanged (SONNY-6527).
+- `GraphEngine.setEdgePropertyTxn` (an edge property write inside the
+  caller's transaction, undone by `abortTxn`), `GraphConfig.abort_undo`
+  (`AbortUndoPolicy`: `.fail_closed`, default, or `.keep_writes`),
+  `error.AbortNotUndone`, `Metrics.txn_aborts_undone` /
+  `txn_aborts_not_undone`, `GraphEngine.idStride`, `TxnManager.journal` /
+  `takeJournal`, `PropStore.slabBlobCopy` / `restoreSlabBlob` /
+  `retireSlabChain`, and `GraphEngine.logPage` / `logTouchedAdj` /
+  `nodePageId` / `markDirty` made public for the engine's sibling modules
+  (consumers keep using `logPagePublic`) (SONNY-6529).
 - `AdjStore.forEachEdgeIdOnPage` and `zig build bench-edge-prop-set
   [-- <dir>]` (ns and WAL bytes per head-moving edge property set)
   (SONNY-6529).
 
 ### Changed
 
+- `GraphEngine.abortTxn` undoes the transaction's writes (SONNY-6529). It
+  used to drop the transaction's WAL records only: the pages it had written
+  stayed modified and the slots, counts and ids it had taken stayed taken,
+  so readers saw the aborted writes and the next checkpoint made them
+  durable. Every engine write now records its inverse (node create, node
+  update of `prop_head`/`flags`/`txn_stamp`, node delete, label add/remove,
+  properties on new or transaction-created chains, property put/remove on
+  an existing slab chain (its bytes are copied first and written back),
+  edge add/remove, first edge property); the abort applies them in reverse
+  through the engine,
+  logs their images in the aborting transaction and ends it with COMMIT, so
+  it is crash-safe (a crash before that record recovers the pre-transaction
+  state). The auto-commit wrappers undo a failed write the same way, in
+  memory only (allocation-free for property writes, so it completes under
+  the out-of-memory that failed the write). A transaction the engine cannot
+  undo exactly (a property change on a pre-existing legacy chain or one
+  that freed an overflow value, a chain pointer of an existing node changed
+  through
+  `putNodeTxn`, a page imaged with `logPagePublic`/`zeroPageLogged`, more
+  than 1,048,576 writes) fails closed by default: `abortTxn` returns
+  `error.AbortNotUndone` and every later write, commit and checkpoint on
+  that engine fails the same way until it is reopened (`close` syncs the WAL
+  and skips its checkpoint). `abort_undo = .keep_writes` keeps the old
+  behaviour for those. No on-disk format change. `test-txn-abort-undo`
+  (also under `test-integration`). See "Transactions" in
+  docs/operations.md.
 - `GraphEngine.persistence_dirty` is a `std.atomic.Value(bool)` (was
   `bool`); read it with the new `GraphEngine.isPersistenceDirty()`. A
   checkpoint now takes the flag when it starts and puts it back when it
@@ -55,7 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loaded edge index and re-derives that node; the result is key-for-key
   what a full rebuild gives. `test-edge-prop-crash` (also under
   `test-integration`) (SONNY-6529).
-
 - `LabelDictionary.getOrAssign` computed `next_id = id + 1` without a
   bound: at `maxInt(u32)` a safe build panicked and a release build wrapped
   to 0 and handed out ids already in use. A new name now fails with

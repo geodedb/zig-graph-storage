@@ -22,6 +22,13 @@ pub const Metrics = struct {
     txn_begun: u64 = 0,
     txn_committed: u64 = 0,
     txn_aborted: u64 = 0,
+    /// SONNY-6529: aborts whose writes were undone (a subset of
+    /// `txn_aborted`; aborts of transactions that wrote nothing count in
+    /// neither of these two).
+    txn_aborts_undone: u64 = 0,
+    /// SONNY-6529: aborts that could not undo the transaction's writes
+    /// (`error.AbortNotUndone` under `abort_undo = .fail_closed`).
+    txn_aborts_not_undone: u64 = 0,
 
     // Operations
     nodes_created: u64 = 0,

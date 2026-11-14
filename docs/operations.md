@@ -48,6 +48,60 @@ try engine.commitTxn(txn);
 
 If a transaction is not committed it will be discarded during recovery.
 
+Writes are applied to the pages in memory as they happen, so readers see
+them before the commit, and a transaction is not isolated from another one
+running at the same time on the same engine (the caller serializes writes).
+
+`abortTxn` undoes the transaction's writes (SONNY-6529, releases after
+0.4.15): each engine write records its inverse, and the abort applies them
+in reverse order, logs their page images in the aborting transaction and
+ends it with a COMMIT record, so a crash before that record recovers the
+state before the transaction and a crash after it replays the undo. Undone:
+
+- node create (`allocNode` + `putNodeTxn` into an empty slot): the slot is
+  emptied, the count given back, and the id too when nothing was allocated
+  after it;
+- `putNodeTxn` on an existing node changing `prop_head` (to a chain the
+  transaction created), `flags` or `txn_stamp`;
+- `deleteNodeTxn`;
+- `addLabelTxn`, `removeLabelTxn` (a re-added label goes to the end of the
+  node's list);
+- `putPropertyTxn` / `putPropertyLegacyTxn` on a new chain (`owner == 0`) or
+  a chain the transaction created (the chain is retired);
+- `putPropertyTxn` / `removeProperty` on a slab-packed chain that existed
+  before the transaction, in place or moved: the chain's bytes are copied
+  before the write and written back (refused, failing closed, if another
+  live chain has taken those bytes since);
+- `addEdgeTxn`, `addEdgeColocatedTxn*` (edge id given back when last);
+- `removeEdgeTxn` (the entry is re-inserted with its id, type, property
+  head and public id; its position in the chain may change);
+- `setEdgePropertyTxn` giving an edge its first property.
+
+Space the undone writes took (a new chain, a moved run) is not reused until
+compaction. Not undoable: a property change on a legacy (non-slab) chain
+that existed before the transaction, or one that replaced a value stored in
+an overflow chain (the write frees it), a `putNodeTxn` that changes
+`out_head`, `in_head`, `label_head` or `label_count` of an existing node, a
+page the caller imaged itself (`logPagePublic`, `zeroPageLogged`), and a
+transaction past 1,048,576 writes. With `GraphConfig.abort_undo = .fail_closed` (default)
+aborting such a transaction returns `error.AbortNotUndone`, and every later
+write, commit and checkpoint on that engine fails the same way: the aborted
+writes are in memory and must never reach a checkpoint. `close` then syncs
+the WAL, skips its checkpoint and returns the error; reopen the store to
+continue from its committed state. `.keep_writes` keeps the older behaviour
+for such transactions (the writes stay and are checkpointed).
+
+When one of the engine's auto-commit calls (`putNode`, `addEdge`,
+`putProperty`, ...) fails after it changed something, it undoes the change
+the same way, in memory only (no other transaction can have committed in
+between, so nothing durable carries it), which also works when the failure
+was running out of memory.
+
+Known limits: a page another transaction commits while this one is still
+open carries this one's uncommitted bytes in its image, and a dirty page
+evicted to disk mid-transaction keeps them on disk; both are reverted by the
+undo's own logged images, but not if the process dies before the abort.
+
 ---
 
 ## Checkpoint

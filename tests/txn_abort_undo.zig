@@ -19,10 +19,10 @@
 // handed out again, and the derived indexes are checked to equal a rebuild
 // over the same pages.
 //
-// A write the engine cannot undo exactly (a property change on a chain that
-// existed before the transaction, a page the caller imaged itself) makes the
-// abort fail closed: `error.AbortNotUndone`, and the engine refuses further
-// writes and checkpoints, so the aborted change is never checkpointed.
+// A write the engine cannot undo exactly (a page the caller imaged itself, a
+// legacy property chain) makes the abort fail closed: `error.AbortNotUndone`,
+// and the engine refuses further writes and checkpoints, so the aborted
+// change is never checkpointed.
 
 const std = @import("std");
 const gs = @import("graph_storage");
@@ -239,6 +239,30 @@ fn labelChanges(eng: *GraphEngine, txn: gs.TxnId, base: *const Base, _: *Extra) 
     try eng.addLabelTxn(base.b, base.l0, txn);
 }
 
+fn setExistingPropertyInPlace(eng: *GraphEngine, txn: gs.TxnId, base: *const Base, _: *Extra) !void {
+    // SET a.p = 2: same size, rewritten in place in the committed chain.
+    const ra = (try eng.getNode(base.a)).?;
+    const h = try eng.putPropertyTxn(ra.prop_head, "p", .{ .int = 2 }, txn);
+    try testing.expectEqual(ra.prop_head, h);
+}
+
+fn setExistingPropertyRelocating(eng: *GraphEngine, txn: gs.TxnId, base: *const Base, _: *Extra) !void {
+    // Another chain is written after a's on the same slab page first, so
+    // a's blob is no longer the page tail; then SET a.p = 3, a.big = <300
+    // bytes>: the chain outgrows its slot and moves; the node is pointed at
+    // the new head, as a caller does.
+    _ = try eng.putPropertyTxn(0, "other", .{ .int = 8 }, txn);
+    const ra = (try eng.getNode(base.a)).?;
+    var h = try eng.putPropertyTxn(ra.prop_head, "p", .{ .int = 3 }, txn);
+    var big: [300]u8 = undefined;
+    @memset(&big, 'b');
+    h = try eng.putPropertyTxn(h, "big", .{ .string = &big }, txn);
+    try testing.expect(h != ra.prop_head);
+    var rec = ra;
+    rec.prop_head = h;
+    try eng.putNodeTxn(base.a, rec, txn);
+}
+
 fn edgeAdd(eng: *GraphEngine, txn: gs.TxnId, base: *const Base, extra: *Extra) !void {
     extra.edge = try eng.addEdgeColocatedTxnWithPublicId(base.b, base.a, REL, txn, 0xC1);
     _ = try eng.addEdgeColocatedTxnWithPublicId(base.a, base.b, REL + 1, txn, 0xC2);
@@ -279,6 +303,22 @@ test "SONNY-6529: abort gives back the node slot, count and id of a create" {
 
 test "SONNY-6529: abort undoes the first property of an existing node" {
     try runScenario(4, firstPropertyOnExistingNode, .checkpoint_close);
+}
+
+test "SONNY-6529: abort undoes an in-place change of an existing property" {
+    try runScenario(15, setExistingPropertyInPlace, .checkpoint_close);
+}
+
+test "SONNY-6529: abort undoes an in-place change of an existing property (crash, reopen)" {
+    try runScenario(16, setExistingPropertyInPlace, .crash);
+}
+
+test "SONNY-6529: abort undoes a property change that moved an existing chain" {
+    try runScenario(17, setExistingPropertyRelocating, .checkpoint_close);
+}
+
+test "SONNY-6529: abort undoes a property change that moved an existing chain (crash, reopen)" {
+    try runScenario(18, setExistingPropertyRelocating, .crash);
 }
 
 test "SONNY-6529: abort undoes label adds and removes on existing nodes" {
@@ -357,13 +397,16 @@ test "SONNY-6529: an abort that cannot undo a write fails closed and the write i
         errdefer eng.deinit();
         base = try buildBase(eng);
 
-        // Changing a property of a chain that existed before the
-        // transaction rewrites it in place: not undoable.
+        // The caller rewrites an adjacency entry itself and images the page
+        // (geode's publishEdgePropHead shape): the engine cannot undo it.
         const txn = try eng.beginTxn();
         const ra = (try eng.getNode(base.a)).?;
-        const h = try eng.putPropertyTxn(ra.prop_head, "p", .{ .int = 99 }, txn);
-        try testing.expectEqual(ra.prop_head, h);
+        const h = try eng.putPropertyTxn(0, "w", .{ .int = 99 }, txn);
+        const page = (try eng.adj_out.updateEdgePropHead(ra.out_head, base.ab, h)).?;
+        try eng.logPagePublic(txn, .adj_out, page);
+        try eng.edge_index.updatePropHead(base.ab, h);
         try testing.expectError(error.AbortNotUndone, eng.abortTxn(txn));
+        try testing.expectEqual(@as(u64, 1), eng.metrics.txn_aborts_not_undone);
 
         // Fail closed: no write, no checkpoint can make it durable.
         try testing.expectError(error.AbortNotUndone, eng.checkpoint());
@@ -375,4 +418,85 @@ test "SONNY-6529: an abort that cannot undo a write fails closed and the write i
     const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
     defer eng.close() catch {};
     try expectBase(eng, alloc, &base, "after a refused abort and reopen");
+}
+
+test "SONNY-6529: abort_undo = .keep_writes keeps a write it cannot undo, as before, and stays writable" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    var cfg = test_support.testConfig();
+    cfg.abort_undo = .keep_writes;
+    const eng = try GraphEngine.create(alloc, td.path, uuidFor(13), cfg);
+    defer eng.close() catch {};
+    const base = try buildBase(eng);
+
+    const txn = try eng.beginTxn();
+    const ra = (try eng.getNode(base.a)).?;
+    const h = try eng.putPropertyTxn(0, "w", .{ .int = 99 }, txn);
+    const page = (try eng.adj_out.updateEdgePropHead(ra.out_head, base.ab, h)).?;
+    try eng.logPagePublic(txn, .adj_out, page);
+    try eng.abortTxn(txn);
+    try testing.expectEqual(@as(u64, 1), eng.metrics.txn_aborts_not_undone);
+    // The caller's write stays (the old behaviour).
+    var it = try eng.expandOutIter(base.a, null);
+    defer it.deinit();
+    try testing.expectEqual(h, (try it.next()).?.prop_head);
+
+    // Undoable transactions are still undone under this policy.
+    const t2 = try eng.beginTxn();
+    const n = try eng.allocNode();
+    try eng.putNodeTxn(n, emptyNode(), t2);
+    try eng.abortTxn(t2);
+    try testing.expect((try eng.getNode(n)) == null);
+    try eng.checkpoint();
+}
+
+test "SONNY-6529: ShardedGraphEngine: an aborted shard transaction is undone across a crash" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(14);
+    var cfg = test_support.testConfig();
+    cfg.sync_mode = .deferred;
+
+    var a: u64 = 0;
+    var b: u64 = 0;
+    var n: u64 = 0;
+    {
+        const eng = try gs.ShardedGraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.deinit();
+        const l = try eng.getOrAssignLabel("L");
+        a = try eng.allocNode();
+        try eng.putNode(a, emptyNode());
+        b = try eng.allocNode();
+        try eng.putNode(b, emptyNode());
+        _ = try eng.addEdgeColocatedWithPublicId(a, b, REL, 0xD1);
+        try eng.checkpoint();
+
+        // A statement on a's shard: a new node with a property and a label,
+        // and an edge a -> new node; then aborted.
+        const shard = eng.shards[gs.shard_count.shardOfNode(a)];
+        const txn = try shard.beginTxn();
+        n = try shard.allocNode();
+        try shard.putNodeTxn(n, emptyNode(), txn);
+        const h = try shard.putPropertyTxn(0, "k", .{ .int = 1 }, txn);
+        var rec = (try shard.getNode(n)).?;
+        rec.prop_head = h;
+        try shard.putNodeTxn(n, rec, txn);
+        try shard.addLabelTxn(n, l, txn);
+        _ = try shard.addEdgeColocatedTxnWithPublicId(a, n, REL, txn, 0xD2);
+        try shard.abortTxn(txn);
+        eng.deinit(); // crash
+    }
+
+    const eng = try gs.ShardedGraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    try testing.expect((try eng.getNode(n)) == null);
+    try testing.expectEqual(@as(u64, 2), try eng.nodeCount());
+    try testing.expectEqual(@as(u64, 1), try eng.edgeCount());
+    const shard = eng.shards[gs.shard_count.shardOfNode(a)];
+    const outs = try outEdgeIds(shard, alloc, a);
+    defer alloc.free(outs);
+    try testing.expectEqual(@as(usize, 1), outs.len);
+    try expectConsistent(shard, "sharded, after reopen");
 }

@@ -58,6 +58,27 @@ pub const LegacyPolicy = enum {
     read_only,
 };
 
+/// SONNY-6529: what `GraphEngine.abortTxn` does with a transaction it cannot
+/// undo exactly. The engine undoes node creates / updates (properties on new
+/// chains, flags) / deletes, label adds and removes, edge creates and
+/// removes and first edge properties; a property change on a chain that
+/// existed before the transaction, a `putNodeTxn` that moves a chain pointer
+/// of an existing node, or a page the caller imaged itself
+/// (`logPagePublic` / `zeroPageLogged`) cannot be.
+pub const AbortUndoPolicy = enum {
+    /// `abortTxn` fails with `error.AbortNotUndone`, and the engine refuses
+    /// every later write, commit and checkpoint (`error.AbortNotUndone`), and
+    /// `close` skips its checkpoint (it still syncs the WAL) and returns the
+    /// error. The aborted writes are never checkpointed; reopen the store to
+    /// continue from its committed state (default).
+    fail_closed,
+    /// The pre-SONNY-6529 behaviour: such an abort drops the transaction's
+    /// WAL records and leaves its writes in place, visible and checkpointed
+    /// with the next checkpoint. Only for a consumer that compensates
+    /// aborted writes itself.
+    keep_writes,
+};
+
 /// SONNY-6527: one shard label-dictionary finding of a `ShardedGraphEngine`,
 /// handed to `GraphConfig.label_dict_report` as it is found. The same detail
 /// still goes to `std.log.warn`, which a consumer's release `log_level` may
@@ -264,6 +285,8 @@ pub const GraphConfig = struct {
     /// (`LabelDictDiagnostic`) of `ShardedGraphEngine.open` and
     /// `getOrAssignLabel`. Null (default): only `std.log.warn` reports them.
     label_dict_report: ?LabelDictReport = null,
+    /// SONNY-6529: see `AbortUndoPolicy`.
+    abort_undo: AbortUndoPolicy = .fail_closed,
 
     /// Compute the effective buffer pool size, applying auto-sizing when enabled.
     ///

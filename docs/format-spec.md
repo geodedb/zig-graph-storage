@@ -656,6 +656,16 @@ trailer.
 | 4     | `abort_txn`         | Transaction abort/rollback marker    |
 | 5     | `checkpoint_marker` | Checkpoint boundary marker           |
 
+An `abort_txn` record ends a transaction whose records recovery discards.
+Since SONNY-6529 (releases after 0.4.15) `GraphEngine.abortTxn` writes it
+only for a transaction that wrote nothing it could undo, or that it could
+not undo (`error.AbortNotUndone`). A transaction whose writes it undid ends
+with `page_update` records of the inverse writes followed by `commit_txn`:
+replay applies the forward images and then the inverse ones, which leaves
+the pages as they were before the transaction (byte-for-byte apart from
+retired slab slots and space leaked until compaction). No record type or
+layout changed; a store written this way opens with 0.4.15.
+
 ### 7.3 Record Layout
 
 | Offset           | Size         | Field          | Type   | Description                       |
