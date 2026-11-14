@@ -58,6 +58,25 @@ pub const LegacyPolicy = enum {
     read_only,
 };
 
+/// SONNY-6524: what `ShardedGraphEngine.open` does when a shard's label
+/// dictionary disagrees with shard 0's in a way that changes what an id
+/// means on that shard, AND a record on that shard (a node label, an edge
+/// type, a declared property or ordered index) uses that id. Disagreements
+/// no record depends on (a shard missing names shard 0 has, or naming an id
+/// none of its records carry) are always repaired from shard 0.
+pub const LabelDictDivergencePolicy = enum {
+    /// Refuse to open with `error.LabelDictionaryDiverged`, logging the shard,
+    /// the id, both names and how many records use it (default). Nothing on
+    /// disk is changed.
+    reject,
+    /// Rewrite the shard's dictionary from shard 0's. Correct only when the
+    /// caller knows every label id it wrote to any shard came from shard 0
+    /// (`ShardedGraphEngine.getOrAssignLabel`, or names read from shard 0's
+    /// dictionary), so shard 0's name is what those records mean. geode
+    /// stores whose dictionaries were split by its old ORDER BY path qualify.
+    adopt_shard0,
+};
+
 /// Durability policy for committing a transaction's WAL records.
 ///
 /// Controls whether each commit issues its own `fsync` of the WAL. The
@@ -166,6 +185,9 @@ pub const GraphConfig = struct {
     /// (default), each engine creates and owns a pool of
     /// `default_owned_pool_max_threads` workers (4 — see engine.zig).
     external_thread_pool: ?*tp.ThreadPool = null,
+    /// SONNY-6524: see `LabelDictDivergencePolicy`. Read by
+    /// `ShardedGraphEngine.open` only.
+    label_dict_divergence: LabelDictDivergencePolicy = .reject,
 
     /// Compute the effective buffer pool size, applying auto-sizing when enabled.
     ///

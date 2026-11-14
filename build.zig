@@ -762,6 +762,18 @@ fn addIntegrationTests(
     const run_label_dict_shards = b.addRunArtifact(label_dict_shards_tests);
     label_dict_shards_step.dependOn(&run_label_dict_shards.step);
 
+    // TSan variant: the parallel per-shard label broadcast (one worker thread
+    // per shard). EXIT=0 and no race report = clean.
+    const tsan_label_dict_shards_step = b.step("test-label-dict-shards-tsan", "Run shard label-dictionary tests under ThreadSanitizer (zero races expected)");
+    const tsan_label_dict_shards_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/label_dict_shards.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+        .use_llvm = true,
+    });
+    tsan_label_dict_shards_tests.root_module.sanitize_thread = true;
+    tsan_label_dict_shards_step.dependOn(&b.addRunArtifact(tsan_label_dict_shards_tests).step);
+
     // At-rest encryption page tail (SONNY-6441) — the pager stores the AES-GCM
     // tag in the last 16 bytes of every encrypted page; fixed-record layouts
     // that reached the page end lost those bytes on every write + reload

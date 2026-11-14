@@ -490,6 +490,33 @@ test "SONNY-6524: open refuses a split whose disagreeing id a node on that shard
     try expectRefusedUntouched(alloc, &td, uuid, &paths);
 }
 
+test "SONNY-6524: label_dict_divergence = .adopt_shard0 opens a split that a node uses and rewrites it from shard 0" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(12);
+    var paths = try buildStore(alloc, td.path, uuid, xNodeOnShard5);
+    defer paths.deinit(alloc);
+    try splitLikeOrderBy(alloc, &paths);
+
+    var cfg = test_support.testConfig();
+    cfg.label_dict_divergence = .adopt_shard0;
+    {
+        const eng = try ShardedGraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try expectShardsAgree(alloc, eng, "after an adopting open");
+        // The node shard 5 carries under id 1 now reads as X, as shard 0 says.
+        try testing.expectEqualStrings("X", eng.shards[5].label_dict.getName(1).?);
+        const xs = try eng.scanLabel(1, alloc);
+        defer alloc.free(xs);
+        try testing.expectEqual(@as(usize, 1), xs.len);
+    }
+    // Repaired on disk: the default policy opens it now.
+    const eng = try ShardedGraphEngine.open(alloc, td.path, uuid, test_support.testConfig());
+    defer eng.close() catch {};
+    try expectShardsAgree(alloc, eng, "after a default reopen");
+}
+
 test "SONNY-6524: open refuses a split whose disagreeing id an edge on that shard carries" {
     const alloc = testing.allocator;
     var td = try test_support.TestDataDir.init(alloc);
