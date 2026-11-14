@@ -157,7 +157,7 @@ pub const SyncMode = config.SyncMode;
 pub const LabelDictDivergencePolicy = config.LabelDictDivergencePolicy;
 pub const Metrics = metrics.Metrics;
 
-pub const version = "0.4.14";
+pub const version = "0.4.15";
 
 // ============================================================================
 // Unit Tests
@@ -178,7 +178,7 @@ test "re-exported types match source types" {
 }
 
 test "version is set" {
-    try std.testing.expectEqualStrings("0.4.14", version);
+    try std.testing.expectEqualStrings("0.4.15", version);
 }
 
 test {

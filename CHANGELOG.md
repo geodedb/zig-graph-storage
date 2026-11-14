@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.15] - 2026-11-13
+
 ### Added
 
 - `GraphConfig.label_dict_divergence` (`LabelDictDivergencePolicy`:
@@ -423,7 +425,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.14...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.15...HEAD
+[0.4.15]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.14...v0.4.15
 [0.4.14]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.13...v0.4.14
 [0.4.13]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.12...v0.4.13
 [0.4.12]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.11...v0.4.12
