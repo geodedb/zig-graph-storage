@@ -310,6 +310,50 @@ test "SONNY-6524: assignId records a foreign id and rejects conflicts" {
     try std.testing.expectEqualStrings("B", copy.getName(1).?);
 }
 
+test "SONNY-6527: getOrAssign refuses a new name once the id space is used up" {
+    const allocator = std.testing.allocator;
+    var dict = LabelDictionary.init(allocator);
+    defer dict.deinit();
+
+    const last = std.math.maxInt(u32) - 1;
+    try std.testing.expect(try dict.assignId("Last", last));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), dict.next_id);
+
+    // Known names still resolve; a new one fails and changes nothing.
+    try std.testing.expectEqual(last, try dict.getOrAssign("Last"));
+    try std.testing.expectError(error.LabelIdSpaceExhausted, dict.getOrAssign("New"));
+    try std.testing.expect(dict.getId("New") == null);
+    try std.testing.expectEqual(@as(u32, 1), dict.count());
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), dict.next_id);
+}
+
+test "SONNY-6527: loadFromFile accepts an id of maxInt(u32) and assigns no further ids" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(dir_path);
+    const path = try std.fs.path.join(allocator, &.{ dir_path, "labels.dict" });
+    defer allocator.free(path);
+
+    // A file written by a release build whose getOrAssign wrapped past the
+    // top of the id space.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendU32(&buf, allocator, 1);
+    try appendU32(&buf, allocator, 3);
+    try buf.appendSlice(allocator, "Top");
+    try appendU32(&buf, allocator, std.math.maxInt(u32));
+    try appendU32(&buf, allocator, Crc32.hash(buf.items));
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "labels.dict", .data = buf.items });
+
+    var dict = LabelDictionary.init(allocator);
+    defer dict.deinit();
+    try dict.loadFromFile(path);
+    try std.testing.expectEqualStrings("Top", dict.getName(std.math.maxInt(u32)).?);
+    try std.testing.expectError(error.LabelIdSpaceExhausted, dict.getOrAssign("Other"));
+}
+
 test "getId / getName lookups" {
     const allocator = std.testing.allocator;
     var dict = LabelDictionary.init(allocator);
