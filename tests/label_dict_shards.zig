@@ -582,3 +582,162 @@ test "SONNY-6527: a new label name and writes on a shard from another thread do 
     try expectShardsAgree(alloc, eng, "after names assigned during shard writes");
     try testing.expect(writer.written >= 4);
 }
+
+// ---------------------------------------------------------------------------
+// SONNY-6527 item 4: the divergence detail reaches the caller, not only
+// std.log (which a release consumer may compile out)
+// ---------------------------------------------------------------------------
+
+const has_label_dict_report = @hasField(gs.GraphConfig, "label_dict_report");
+
+/// Copies of the diagnostics one open/assign delivered (strings are only
+/// borrowed for the duration of the callback).
+const Collected = struct {
+    const Max = 32;
+    const Item = struct {
+        kind: []const u8,
+        action: []const u8,
+        shard: u32,
+        label_id: u32,
+        shard_label_id: u32,
+        label: [16]u8 = undefined,
+        label_len: usize = 0,
+        shard0_label: [16]u8 = undefined,
+        shard0_label_len: ?usize = null,
+        nodes: u64,
+        edges: u64,
+        indexes: u64,
+
+        fn labelSlice(it: *const Item) []const u8 {
+            return it.label[0..it.label_len];
+        }
+        fn shard0Slice(it: *const Item) ?[]const u8 {
+            return if (it.shard0_label_len) |n| it.shard0_label[0..n] else null;
+        }
+    };
+    items: [Max]Item = undefined,
+    n: usize = 0,
+
+    fn record(ctx: ?*anyopaque, d: anytype) void {
+        const self: *Collected = @ptrCast(@alignCast(ctx.?));
+        if (self.n == Max) return;
+        var it = Item{
+            .kind = @tagName(d.kind),
+            .action = @tagName(d.action),
+            .shard = d.shard,
+            .label_id = d.label_id,
+            .shard_label_id = d.shard_label_id,
+            .nodes = d.nodes,
+            .edges = d.edges,
+            .indexes = d.indexes,
+        };
+        it.label_len = @min(d.label.len, it.label.len);
+        @memcpy(it.label[0..it.label_len], d.label[0..it.label_len]);
+        if (d.shard0_label) |s| {
+            const n = @min(s.len, it.shard0_label.len);
+            @memcpy(it.shard0_label[0..n], s[0..n]);
+            it.shard0_label_len = n;
+        }
+        self.items[self.n] = it;
+        self.n += 1;
+    }
+};
+
+fn reportingConfig(c: *Collected) gs.GraphConfig {
+    var cfg = test_support.testConfig();
+    cfg.label_dict_report = .{
+        .ctx = c,
+        .func = struct {
+            fn f(ctx: ?*anyopaque, d: *const gs.LabelDictDiagnostic) void {
+                Collected.record(ctx, d);
+            }
+        }.f,
+    };
+    return cfg;
+}
+
+fn refusedOpenReportsDetail() !void {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(13);
+    var paths = try buildStore(alloc, td.path, uuid, xEdgeFromShard5);
+    defer paths.deinit(alloc);
+    try splitLikeOrderBy(alloc, &paths);
+
+    var c = Collected{};
+    if (ShardedGraphEngine.open(alloc, td.path, uuid, reportingConfig(&c))) |eng| {
+        eng.close() catch {};
+        return error.DivergedStoreOpened;
+    } else |err| try testing.expectEqual(error.LabelDictionaryDiverged, err);
+
+    // Exactly one finding: shard 5 names id 1 'Y', shard 0 'X', one edge on
+    // shard 5 uses it, and the open was refused.
+    try testing.expectEqual(@as(usize, 1), c.n);
+    const it = &c.items[0];
+    try testing.expectEqualStrings("id_in_use_diverged", it.kind);
+    try testing.expectEqualStrings("refused", it.action);
+    try testing.expectEqual(@as(u32, 5), it.shard);
+    try testing.expectEqual(@as(u32, 1), it.label_id);
+    try testing.expectEqualStrings("Y", it.labelSlice());
+    try testing.expectEqualStrings("X", it.shard0Slice().?);
+    try testing.expectEqual(@as(u64, 0), it.nodes);
+    try testing.expectEqual(@as(u64, 1), it.edges);
+    try testing.expectEqual(@as(u64, 0), it.indexes);
+}
+
+fn repairedOpenReportsEveryShard() !void {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(14);
+    var paths = try buildStore(alloc, td.path, uuid, noExtra);
+    defer paths.deinit(alloc);
+    try splitLikeOrderBy(alloc, &paths);
+
+    var c = Collected{};
+    const eng = try ShardedGraphEngine.open(alloc, td.path, uuid, reportingConfig(&c));
+    defer eng.close() catch {};
+
+    // One `rewritten` finding per shard 1..N-1, in shard order.
+    try testing.expectEqual(@as(usize, SHARD_COUNT - 1), c.n);
+    for (c.items[0..c.n], 1..) |*it, k| {
+        try testing.expectEqualStrings("rewritten", it.kind);
+        try testing.expectEqualStrings("rewritten", it.action);
+        try testing.expectEqual(@as(u32, @intCast(k)), it.shard);
+    }
+}
+
+fn assignConflictReportsDetail() !void {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    var c = Collected{};
+    const eng = try ShardedGraphEngine.create(alloc, td.path, uuidFor(15), reportingConfig(&c));
+    defer eng.close() catch {};
+    _ = try eng.getOrAssignLabel("A");
+    // Shard 7 holds "B" under an id shard 0 will not give it.
+    _ = try eng.shards[7].label_dict.assignId("B", 9);
+
+    try testing.expectError(error.LabelDictionaryDiverged, eng.getOrAssignLabel("B"));
+    try testing.expectEqual(@as(usize, 1), c.n);
+    const it = &c.items[0];
+    try testing.expectEqualStrings("name_id_conflict", it.kind);
+    try testing.expectEqualStrings("refused", it.action);
+    try testing.expectEqual(@as(u32, 7), it.shard);
+    try testing.expectEqual(@as(u32, 1), it.label_id);
+    try testing.expectEqual(@as(u32, 9), it.shard_label_id);
+    try testing.expectEqualStrings("B", it.labelSlice());
+}
+
+test "SONNY-6527: a refused open hands the caller the shard, id, both names and record counts" {
+    if (comptime has_label_dict_report) try refusedOpenReportsDetail() else return error.NoLabelDictReport;
+}
+
+test "SONNY-6527: a repairing open reports every shard it rewrote" {
+    if (comptime has_label_dict_report) try repairedOpenReportsEveryShard() else return error.NoLabelDictReport;
+}
+
+test "SONNY-6527: a name whose id differs on a shard is reported to the caller" {
+    if (comptime has_label_dict_report) try assignConflictReportsDetail() else return error.NoLabelDictReport;
+}
