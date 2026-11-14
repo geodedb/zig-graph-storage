@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.15] - 2026-11-13
+
+### Added
+
+- `GraphConfig.label_dict_divergence` (`LabelDictDivergencePolicy`:
+  `.reject`, default, or `.adopt_shard0`), `GraphEngine.assignLabelId`,
+  and `LabelDictionary.assignId` / `unassign` / `clone` (SONNY-6524).
+- `zig build bench-label-assign [-- <dir>]` times `getOrAssignLabel` for
+  new and existing names on a 16-shard store and a single engine
+  (SONNY-6524).
+
+### Changed
+
+- `ShardedGraphEngine.getOrAssignLabel` with a new name writes shard 0's
+  `labels.dict` first and then the other 15 shards' in parallel with shard
+  0's id, instead of all 16 one after another (32 serial fsyncs since
+  0.4.14). `bench-label-assign` on ext4/NVMe, same machine and load: 160 to
+  31 ms median per new name, 4.86 to 0.92 s for 30 (a single `GraphEngine`
+  is 10 ms). Existing names still write nothing. The calling thread waits
+  for every shard, so the caller's existing serialization of label
+  assignment covers the parallel writes; the injected allocator must be
+  thread-safe, as `open` already requires (SONNY-6524).
+
+### Fixed
+
+- A failed durable write of a new label name left the name in memory: the
+  call failed, but later calls found the name and never wrote it, and on a
+  `ShardedGraphEngine` the shards after the failing one were never given
+  it, so the next new name got a different id on them than on shard 0.
+  `GraphEngine.getOrAssignLabel` now removes the name again when the write
+  fails, and the sharded broadcast gives every shard shard 0's id
+  explicitly; a shard that already holds the name or the id differently
+  fails the call with `error.LabelDictionaryDiverged` (SONNY-6524).
+- `ShardedGraphEngine.open` did not compare shard label dictionaries. It
+  now rewrites a shard's `labels.dict` from shard 0's when the shard is
+  missing names (a crash or failed write during a new name) or names an id
+  that none of its records uses differently, and refuses with
+  `error.LabelDictionaryDiverged` (warning names the shard, id, both names
+  and record counts; nothing written) when one of the shard's nodes, edges
+  or declared indexes carries an id the shard names differently, as stores
+  split by geode's old ORDER BY path do. `.adopt_shard0` rewrites those
+  too, for callers whose ids all come from shard 0. No on-disk format
+  change. `test-label-dict-shards` (also under `test-integration`)
+  (SONNY-6524).
+
 ## [0.4.14] - 2026-11-13
 
 ### Changed
@@ -380,7 +425,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.14...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.15...HEAD
+[0.4.15]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.14...v0.4.15
 [0.4.14]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.13...v0.4.14
 [0.4.13]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.12...v0.4.13
 [0.4.12]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.11...v0.4.12

@@ -78,7 +78,37 @@ it leaves the new manifest with a `free.store` at least as new. Snapshots
 that a crash leaves behind the manifest are rejected by their stamp and
 rebuilt. `labels.dict` is not written by a checkpoint: label assignment is
 not WAL-logged, so `getOrAssignLabel` makes every new name durable (file
-fsync, rename, directory fsync) before it returns its id.
+fsync, rename, directory fsync) before it returns its id. If that write
+fails, the name is not kept in memory: the call fails and the next one
+assigns and writes it again (SONNY-6524).
+
+### Label dictionaries on a sharded store
+
+Each shard of a `ShardedGraphEngine` keeps its own `labels.dict`; shard 0
+chooses every id. `getOrAssignLabel` with a new name writes shard 0's
+dictionary first, then the other shards' in parallel with shard 0's id, so
+one new name costs about two durable writes in sequence rather than one per
+shard (`zig build bench-label-assign`). On disk each shard's dictionary is a
+subset of shard 0's whatever a crash interrupts. A shard whose write failed
+is left without the name; retrying, or reopening, completes it.
+
+`ShardedGraphEngine.open` compares every shard's dictionary with shard 0's
+before anything else writes:
+
+- a shard missing names shard 0 has (a crash or a failed write during a new
+  name), or naming an id that none of its records uses differently from
+  shard 0, has its `labels.dict` rewritten from shard 0's, with a warning;
+- a shard that names an id differently from shard 0 while one of its nodes,
+  edges or declared indexes carries that id makes the open fail with
+  `error.LabelDictionaryDiverged`. The warning logged names the shard, the
+  id, both names and the record counts; nothing on disk is changed. Stores
+  split by geode's old ORDER BY path (a label named in shard 0's dictionary
+  only, so the next name got a lower id on the other shards) take this path
+  when the other shards hold records of the first label.
+  `GraphConfig.label_dict_divergence = .adopt_shard0` instead rewrites the
+  shard from shard 0. Use it only when every label id written to any shard
+  came from shard 0 (`ShardedGraphEngine.getOrAssignLabel`, or names read
+  from shard 0's dictionary), as in geode.
 
 Releases up to 0.4.13 wrote the manifest and truncated the WAL before saving
 `free.store` and `labels.dict`. A store that crashed in that window opens

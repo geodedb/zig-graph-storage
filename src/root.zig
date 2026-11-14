@@ -133,6 +133,7 @@ pub const shard_manifest = @import("shard_manifest.zig");
 pub const sharded_engine = @import("sharded_engine.zig");
 pub const sharded_engine_2pc = @import("sharded_engine_2pc.zig");
 pub const sharded_recovery = @import("sharded_recovery.zig");
+pub const sharded_labels = @import("sharded_labels.zig");
 
 pub const GraphEngine = engine.GraphEngine;
 pub const ShardedGraphEngine = sharded_engine.ShardedGraphEngine;
@@ -153,9 +154,10 @@ pub const PropertyValue = types.PropertyValue;
 pub const StorageError = errors.StorageError;
 pub const GraphConfig = config.GraphConfig;
 pub const SyncMode = config.SyncMode;
+pub const LabelDictDivergencePolicy = config.LabelDictDivergencePolicy;
 pub const Metrics = metrics.Metrics;
 
-pub const version = "0.4.14";
+pub const version = "0.4.15";
 
 // ============================================================================
 // Unit Tests
@@ -176,7 +178,7 @@ test "re-exported types match source types" {
 }
 
 test "version is set" {
-    try std.testing.expectEqualStrings("0.4.14", version);
+    try std.testing.expectEqualStrings("0.4.15", version);
 }
 
 test {

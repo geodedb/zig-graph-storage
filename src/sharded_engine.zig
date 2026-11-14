@@ -23,6 +23,7 @@ const metrics_mod = @import("metrics.zig");
 const adj_store_mod = @import("adj_store.zig");
 const label_index_mod = @import("label_index.zig");
 const sharded_recovery = @import("sharded_recovery.zig");
+const sharded_labels = @import("sharded_labels.zig");
 const prop_store_mod = @import("prop_store.zig");
 
 const GraphConfig = config_mod.GraphConfig;
@@ -80,6 +81,31 @@ pub const OpenConcurrencyGauge = struct {
 /// Process-global instrumentation for the most recent `ShardedGraphEngine.open`.
 /// Reset at the start of every `open`. See `OpenConcurrencyGauge`.
 pub var open_concurrency_gauge: OpenConcurrencyGauge = .{};
+
+/// SONNY-6524: test instrumentation for `getOrAssignLabel`'s broadcast of a
+/// new name to shards 1..N-1. Counts the shard assignments that ran on a
+/// thread other than the caller's, so a test can tell a parallel broadcast
+/// from a serial one without timing anything. Not a production signal.
+pub const LabelBroadcastStats = struct {
+    off_caller_thread: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn reset(self: *LabelBroadcastStats) void {
+        if (!builtin.is_test) return;
+        self.off_caller_thread.store(0, .seq_cst);
+    }
+
+    pub fn record(self: *LabelBroadcastStats, caller: std.Thread.Id) void {
+        if (!builtin.is_test) return;
+        if (std.Thread.getCurrentId() != caller) _ = self.off_caller_thread.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn offCallerThread(self: *const LabelBroadcastStats) u32 {
+        return self.off_caller_thread.load(.seq_cst);
+    }
+};
+
+/// Process-global; see `LabelBroadcastStats`.
+pub var label_broadcast_stats: LabelBroadcastStats = .{};
 
 /// Worker context for the PARALLEL shard-open phase. Threads pull shard indices
 /// from a shared atomic counter and run the (fully independent) per-shard
@@ -358,6 +384,11 @@ pub const ShardedGraphEngine = struct {
         // AFTER the pool-teardown errdefer so Zig's LIFO closes shards first,
         // then tears down the pool — never the reverse.
         errdefer for (self.shards) |e| e.close() catch {};
+
+        // SONNY-6524: before anything else writes, bring every shard's label
+        // dictionary to shard 0's, or refuse a disagreement that records on
+        // the disagreeing shard depend on.
+        try sharded_labels.reconcileAtOpen(self, cfg.label_dict_divergence);
 
         _ = try sharded_recovery.reconcilePendingPrepares(self);
 
@@ -694,16 +725,28 @@ pub const ShardedGraphEngine = struct {
         };
     }
 
+    /// Label dictionary is global across shards: shard 0 assigns the id and
+    /// makes it durable, then shards 1..N-1 record the same pair in parallel
+    /// (SONNY-6524; see sharded_labels.zig). Hot-path addLabel(node, id) is
+    /// single-shard; the broadcast only fires when a new name is registered.
+    /// An existing name costs N hash lookups and no write.
+    ///
+    /// CONCURRENCY: as before, the caller serializes label assignment for
+    /// this graph (geode: per-graph `string_indexes_mutex` or the graph
+    /// lock); the call returns only after every per-shard worker has joined,
+    /// so that serialization covers the parallel section and no other
+    /// assignment can interleave a different id on any shard. Each worker
+    /// writes only its own shard's dictionary and directory. The injected
+    /// allocator must be thread-safe (the same precondition as `open`).
+    ///
+    /// ERRORS: if shard 0's write fails nothing is assigned anywhere. If a
+    /// shard k >= 1 fails, the call fails, shard k has the name unassigned
+    /// and the shards that succeeded keep shard 0's pair; retrying completes
+    /// the missing shards with the same id, and `open` after a crash fills
+    /// them in. `error.LabelDictionaryDiverged` when a shard already has the
+    /// name under a different id, or the id under a different name.
     pub fn getOrAssignLabel(self: *ShardedGraphEngine, label_name: []const u8) !LabelId {
-        // Label dictionary is global across shards: assign on shard 0 and
-        // broadcast the mapping so every shard's label_dict.get agrees on
-        // the id. Hot-path addLabel(node, id) is single-shard; this
-        // broadcast only fires when a new name is registered.
-        const id = try self.shards[0].getOrAssignLabel(label_name);
-        for (self.shards[1..]) |eng| {
-            _ = try eng.getOrAssignLabel(label_name);
-        }
-        return id;
+        return sharded_labels.getOrAssignLabel(self, label_name);
     }
 
     pub fn beginTxn(self: *ShardedGraphEngine) anyerror!TxnId {

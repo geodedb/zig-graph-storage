@@ -749,6 +749,31 @@ fn addIntegrationTests(
     const run_ckpt_side_crash = b.addRunArtifact(ckpt_side_crash_tests);
     ckpt_side_crash_step.dependOn(&run_ckpt_side_crash.step);
 
+    // SONNY-6524: shard label dictionaries — a failed labels.dict write is
+    // undone in memory, a new name reaches shards 1..N-1 in parallel, a crash
+    // mid-broadcast reopens consistent, and a split store is repaired at open
+    // or refused.
+    const label_dict_shards_step = b.step("test-label-dict-shards", "Run shard label-dictionary tests: failed writes are undone, new names reach shards 1..N-1 in parallel, crashes mid-broadcast reopen consistent, split stores are repaired at open or refused");
+    const label_dict_shards_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/label_dict_shards.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_label_dict_shards = b.addRunArtifact(label_dict_shards_tests);
+    label_dict_shards_step.dependOn(&run_label_dict_shards.step);
+
+    // TSan variant: the parallel per-shard label broadcast (one worker thread
+    // per shard). EXIT=0 and no race report = clean.
+    const tsan_label_dict_shards_step = b.step("test-label-dict-shards-tsan", "Run shard label-dictionary tests under ThreadSanitizer (zero races expected)");
+    const tsan_label_dict_shards_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/label_dict_shards.zig", target, .Debug, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+        .use_llvm = true,
+    });
+    tsan_label_dict_shards_tests.root_module.sanitize_thread = true;
+    tsan_label_dict_shards_step.dependOn(&b.addRunArtifact(tsan_label_dict_shards_tests).step);
+
     // At-rest encryption page tail (SONNY-6441) — the pager stores the AES-GCM
     // tag in the last 16 bytes of every encrypted page; fixed-record layouts
     // that reached the page end lost those bytes on every write + reload
@@ -912,6 +937,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_batch_replay_order.step);
     // Checkpoint crash points (SONNY-6491) are the same silent-loss class.
     integration_step.dependOn(&run_ckpt_side_crash.step);
+    // Shard label dictionaries (SONNY-6524) are the same lost-name class.
+    integration_step.dependOn(&run_label_dict_shards.step);
     // The encrypted-page tail guards (SONNY-6441) likewise.
     integration_step.dependOn(&run_tde_page_tail.step);
     integration_step.dependOn(&run_adj_tail_repair.step);
@@ -1006,6 +1033,18 @@ fn addBenchmarks(
     });
     const run_checksum_bench = b.addRunArtifact(checksum_bench_exe);
     checksum_bench_step.dependOn(&run_checksum_bench.step);
+
+    // SONNY-6524: cost of a new label name on a 16-shard store.
+    const label_assign_bench_step = b.step("bench-label-assign", "SONNY-6524 new label name latency: ShardedGraphEngine.getOrAssignLabel (shard 0, then shards 1..N-1) vs a single GraphEngine (pass a data directory on a real disk after --)");
+    const label_assign_bench_exe = b.addExecutable(.{
+        .name = "label-assign-bench",
+        .root_module = createModule(b, "benchmarks/label_assign_bench.zig", target, bench_optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_label_assign_bench = b.addRunArtifact(label_assign_bench_exe);
+    if (b.args) |args| run_label_assign_bench.addArgs(args);
+    label_assign_bench_step.dependOn(&run_label_assign_bench.step);
 
     // GAP-0900: WAL-batch A/B microbench (deferred multi-page txns).
     const wal_batch_ab_step = b.step("bench-wal-batch-ab", "GAP-0900 WAL-batch A/B: deferred multi-page txn throughput + syscall count");

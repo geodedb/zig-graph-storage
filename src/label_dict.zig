@@ -41,8 +41,51 @@ pub const LabelDictionary = struct {
         }
 
         const id = self.next_id;
-        self.next_id += 1;
+        try self.insert(label, id);
+        self.next_id = id + 1;
+        return id;
+    }
 
+    /// SONNY-6524: record `label` under `id`, an id another dictionary (shard
+    /// 0's) chose. Returns true when the pair is new, false when it is already
+    /// present. `error.LabelIdConflict` when `label` has a different id here
+    /// or `id` names a different label here; the dictionary is unchanged.
+    pub fn assignId(self: *LabelDictionary, label: []const u8, id: u32) !bool {
+        if (self.name_to_id.get(label)) |have| {
+            if (have == id) return false;
+            return error.LabelIdConflict;
+        }
+        if (self.id_to_name.contains(id)) return error.LabelIdConflict;
+        const next = std.math.add(u32, id, 1) catch return error.LabelIdConflict;
+        try self.insert(label, id);
+        self.next_id = @max(self.next_id, next);
+        return true;
+    }
+
+    /// SONNY-6524: undo the assignment of `label` that `getOrAssign` or
+    /// `assignId` just made, restoring `next_id` to `previous_next_id` (its
+    /// value before that call). Used when the durable write of a new name
+    /// fails, so a later call assigns and writes it again instead of finding
+    /// it in memory only.
+    pub fn unassign(self: *LabelDictionary, label: []const u8, previous_next_id: u32) void {
+        const kv = self.name_to_id.fetchRemove(label) orelse return;
+        _ = self.id_to_name.remove(kv.value);
+        self.allocator.free(kv.key);
+        self.next_id = previous_next_id;
+    }
+
+    /// SONNY-6524: a deep copy of `self` on `allocator`.
+    pub fn clone(self: *const LabelDictionary, allocator: Allocator) !LabelDictionary {
+        var out = LabelDictionary.init(allocator);
+        errdefer out.deinit();
+        var it = self.name_to_id.iterator();
+        while (it.next()) |e| try out.insert(e.key_ptr.*, e.value_ptr.*);
+        out.next_id = self.next_id;
+        return out;
+    }
+
+    /// Insert a pair whose name and id are both absent.
+    fn insert(self: *LabelDictionary, label: []const u8, id: u32) !void {
         const owned = try self.allocator.dupe(u8, label);
         errdefer self.allocator.free(owned);
 
@@ -50,8 +93,6 @@ pub const LabelDictionary = struct {
         errdefer _ = self.name_to_id.remove(owned);
 
         try self.id_to_name.put(id, owned);
-
-        return id;
     }
 
     /// Look up ID for a label string. Returns null if not found.
@@ -229,6 +270,44 @@ test "getOrAssign assigns incrementing IDs" {
     try std.testing.expectEqual(@as(u32, 1), id_b);
     try std.testing.expectEqual(@as(u32, 2), id_c);
     try std.testing.expectEqual(@as(u32, 3), dict.count());
+}
+
+test "SONNY-6524: unassign undoes a new name and restores next_id" {
+    const allocator = std.testing.allocator;
+    var dict = LabelDictionary.init(allocator);
+    defer dict.deinit();
+
+    _ = try dict.getOrAssign("A");
+    const before = dict.next_id;
+    const x = try dict.getOrAssign("X");
+    dict.unassign("X", before);
+    try std.testing.expect(dict.getId("X") == null);
+    try std.testing.expect(dict.getName(x) == null);
+    try std.testing.expectEqual(x, try dict.getOrAssign("Y"));
+    dict.unassign("not-there", 99); // no-op
+    try std.testing.expectEqual(x + 1, dict.next_id);
+}
+
+test "SONNY-6524: assignId records a foreign id and rejects conflicts" {
+    const allocator = std.testing.allocator;
+    var dict = LabelDictionary.init(allocator);
+    defer dict.deinit();
+
+    _ = try dict.getOrAssign("A"); // 0
+    try std.testing.expect(try dict.assignId("C", 2)); // leaves a hole at 1
+    try std.testing.expect(!try dict.assignId("C", 2));
+    try std.testing.expectEqual(@as(u32, 3), dict.next_id);
+    try std.testing.expectError(error.LabelIdConflict, dict.assignId("C", 1));
+    try std.testing.expectError(error.LabelIdConflict, dict.assignId("B", 2));
+    try std.testing.expect(try dict.assignId("B", 1));
+    try std.testing.expectEqual(@as(u32, 3), dict.next_id);
+    try std.testing.expectEqual(@as(u32, 3), dict.count());
+
+    var copy = try dict.clone(allocator);
+    defer copy.deinit();
+    try std.testing.expectEqual(dict.count(), copy.count());
+    try std.testing.expectEqual(dict.next_id, copy.next_id);
+    try std.testing.expectEqualStrings("B", copy.getName(1).?);
 }
 
 test "getId / getName lookups" {

@@ -2760,17 +2760,45 @@ pub const GraphEngine = struct {
         errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
 
         try self.ensureWritable();
-        const is_new = self.label_dict.getId(label) == null;
+        if (self.label_dict.getId(label)) |id| {
+            observability.endOperationSpan(__obs_span, true, "");
+            return id;
+        }
+        const previous_next_id = self.label_dict.next_id;
         const id = try self.label_dict.getOrAssign(label);
+        // SONNY-6524: a failed write must not leave the name in memory, where
+        // a later call would find it and never write it.
+        errdefer self.label_dict.unassign(label, previous_next_id);
         self.markDirty();
         // SONNY-6491: label assignment is not WAL-logged and labels.dict is the
         // only record of a name, so a new name is made durable (file fsync,
         // rename, directory fsync) before the id is returned and can reach a
         // committed record. A crash at any later point then finds the name.
         // New names are rare (schema-level); existing names cost nothing.
-        if (is_new) try engine_persist.saveLabelDictionaryDurable(self);
+        try engine_persist.saveLabelDictionaryDurable(self);
         observability.endOperationSpan(__obs_span, true, "");
         return id;
+    }
+
+    /// SONNY-6524: record `label` under `id`, the id another engine's
+    /// dictionary chose (ShardedGraphEngine: shard 0's), and make it durable
+    /// the way `getOrAssignLabel` does. No write when the pair is already
+    /// present. `error.LabelIdConflict` when this engine has `label` under a
+    /// different id or `id` under a different name. A failed write leaves the
+    /// pair unassigned in memory.
+    pub fn assignLabelId(self: *GraphEngine, label: []const u8, id: LabelId) !void {
+        var __obs_span = observability.startOperationSpan("assign_label_id");
+        defer __obs_span.end(null);
+        errdefer |err| observability.endOperationSpan(__obs_span, false, @errorName(err));
+
+        try self.ensureWritable();
+        const previous_next_id = self.label_dict.next_id;
+        if (try self.label_dict.assignId(label, id)) {
+            errdefer self.label_dict.unassign(label, previous_next_id);
+            self.markDirty();
+            try engine_persist.saveLabelDictionaryDurable(self);
+        }
+        observability.endOperationSpan(__obs_span, true, "");
     }
 
     // ── B+tree property indexes (delegated to engine_property_index.zig) ─
