@@ -81,6 +81,31 @@ pub const OpenConcurrencyGauge = struct {
 /// Reset at the start of every `open`. See `OpenConcurrencyGauge`.
 pub var open_concurrency_gauge: OpenConcurrencyGauge = .{};
 
+/// SONNY-6524: test instrumentation for `getOrAssignLabel`'s broadcast of a
+/// new name to shards 1..N-1. Counts the shard assignments that ran on a
+/// thread other than the caller's, so a test can tell a parallel broadcast
+/// from a serial one without timing anything. Not a production signal.
+pub const LabelBroadcastStats = struct {
+    off_caller_thread: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn reset(self: *LabelBroadcastStats) void {
+        if (!builtin.is_test) return;
+        self.off_caller_thread.store(0, .seq_cst);
+    }
+
+    pub fn record(self: *LabelBroadcastStats, caller: std.Thread.Id) void {
+        if (!builtin.is_test) return;
+        if (std.Thread.getCurrentId() != caller) _ = self.off_caller_thread.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn offCallerThread(self: *const LabelBroadcastStats) u32 {
+        return self.off_caller_thread.load(.seq_cst);
+    }
+};
+
+/// Process-global; see `LabelBroadcastStats`.
+pub var label_broadcast_stats: LabelBroadcastStats = .{};
+
 /// Worker context for the PARALLEL shard-open phase. Threads pull shard indices
 /// from a shared atomic counter and run the (fully independent) per-shard
 /// `GraphEngine.open` body — recovery + derived-index rebuild — into distinct
@@ -700,7 +725,9 @@ pub const ShardedGraphEngine = struct {
         // the id. Hot-path addLabel(node, id) is single-shard; this
         // broadcast only fires when a new name is registered.
         const id = try self.shards[0].getOrAssignLabel(label_name);
+        const caller = std.Thread.getCurrentId();
         for (self.shards[1..]) |eng| {
+            label_broadcast_stats.record(caller);
             _ = try eng.getOrAssignLabel(label_name);
         }
         return id;
