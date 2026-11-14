@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names, node/edge/index counts and name counts — so the detail survives a
   release build whose `log_level` drops `std.log.warn`. Default null; the
   warnings are unchanged (SONNY-6527).
+- `AdjStore.forEachEdgeIdOnPage` and `zig build bench-edge-prop-set
+  [-- <dir>]` (ns and WAL bytes per head-moving edge property set)
+  (SONNY-6529).
 
 ### Changed
 
@@ -26,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint now takes the flag when it starts and puts it back when it
   fails, so a write that lands during a checkpoint is persisted by the next
   one instead of being forgotten (SONNY-6527).
+- `GraphEngine.setEdgeProperty` no longer WAL-images the source's node
+  page (it does not change). A head-moving set logs the property, `.adj_out`
+  and `.in_idx` pages only: 24,826 instead of 33,068 WAL bytes and 72 instead
+  of 122 µs per set at the default 8 KiB page in deferred sync
+  (`bench-edge-prop-set`, median of 7 x 2,000 sets on ext4/NVMe, same
+  binary). Consumers that rewrite `prop_head` in place themselves (geode's
+  `publishEdgePropHead`) may drop that image too; see "Pages a consumer
+  must image" in docs/operations.md (SONNY-6529).
 
 ### Fixed
 
@@ -35,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the same shard under per-shard locks (TSan:
   `markDirty` from `assignLabelId` vs `putNodeTxn`). The flag is atomic
   now; `test-label-dict-shards-tsan` covers it (SONNY-6527).
+- The first-access WAL-tail reconcile of the derived indexes ignored
+  `.adj_out` pages: an edge whose `prop_head` was rewritten in place in a
+  transaction that imaged the adjacency page but not the source's node
+  page kept its checkpoint-era `prop_head` in the edge index after a crash,
+  and its committed property was unreachable. The reconcile now resolves
+  every entry of a tail `.adj_out` page to its source node through the
+  loaded edge index and re-derives that node; the result is key-for-key
+  what a full rebuild gives. `test-edge-prop-crash` (also under
+  `test-integration`) (SONNY-6529).
 
 - `LabelDictionary.getOrAssign` computed `next_id = id + 1` without a
   bound: at `maxInt(u32)` a safe build panicked and a release build wrapped

@@ -1046,6 +1046,19 @@ fn addBenchmarks(
     if (b.args) |args| run_label_assign_bench.addArgs(args);
     label_assign_bench_step.dependOn(&run_label_assign_bench.step);
 
+    // SONNY-6529: head-moving edge property set with and without the source
+    // node-page image.
+    const edge_prop_set_bench_step = b.step("bench-edge-prop-set", "SONNY-6529 head-moving edge property set: ns and WAL bytes per set, setEdgeProperty vs consumer path with and without the source node-page image (pass a data directory on a real disk after --)");
+    const edge_prop_set_bench_exe = b.addExecutable(.{
+        .name = "edge-prop-set-bench",
+        .root_module = createModule(b, "benchmarks/edge_prop_set_bench.zig", target, bench_optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_edge_prop_set_bench = b.addRunArtifact(edge_prop_set_bench_exe);
+    if (b.args) |args| run_edge_prop_set_bench.addArgs(args);
+    edge_prop_set_bench_step.dependOn(&run_edge_prop_set_bench.step);
+
     // GAP-0900: WAL-batch A/B microbench (deferred multi-page txns).
     const wal_batch_ab_step = b.step("bench-wal-batch-ab", "GAP-0900 WAL-batch A/B: deferred multi-page txn throughput + syscall count");
     const wal_batch_ab_exe = b.addExecutable(.{

@@ -195,6 +195,24 @@ If WAL records fail decode or checksum validation, open now fails closed and
 `Recovery.last_failure` identifies the offending `wal/graph.wal` LSN and
 failure kind.
 
+### Pages a consumer must image
+
+The derived indexes (label, property chain, edge, edge existence) are
+loaded from their checkpoint snapshots and the pages the committed WAL tail
+touched are re-derived on first access. A consumer that writes store pages
+itself (`logPagePublic`) must image every page it changed; the reconcile
+then finds the affected nodes as follows:
+
+- `.nodes` page: every node on it;
+- `.props` slab page: every live chain on it;
+- `.adj_out` page (releases after 0.4.15, SONNY-6529): the source node of
+  every entry on it, through the loaded edge index. An in-place `prop_head`
+  rewrite (`AdjStore.updateEdgePropHead`) therefore needs only its
+  `.adj_out` and `.in_idx` pages and the property pages; the source's node
+  page, which does not change, need not be imaged. Adding or removing an
+  edge still images the source's node page: a removed entry is no longer on
+  the adjacency page.
+
 ### Metrics
 
 When a `Metrics` struct is wired into the `Recovery` instance,
