@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.20] - 2026-11-15
+
 ### Security
 
 - **Topology snapshots sealed under at-rest encryption (SONNY-6616).**
@@ -669,7 +671,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.18...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.20...HEAD
+[0.4.20]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.18...v0.4.20
 [0.4.18]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.17...v0.4.18
 [0.4.17]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.16...v0.4.17
 [0.4.16]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.15...v0.4.16
