@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BufferPool.pageNewerThanDisk(file_id, page_id)` and
+  `PageFrame.newerThanDisk()` (caller holds the pool mutex): whether a
+  page's bytes on disk may be older than the pool's copy, so a reader that
+  reads pages straight from the pager must read this one through the pool.
+  True while the frame is dirty and while a flush's write of it is in
+  flight (`PageFrame.writes_in_flight`) (SONNY-6605).
+
+### Fixed
+
+- A flush (`flushAllParallel`, and `writeFrameBytes` under `flushAll`,
+  `flushDirty`, `flushDirtyPages` and a dirty eviction) clears a frame's
+  `dirty` flag when it copies the frame, then writes the copy with the pool
+  mutex dropped; in a parallel flush the frames of later waves wait for
+  their wave with the flag already clear. A reader that read pages straight
+  from disk and asked the pool which pages were dirty read the older disk
+  image in that window (geode's hydration scan quarantined a healthy graph
+  as `DataCorruption`, and hydrated an old property value: SONNY-6597). The
+  frame now counts the flushes whose write of it has not landed, from the
+  copy until the write is done or has failed, and `newerThanDisk` reports
+  it. `dirty` is cleared where it was, so flush selection and eviction are
+  unchanged (SONNY-6605).
+
 ## [0.4.17] - 2026-11-15
 
 ### Security

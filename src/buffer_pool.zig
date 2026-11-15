@@ -950,6 +950,7 @@ pub const BufferPool = struct {
                     // Undo previously pinned frames and bail
                     for (items[0..idx]) |item| {
                         _ = @atomicRmw(u32, &self.frames[item.frame_idx].pin_count, .Sub, 1, .acq_rel);
+                        self.frames[item.frame_idx].writes_in_flight -= 1;
                         @atomicStore(bool, &self.frames[item.frame_idx].dirty, true, .monotonic);
                     }
                     self.allocator.free(items);
@@ -959,6 +960,10 @@ pub const BufferPool = struct {
 
                 _ = @atomicRmw(u32, &frame.pin_count, .Add, 1, .acq_rel);
                 @atomicStore(bool, &frame.dirty, false, .monotonic);
+                // SONNY-6605: clean from here, but the disk keeps the older
+                // image until this frame's wave has written it
+                // (`newerThanDisk`); cleared below when the write is done.
+                frame.writes_in_flight += 1;
 
                 items[idx] = .{
                     .pager = p,
@@ -1036,6 +1041,7 @@ pub const BufferPool = struct {
             self.mutex.lockUncancelable(io);
             for (wave) |*item| {
                 _ = @atomicRmw(u32, &self.frames[item.frame_idx].pin_count, .Sub, 1, .acq_rel);
+                self.frames[item.frame_idx].writes_in_flight -= 1;
                 if (item.err) |e| {
                     @atomicStore(bool, &self.frames[item.frame_idx].dirty, true, .monotonic);
                     if (first_err == null) first_err = e;
@@ -1101,6 +1107,20 @@ pub const BufferPool = struct {
         return flushed;
     }
 
+    /// SONNY-6605: whether the bytes on disk of a page the pool holds may be
+    /// older than the pool's copy, so a reader that reads pages straight from
+    /// the pager (bypassing the pool) must read this one through the pool.
+    /// True while the frame is dirty and while a flush's write of it is in
+    /// flight: a flush clears `dirty` when it copies the frame, before its
+    /// write reaches the file. False for a page the pool does not hold.
+    pub fn pageNewerThanDisk(self: *BufferPool, file_id: FileId, page_id: PageId) bool {
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const idx = self.page_table.get(.{ .file_id = file_id, .page_id = page_id }) orelse return false;
+        return self.frames[idx].newerThanDisk();
+    }
+
     /// Get the frame index for a given frame pointer.
     pub fn frameIndex(self: *const BufferPool, frame: *const PageFrame) u32 {
         const base = @intFromPtr(self.frames.ptr);
@@ -1156,6 +1176,9 @@ pub const BufferPool = struct {
         const p = self.pagers[@intFromEnum(fid)] orelse return error.NoPagerRegistered;
 
         @atomicStore(bool, &frame.dirty, false, .monotonic);
+        // SONNY-6605: clean from here, but the disk keeps the older image
+        // until the write below lands (`newerThanDisk`).
+        frame.writes_in_flight += 1;
 
         var buf: [16384]u8 = undefined;
         std.debug.assert(self.page_size <= buf.len);
@@ -1164,11 +1187,13 @@ pub const BufferPool = struct {
         self.mutex.unlock(io);
         p.writePage(pid, buf[0..self.page_size]) catch |err| {
             self.mutex.lockUncancelable(io);
+            frame.writes_in_flight -= 1;
             // Restore dirty state if write failed so we can retry later.
             @atomicStore(bool, &frame.dirty, true, .monotonic);
             return err;
         };
         self.mutex.lockUncancelable(io);
+        frame.writes_in_flight -= 1;
 
         // PERF-0057: the write reached the OS page cache; this file now needs an
         // fsync before its data is durable. Flag it so the next checkpoint syncs
@@ -1395,6 +1420,7 @@ pub const BufferPool = struct {
         @atomicStore(u32, &frame.pin_count, 0, .release);
         frame.referenced = 0;
         frame.dirty = false;
+        frame.writes_in_flight = 0;
         frame.loading = false;
         frame.evicting = false;
         frame.lsn = 0;
@@ -2346,4 +2372,131 @@ test "PERF-0056: bounded scratch flushes more dirty pages than scratch capacity 
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// SONNY-6605: a flush clears a frame's dirty flag when it copies the frame and
+// writes the copy with the pool mutex dropped. A reader that reads pages
+// straight from the pager and asks the pool which pages to read through it
+// must be told the page is newer than disk until the write has landed.
+const Gate6605 = struct {
+    release: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(usize) = .init(0),
+
+    fn run(ctx: *anyopaque, _: *tp.TaskContext) void {
+        const self: *Gate6605 = @ptrCast(@alignCast(ctx));
+        _ = self.started.fetchAdd(1, .acq_rel);
+        while (!self.release.load(.acquire)) bpio().sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+};
+
+fn flushAllThread6605(pool: *BufferPool, err: *?anyerror) void {
+    pool.flushAll() catch |e| {
+        err.* = e;
+    };
+}
+
+fn frameDirtyLocked6605(pool: *BufferPool, idx: u32) bool {
+    pool.mutex.lockUncancelable(bpio());
+    defer pool.mutex.unlock(bpio());
+    return pool.frames[idx].dirty;
+}
+
+fn diskBodyIs6605(p: *Pager, page_id: PageId, pattern: u8) !bool {
+    var read_buf: [4096]u8 = undefined;
+    try p.readPage(page_id, &read_buf);
+    for (read_buf[page_mod.PAGE_HEADER_SIZE..]) |b| {
+        if (b != pattern) return false;
+    }
+    return true;
+}
+
+test "SONNY-6605: a page whose parallel flush write is in flight reads as newer than disk" {
+    const file = try createTempFile(".test_bp_6605_parallel");
+    defer cleanupTempFile(file, ".test_bp_6605_parallel");
+    const page_size: u32 = 4096;
+    var p = Pager.init(file, page_size);
+    try writeTestPage(&p, 0, 0x11);
+
+    var pool = try BufferPool.init(testing.allocator, page_size, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+    var thread_pool = try tp.ThreadPool.init(testing.allocator, .{ .max_threads = 1 });
+    defer thread_pool.deinit();
+    pool.setThreadPool(&thread_pool);
+
+    const frame = try pool.pin(.nodes, 0);
+    const idx = pool.frameIndex(frame);
+    @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x22);
+    pool.unpin(idx, true);
+    try testing.expect(pool.pageNewerThanDisk(.nodes, 0));
+
+    // Keep the pool's only worker busy: the flush copies the frame, clears
+    // its dirty flag, drops the mutex and waits for a write that cannot run.
+    var gate = Gate6605{};
+    _ = try thread_pool.submit(Gate6605.run, @ptrCast(&gate), .{});
+    while (gate.started.load(.acquire) == 0) try bpio().sleep(.fromMilliseconds(1), .awake);
+    defer gate.release.store(true, .release);
+
+    var flush_err: ?anyerror = null;
+    const flusher = try std.Thread.spawn(.{}, flushAllThread6605, .{ &pool, &flush_err });
+    var waited: usize = 0;
+    while (frameDirtyLocked6605(&pool, idx)) : (waited += 1) {
+        if (waited > 10_000) return error.FlushDidNotStart;
+        try bpio().sleep(.fromMilliseconds(1), .awake);
+    }
+
+    // In the window: the frame reads clean and the disk still holds the old
+    // image. The page is newer than disk.
+    try testing.expect(try diskBodyIs6605(&p, 0, 0x11));
+    const in_window = pool.pageNewerThanDisk(.nodes, 0);
+
+    gate.release.store(true, .release);
+    flusher.join();
+    try testing.expectEqual(@as(?anyerror, null), flush_err);
+    try testing.expect(in_window);
+
+    // The write landed: the disk holds the new image, and the page is not
+    // newer than disk any more.
+    try testing.expect(try diskBodyIs6605(&p, 0, 0x22));
+    try testing.expect(!pool.pageNewerThanDisk(.nodes, 0));
+}
+
+test "SONNY-6605: a failed flush write leaves the page dirty, and no write in flight" {
+    // A read-only file: every page write fails (EBADF), sequentially
+    // (`writeFrameBytes`) and in parallel (`flushAllParallel`).
+    const name = ".test_bp_6605_failed_write";
+    {
+        const file = try createTempFile(name);
+        var p = Pager.init(file, 4096);
+        try writeTestPage(&p, 0, 0x11);
+        try writeTestPage(&p, 1, 0x11);
+        file.close(bpio());
+    }
+    defer std.Io.Dir.cwd().deleteFile(bpio(), name) catch {};
+    const ro = try std.Io.Dir.cwd().openFile(bpio(), name, .{ .mode = .read_only });
+    defer ro.close(bpio());
+    var p = Pager.init(ro, 4096);
+
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+    pool.registerPager(.nodes, &p);
+
+    for ([_]PageId{ 0, 1 }) |page_id| {
+        const frame = try pool.pin(.nodes, page_id);
+        @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x22);
+        pool.unpin(pool.frameIndex(frame), true);
+    }
+
+    // Sequential.
+    if (pool.flushAll()) |_| return error.FlushOfReadOnlyFileSucceeded else |_| {}
+    try testing.expect(pool.pageNewerThanDisk(.nodes, 0));
+    for (pool.frames) |*f| try testing.expectEqual(@as(u16, 0), f.writes_in_flight);
+
+    // Parallel.
+    var thread_pool = try tp.ThreadPool.init(testing.allocator, .{ .max_threads = 2 });
+    defer thread_pool.deinit();
+    pool.setThreadPool(&thread_pool);
+    if (pool.flushAll()) |_| return error.FlushOfReadOnlyFileSucceeded else |_| {}
+    for ([_]PageId{ 0, 1 }) |page_id| try testing.expect(pool.pageNewerThanDisk(.nodes, page_id));
+    for (pool.frames) |*f| try testing.expectEqual(@as(u16, 0), f.writes_in_flight);
 }
