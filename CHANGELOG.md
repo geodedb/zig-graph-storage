@@ -26,6 +26,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them apart); it failed with `NoManifest`, which reads as a missing store.
   Absent manifests are still `NoManifest`. Callers matching `NoManifest`
   for these cases must match the new error. New `Manifest.readSelected`.
+- **The WAL is never truncated for being unreadable (SONNY-6622).** wal
+  v0.1.24 refuses, and leaves untouched, a log it cannot decode instead of
+  truncating it. `WalManager.init` maps `WalAuthFailed` and
+  `WalEncryptionMismatch` (records of another key, or plaintext records in
+  an encrypted store) to `EncryptionKeyMismatch`; `WalCorrupted` (a bad
+  record with valid records after it) stays as itself. A checkpoint whose
+  compaction wal refuses completes: the log keeps its records, stays
+  usable, and the refusal is counted (`WalManager.compactions_refused`) and
+  logged.
+- **`VerifyTool` no longer wipes encrypted WALs (SONNY-6622).** It opened
+  `wal/graph.wal` through `WalManager.init` on the store's directory,
+  without the at-rest key it was given and through a modifying open; on
+  wal <= 0.1.23 an encrypted log read as a torn tail and was truncated to
+  nothing, so an integrity check deleted every un-checkpointed commit. It
+  now opens the store's WAL read-only, copies it into a private temporary
+  directory ($TMPDIR or /tmp, files 0600, removed afterwards) and validates
+  the copy under the key.
+
+### Changed
+
+- wal v0.1.24 (fail-closed recovery and compaction) and thread_pool
+  v0.2.11 (the version wal v0.1.24 pins). The thread_pool v0.2.9 copy that
+  otel's chain brings is unchanged (pre-existing diamond).
 
 ### Added
 
@@ -41,6 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `restampSealed` (SONNY-6616).
 - `zig build test-tde-residuals` (also under `test-integration`)
   (SONNY-6616).
+- `zig build test-wal-fail-closed` (also under `test-integration`)
+  (SONNY-6622).
 
 ## [0.4.18] - 2026-11-15
 
