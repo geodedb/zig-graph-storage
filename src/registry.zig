@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const scoped_file = @import("scoped_file.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
 const Allocator = std.mem.Allocator;
 // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
 // for on-disk format; not authentication.
@@ -11,6 +12,10 @@ const owner_only_file_mode = 0o600;
 
 pub const REGISTRY_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'D', 'R', 'E', 'G', '1' };
 pub const REGISTRY_VERSION: u32 = 1;
+
+/// SONNY-6616: the uuid a data directory's registry cipher is bound to when
+/// the caller has none of its own (`Cipher.forKey(key, SEAL_UUID)`).
+pub const SEAL_UUID: [16]u8 = [_]u8{0} ** 16;
 
 pub const GraphEntry = struct {
     name: []const u8, // owned by registry
@@ -88,8 +93,21 @@ pub const GraphRegistry = struct {
     /// Entries: name_len(4) + name_bytes + uuid(16) + node_count(8) + edge_count(8)
     /// CRC32 covers header[0..40] + all entry bytes
     pub fn saveToFile(self: *const GraphRegistry, path: []const u8) !void {
+        return self.saveToFileWith(path, null);
+    }
+
+    /// SONNY-6616: save, sealed with `cipher` under at-rest encryption, else
+    /// in the plaintext layout. The registry names every graph (and counts
+    /// its nodes and edges). The envelope binds the file's base name and
+    /// `Kind.graph_registry`; the registry belongs to a data directory, not a
+    /// graph, so the caller picks the uuid the cipher is bound to
+    /// (`SEAL_UUID` unless it has a better one).
+    pub fn saveToFileWith(self: *const GraphRegistry, path: []const u8, cipher: ?*const side_file_crypto.Cipher) !void {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(self.allocator);
+        defer {
+            if (cipher != null) std.crypto.secureZero(u8, buf.items);
+            buf.deinit(self.allocator);
+        }
 
         // Header (without CRC - we'll compute it over everything)
         try buf.appendSlice(self.allocator, &REGISTRY_MAGIC); // 8
@@ -113,6 +131,9 @@ pub const GraphRegistry = struct {
         const crc = Crc32.hash(buf.items);
         try appendU32(&buf, self.allocator, crc);
 
+        const disk = try side_file_crypto.encode(self.allocator, cipher, .graph_registry, std.fs.path.basename(path), buf.items);
+        defer self.allocator.free(disk);
+
         // Write atomically
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
@@ -125,24 +146,40 @@ pub const GraphRegistry = struct {
             .resolve_beneath = true,
         });
         defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
-        try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf.items);
+        try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), disk);
         try tmp_file.sync(std.Io.Threaded.global_single_threaded.io());
 
         try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, std.Io.Threaded.global_single_threaded.io());
     }
 
     /// Load from file in GEODREG1 format.
+    /// A sealed file is refused with `error.SideFileEncrypted`.
     pub fn loadFromFile(self: *GraphRegistry, path: []const u8) !void {
+        _ = try self.loadFromFileWith(path, .{ .cipher = null, .require_sealed = false });
+    }
+
+    /// SONNY-6616: load under `policy`. Returns true when the file was in
+    /// the plaintext layout (written without a key, or by a build that did
+    /// not seal the registry: the caller saves it sealed).
+    pub fn loadFromFileWith(self: *GraphRegistry, path: []const u8, policy: side_file_crypto.ReadPolicy) !bool {
         const io = std.Io.Threaded.global_single_threaded.io();
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
+        const raw = blk: {
+            const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+            defer file.close(io);
+            const file_len = try file.length(io);
+            if (file_len > 64 * 1024 * 1024) return error.InvalidData;
+            break :blk try side_file_crypto.readWholeOpenFile(self.allocator, file);
+        };
+        const decoded = try side_file_crypto.decode(self.allocator, policy, .graph_registry, std.fs.path.basename(path), raw);
+        defer {
+            std.crypto.secureZero(u8, decoded.bytes);
+            self.allocator.free(decoded.bytes);
+        }
+        try self.parse(decoded.bytes);
+        return decoded.was_plaintext;
+    }
 
-        const file_len = try file.length(io);
-        if (file_len > 64 * 1024 * 1024) return error.InvalidData;
-        const data = try self.allocator.alloc(u8, @intCast(file_len));
-        defer self.allocator.free(data);
-        _ = try file.readPositionalAll(io, data, 0);
-
+    fn parse(self: *GraphRegistry, data: []const u8) !void {
         if (data.len < 44) return error.InvalidData;
 
         // Validate magic

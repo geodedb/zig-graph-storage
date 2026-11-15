@@ -81,6 +81,7 @@
 
 const std = @import("std");
 const scoped_file = @import("scoped_file.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -348,6 +349,10 @@ pub const Loaded = struct {
     /// read-only deployment would re-adopt the same corrupt file on every
     /// open and error on the same key range forever.
     invalidate_path: ?[]u8,
+    /// SONNY-6616: the "mapping" is a heap buffer holding the decrypted image
+    /// of a sealed snapshot (`loadSealed`), not an mmap of the file. Freed
+    /// (after zeroing) instead of unmapped; never madvise'd.
+    heap: bool = false,
 
     const WORD_BITS = @bitSizeOf(usize);
 
@@ -404,11 +409,13 @@ pub const Loaded = struct {
     /// full-payload scans (checkpoint-save iteration) — the load-time
     /// MADV_RANDOM would otherwise disable readahead for hundreds of MB.
     pub fn adviseSequential(self: *const Loaded) void {
+        if (self.heap) return;
         std.posix.madvise(self.mapping.ptr, self.mapping.len, std.posix.MADV.SEQUENTIAL) catch {};
     }
 
     /// Restore the point-lookup access hint (pairs with adviseSequential).
     pub fn adviseRandom(self: *const Loaded) void {
+        if (self.heap) return;
         std.posix.madvise(self.mapping.ptr, self.mapping.len, std.posix.MADV.RANDOM) catch {};
     }
 
@@ -431,7 +438,10 @@ pub const Loaded = struct {
     /// Unmap. See the UNMAP ORDERING note in the file header: callers must
     /// guarantee no reader still holds a `recordAt` slice.
     pub fn deinit(self: *Loaded) void {
-        std.posix.munmap(self.mapping);
+        if (self.heap) {
+            std.crypto.secureZero(u8, self.mapping);
+            self.allocator.free(self.mapping);
+        } else std.posix.munmap(self.mapping);
         self.allocator.free(self.verified);
         if (self.invalidate_path) |p| self.allocator.free(p);
         self.invalidate_path = null;
@@ -471,7 +481,21 @@ pub fn load(
     errdefer std.posix.munmap(mapping);
     // Lookups are binary searches / point probes — hint random access.
     std.posix.madvise(mapping.ptr, mapping.len, std.posix.MADV.RANDOM) catch {};
+    return try adopt(allocator, mapping, expected_magic, expected_record_size, false);
+}
 
+/// Validate a complete snapshot image (header, layout, eager meta-CRC) and
+/// wrap it. On success the returned `Loaded` owns `mapping`; on error the
+/// caller still does.
+fn adopt(
+    allocator: Allocator,
+    mapping: []align(std.heap.page_size_min) u8,
+    expected_magic: []const u8,
+    expected_record_size: u32,
+    heap: bool,
+) !Loaded {
+    const size = mapping.len;
+    if (size < HEADER_SIZE + META_CRC_SIZE) return error.InvalidFormat;
     if (!std.mem.eql(u8, mapping[0..8], expected_magic)) return error.InvalidFormat;
 
     const checkpoint_epoch = std.mem.readInt(u64, mapping[8..16], .little);
@@ -518,7 +542,203 @@ pub fn load(
         .verified = verified,
         .poisoned = std.atomic.Value(bool).init(false),
         .invalidate_path = null,
+        .heap = heap,
     };
+}
+
+// ---------------------------------------------------------------------------
+// SONNY-6616: sealed snapshots (at-rest encryption)
+// ---------------------------------------------------------------------------
+//
+// Under a key the snapshot image (the same layout as above) is sealed whole
+// with the side-file envelope (side_file_crypto: AES-256-GCM, bound to the
+// shard's uuid, the file name and `kind`). A sealed file cannot be mmap'd and
+// read in place: it is read, authenticated and decrypted into a page-aligned
+// heap buffer, which the `Loaded` owns (`heap = true`). The trade-off is
+// O(file) at load and the snapshot resident in memory, instead of O(header)
+// and paged on demand; without a key nothing changes. The heap base is not a
+// mapping of the file, so the mapped-inode rule does not constrain the
+// sealed restamp, which rewrites the file atomically.
+
+/// The complete image `write` produces, magic included, in one buffer
+/// (caller frees; it holds the plaintext records).
+fn buildImage(
+    allocator: Allocator,
+    magic: []const u8,
+    checkpoint_epoch: u64,
+    covered_lsn: u64,
+    record_size: u32,
+    payload: []const u8,
+) ![]u8 {
+    if (magic.len != 8) return error.InvalidMagicLength;
+    std.debug.assert(record_size > 0);
+    std.debug.assert(payload.len % record_size == 0);
+    const record_count: u64 = payload.len / record_size;
+    const nblocks: usize = (payload.len + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    const dir_len = nblocks * BLOCK_CRC_SIZE;
+    const total = HEADER_SIZE + payload.len + dir_len + META_CRC_SIZE;
+    const img = try allocator.alloc(u8, total);
+    errdefer allocator.free(img);
+
+    @memcpy(img[0..8], magic);
+    std.mem.writeInt(u64, img[8..16], checkpoint_epoch, .little);
+    std.mem.writeInt(u64, img[16..24], covered_lsn, .little);
+    std.mem.writeInt(u64, img[24..32], record_count, .little);
+    std.mem.writeInt(u32, img[32..36], record_size, .little);
+    std.mem.writeInt(u32, img[36..40], DEFAULT_BLOCK_SIZE, .little);
+    @memcpy(img[HEADER_SIZE..][0..payload.len], payload);
+    const dir = img[HEADER_SIZE + payload.len ..][0..dir_len];
+    var b: usize = 0;
+    while (b < nblocks) : (b += 1) {
+        const start = b * DEFAULT_BLOCK_SIZE;
+        const end = @min(start + DEFAULT_BLOCK_SIZE, payload.len);
+        std.mem.writeInt(u32, dir[b * BLOCK_CRC_SIZE ..][0..4], Crc32.hash(payload[start..end]), .little);
+    }
+    var meta = Crc32.init();
+    meta.update(img[8..HEADER_SIZE]);
+    meta.update(dir);
+    std.mem.writeInt(u32, img[total - META_CRC_SIZE ..][0..4], meta.final(), .little);
+    return img;
+}
+
+/// Seal `image` and replace `<dir_path>/<file_name>` atomically (tmp file,
+/// fsync, rename, directory fsync).
+fn writeSealedImage(
+    allocator: Allocator,
+    dir_path: []const u8,
+    file_name: []const u8,
+    image: []const u8,
+    cipher: *const side_file_crypto.Cipher,
+    kind: side_file_crypto.Kind,
+) !void {
+    const sealed = try cipher.seal(allocator, kind, file_name, image);
+    defer allocator.free(sealed);
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, file_name });
+    defer allocator.free(path);
+    try side_file_crypto.writeAtomic(allocator, path, sealed);
+    var gdir = try std.Io.Dir.cwd().openDir(ioT(), dir_path, .{ .iterate = true });
+    defer gdir.close(ioT());
+    const gdir_file = std.Io.File{ .handle = gdir.handle, .flags = .{ .nonblocking = false } };
+    try gdir_file.sync(ioT());
+}
+
+/// SONNY-6616: `writeAtomicReplace`, sealed under `cipher` as `kind`.
+pub fn writeAtomicReplaceSealed(
+    allocator: Allocator,
+    dir_path: []const u8,
+    file_name: []const u8,
+    magic: []const u8,
+    checkpoint_epoch: u64,
+    covered_lsn: u64,
+    record_size: u32,
+    payload: []const u8,
+    cipher: *const side_file_crypto.Cipher,
+    kind: side_file_crypto.Kind,
+) !void {
+    const image = try buildImage(allocator, magic, checkpoint_epoch, covered_lsn, record_size, payload);
+    defer {
+        std.crypto.secureZero(u8, image);
+        allocator.free(image);
+    }
+    try writeSealedImage(allocator, dir_path, file_name, image, cipher, kind);
+}
+
+/// SONNY-6616: `load` for a sealed snapshot. Returns null for an empty file
+/// (never written: rebuild). `error.SideFileNotSealed` for a file in the
+/// plaintext layout (written without the key, e.g. by 0.4.17, which did not
+/// seal topology snapshots), `error.SideFileAuthFailed` for one sealed under
+/// another key, modified, or copied from another shard or file; the caller
+/// rebuilds on any error, as for a torn or corrupt plaintext snapshot.
+pub fn loadSealed(
+    allocator: Allocator,
+    file: *std.Io.File,
+    expected_magic: []const u8,
+    expected_record_size: u32,
+    cipher: *const side_file_crypto.Cipher,
+    kind: side_file_crypto.Kind,
+    file_name: []const u8,
+) !?Loaded {
+    if (expected_magic.len != 8) return error.InvalidMagicLength;
+    const raw = try side_file_crypto.readWholeOpenFile(allocator, file.*);
+    defer allocator.free(raw);
+    if (raw.len == 0) return null;
+    if (!side_file_crypto.isSealed(raw)) return error.SideFileNotSealed;
+    const plain = try cipher.open(allocator, kind, file_name, raw);
+    defer {
+        std.crypto.secureZero(u8, plain);
+        allocator.free(plain);
+    }
+    const image = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(std.heap.page_size_min), plain.len);
+    errdefer {
+        std.crypto.secureZero(u8, image);
+        allocator.free(image);
+    }
+    @memcpy(image, plain);
+    return try adopt(allocator, image, expected_magic, expected_record_size, true);
+}
+
+/// SONNY-6616: `restampStamps` for a sealed snapshot: authenticate, check
+/// the old stamp's meta-CRC, write the new stamps, reseal and replace the
+/// file atomically (a sealed file cannot be patched in place). Same return
+/// contract: false (file untouched) when there is nothing safe to restamp —
+/// absent, empty, plaintext, unauthenticated, foreign or corrupt.
+pub fn restampSealed(
+    allocator: Allocator,
+    dir_path: []const u8,
+    file_name: []const u8,
+    expected_magic: []const u8,
+    expected_record_size: u32,
+    new_epoch: u64,
+    new_covered_lsn: u64,
+    cipher: *const side_file_crypto.Cipher,
+    kind: side_file_crypto.Kind,
+) !bool {
+    if (expected_magic.len != 8) return error.InvalidMagicLength;
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, file_name });
+    defer allocator.free(path);
+    const raw = side_file_crypto.readWholeFile(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(raw);
+    if (raw.len == 0 or !side_file_crypto.isSealed(raw)) return false;
+    const img = cipher.open(allocator, kind, file_name, raw) catch return false;
+    defer {
+        std.crypto.secureZero(u8, img);
+        allocator.free(img);
+    }
+    if (img.len < HEADER_SIZE + META_CRC_SIZE) return false;
+    if (!std.mem.eql(u8, img[0..8], expected_magic)) return false;
+    const record_count = std.mem.readInt(u64, img[24..32], .little);
+    const record_size = std.mem.readInt(u32, img[32..36], .little);
+    const block_size = std.mem.readInt(u32, img[36..40], .little);
+    if (record_size != expected_record_size) return false;
+    if (block_size < MIN_BLOCK_SIZE or block_size > MAX_BLOCK_SIZE) return false;
+    const m = std.math;
+    const payload_len = m.mul(usize, m.cast(usize, record_count) orelse return false, record_size) catch return false;
+    const nblocks = if (payload_len == 0) 0 else (payload_len - 1) / block_size + 1;
+    const dir_off = m.add(usize, HEADER_SIZE, payload_len) catch return false;
+    const dir_len = m.mul(usize, nblocks, BLOCK_CRC_SIZE) catch return false;
+    const meta_off = m.add(usize, dir_off, dir_len) catch return false;
+    const total = m.add(usize, meta_off, META_CRC_SIZE) catch return false;
+    if (total != img.len) return false;
+
+    if (std.mem.readInt(u64, img[8..16], .little) == new_epoch and
+        std.mem.readInt(u64, img[16..24], .little) == new_covered_lsn) return true;
+
+    var old_meta = Crc32.init();
+    old_meta.update(img[8..HEADER_SIZE]);
+    old_meta.update(img[dir_off..meta_off]);
+    if (std.mem.readInt(u32, img[meta_off..][0..4], .little) != old_meta.final()) return false;
+
+    std.mem.writeInt(u64, img[8..16], new_epoch, .little);
+    std.mem.writeInt(u64, img[16..24], new_covered_lsn, .little);
+    var new_meta = Crc32.init();
+    new_meta.update(img[8..HEADER_SIZE]);
+    new_meta.update(img[dir_off..meta_off]);
+    std.mem.writeInt(u32, img[meta_off..][0..4], new_meta.final(), .little);
+    try writeSealedImage(allocator, dir_path, file_name, img, cipher, kind);
+    return true;
 }
 
 /// In-place sort of fixed-width records inside `payload`. `lessThan` compares

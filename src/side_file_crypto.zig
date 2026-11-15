@@ -56,13 +56,41 @@ pub const OVERHEAD: usize = HEADER_SIZE + TAG_SIZE; // 40
 const KDF_SALT = "graph-storage side-file key (SONNY-6590)";
 const KDF_INFO = "aes-256-gcm v1";
 
-/// What a sealed file holds. Bound into the associated data.
+/// What a sealed file holds. Bound into the associated data (header byte 9).
+///
+/// SONNY-6616: non-exhaustive. 1..127 are graph-storage's (the named values;
+/// the rest reserved for later graph-storage files); 128..255 belong to the
+/// consumer, which seals its own files with `Cipher` and `Kind.consumer(n)`
+/// instead of borrowing one of graph-storage's kinds. 0 is never used. The
+/// header byte is unchanged, so files sealed by 0.4.17 read as before.
 pub const Kind = enum(u8) {
     label_dict = 1,
     prop_chain_index = 2,
     ordered_index = 3,
     index_catalog = 4,
     btree_index = 5,
+    /// SONNY-6616: `edges.idx` (edge id, source, target, relationship-type
+    /// id, property head, public id per relationship).
+    edge_index = 6,
+    /// SONNY-6616: `edges_exist.idx` (source, target, relationship-type id,
+    /// edge id per relationship).
+    edge_exist_index = 7,
+    /// SONNY-6616: `graph_registry.dat` (graph names, uuids, counts).
+    graph_registry = 8,
+    _,
+
+    pub const consumer_first: u8 = 128;
+
+    /// The consumer's kind `n` (0..127), header byte `128 + n`.
+    pub fn consumer(comptime n: u7) Kind {
+        return @enumFromInt(@as(u8, consumer_first) + n);
+    }
+
+    /// True for graph-storage's own range (1..127).
+    pub fn isLibrary(k: Kind) bool {
+        const v = @intFromEnum(k);
+        return v != 0 and v < consumer_first;
+    }
 };
 
 pub const Error = error{

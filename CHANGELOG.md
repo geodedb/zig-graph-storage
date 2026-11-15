@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Topology snapshots sealed under at-rest encryption (SONNY-6616).**
+  `edges.idx` and `edges_exist.idx` hold one record per relationship (edge
+  id, source, target, relationship-type id; `edges.idx` also the
+  property-chain head and public id): the graph's complete topology, in
+  plaintext next to the encrypted adjacency pages. Under a key they are now
+  sealed (`side_file_crypto` kinds `edge_index`, `edge_exist_index`) and
+  decrypted into memory at load instead of memory-mapped (O(file) at open,
+  resident). A plaintext one (0.4.17 wrote them so) is emptied when read and
+  rebuilt sealed; one that fails authentication is rebuilt. No manifest
+  change: 0.4.17 rebuilds a sealed snapshot it cannot read.
+- **A wrong key is `error.EncryptionKeyMismatch` (SONNY-6616).** When no
+  manifest slot authenticates under the configured key and at least one
+  failed its HMAC, the open fails with `EncryptionKeyMismatch` (another
+  key, no key at write time, or modified manifests: the HMAC cannot tell
+  them apart); it failed with `NoManifest`, which reads as a missing store.
+  Absent manifests are still `NoManifest`. Callers matching `NoManifest`
+  for these cases must match the new error. New `Manifest.readSelected`.
+
+### Added
+
+- `side_file_crypto.Kind` is non-exhaustive: 1..127 graph-storage's,
+  128..255 the consumer's (`Kind.consumer(n)`, `Kind.isLibrary`), so a
+  consumer seals its own files without borrowing a library kind. Header
+  byte unchanged (SONNY-6616).
+- `GraphRegistry.saveToFileWith` / `loadFromFileWith` and
+  `registry.SEAL_UUID`: the registry (graph names) sealed under a key;
+  `loadFromFile` refuses a sealed registry with `SideFileEncrypted`
+  (SONNY-6616).
+- `sorted_index_snapshot.writeAtomicReplaceSealed`, `loadSealed`,
+  `restampSealed` (SONNY-6616).
+- `zig build test-tde-residuals` (also under `test-integration`)
+  (SONNY-6616).
+
 ## [0.4.17] - 2026-11-15
 
 ### Security

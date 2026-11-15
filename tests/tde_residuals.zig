@@ -155,6 +155,27 @@ test "SONNY-6616: one manifest slot that fails its HMAC is skipped as before whe
 // 2. consumer kinds
 // ---------------------------------------------------------------------------
 
+test "SONNY-6616: side_file_crypto kinds 128..255 belong to the consumer and are bound like graph-storage's" {
+    const alloc = testing.allocator;
+    var c = crypto.Cipher.init(KEY, uuidFor(4));
+    defer c.deinit();
+    const mine = crypto.Kind.consumer(0);
+    const other = crypto.Kind.consumer(1);
+    try testing.expectEqual(@as(u8, 128), @intFromEnum(mine));
+    try testing.expectEqual(@as(u8, 255), @intFromEnum(crypto.Kind.consumer(127)));
+    try testing.expect(!crypto.Kind.isLibrary(mine));
+    try testing.expect(crypto.Kind.isLibrary(.label_dict));
+
+    const sealed = try c.seal(alloc, mine, "consumer.idx", "consumer payload");
+    defer alloc.free(sealed);
+    try testing.expectEqual(@as(u8, 128), sealed[9]);
+    const plain = try c.open(alloc, mine, "consumer.idx", sealed);
+    defer alloc.free(plain);
+    try testing.expectEqualStrings("consumer payload", plain);
+    try testing.expectError(error.SideFileAuthFailed, c.open(alloc, other, "consumer.idx", sealed));
+    try testing.expectError(error.SideFileAuthFailed, c.open(alloc, .prop_chain_index, "consumer.idx", sealed));
+}
+
 // ---------------------------------------------------------------------------
 // 3. topology snapshots
 // ---------------------------------------------------------------------------
@@ -349,4 +370,52 @@ test "SONNY-6616: sealed topology snapshots survive a crash and recovery with no
         try testing.expect(try hasEdge(eng, t.b, t.a, t.rel));
     }
     try expectTopologyHidden(alloc, td.path, gp, t);
+}
+
+// ---------------------------------------------------------------------------
+// 4. graph registry
+// ---------------------------------------------------------------------------
+
+const GRAPH_NAME = "Zq6616PatientsGraph";
+
+test "SONNY-6616: GraphRegistry.saveToFileWith seals the graph names; loadFromFileWith reads them back and refuses what it must" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const path = try std.fmt.allocPrint(alloc, "{s}/graph_registry.dat", .{td.path});
+    defer alloc.free(path);
+
+    var c = crypto.Cipher.init(KEY, gs.registry.SEAL_UUID);
+    defer c.deinit();
+    {
+        var reg = gs.registry.GraphRegistry.init(alloc);
+        defer reg.deinit();
+        try reg.addGraph(GRAPH_NAME, uuidFor(9));
+        try reg.saveToFileWith(path, &c);
+    }
+    try testing.expect(!try anyFileHolds(alloc, td.path, GRAPH_NAME));
+    {
+        var reg = gs.registry.GraphRegistry.init(alloc);
+        defer reg.deinit();
+        try testing.expect(!try reg.loadFromFileWith(path, .{ .cipher = &c, .require_sealed = true }));
+        try testing.expect(reg.findByName(GRAPH_NAME) != null);
+        // Without the key: refused, not misread.
+        try testing.expectError(error.SideFileEncrypted, reg.loadFromFile(path));
+        var other = crypto.Cipher.init(OTHER_KEY, gs.registry.SEAL_UUID);
+        defer other.deinit();
+        try testing.expectError(error.SideFileAuthFailed, reg.loadFromFileWith(path, .{ .cipher = &other, .require_sealed = true }));
+    }
+    // A plaintext registry (written without a key) loads only when allowed.
+    {
+        var reg = gs.registry.GraphRegistry.init(alloc);
+        defer reg.deinit();
+        try reg.addGraph(GRAPH_NAME, uuidFor(9));
+        try reg.saveToFile(path);
+    }
+    try testing.expect(try anyFileHolds(alloc, td.path, GRAPH_NAME));
+    var reg = gs.registry.GraphRegistry.init(alloc);
+    defer reg.deinit();
+    try testing.expectError(error.SideFileNotSealed, reg.loadFromFileWith(path, .{ .cipher = &c, .require_sealed = true }));
+    try testing.expect(try reg.loadFromFileWith(path, .{ .cipher = &c, .require_sealed = false }));
+    try testing.expect(reg.findByName(GRAPH_NAME) != null);
 }

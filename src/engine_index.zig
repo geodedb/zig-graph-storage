@@ -23,6 +23,7 @@ const label_index_mod = @import("label_index.zig");
 const property_chain_index_mod = @import("property_chain_index.zig");
 const file_manager_mod = @import("file_manager.zig");
 const engine_persist = @import("engine_persist.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
 
 /// File names of the two sorted edge snapshots, shared with FileManager so
 /// the atomic-replace save (tmp + rename) and the fd reopen target the same
@@ -829,20 +830,77 @@ pub fn restampCleanDerivedSnapshots(
             if (restamped) engine.metrics.derived_index_restamps += 1;
         }
     }
+    // SONNY-6616: under a key the topology snapshots are sealed; a sealed
+    // file is restamped by rewriting it (atomically) and the fd reopened.
+    var topo_cipher = engine_persist.sideCipher(engine);
+    defer if (topo_cipher) |*c| c.deinit();
     if (edge_clean) {
         if (engine.file_manager.getFile(.edge_idx)) |f| {
-            if (try sorted_snapshot.restampStamps(engine.allocator, f, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE, epoch, covered_lsn)) {
+            const restamped = if (topo_cipher) |*c|
+                try sorted_snapshot.restampSealed(engine.allocator, engine.graph_dir.path, EDGE_IDX_NAME, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE, epoch, covered_lsn, c, .edge_index)
+            else
+                try sorted_snapshot.restampStamps(engine.allocator, f, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE, epoch, covered_lsn);
+            if (restamped) {
+                if (topo_cipher != null) try engine.file_manager.reopenFile(.edge_idx);
                 engine.metrics.derived_index_restamps += 1;
             }
         }
     }
     if (edge_exist_clean) {
         if (engine.file_manager.getFile(.edge_exist_idx)) |f| {
-            if (try sorted_snapshot.restampStamps(engine.allocator, f, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE, epoch, covered_lsn)) {
+            const restamped = if (topo_cipher) |*c|
+                try sorted_snapshot.restampSealed(engine.allocator, engine.graph_dir.path, EDGE_EXIST_IDX_NAME, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE, epoch, covered_lsn, c, .edge_exist_index)
+            else
+                try sorted_snapshot.restampStamps(engine.allocator, f, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE, epoch, covered_lsn);
+            if (restamped) {
+                if (topo_cipher != null) try engine.file_manager.reopenFile(.edge_exist_idx);
                 engine.metrics.derived_index_restamps += 1;
             }
         }
     }
+}
+
+/// SONNY-6616: write a topology snapshot, sealed under the store's key.
+fn saveTopologySnapshot(
+    engine: *GraphEngine,
+    name: []const u8,
+    magic: []const u8,
+    covered_lsn: u64,
+    record_size: u32,
+    payload: []const u8,
+    kind: side_file_crypto.Kind,
+) !void {
+    var cipher = engine_persist.sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
+    if (cipher) |*c| {
+        try sorted_snapshot.writeAtomicReplaceSealed(engine.allocator, engine.graph_dir.path, name, magic, engine.manifest.checkpoint_epoch, covered_lsn, record_size, payload, c, kind);
+    } else {
+        try sorted_snapshot.writeAtomicReplace(engine.allocator, engine.graph_dir.path, name, magic, engine.manifest.checkpoint_epoch, covered_lsn, record_size, payload);
+    }
+}
+
+/// SONNY-6616: load a topology snapshot: mmap'd without a key, decrypted
+/// into memory under one. A plaintext snapshot under a key (0.4.17 wrote
+/// them so) is emptied at once and the caller rebuilds; the rebuilt index
+/// is saved sealed at the next checkpoint.
+fn loadTopologySnapshot(
+    engine: *GraphEngine,
+    file: *std.Io.File,
+    name: []const u8,
+    magic: []const u8,
+    record_size: u32,
+    kind: side_file_crypto.Kind,
+) !?sorted_snapshot.Loaded {
+    var cipher = engine_persist.sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
+    const c = if (cipher) |*cc| cc else return sorted_snapshot.load(engine.allocator, file, magic, record_size);
+    return sorted_snapshot.loadSealed(engine.allocator, file, magic, record_size, c, kind, name) catch |err| {
+        if (err == error.SideFileNotSealed) {
+            file.setLength(std.Io.Threaded.global_single_threaded.io(), 0) catch {};
+            file.sync(std.Io.Threaded.global_single_threaded.io()) catch {};
+        }
+        return err;
+    };
 }
 
 // GAP warm-reopen P1: both edge snapshots now use the SORTED mmap container
@@ -883,16 +941,7 @@ fn saveEdgeIndex(engine: *GraphEngine, covered_lsn: u64) !void {
     if (ctx.i != n) return error.InvalidFormat;
 
     sorted_snapshot.sortRecords(payload, EDGE_RECORD_SIZE, edge_index_map_mod.recordLess);
-    try sorted_snapshot.writeAtomicReplace(
-        engine.allocator,
-        engine.graph_dir.path,
-        EDGE_IDX_NAME,
-        EDGE_SNAPSHOT_MAGIC,
-        engine.manifest.checkpoint_epoch,
-        covered_lsn,
-        EDGE_RECORD_SIZE,
-        payload,
-    );
+    try saveTopologySnapshot(engine, EDGE_IDX_NAME, EDGE_SNAPSHOT_MAGIC, covered_lsn, EDGE_RECORD_SIZE, payload, .edge_index);
     try engine.file_manager.reopenFile(.edge_idx);
 }
 
@@ -900,7 +949,7 @@ fn loadEdgeIndex(engine: *GraphEngine, file: *std.Io.File) !?index_snapshot_mod.
     // mmap-adopt: O(header + directory) instead of O(snapshot). Any error
     // (old GSEIDX2/3/4 magic, torn write, truncation, header/dir CRC)
     // propagates to materializeDerivedIndexes' `catch false` → clean rebuild.
-    var loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE)) orelse return null;
+    var loaded = (try loadTopologySnapshot(engine, file, EDGE_IDX_NAME, EDGE_SNAPSHOT_MAGIC, EDGE_RECORD_SIZE, .edge_index)) orelse return null;
     errdefer loaded.deinit();
     // I1 (P1 review): arm the one-shot bit-rot self-invalidation — a lazy
     // payload ChecksumMismatch zeroes the file's magic so the NEXT open
@@ -939,21 +988,12 @@ fn saveEdgeExistIndex(engine: *GraphEngine, covered_lsn: u64) !void {
     if (ctx.i != n) return error.InvalidFormat;
 
     sorted_snapshot.sortRecords(payload, EDGE_EXIST_RECORD_SIZE, edge_exist_index_mod.recordLess);
-    try sorted_snapshot.writeAtomicReplace(
-        engine.allocator,
-        engine.graph_dir.path,
-        EDGE_EXIST_IDX_NAME,
-        EDGE_EXIST_SNAPSHOT_MAGIC,
-        engine.manifest.checkpoint_epoch,
-        covered_lsn,
-        EDGE_EXIST_RECORD_SIZE,
-        payload,
-    );
+    try saveTopologySnapshot(engine, EDGE_EXIST_IDX_NAME, EDGE_EXIST_SNAPSHOT_MAGIC, covered_lsn, EDGE_EXIST_RECORD_SIZE, payload, .edge_exist_index);
     try engine.file_manager.reopenFile(.edge_exist_idx);
 }
 
 fn loadEdgeExistIndex(engine: *GraphEngine, file: *std.Io.File) !?index_snapshot_mod.Stamp {
-    var loaded = (try sorted_snapshot.load(engine.allocator, file, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE)) orelse return null;
+    var loaded = (try loadTopologySnapshot(engine, file, EDGE_EXIST_IDX_NAME, EDGE_EXIST_SNAPSHOT_MAGIC, EDGE_EXIST_RECORD_SIZE, .edge_exist_index)) orelse return null;
     errdefer loaded.deinit();
     const path = try std.fmt.allocPrint(engine.allocator, "{s}/{s}", .{ engine.graph_dir.path, EDGE_EXIST_IDX_NAME });
     defer engine.allocator.free(path);

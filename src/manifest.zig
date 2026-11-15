@@ -462,6 +462,30 @@ pub const Manifest = struct {
         return try deserializeWithKey(allocator, data, key);
     }
 
+    /// SONNY-6616: read slots A and B under `key` and pick the newer one, as
+    /// recovery does. A slot that cannot be read is skipped. When neither
+    /// slot can be used and at least one failed its HMAC
+    /// (`error.ManifestAuthFailed`: written under another key, or without
+    /// one, or modified), the result is `error.EncryptionKeyMismatch`
+    /// instead of `error.NoManifest`, which said the store was missing.
+    /// Only `key != null` can produce it: without a key the HMAC is not
+    /// checked.
+    pub fn readSelected(allocator: Allocator, path_a: []const u8, path_b: []const u8, key: ?[32]u8) !Manifest {
+        var auth_failed = false;
+        const a = readFromFileWithKey(allocator, path_a, key) catch |err| blk: {
+            if (err == error.ManifestAuthFailed) auth_failed = true;
+            break :blk null;
+        };
+        const b = readFromFileWithKey(allocator, path_b, key) catch |err| blk: {
+            if (err == error.ManifestAuthFailed) auth_failed = true;
+            break :blk null;
+        };
+        return selectManifest(a, b) catch |err| {
+            if (err == error.NoManifest and auth_failed) return error.EncryptionKeyMismatch;
+            return err;
+        };
+    }
+
     /// Pick the manifest with the higher counter.
     /// If both null, return error. If one null, return the other.
     pub fn selectManifest(a: ?Manifest, b: ?Manifest) !Manifest {
