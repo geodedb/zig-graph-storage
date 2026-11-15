@@ -800,6 +800,19 @@ fn addIntegrationTests(
     const run_tde_page_tail = b.addRunArtifact(tde_page_tail_tests);
     tde_page_tail_step.dependOn(&run_tde_page_tail.step);
 
+    // SONNY-6590: under at-rest encryption no schema name (label, relationship
+    // type, property key) or indexed value reaches disk in plaintext — every
+    // file of single and sharded stores is scanned after close, crash and
+    // reopen; <= 0.4.16 stores upgrade; foreign dictionaries are refused.
+    const tde_schema_names_step = b.step("test-tde-schema-names", "Run at-rest encryption schema-name tests: no label, relationship-type or property-key name or indexed value is on disk in plaintext after close, crash or reopen (single and sharded); <= 0.4.16 stores upgrade crash-safely; tampered or foreign side files are refused");
+    const tde_schema_names_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/tde_schema_names.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_tde_schema_names = b.addRunArtifact(tde_schema_names_tests);
+    tde_schema_names_step.dependOn(&run_tde_schema_names.step);
+
     // SONNY-6461: restore the adjacency entries a <= 0.4.11 encrypted store
     // lost to the AES-GCM tag tail, from the same edge's other-direction copy.
     const adj_tail_repair_step = b.step("test-adj-tail-repair", "Run legacy TDE page-tail adjacency repair tests: entries lost by <= 0.4.11 encrypted stores (v3 at 4 KiB, v1 at 8 KiB) are restored from their mirror; unrepairable ones are reported");
