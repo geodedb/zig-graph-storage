@@ -80,6 +80,11 @@ pub const WalManager = struct {
     /// arena because the arena pointer can only be resolved once it has
     /// stopped growing (i.e. at flush, not during collection).
     batch_ptrs: std.ArrayList([]const u8) = .empty,
+    /// SONNY-6622: checkpoint compactions the wal library refused (the log no
+    /// longer validates: `WalCorrupted`, `WalAuthFailed`,
+    /// `WalEncryptionMismatch`). The log keeps its records and stays usable;
+    /// the next open reports the damage.
+    compactions_refused: u64 = 0,
 
     const Span = struct { off: usize, len: usize };
 
@@ -108,11 +113,20 @@ pub const WalManager = struct {
     ) !WalManager {
         try ensureGraphIdentity(wal_dir, graph_uuid, config.create_identity_if_missing);
 
-        var inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, "graph.wal", .{
+        // SONNY-6622: wal 0.1.24 refuses, and leaves untouched, a log it
+        // cannot decode instead of truncating it. Records of the other key
+        // mode or that authenticate under no record's key mean the store's
+        // WAL was written under another key (or without one): the same
+        // refusal as a manifest that fails its HMAC. WalCorrupted (a bad
+        // record with valid records after it) passes through as itself.
+        var inner = wal_lib.WriteAheadLog.init(allocator, wal_dir, "graph.wal", .{
             .encryption_key = config.encryption_key,
             .manual_sync = true,
             .checkpoint = true,
-        });
+        }) catch |err| switch (err) {
+            error.WalAuthFailed, error.WalEncryptionMismatch => return error.EncryptionKeyMismatch,
+            else => return err,
+        };
         errdefer inner.deinit();
 
         if (inner.currentLsn() < start_lsn) {
@@ -427,8 +441,22 @@ pub const WalManager = struct {
     }
 
     /// Truncate WAL: compact entries up to the given LSN.
+    ///
+    /// SONNY-6622: wal 0.1.24 validates the whole log before it compacts and
+    /// refuses (file untouched, handle reopened) when a record no longer
+    /// validates. That is not fatal to the checkpoint that asked: every
+    /// record up to `up_to_lsn` is already in the pages and the manifest,
+    /// the log keeps them (recovery skips them), and later appends work. The
+    /// refusal is counted (`compactions_refused`) and logged; the next open
+    /// reports the damage. Any other error is returned.
     pub fn truncate(self: *WalManager, up_to_lsn: u64) !void {
-        try self.inner.compact(up_to_lsn);
+        self.inner.compact(up_to_lsn) catch |err| switch (err) {
+            error.WalCorrupted, error.WalAuthFailed, error.WalEncryptionMismatch => {
+                self.compactions_refused += 1;
+                std.log.warn("graph-storage: WAL compaction up to LSN {d} refused ({s}); the WAL keeps its records and stays usable, the next open reports the damage (SONNY-6622)", .{ up_to_lsn, @errorName(err) });
+            },
+            else => return err,
+        };
     }
 
     /// Current LSN (read-only accessor).

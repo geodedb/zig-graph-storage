@@ -303,7 +303,12 @@ the snapshot stays resident (about 44 bytes per relationship for
 with fails with `error.EncryptionKeyMismatch` (since 0.4.19; it used to be
 `error.NoManifest`, which read as a missing store): no manifest slot
 authenticates under the key. A store whose manifests are absent is still
-`error.NoManifest`.
+`error.NoManifest`. A WAL whose records do not decode under the key
+(another key's, or plaintext records in an encrypted store) refuses the
+open with the same error and is left as it is (SONNY-6622); a WAL with a
+bad record followed by valid ones is `error.WalCorrupted`. The offline
+verify tool (`VerifyTool`) checks a private copy of the WAL under the key
+and never modifies the store's.
 
 A sealed side file that fails authentication refuses the open (wrong key,
 modified, or copied from another graph or shard: `error.SideFileAuthFailed`);

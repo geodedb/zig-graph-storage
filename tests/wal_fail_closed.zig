@@ -187,3 +187,43 @@ test "SONNY-6622: a WAL of another key, or a plaintext WAL in an encrypted store
     const eng = try GraphEngine.open(alloc, td.path, uuid, configFor(KEY));
     try eng.close();
 }
+
+// ---------------------------------------------------------------------------
+// 3. refused compaction
+// ---------------------------------------------------------------------------
+
+test "SONNY-6622: a checkpoint whose WAL compaction is refused completes, and the engine keeps working" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(4);
+    const wp = try walPath(alloc, td.path, uuid);
+    defer alloc.free(wp);
+
+    const eng = try GraphEngine.create(alloc, td.path, uuid, configFor(KEY));
+    defer eng.close() catch {};
+    try eng.checkpoint();
+    for (0..32) |_| {
+        const id = try eng.allocNode();
+        try eng.putNode(id, test_support.emptyNode(1));
+    }
+    // Damage a record in the middle of the log behind the engine's back: the
+    // compaction's validation finds a bad record with valid ones after it.
+    {
+        const f = try std.Io.Dir.cwd().openFile(io, wp, .{ .mode = .read_write });
+        defer f.close(io);
+        const len = try f.length(io);
+        try testing.expect(len > 256);
+        var b: [1]u8 = undefined;
+        _ = try f.readPositionalAll(io, &b, len / 2);
+        b[0] ^= 0xFF;
+        try f.writePositionalAll(io, &b, len / 2);
+    }
+    const refused_before = eng.wal.compactions_refused;
+    try eng.checkpoint();
+    try testing.expectEqual(refused_before + 1, eng.wal.compactions_refused);
+    // Still usable: a write and another checkpoint go through.
+    const id = try eng.allocNode();
+    try eng.putNode(id, test_support.emptyNode(1));
+    try eng.checkpoint();
+}
