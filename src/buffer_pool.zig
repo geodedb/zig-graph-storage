@@ -2500,3 +2500,150 @@ test "SONNY-6605: a failed flush write leaves the page dirty, and no write in fl
     for ([_]PageId{ 0, 1 }) |page_id| try testing.expect(pool.pageNewerThanDisk(.nodes, page_id));
     for (pool.frames) |*f| try testing.expectEqual(@as(u16, 0), f.writes_in_flight);
 }
+
+// SONNY-6632: a frame dirtied again while one flush's write of it is in
+// flight can be taken by a second flush; the two writes must land in copy
+// order. And a flush that must make every earlier change durable (`flushAll`,
+// a checkpoint) must wait for the writes other flushes have in flight: their
+// frames were already clean when it looked.
+
+fn flushDirtyThread6632(pool: *BufferPool, done: *std.atomic.Value(bool), err: *?anyerror) void {
+    pool.flushDirty(std.math.maxInt(Lsn)) catch |e| {
+        err.* = e;
+    };
+    done.store(true, .release);
+}
+
+const FlushAllProbe6632 = struct {
+    pool: *BufferPool,
+    pager: *Pager,
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+    /// The disk image when `flushAll` returned held the second write.
+    durable_on_return: bool = false,
+
+    fn run(self: *FlushAllProbe6632) void {
+        self.pool.flushAll() catch |e| {
+            self.err = e;
+        };
+        self.durable_on_return = diskBodyIs6605(self.pager, 0, 0x22) catch false;
+        self.done.store(true, .release);
+    }
+};
+
+/// Wait up to `ms` for `flag`; true when it was set.
+fn waitFlag6632(flag: *std.atomic.Value(bool), ms: u64) bool {
+    var waited: u64 = 0;
+    while (!flag.load(.acquire)) : (waited += 1) {
+        if (waited >= ms) return false;
+        bpio().sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    return true;
+}
+
+/// Pool with one worker, page 0 on disk holding 0x11 and cached dirty with
+/// 0x22, and a parallel flush of it held in its write window (the worker is
+/// busy with `gate`). Returns the flusher thread.
+const HeldFlush6632 = struct {
+    file: std.Io.File,
+    name: []const u8,
+    p: Pager,
+    pool: BufferPool,
+    thread_pool: *tp.ThreadPool,
+    gate: Gate6605 = .{},
+    flush_err: ?anyerror = null,
+    flusher: ?std.Thread = null,
+    idx: u32 = 0,
+
+    fn start(self: *HeldFlush6632, name: []const u8) !void {
+        self.* = .{ .file = undefined, .name = name, .p = undefined, .pool = undefined, .thread_pool = undefined };
+        self.file = try createTempFile(name);
+        errdefer cleanupTempFile(self.file, name);
+        self.p = Pager.init(self.file, 4096);
+        try writeTestPage(&self.p, 0, 0x11);
+        self.pool = try BufferPool.init(testing.allocator, 4096, 4);
+        errdefer self.pool.deinit();
+        self.pool.registerPager(.nodes, &self.p);
+        self.thread_pool = try testing.allocator.create(tp.ThreadPool);
+        errdefer testing.allocator.destroy(self.thread_pool);
+        self.thread_pool.* = try tp.ThreadPool.init(testing.allocator, .{ .max_threads = 1 });
+        self.pool.setThreadPool(self.thread_pool);
+
+        const frame = try self.pool.pin(.nodes, 0);
+        self.idx = self.pool.frameIndex(frame);
+        @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x22);
+        self.pool.unpin(self.idx, true);
+
+        _ = try self.thread_pool.submit(Gate6605.run, @ptrCast(&self.gate), .{});
+        while (self.gate.started.load(.acquire) == 0) try bpio().sleep(.fromMilliseconds(1), .awake);
+        self.flusher = try std.Thread.spawn(.{}, flushAllThread6605, .{ &self.pool, &self.flush_err });
+        var waited: usize = 0;
+        while (frameDirtyLocked6605(&self.pool, self.idx)) : (waited += 1) {
+            if (waited > 10_000) return error.FlushDidNotStart;
+            try bpio().sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    fn release(self: *HeldFlush6632) void {
+        self.gate.release.store(true, .release);
+        if (self.flusher) |t| t.join();
+        self.flusher = null;
+    }
+
+    fn deinit(self: *HeldFlush6632) void {
+        self.release();
+        self.thread_pool.deinit();
+        testing.allocator.destroy(self.thread_pool);
+        self.pool.deinit();
+        cleanupTempFile(self.file, self.name);
+    }
+};
+
+test "SONNY-6632: two flushes of a frame dirtied again during the first write land in copy order" {
+    var h: HeldFlush6632 = undefined;
+    try h.start(".test_bp_6632_order");
+    defer h.deinit();
+
+    // The first flush copied 0x22 and waits to write it. Dirty the frame
+    // again with 0x33 and flush it on the sequential path.
+    const frame = try h.pool.pin(.nodes, 0);
+    @memset(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..], 0x33);
+    h.pool.unpin(h.idx, true);
+    var second_done = std.atomic.Value(bool).init(false);
+    var second_err: ?anyerror = null;
+    const second = try std.Thread.spawn(.{}, flushDirtyThread6632, .{ &h.pool, &second_done, &second_err });
+    // Give the second flush time to write ahead of the first (it does when
+    // writes are not ordered), then let the first write.
+    _ = waitFlag6632(&second_done, 200);
+    h.release();
+    second.join();
+    try testing.expectEqual(@as(?anyerror, null), h.flush_err);
+    try testing.expectEqual(@as(?anyerror, null), second_err);
+
+    // The frame holds 0x33 and reads clean: the disk must hold 0x33.
+    try testing.expect(!h.pool.pageNewerThanDisk(.nodes, 0));
+    const newest = try diskBodyIs6605(&h.p, 0, 0x33);
+    if (!newest) {
+        const older = try diskBodyIs6605(&h.p, 0, 0x22);
+        std.debug.print("SONNY-6632: the page reads clean with 0x33 cached and the disk holds {s}\n", .{if (older) "the older copy 0x22" else "neither copy"});
+    }
+    try testing.expect(newest);
+}
+
+test "SONNY-6632: flushAll waits for a write another flush has in flight" {
+    var h: HeldFlush6632 = undefined;
+    try h.start(".test_bp_6632_flushall");
+    defer h.deinit();
+
+    // A checkpoint's flushAll while another flush's write of page 0 is in
+    // flight: page 0 is clean in the pool, its new image is not on disk.
+    var probe = FlushAllProbe6632{ .pool = &h.pool, .pager = &h.p };
+    const t = try std.Thread.spawn(.{}, FlushAllProbe6632.run, .{&probe});
+    _ = waitFlag6632(&probe.done, 200);
+    h.release();
+    t.join();
+    try testing.expectEqual(@as(?anyerror, null), h.flush_err);
+    try testing.expectEqual(@as(?anyerror, null), probe.err);
+    if (!probe.durable_on_return) std.debug.print("SONNY-6632: flushAll returned while page 0's write was still in flight (the disk held the old image)\n", .{});
+    try testing.expect(probe.durable_on_return);
+}
