@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Two flushes of one frame could land out of order: a frame dirtied again
+  while a flush's write of it was in flight could be copied and written by
+  a second flush (`flushDirty`, `flushDirtyPages`, a sequential `flushAll`)
+  ahead of the first, which then landed the older copy: the page read clean
+  with the older image on disk. A flush now waits for a frame's write in
+  flight before it copies the frame (`writeFrameBytes`), and a parallel
+  `flushAll` waits for every write in flight before it selects, so writes of
+  a frame land in copy order (SONNY-6632).
+- `flushAll` and `flushDirty` returned while another flush's write was
+  still in flight: that frame was already clean, so they skipped it, and a
+  checkpoint could truncate the WAL before the page's new image was on
+  disk. They now wait for every write in flight
+  (`BufferPool.writes_in_flight_total`): before selecting, and for the
+  sequential paths again after the pass (SONNY-6632).
+
 ## [0.4.20] - 2026-11-15
 
 ### Security

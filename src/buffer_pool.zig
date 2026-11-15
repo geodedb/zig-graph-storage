@@ -202,6 +202,12 @@ pub const BufferPool = struct {
     // NEVER sleep forever. This is the v0.2.6 wait protocol made deadlock-proof,
     // not a new coordination model — the mutex discipline is identical.
     wait_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// SONNY-6632: page writes in flight, pool-wide (the sum of every frame's
+    /// `writes_in_flight`). Under `mutex`. A durability flush (`flushAll`,
+    /// `flushDirty`) waits for it to reach zero: the frames of those writes
+    /// were already clean when it looked, and their new image is not on disk
+    /// until the writes land.
+    writes_in_flight_total: u32 = 0,
     // PERF-0058 (pin-contention): a SEQLOCK generation counter that lets the
     // COMMON cache-HIT pin/unpin path run lock-free, so concurrent readers no
     // longer serialize on the pool-wide `mutex` (which collapsed aggregate
@@ -402,6 +408,35 @@ pub const BufferPool = struct {
             .clock = .awake,
         } };
         io.futexWaitTimeout(u32, &self.wait_gen.raw, expected_gen, timeout) catch {};
+    }
+
+    /// SONNY-6632: a flush copied `frame` and will write the copy. Caller
+    /// holds the mutex.
+    fn beginFrameWrite(self: *BufferPool, frame: *PageFrame) void {
+        frame.writes_in_flight += 1;
+        self.writes_in_flight_total += 1;
+    }
+
+    /// SONNY-6632: a flush's write of `frame` landed or failed; wakes the
+    /// flushes waiting for it. Caller holds the mutex.
+    fn endFrameWrite(self: *BufferPool, frame: *PageFrame) void {
+        frame.writes_in_flight -= 1;
+        self.writes_in_flight_total -= 1;
+        self.wakeFrameWaiters();
+    }
+
+    /// SONNY-6632: wait until no flush has a write of `frame` in flight, so
+    /// a newer copy is never written before an older one lands (the older
+    /// would overwrite it). Caller holds the mutex (dropped while waiting)
+    /// and a pin on `frame` or its eviction claim.
+    fn waitFrameWrites(self: *BufferPool, io: std.Io, frame: *const PageFrame) void {
+        while (frame.writes_in_flight != 0) self.waitFrameChange(io, self.wait_gen.load(.acquire));
+    }
+
+    /// SONNY-6632: wait until no flush has a write in flight. Caller holds
+    /// the mutex (dropped while waiting).
+    fn waitAllWrites(self: *BufferPool, io: std.Io) void {
+        while (self.writes_in_flight_total != 0) self.waitFrameChange(io, self.wait_gen.load(.acquire));
     }
 
     /// Increment the resident-page counter for `file_id`. Caller holds the mutex.
@@ -861,16 +896,21 @@ pub const BufferPool = struct {
     }
 
     /// Flush all dirty frames with LSN <= up_to_lsn to disk.
+    /// SONNY-6632: also waits for the writes other flushes have in flight,
+    /// before the pass (their frames are clean but not on disk) and after it
+    /// (a frame another flush took while this one dropped the mutex).
     pub fn flushDirty(self: *BufferPool, up_to_lsn: Lsn) !void {
         const io = bpio();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.waitAllWrites(io);
         for (self.frames, 0..) |*frame, i| {
             _ = i;
             if (frame.dirty and frame.valid and frame.lsn <= up_to_lsn) {
                 try self.flushFrame(frame);
             }
         }
+        self.waitAllWrites(io);
     }
 
     /// Flush all dirty frames to disk regardless of LSN.
@@ -883,11 +923,14 @@ pub const BufferPool = struct {
         const io = bpio();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        // SONNY-6632: as `flushDirty`.
+        self.waitAllWrites(io);
         for (self.frames) |*frame| {
             if (frame.dirty and frame.valid) {
                 try self.flushFrame(frame);
             }
         }
+        self.waitAllWrites(io);
     }
 
     /// Parallel flush: collect dirty frames under mutex, copy data, then
@@ -909,6 +952,13 @@ pub const BufferPool = struct {
         // window drops the mutex while frames are pin-bumped, every pin_count/
         // dirty mutation here is atomic (a concurrent fast-path unpin may race).
         self.mutex.lockUncancelable(io);
+        // SONNY-6632: the writes other flushes have in flight land first:
+        // their frames are clean but their new images are not on disk (this
+        // flush would return before them), and a frame dirtied again during
+        // one would be copied and could be written before it (the older copy
+        // landing last). The selection below then runs under one hold of the
+        // mutex, so no other flush starts a write in between.
+        self.waitAllWrites(io);
 
         // Count dirty frames
         var dirty_count: usize = 0;
@@ -950,7 +1000,7 @@ pub const BufferPool = struct {
                     // Undo previously pinned frames and bail
                     for (items[0..idx]) |item| {
                         _ = @atomicRmw(u32, &self.frames[item.frame_idx].pin_count, .Sub, 1, .acq_rel);
-                        self.frames[item.frame_idx].writes_in_flight -= 1;
+                        self.endFrameWrite(&self.frames[item.frame_idx]);
                         @atomicStore(bool, &self.frames[item.frame_idx].dirty, true, .monotonic);
                     }
                     self.allocator.free(items);
@@ -963,7 +1013,7 @@ pub const BufferPool = struct {
                 // SONNY-6605: clean from here, but the disk keeps the older
                 // image until this frame's wave has written it
                 // (`newerThanDisk`); cleared below when the write is done.
-                frame.writes_in_flight += 1;
+                self.beginFrameWrite(frame);
 
                 items[idx] = .{
                     .pager = p,
@@ -1041,7 +1091,7 @@ pub const BufferPool = struct {
             self.mutex.lockUncancelable(io);
             for (wave) |*item| {
                 _ = @atomicRmw(u32, &self.frames[item.frame_idx].pin_count, .Sub, 1, .acq_rel);
-                self.frames[item.frame_idx].writes_in_flight -= 1;
+                self.endFrameWrite(&self.frames[item.frame_idx]);
                 if (item.err) |e| {
                     @atomicStore(bool, &self.frames[item.frame_idx].dirty, true, .monotonic);
                     if (first_err == null) first_err = e;
@@ -1175,10 +1225,16 @@ pub const BufferPool = struct {
         const pid = frame.page_id;
         const p = self.pagers[@intFromEnum(fid)] orelse return error.NoPagerRegistered;
 
+        // SONNY-6632: one write of a frame at a time, in copy order. The
+        // caller found the frame dirty; another flush may have written it
+        // while this one waited.
+        self.waitFrameWrites(io, frame);
+        if (!@atomicLoad(bool, &frame.dirty, .acquire)) return;
+
         @atomicStore(bool, &frame.dirty, false, .monotonic);
         // SONNY-6605: clean from here, but the disk keeps the older image
         // until the write below lands (`newerThanDisk`).
-        frame.writes_in_flight += 1;
+        self.beginFrameWrite(frame);
 
         var buf: [16384]u8 = undefined;
         std.debug.assert(self.page_size <= buf.len);
@@ -1187,13 +1243,13 @@ pub const BufferPool = struct {
         self.mutex.unlock(io);
         p.writePage(pid, buf[0..self.page_size]) catch |err| {
             self.mutex.lockUncancelable(io);
-            frame.writes_in_flight -= 1;
+            self.endFrameWrite(frame);
             // Restore dirty state if write failed so we can retry later.
             @atomicStore(bool, &frame.dirty, true, .monotonic);
             return err;
         };
         self.mutex.lockUncancelable(io);
-        frame.writes_in_flight -= 1;
+        self.endFrameWrite(frame);
 
         // PERF-0057: the write reached the OS page cache; this file now needs an
         // fsync before its data is durable. Flag it so the next checkpoint syncs
