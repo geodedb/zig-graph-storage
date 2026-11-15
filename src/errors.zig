@@ -14,6 +14,12 @@ pub const StorageError = error{
     HmacMismatch,
     DataCorruption,
     ManifestAuthFailed,
+    /// SONNY-6616: no manifest slot of the store authenticates under the
+    /// configured at-rest key and at least one failed its HMAC: the store was
+    /// written under another key (or without one), or its manifests were
+    /// modified - the HMAC cannot tell these apart. Was reported as
+    /// `NoManifest`.
+    EncryptionKeyMismatch,
 
     // Not-found
     PageNotFound,
@@ -197,6 +203,7 @@ test "StorageError coherence guard — ad-hoc errors used by library code are de
     assertMember("DataCorruption");
     assertMember("HmacMismatch");
     assertMember("ManifestAuthFailed");
+    assertMember("EncryptionKeyMismatch");
 
     // Input / format parsing
     assertMember("InvalidData");

@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.20] - 2026-11-15
+
+### Security
+
+- **Topology snapshots sealed under at-rest encryption (SONNY-6616).**
+  `edges.idx` and `edges_exist.idx` hold one record per relationship (edge
+  id, source, target, relationship-type id; `edges.idx` also the
+  property-chain head and public id): the graph's complete topology, in
+  plaintext next to the encrypted adjacency pages. Under a key they are now
+  sealed (`side_file_crypto` kinds `edge_index`, `edge_exist_index`) and
+  decrypted into memory at load instead of memory-mapped (O(file) at open,
+  resident). A plaintext one (0.4.17 wrote them so) is emptied when read and
+  rebuilt sealed; one that fails authentication is rebuilt. No manifest
+  change: 0.4.17 rebuilds a sealed snapshot it cannot read.
+- **A wrong key is `error.EncryptionKeyMismatch` (SONNY-6616).** When no
+  manifest slot authenticates under the configured key and at least one
+  failed its HMAC, the open fails with `EncryptionKeyMismatch` (another
+  key, no key at write time, or modified manifests: the HMAC cannot tell
+  them apart); it failed with `NoManifest`, which reads as a missing store.
+  Absent manifests are still `NoManifest`. Callers matching `NoManifest`
+  for these cases must match the new error. New `Manifest.readSelected`.
+- **The WAL is never truncated for being unreadable (SONNY-6622).** wal
+  v0.1.24 refuses, and leaves untouched, a log it cannot decode instead of
+  truncating it. `WalManager.init` maps `WalAuthFailed` and
+  `WalEncryptionMismatch` (records of another key, or plaintext records in
+  an encrypted store) to `EncryptionKeyMismatch`; `WalCorrupted` (a bad
+  record with valid records after it) stays as itself. A checkpoint whose
+  compaction wal refuses completes: the log keeps its records, stays
+  usable, and the refusal is counted (`WalManager.compactions_refused`) and
+  logged.
+- **`VerifyTool` no longer wipes encrypted WALs (SONNY-6622).** It opened
+  `wal/graph.wal` through `WalManager.init` on the store's directory,
+  without the at-rest key it was given and through a modifying open; on
+  wal <= 0.1.23 an encrypted log read as a torn tail and was truncated to
+  nothing, so an integrity check deleted every un-checkpointed commit. It
+  now opens the store's WAL read-only, copies it into a private temporary
+  directory ($TMPDIR or /tmp, files 0600, removed afterwards) and validates
+  the copy under the key.
+
+### Changed
+
+- wal v0.1.25 (fail-closed recovery, compaction and `truncateAfter`;
+  v0.1.24 introduced the first two) and thread_pool v0.2.11 (the version
+  wal pins). The thread_pool v0.2.9 copy that
+  otel's chain brings is unchanged (pre-existing diamond).
+
+### Added
+
+- `side_file_crypto.Kind` is non-exhaustive: 1..127 graph-storage's,
+  128..255 the consumer's (`Kind.consumer(n)`, `Kind.isLibrary`), so a
+  consumer seals its own files without borrowing a library kind. Header
+  byte unchanged (SONNY-6616).
+- `GraphRegistry.saveToFileWith` / `loadFromFileWith` and
+  `registry.SEAL_UUID`: the registry (graph names) sealed under a key;
+  `loadFromFile` refuses a sealed registry with `SideFileEncrypted`
+  (SONNY-6616).
+- `sorted_index_snapshot.writeAtomicReplaceSealed`, `loadSealed`,
+  `restampSealed` (SONNY-6616).
+- `zig build test-tde-residuals` (also under `test-integration`)
+  (SONNY-6616).
+- `zig build test-wal-fail-closed` (also under `test-integration`)
+  (SONNY-6622).
+
 ## [0.4.18] - 2026-11-15
 
 ### Added
@@ -608,7 +671,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.18...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.20...HEAD
+[0.4.20]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.18...v0.4.20
 [0.4.18]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.17...v0.4.18
 [0.4.17]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.16...v0.4.17
 [0.4.16]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.15...v0.4.16

@@ -286,12 +286,29 @@ HMAC-SHA256 backup integrity.
 
 Encrypted: every store page, the WAL, and (since SONNY-6590) the side files
 that hold schema names or indexed values — `labels.dict`, `props.idx`,
-`ordered_propidx.snap`, `props.catalog`, `propidx_*.btree`
-(`docs/format-spec.md` §1.6). The manifests are authenticated (HMAC-SHA256),
-not encrypted. Not encrypted: `labels.idx`, `edges.idx`, `edges_exist.idx`,
-`prop_rev.idx` and `free.store` hold ids, counts and checksums only, but
-`edges.idx`/`edges_exist.idx` reveal which nodes are connected and by which
-relationship-type id. File sizes and modification times are visible.
+`ordered_propidx.snap`, `props.catalog`, `propidx_*.btree` — and (since
+SONNY-6616, 0.4.19) the topology snapshots `edges.idx` and `edges_exist.idx`
+(`docs/format-spec.md` §1.6). A consumer that saves its `GraphRegistry` with
+`saveToFileWith` gets `graph_registry.dat` (graph names) sealed too. The
+manifests are authenticated (HMAC-SHA256), not encrypted. Not encrypted:
+`labels.idx`, `prop_rev.idx` and `free.store` (ids, counts and checksums
+only). File sizes and modification times are visible.
+
+Under a key the topology snapshots are decrypted into memory when a graph
+opens instead of being memory-mapped: the open reads the whole file, and
+the snapshot stays resident (about 44 bytes per relationship for
+`edges.idx` and 28 for `edges_exist.idx`) rather than paged on demand.
+
+**Wrong key.** Opening a store with a key other than the one it was written
+with fails with `error.EncryptionKeyMismatch` (since 0.4.19; it used to be
+`error.NoManifest`, which read as a missing store): no manifest slot
+authenticates under the key. A store whose manifests are absent is still
+`error.NoManifest`. A WAL whose records do not decode under the key
+(another key's, or plaintext records in an encrypted store) refuses the
+open with the same error and is left as it is (SONNY-6622); a WAL with a
+bad record followed by valid ones is `error.WalCorrupted`. The offline
+verify tool (`VerifyTool`) checks a private copy of the WAL under the key
+and never modifies the store's.
 
 A sealed side file that fails authentication refuses the open (wrong key,
 modified, or copied from another graph or shard: `error.SideFileAuthFailed`);
