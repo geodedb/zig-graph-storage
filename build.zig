@@ -813,6 +813,19 @@ fn addIntegrationTests(
     const run_tde_schema_names = b.addRunArtifact(tde_schema_names_tests);
     tde_schema_names_step.dependOn(&run_tde_schema_names.step);
 
+    // SONNY-6616: at-rest encryption residuals: a wrong key is
+    // EncryptionKeyMismatch (it was NoManifest), side-file kinds 128..255 are
+    // the consumer's, and the topology snapshots (edges.idx,
+    // edges_exist.idx) are sealed.
+    const tde_residuals_step = b.step("test-tde-residuals", "Run at-rest encryption residual tests: a wrong key fails with EncryptionKeyMismatch (single and sharded), consumer side-file kinds, edges.idx / edges_exist.idx sealed under a key (reload, restamp, crash), and a plaintext or modified topology snapshot rebuilt sealed");
+    const tde_residuals_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/tde_residuals.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_tde_residuals = b.addRunArtifact(tde_residuals_tests);
+    tde_residuals_step.dependOn(&run_tde_residuals.step);
+
     // SONNY-6461: restore the adjacency entries a <= 0.4.11 encrypted store
     // lost to the AES-GCM tag tail, from the same edge's other-direction copy.
     const adj_tail_repair_step = b.step("test-adj-tail-repair", "Run legacy TDE page-tail adjacency repair tests: entries lost by <= 0.4.11 encrypted stores (v3 at 4 KiB, v1 at 8 KiB) are restored from their mirror; unrepairable ones are reported");
@@ -971,6 +984,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_tde_page_tail.step);
     // Schema names in plaintext under at-rest encryption (SONNY-6590).
     integration_step.dependOn(&run_tde_schema_names.step);
+    // ... and their residuals (SONNY-6616).
+    integration_step.dependOn(&run_tde_residuals.step);
     integration_step.dependOn(&run_adj_tail_repair.step);
     integration_step.dependOn(&run_page_checksum.step);
     integration_step.dependOn(&run_free_store_offline.step);
