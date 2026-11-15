@@ -486,7 +486,7 @@ under a key. Source: `src/side_file_crypto.zig`.
 |--------------|--------------------------------------------------------|
 | 0..8         | magic `00 00 00 00 'G' 'S' 'E' 'F'`                    |
 | 8            | envelope version (1)                                   |
-| 9            | kind: 1 labels.dict, 2 props.idx, 3 ordered_propidx.snap, 4 props.catalog, 5 propidx_*.btree |
+| 9            | kind: 1 labels.dict, 2 props.idx, 3 ordered_propidx.snap, 4 props.catalog, 5 propidx_*.btree, 6 edges.idx, 7 edges_exist.idx, 8 graph_registry.dat (SONNY-6616); 9..127 reserved for graph-storage, 128..255 the consumer's (`Kind.consumer(n)`), 0 never |
 | 10..12       | reserved, zero                                         |
 | 12..24       | nonce (96 bits, OS CSPRNG, fresh for every write)      |
 | 24..n-16     | AES-256-GCM ciphertext of the file's plaintext layout (CRC32C included) |
@@ -511,10 +511,25 @@ under a key. Source: `src/side_file_crypto.zig`.
   magic the envelope does not match. A <= 0.4.16 binary also refuses the
   manifest of a sealed store (format_version 5, §5.1).
 
+Since 0.4.19 (SONNY-6616) also sealed: `edges.idx` and `edges_exist.idx`
+(one record per relationship: edge id, source, target, relationship-type
+id; `edges.idx` also the property-chain head and public id — the graph's
+complete topology). Without a key they keep the memory-mapped layout of §4
+(sorted snapshot); under a key the same image is sealed whole, written by
+temp file, fsync, rename and directory fsync, and read, authenticated and
+decrypted into memory at load (no mmap, O(file) at open, resident). A
+plaintext one under a key (0.4.17 wrote them so) is emptied when it is
+read and the index rebuilt from the pages and saved sealed at the next
+checkpoint; one that fails authentication is rebuilt the same way. They
+are derived, so manifest format_version stays 5 and 0.4.17 rebuilds (and
+rewrites in plaintext) a sealed one it cannot read. `GraphRegistry` (a
+data directory's `graph_registry.dat`: graph names, uuids, node and edge
+counts) is sealed when the caller saves it with `saveToFileWith`
+(`registry.SEAL_UUID` unless the caller binds another uuid).
+
 Not sealed (ids, counts and checksums only, no names or values):
-`labels.idx`, `edges.idx`, `edges_exist.idx` (memory-mapped), `prop_rev.idx`,
-`free.store`, the manifests and `wal/graph.uuid`. `edges.idx` and
-`edges_exist.idx` reveal the graph's topology and relationship-type ids.
+`labels.idx`, `prop_rev.idx`, `free.store`, the manifests and
+`wal/graph.uuid`.
 
 ---
 

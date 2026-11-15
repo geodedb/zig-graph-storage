@@ -232,10 +232,8 @@ pub const Recovery = struct {
 
         // SEC-0043: under TDE (key configured) the manifest is HMAC-authenticated.
         // A forged manifest (e.g. rolled-back last_checkpoint_lsn) is rejected here.
-        const manifest_a = Manifest.readFromFileWithKey(self.allocator, path_a, self.encryption_key) catch null;
-        const manifest_b = Manifest.readFromFileWithKey(self.allocator, path_b, self.encryption_key) catch null;
-
-        var m = try Manifest.selectManifest(manifest_a, manifest_b);
+        // SONNY-6616: a store written under another key is EncryptionKeyMismatch.
+        var m = try Manifest.readSelected(self.allocator, path_a, path_b, self.encryption_key);
         if (!std.mem.eql(u8, &m.graph_uuid, &graph_dir.graph_uuid)) {
             return error.UuidMismatch;
         }
@@ -2110,8 +2108,11 @@ test "SEC-0043: recovery rejects forged TDE manifest (rolled-back LSN, recompute
     defer recovery.deinit();
     // No valid manifest survives: slot A is forged (HMAC fails -> dropped) and
     // slot B was never written, so recovery has nothing authentic to load.
+    // SONNY-6616: a slot that failed its HMAC makes that EncryptionKeyMismatch
+    // (another key, or a modified manifest: the HMAC cannot tell them apart);
+    // it was NoManifest.
     const result = recovery.recover(&setup.graph_dir, &pool, &fm);
-    try testing.expectError(error.NoManifest, result);
+    try testing.expectError(error.EncryptionKeyMismatch, result);
 }
 
 test "SEC-0043: TDE recovery round-trip — authenticated manifest loads cleanly" {
