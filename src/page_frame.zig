@@ -41,6 +41,12 @@ pub const PageFrame = struct {
     // referenced.
     referenced: u8 = 0,
     dirty: bool = false,
+    /// SONNY-6605: flushes that have copied this frame (and cleared `dirty`)
+    /// and whose write has not completed: while non-zero the bytes on disk
+    /// may still be older than the frame's. A count, not a flag: a frame
+    /// dirtied again during one flush's write can be taken by another flush
+    /// before the first write lands. Always mutated under the pool mutex.
+    writes_in_flight: u16 = 0,
     loading: bool = false,
     // True while this frame is being torn down for reuse by eviction: its
     // dirty bytes are being flushed to disk with the pool mutex dropped, after
@@ -59,6 +65,12 @@ pub const PageFrame = struct {
     /// Get the page data as a slice.
     pub fn dataSlice(self: *const PageFrame) []u8 {
         return self.data[0..self.page_size];
+    }
+
+    /// SONNY-6605: the page's bytes on disk may be older than this frame's.
+    /// Caller holds the pool mutex.
+    pub fn newerThanDisk(self: *const PageFrame) bool {
+        return @atomicLoad(bool, &self.dirty, .acquire) or self.writes_in_flight != 0;
     }
 
     /// Check if this frame can be evicted (unpinned).
