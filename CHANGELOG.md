@@ -46,8 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- wal v0.1.24 (fail-closed recovery and compaction) and thread_pool
-  v0.2.11 (the version wal v0.1.24 pins). The thread_pool v0.2.9 copy that
+- wal v0.1.25 (fail-closed recovery, compaction and `truncateAfter`;
+  v0.1.24 introduced the first two) and thread_pool v0.2.11 (the version
+  wal pins). The thread_pool v0.2.9 copy that
   otel's chain brings is unchanged (pre-existing diamond).
 
 ### Added
