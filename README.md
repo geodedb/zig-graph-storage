@@ -239,7 +239,7 @@ graph LR
 - **Locality-Friendly Adjacency**: Edge blocks with 339 entries per page, overflow chaining
 - **Typed Properties**: TLV encoding for null, bool, int, float, string, decimal, ext
 - **Derived Snapshots**: Persisted `labels.idx`, `props.idx`, and `edges.idx` accelerate reopen paths
-- **Optional Encryption**: AES-256-GCM per-page encryption with key zeroization
+- **Optional Encryption**: AES-256-GCM per-page encryption with key zeroization; schema-name and index side files sealed under the same key (see `docs/operations.md`, "What the key covers")
 - **Authenticated Backup**: Self-contained archives with CRC32C + optional HMAC-SHA256
 - **Free Space Reuse**: Bitmap-based page allocation with O(1) amortized alloc
 - **Iterator Hot Paths**: `expandOutIter`, `expandInIter`, and `scanLabelIter` avoid result-sized allocations

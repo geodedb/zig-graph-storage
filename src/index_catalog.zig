@@ -7,6 +7,11 @@ const Allocator = std.mem.Allocator;
 // for on-disk format; not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const owner_only_file_mode = 0o600;
+const side_file_crypto = @import("side_file_crypto.zig");
+
+/// The catalog's file name in a graph directory, bound into the sealed
+/// envelope under at-rest encryption (SONNY-6590).
+pub const FILE_NAME = "props.catalog";
 
 pub const CATALOG_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'C', 'A', 'T', '0', '1' };
 pub const CATALOG_VERSION: u32 = 1;
@@ -219,9 +224,13 @@ pub const IndexCatalog = struct {
     ///   [u32 label_id] [u8 index_type] [u8 state] [u16 key_len] [key_len bytes]
     /// Followed by [CRC32 4B] over all preceding bytes.
     pub fn saveToFile(self: *const IndexCatalog, path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        return self.saveToFileWith(path, null);
+    }
 
+    /// SONNY-6590: save, sealed with `cipher` under at-rest encryption (the
+    /// catalog holds property-key names). Written atomically (temp file,
+    /// fsync, rename) so a crash mid-save keeps the previous catalog.
+    pub fn saveToFileWith(self: *const IndexCatalog, path: []const u8, cipher: ?*const side_file_crypto.Cipher) !void {
         // Serialize to an in-memory buffer, then write all at once.
         var data: std.ArrayList(u8) = .empty;
         defer data.deinit(self.allocator);
@@ -269,7 +278,9 @@ pub const IndexCatalog = struct {
             try data.appendSlice(self.allocator, &tmp);
         }
 
-        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), data.items);
+        const disk = try side_file_crypto.encode(self.allocator, cipher, .index_catalog, FILE_NAME, data.items);
+        defer self.allocator.free(disk);
+        try side_file_crypto.writeAtomic(self.allocator, path, disk);
     }
 
     /// Load the catalog from a file, replacing any existing entries.
@@ -282,6 +293,13 @@ pub const IndexCatalog = struct {
     ///     catalog's registry: loaded as `IndexKind{ .extension = type_id }`.
     ///   - Otherwise: `error.InvalidData` (fail-closed; no silent acceptance).
     pub fn loadFromFile(self: *IndexCatalog, path: []const u8) !void {
+        return self.loadFromFileWith(path, .{ .cipher = null, .require_sealed = false });
+    }
+
+    /// SONNY-6590: load under `policy` (side_file_crypto.ReadPolicy). A sealed
+    /// catalog without a key is `error.SideFileEncrypted`; one that fails
+    /// authentication is `error.SideFileAuthFailed`.
+    pub fn loadFromFileWith(self: *IndexCatalog, path: []const u8, policy: side_file_crypto.ReadPolicy) !void {
         // Clear existing.
         for (self.owned_keys.items) |key| {
             self.allocator.free(key);
@@ -289,15 +307,11 @@ pub const IndexCatalog = struct {
         self.owned_keys.clearRetainingCapacity();
         self.indexes.clearRetainingCapacity();
 
-        const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-
         // Read entire file into memory.
-        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
-        const content = try self.allocator.alloc(u8, stat.size);
+        const raw = try side_file_crypto.readWholeFile(self.allocator, path);
+        const decoded = try side_file_crypto.decode(self.allocator, policy, .index_catalog, FILE_NAME, raw);
+        const content = decoded.bytes;
         defer self.allocator.free(content);
-        const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), content, 0);
-        if (bytes_read != stat.size) return error.UnexpectedEndOfFile;
 
         // Minimum size: magic(8) + version(4) + count(4) + crc(4) = 20
         if (content.len < 20) return error.InvalidData;

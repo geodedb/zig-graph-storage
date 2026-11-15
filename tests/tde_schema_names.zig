@@ -320,8 +320,16 @@ fn copySideFile(alloc: Allocator, from: []const u8, to: []const u8, name: []cons
     };
 }
 
-/// Rewrite both manifest slots of `graph_path` with format_version 4, the
-/// version graph_storage <= 0.4.16 writes.
+fn copySideFileAs(alloc: Allocator, from: []const u8, name: []const u8, to: []const u8, as: []const u8) !void {
+    const src = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ from, name });
+    defer alloc.free(src);
+    const dst = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ to, as });
+    defer alloc.free(dst);
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), src, std.Io.Dir.cwd(), dst, io, .{});
+}
+
+/// Rewrite both manifest slots of `graph_path` with `version` (4 is what
+/// graph_storage <= 0.4.16 writes).
 fn setManifestVersion(alloc: Allocator, graph_path: []const u8, version: u32) !void {
     for ([_][]const u8{ "manifest.a", "manifest.b" }) |slot| {
         const p = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ graph_path, slot });
@@ -337,6 +345,91 @@ fn graphPathOf(alloc: Allocator, data_dir: []const u8, uuid: [16]u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}/graphs/{s}", .{ data_dir, &hex });
 }
 
+/// Base names of every side file that carries names or values (the B+tree
+/// file name is derived from the label id and a hash of the key, as in
+/// engine_property_index.indexTreePath).
+fn legacySideFiles(alloc: Allocator, patient: LabelId) ![5][]u8 {
+    var out: [5][]u8 = undefined;
+    out[0] = try alloc.dupe(u8, "labels.dict");
+    out[1] = try alloc.dupe(u8, "props.idx");
+    out[2] = try alloc.dupe(u8, "ordered_propidx.snap");
+    out[3] = try alloc.dupe(u8, "props.catalog");
+    // fips-exempt: non-security — recomputes the engine's file-name hash
+    // (engine_property_index.indexTreePath); not a secret.
+    out[4] = try std.fmt.allocPrint(alloc, "propidx_{d}_{x}.btree", .{ patient, std.hash.Wyhash.hash(0, KEY_BTREE) });
+    return out;
+}
+
+const LegacyStore = struct {
+    ids: Ids,
+    graph: []u8,
+    plain_graph: []u8,
+
+    fn deinit(self: *LegacyStore, alloc: Allocator) void {
+        alloc.free(self.graph);
+        alloc.free(self.plain_graph);
+    }
+};
+
+/// Build in `old_dir` exactly what graph_storage <= 0.4.16 leaves for the
+/// workload under a key: encrypted pages + WAL, manifest format_version 4,
+/// side files in the plaintext layout. The plaintext layout is produced by
+/// the same operations on a plaintext twin with the same graph id (<= 0.4.16
+/// wrote the side files identically with and without a key).
+fn makeLegacyStore(alloc: Allocator, old_dir: []const u8, plain_dir: []const u8, uuid: [16]u8) !LegacyStore {
+    var ids: Ids = undefined;
+    inline for (.{ true, false }) |encrypted| {
+        const dir = if (encrypted) old_dir else plain_dir;
+        const eng = try GraphEngine.create(alloc, dir, uuid, if (encrypted) tdeConfig() else plainConfig());
+        defer eng.close() catch {};
+        ids = try workloadSingle(eng);
+        try eng.checkpoint();
+    }
+    const graph = try graphPathOf(alloc, old_dir, uuid);
+    errdefer alloc.free(graph);
+    const plain_graph = try graphPathOf(alloc, plain_dir, uuid);
+    errdefer alloc.free(plain_graph);
+    const names = try legacySideFiles(alloc, ids.patient);
+    defer for (names) |n| alloc.free(n);
+    for (names) |name| try copySideFile(alloc, plain_graph, graph, name);
+    try setManifestVersion(alloc, graph, gs.manifest.MANIFEST_VERSION);
+    return .{ .ids = ids, .graph = graph, .plain_graph = plain_graph };
+}
+
+fn manifestVersions(alloc: Allocator, graph_path: []const u8) !u32 {
+    var best: u32 = 0;
+    var counter: u64 = 0;
+    for ([_][]const u8{ "manifest.a", "manifest.b" }) |slot| {
+        const p = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ graph_path, slot });
+        defer alloc.free(p);
+        const m = (gs.manifest.Manifest.readFromFileWithKey(alloc, p, KEY) catch continue) orelse continue;
+        if (m.counter >= counter) {
+            counter = m.counter;
+            best = m.format_version;
+        }
+    }
+    return best;
+}
+
+/// Open the upgraded store, check every name and property, close.
+fn expectUpgraded(alloc: Allocator, data_dir: []const u8, uuid: [16]u8, ids: Ids) !void {
+    const eng = try GraphEngine.open(alloc, data_dir, uuid, tdeConfig());
+    defer eng.close() catch {};
+    try expectNamesSingle(eng, ids, false);
+    const a: NodeId = 1;
+    const rec = (try eng.getNode(a)).?;
+    // Through the derived property index (rebuilt from the pages) ...
+    try eng.ensureDerivedHydrated();
+    try testing.expect(eng.property_index.hasKey(rec.prop_head, KEY_SSN));
+    const v = (try eng.getProperty(rec.prop_head, KEY_SSN, alloc)).?;
+    defer gs.property.freeDecoded(alloc, v);
+    try testing.expectEqualStrings(VAL_SSN, v.string);
+    // ... the ordered index (registration + tree) and the declared index.
+    var c = eng.openOrderedCursor(ids.patient, KEY_MRN, .asc).?;
+    try testing.expect(c.next() != null);
+    try testing.expectEqual(@as(usize, 1), eng.property_index_set.catalog.indexes.items.len);
+}
+
 test "SONNY-6590: a store written by <= 0.4.16 under TDE (plaintext side files) opens, keeps every name and leaves no plaintext" {
     const alloc = testing.allocator;
     var td_old = try test_support.TestDataDir.init(alloc);
@@ -345,41 +438,185 @@ test "SONNY-6590: a store written by <= 0.4.16 under TDE (plaintext side files) 
     defer td_plain.deinit();
     const uuid = uuidFor(4);
 
-    // The same operations against a plaintext twin with the same graph id
-    // produce, byte for byte, the side files <= 0.4.16 writes under a key.
-    var ids: Ids = undefined;
-    inline for (.{ true, false }) |encrypted| {
-        const dir = if (encrypted) td_old.path else td_plain.path;
-        const eng = try GraphEngine.create(alloc, dir, uuid, if (encrypted) tdeConfig() else plainConfig());
-        defer eng.close() catch {};
-        ids = try workloadSingle(eng);
-        try eng.checkpoint();
-    }
-    const old_graph = blk: {
-        const eng = try GraphEngine.open(alloc, td_old.path, uuid, tdeConfig());
-        defer eng.close() catch {};
-        break :blk try alloc.dupe(u8, eng.graph_dir.path);
-    };
-    defer alloc.free(old_graph);
-    const plain_graph = try graphPathOf(alloc, td_plain.path, uuid);
-    defer alloc.free(plain_graph);
-    for ([_][]const u8{ "labels.dict", "props.idx", "ordered_propidx.snap", "props.catalog" }) |name| {
-        try copySideFile(alloc, plain_graph, old_graph, name);
-    }
-    try setManifestVersion(alloc, old_graph, 4);
+    var legacy = try makeLegacyStore(alloc, td_old.path, td_plain.path, uuid);
+    defer legacy.deinit(alloc);
+    // A stale labels.dict.tmp an older binary left behind (killed before its
+    // rename) holds the names in plaintext too.
+    try copySideFileAs(alloc, legacy.plain_graph, "labels.dict", legacy.graph, "labels.dict.tmp");
 
-    {
-        const eng = try GraphEngine.open(alloc, td_old.path, uuid, tdeConfig());
-        defer eng.close() catch {};
-        try expectNamesSingle(eng, ids, false);
-        // Every property key still answers through the rebuilt derived index.
-        const a: NodeId = 1;
-        const rec = (try eng.getNode(a)).?;
-        const v = (try eng.getProperty(rec.prop_head, KEY_SSN, alloc)).?;
-        defer gs.property.freeDecoded(alloc, v);
-        try testing.expectEqualStrings(VAL_SSN, v.string);
-    }
+    try expectUpgraded(alloc, td_old.path, uuid, legacy.ids);
     try expectNoPlaintext(alloc, td_old.path, "after opening a <= 0.4.16 store");
+    try testing.expectEqual(gs.manifest.MANIFEST_VERSION_SEALED_SIDE_FILES, try manifestVersions(alloc, legacy.graph));
+    try expectUpgraded(alloc, td_old.path, uuid, legacy.ids);
+    try expectNoPlaintext(alloc, td_old.path, "after reopening the upgraded store");
+}
+
+test "SONNY-6590: a crash at every step of the <= 0.4.16 upgrade leaves a store that opens and finishes the upgrade" {
+    const alloc = testing.allocator;
+    const steps = std.enums.values(gs.side_file_crypto.UpgradeStep);
+    for (steps, 0..) |step, i| {
+        var td_old = try test_support.TestDataDir.init(alloc);
+        defer td_old.deinit();
+        var td_plain = try test_support.TestDataDir.init(alloc);
+        defer td_plain.deinit();
+        const uuid = uuidFor(@intCast(0x40 + i));
+        var legacy = try makeLegacyStore(alloc, td_old.path, td_plain.path, uuid);
+        defer legacy.deinit(alloc);
+
+        gs.side_file_crypto.test_fault = step;
+        const crashed = GraphEngine.open(alloc, td_old.path, uuid, tdeConfig());
+        gs.side_file_crypto.test_fault = null;
+        if (crashed) |eng| {
+            eng.deinit();
+            std.debug.print("upgrade step {s}: the fault point was never reached\n", .{@tagName(step)});
+            return error.FaultPointNotReached;
+        } else |err| try testing.expectEqual(error.TestCrashInjected, err);
+        // The killed upgrade never moved the manifest to 5.
+        try testing.expectEqual(gs.manifest.MANIFEST_VERSION, try manifestVersions(alloc, legacy.graph));
+
+        expectUpgraded(alloc, td_old.path, uuid, legacy.ids) catch |err| {
+            std.debug.print("upgrade killed after step {s}: reopen failed: {s}\n", .{ @tagName(step), @errorName(err) });
+            return err;
+        };
+        try expectNoPlaintext(alloc, td_old.path, @tagName(step));
+        try testing.expectEqual(gs.manifest.MANIFEST_VERSION_SEALED_SIDE_FILES, try manifestVersions(alloc, legacy.graph));
+    }
+}
+
+test "SONNY-6590: once sealed, a plaintext labels.dict is refused (a substituted dictionary would remap labels)" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    var td_plain = try test_support.TestDataDir.init(alloc);
+    defer td_plain.deinit();
+    const uuid = uuidFor(7);
+    var legacy = try makeLegacyStore(alloc, td.path, td_plain.path, uuid);
+    defer legacy.deinit(alloc);
+    try expectUpgraded(alloc, td.path, uuid, legacy.ids);
+
+    // Keep the sealed files to put them back.
+    try copySideFileAs(alloc, legacy.graph, "labels.dict", legacy.graph, "labels.dict.sealed");
+    try copySideFile(alloc, legacy.plain_graph, legacy.graph, "labels.dict");
+    try testing.expectError(error.SideFileNotSealed, GraphEngine.open(alloc, td.path, uuid, tdeConfig()));
+    try copySideFileAs(alloc, legacy.graph, "labels.dict.sealed", legacy.graph, "labels.dict");
+
+    // Same for the declared-index catalog.
+    try copySideFile(alloc, legacy.plain_graph, legacy.graph, "props.catalog");
+    try testing.expectError(error.SideFileNotSealed, GraphEngine.open(alloc, td.path, uuid, tdeConfig()));
+}
+
+test "SONNY-6590: a modified sealed labels.dict, or the store without its key, is refused and never read as empty" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(8);
+    var graph: []u8 = undefined;
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, tdeConfig());
+        defer eng.close() catch {};
+        _ = try eng.getOrAssignLabel(LABEL_PATIENT);
+        graph = try alloc.dupe(u8, eng.graph_dir.path);
+    }
+    defer alloc.free(graph);
+    const path = try std.fmt.allocPrint(alloc, "{s}/labels.dict", .{graph});
+    defer alloc.free(path);
+
+    // On disk: the envelope, whose first four bytes (zero) are the entry
+    // count a <= 0.4.16 parser reads — it then refuses the remaining bytes.
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited);
+    defer alloc.free(bytes);
+    try testing.expect(gs.side_file_crypto.isSealed(bytes));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, bytes[0..4]);
+    try testing.expect(bytes.len > 8);
+
+    // Without a key: the plaintext reader refuses it by name.
+    var d = gs.label_dict.LabelDictionary.init(alloc);
+    defer d.deinit();
+    try testing.expectError(error.SideFileEncrypted, d.loadFromFile(path));
+    try testing.expectError(error.SideFileEncrypted, GraphEngine.open(alloc, td.path, uuid, plainConfig()));
+
+    // Wrong key: the authenticated manifest refuses it first.
+    var wrong = tdeConfig();
+    wrong.encryption_key = [_]u8{0x5B} ** 32;
+    if (GraphEngine.open(alloc, td.path, uuid, wrong)) |e| {
+        e.deinit();
+        return error.OpenedWithWrongKey;
+    } else |_| {}
+
+    // One flipped ciphertext byte.
+    const tampered = try alloc.dupe(u8, bytes);
+    defer alloc.free(tampered);
+    tampered[gs.side_file_crypto.HEADER_SIZE + 2] ^= 0x40;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = tampered });
+    try testing.expectError(error.SideFileAuthFailed, GraphEngine.open(alloc, td.path, uuid, tdeConfig()));
+
+    // Restored: opens again with the name.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    const eng = try GraphEngine.open(alloc, td.path, uuid, tdeConfig());
+    defer eng.close() catch {};
+    try testing.expect(eng.label_dict.getId(LABEL_PATIENT) != null);
+}
+
+test "SONNY-6590: shard label dictionaries are reconciled at open when sealed (repair and refusal)" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(9);
+    const k: usize = 3;
+
+    var shard_uuid: [16]u8 = undefined;
+    var shard_path: []u8 = undefined;
+    var patient: LabelId = undefined;
+    {
+        const eng = try ShardedGraphEngine.create(alloc, td.path, uuid, tdeConfig());
+        defer eng.close() catch {};
+        patient = try eng.getOrAssignLabel(LABEL_PATIENT);
+        _ = try eng.getOrAssignLabel(LABEL_DIAGNOSIS);
+        shard_uuid = eng.shards[k].graph_uuid;
+        shard_path = try alloc.dupe(u8, eng.shards[k].graph_dir.path);
+    }
+    defer alloc.free(shard_path);
+    const dict_path = try std.fmt.allocPrint(alloc, "{s}/labels.dict", .{shard_path});
+    defer alloc.free(dict_path);
+    var cipher = gs.side_file_crypto.Cipher.init(KEY, shard_uuid);
+    defer cipher.deinit();
+
+    // Shard k lost LABEL_DIAGNOSIS (a crash mid-broadcast): repaired at open.
+    {
+        var d = gs.label_dict.LabelDictionary.init(alloc);
+        defer d.deinit();
+        _ = try d.assignId(LABEL_PATIENT, patient);
+        try d.saveToFileWith(dict_path, &cipher);
+    }
+    {
+        const eng = try ShardedGraphEngine.open(alloc, td.path, uuid, tdeConfig());
+        defer eng.close() catch {};
+        try testing.expect(eng.shards[k].label_dict.getId(LABEL_DIAGNOSIS) != null);
+    }
+    {
+        var d = gs.label_dict.LabelDictionary.init(alloc);
+        defer d.deinit();
+        try testing.expect(!try d.loadFromFileWith(dict_path, .{ .cipher = &cipher, .require_sealed = true }));
+        try testing.expect(d.getId(LABEL_DIAGNOSIS) != null);
+    }
+    try expectNoPlaintext(alloc, td.path, "sharded reconcile repair");
+
+    // Shard k names the patient id differently while a node there carries
+    // it: refused, nothing rewritten.
+    {
+        const eng = try ShardedGraphEngine.open(alloc, td.path, uuid, tdeConfig());
+        defer eng.close() catch {};
+        const n = try eng.shards[k].allocNode();
+        try eng.putNode(n, test_support.emptyNode(1));
+        try eng.addLabel(n, patient);
+    }
+    {
+        var d = gs.label_dict.LabelDictionary.init(alloc);
+        defer d.deinit();
+        _ = try d.assignId("Zq7Impostor", patient);
+        try d.saveToFileWith(dict_path, &cipher);
+    }
+    try testing.expectError(error.LabelDictionaryDiverged, ShardedGraphEngine.open(alloc, td.path, uuid, tdeConfig()));
 }
 
 // ---------------------------------------------------------------------------

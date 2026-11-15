@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const side_file_crypto = @import("side_file_crypto.zig");
 const Allocator = std.mem.Allocator;
 // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
 // for on-disk format; not authentication.
@@ -378,6 +379,13 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
         /// Save the tree to a file.
         /// Format: [magic 8B] [version 4B] [serialized tree data] [CRC32 4B]
         pub fn saveToFile(self: *const Self, allocator: Allocator, path: []const u8) !void {
+            return self.saveToFileWith(allocator, path, null);
+        }
+
+        /// SONNY-6590: save, sealed with `cipher` under at-rest encryption
+        /// (the keys are value hashes). The file's base name is bound into
+        /// the envelope. Written atomically (temp file, fsync, rename).
+        pub fn saveToFileWith(self: *const Self, allocator: Allocator, path: []const u8, cipher: ?*const side_file_crypto.Cipher) !void {
             const tree_data = try self.serialize(allocator);
             defer allocator.free(tree_data);
 
@@ -392,25 +400,24 @@ pub fn BPlusTree(comptime K: type, comptime V: type) type {
             const crc = Crc32.hash(buf[0 .. total_size - 4]);
             std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
 
-            const file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .permissions = std.Io.File.Permissions.fromMode(0o600) });
-            defer file.close(std.Io.Threaded.global_single_threaded.io());
-            try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf);
+            const disk = try side_file_crypto.encode(allocator, cipher, .btree_index, std.fs.path.basename(path), buf);
+            defer allocator.free(disk);
+            try side_file_crypto.writeAtomic(allocator, path, disk);
         }
 
         /// Load a tree from a file written by `saveToFile`.
         pub fn loadFromFile(allocator: Allocator, path: []const u8) !Self {
-            const file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
-            defer file.close(std.Io.Threaded.global_single_threaded.io());
+            return loadFromFileWith(allocator, path, .{ .cipher = null, .require_sealed = false });
+        }
 
-            const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
-            const file_size: usize = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
-            if (file_size < 8 + 4 + 4 + 4) return error.InvalidFormat; // magic + version + min tree data + crc
-
-            const buf = try allocator.alloc(u8, file_size);
+        /// SONNY-6590: load under `policy` (side_file_crypto.ReadPolicy).
+        pub fn loadFromFileWith(allocator: Allocator, path: []const u8, policy: side_file_crypto.ReadPolicy) !Self {
+            const raw = try side_file_crypto.readWholeFile(allocator, path);
+            const decoded = try side_file_crypto.decode(allocator, policy, .btree_index, std.fs.path.basename(path), raw);
+            const buf = decoded.bytes;
             defer allocator.free(buf);
-
-            const bytes_read = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, 0);
-            if (bytes_read != file_size) return error.UnexpectedEndOfFile;
+            const file_size = buf.len;
+            if (file_size < 8 + 4 + 4 + 4) return error.InvalidFormat; // magic + version + min tree data + crc
 
             // Verify magic
             if (!std.mem.eql(u8, buf[0..8], &BTREE_SNAPSHOT_MAGIC)) return error.InvalidFormat;

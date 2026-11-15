@@ -46,6 +46,9 @@ under `-Dfips=true`:
 
 - `src/encryption.zig` — AES-256-GCM transparent data encryption (TDE)
   confidentiality.
+- `src/side_file_crypto.zig` — HKDF-SHA256 side-file key derivation,
+  AES-256-GCM sealing of the schema-name side files and their CSPRNG nonces
+  (`Io.randomSecure`) under TDE (SONNY-6590).
 - `src/manifest.zig` / `src/backup.zig` — HMAC-SHA256 + `timing_safe` manifest
   and backup authentication.
 - Key-buffer `secureZero` calls in `src/recovery.zig`, `src/file_manager.zig`,

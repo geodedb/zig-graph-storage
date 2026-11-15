@@ -27,6 +27,8 @@ const label_store_mod = @import("label_store.zig");
 const engine_mod = @import("engine.zig");
 const engine_index = @import("engine_index.zig");
 const engine_property_index = @import("engine_property_index.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
+const manifest_mod = @import("manifest.zig");
 
 const EdgeId = types.EdgeId;
 const GraphConfig = config_mod.GraphConfig;
@@ -325,11 +327,135 @@ fn maxPersistedPagesForStore(engine: *GraphEngine, fid: types.FileId) !u64 {
     return @max(@as(u64, 64), page_count * 2);
 }
 
-/// Persist the label dictionary to a `labels.dict` file.
+/// SONNY-6590: the side-file cipher of this store (labels.dict, props.idx,
+/// ordered_propidx.snap, props.catalog, propidx_*.btree), derived from the
+/// at-rest key and bound to this graph's (shard's) uuid; null without a key.
+/// The caller `deinit`s it (zeroes the derived key).
+pub fn sideCipher(engine: *const GraphEngine) ?side_file_crypto.Cipher {
+    return side_file_crypto.Cipher.forKey(engine.config.encryption_key, engine.graph_uuid);
+}
+
+/// SONNY-6590: how this store reads a side file. Under a key, a plaintext
+/// file is accepted only while the manifest still says format_version 4 (a
+/// store written by <= 0.4.16, upgraded at open by `sealLegacySideFiles`);
+/// once the manifest says 5 every side file must be sealed.
+pub fn sideReadPolicy(engine: *const GraphEngine, cipher: ?*const side_file_crypto.Cipher) side_file_crypto.ReadPolicy {
+    return .{
+        .cipher = cipher,
+        .require_sealed = engine.manifest.format_version >= manifest_mod.MANIFEST_VERSION_SEALED_SIDE_FILES,
+    };
+}
+
+/// Persist the label dictionary to a `labels.dict` file (sealed under
+/// at-rest encryption, SONNY-6590).
 pub fn saveLabelDictionary(engine: *GraphEngine) !void {
     const labels_path = try std.fmt.allocPrint(engine.allocator, "{s}/labels.dict", .{engine.graph_dir.path});
     defer engine.allocator.free(labels_path);
-    try engine.label_dict.saveToFile(labels_path);
+    var cipher = sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
+    try engine.label_dict.saveToFileWith(labels_path, if (cipher) |*c| c else null);
+}
+
+/// SONNY-6590: upgrade the side files of a store written by graph_storage
+/// <= 0.4.16 under at-rest encryption (manifest format_version 4, side files
+/// in the plaintext layout) at open, then mark the manifest format_version 5
+/// (persisted by the next checkpoint or close). Each step is crash-safe on
+/// its own and the manifest stays at 4 until all are done, so a store killed
+/// at any point opens again and resumes:
+///   1. a stale `labels.dict.tmp` (never read) is removed: one left by an
+///      older binary holds the names in plaintext;
+///   2. labels.dict is rewritten sealed (temp + fsync + rename + dir fsync);
+///   3. a plaintext props.idx is emptied (derived: rebuilt from the pages on
+///      first use and saved sealed at the next full checkpoint);
+///   4. ordered_propidx.snap is rewritten sealed from the loaded snapshot,
+///      keeping its stamp (a stale stamp still forces a rebuild), or removed
+///      when it could not be loaded;
+///   5. props.catalog and every declared propidx_*.btree are rewritten sealed
+///      from memory (temp + fsync + rename, then dir fsync).
+/// No-op without a key, on a read-only open, and on a store already at 5
+/// beyond step 1. `label_dict_was_plaintext` and `ordered_stamp` come from
+/// the loads `GraphEngine.open` ran just before. Returns true when it moved
+/// the in-memory manifest to 5: the caller marks the store dirty so the next
+/// checkpoint (or close) persists it.
+pub fn sealLegacySideFiles(
+    engine: *GraphEngine,
+    label_dict_was_plaintext: bool,
+    ordered_stamp: ?@import("index_snapshot.zig").Stamp,
+) !bool {
+    if (engine.read_only) return false;
+    var cipher = sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
+    const c: *const side_file_crypto.Cipher = if (cipher) |*cc| cc else return false;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = engine.allocator;
+    const dir = engine.graph_dir.path;
+
+    {
+        const p = try std.fmt.allocPrint(alloc, "{s}/{s}.tmp", .{ dir, label_dict_mod.FILE_NAME });
+        defer alloc.free(p);
+        std.Io.Dir.cwd().deleteFile(io, p) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+    if (engine.manifest.format_version >= manifest_mod.MANIFEST_VERSION_SEALED_SIDE_FILES) return false;
+
+    var upgraded = false;
+    if (label_dict_was_plaintext) {
+        try saveLabelDictionaryDurable(engine);
+        try side_file_crypto.faultPoint(.label_dict_sealed);
+        upgraded = true;
+    }
+
+    if (engine.file_manager.getFile(.prop_idx)) |f| {
+        if (try plaintextOnDisk(f.*)) {
+            try f.setLength(io, 0);
+            try f.sync(io);
+            try side_file_crypto.faultPoint(.prop_chain_index_dropped);
+            upgraded = true;
+        }
+    }
+
+    {
+        const p = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, @import("ordered_property_index.zig").SNAPSHOT_FILE_NAME });
+        defer alloc.free(p);
+        if (try plaintextFileOnDisk(p)) {
+            if (ordered_stamp) |st| {
+                try engine.ordered_property_index.saveToFileWith(dir, st.epoch, st.covered_lsn, c);
+            } else {
+                try std.Io.Dir.cwd().deleteFile(io, p);
+            }
+            try syncGraphDir(engine);
+            try side_file_crypto.faultPoint(.ordered_index_sealed);
+            upgraded = true;
+        }
+    }
+
+    if (try engine_property_index.sealLegacy(engine, c)) upgraded = true;
+
+    if (upgraded) std.log.info("graph-storage: sealed the side files of a store written by graph_storage <= 0.4.16 under at-rest encryption (SONNY-6590)", .{});
+    engine.manifest.format_version = manifest_mod.MANIFEST_VERSION_SEALED_SIDE_FILES;
+    return true;
+}
+
+/// True when the open file is non-empty and not a sealed envelope.
+pub fn plaintextOnDisk(file: std.Io.File) !bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var head: [side_file_crypto.MAGIC.len]u8 = undefined;
+    const n = try file.readPositionalAll(io, &head, 0);
+    if (n == 0) return false;
+    return !side_file_crypto.isSealed(head[0..n]);
+}
+
+/// `plaintextOnDisk` by path; false when the file does not exist.
+pub fn plaintextFileOnDisk(path: []const u8) !bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer f.close(io);
+    return plaintextOnDisk(f);
 }
 
 /// SONNY-6491: `saveLabelDictionary` (temp file, fsync, rename) followed by a
@@ -657,10 +783,13 @@ pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
     // AFTER doCheckpoint with no intervening writes, so the trees reflect exactly
     // the covered_lsn (last_checkpoint_lsn) state.
     if (save_derived and engine.ordered_index_dirty) {
-        try engine.ordered_property_index.saveToFile(
+        var cipher = sideCipher(engine);
+        defer if (cipher) |*c| c.deinit();
+        try engine.ordered_property_index.saveToFileWith(
             engine.graph_dir.path,
             engine.manifest.checkpoint_epoch,
             engine.manifest.last_checkpoint_lsn,
+            if (cipher) |*c| c else null,
         );
         engine.ordered_index_dirty = false;
         engine.metrics.ordered_index_saves += 1;

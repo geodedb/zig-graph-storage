@@ -29,6 +29,8 @@ const property_mod = @import("property.zig");
 const index_catalog_mod = @import("index_catalog.zig");
 const property_index_mod = @import("property_index.zig");
 const engine_mod = @import("engine.zig");
+const engine_persist = @import("engine_persist.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
 
 const NodeId = types.NodeId;
 const LabelId = types.LabelId;
@@ -42,7 +44,7 @@ const PropertyIndex = property_index_mod.PropertyIndex;
 const GraphEngine = engine_mod.GraphEngine;
 
 /// File name for the per-graph index catalog.
-const CATALOG_FILE_NAME = "props.catalog";
+const CATALOG_FILE_NAME = index_catalog_mod.FILE_NAME;
 
 /// Owns the catalog and the set of live B+tree property indexes for one engine.
 ///
@@ -337,12 +339,16 @@ pub fn save(engine: *GraphEngine) !void {
 
     const path = try catalogPath(engine);
     defer engine.allocator.free(path);
-    try set.catalog.saveToFile(path);
+    // SONNY-6590: sealed under at-rest encryption (key names, value hashes).
+    var cipher = engine_persist.sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
+    const cptr: ?*const side_file_crypto.Cipher = if (cipher) |*c| c else null;
+    try set.catalog.saveToFileWith(path, cptr);
 
     for (set.live.items) |*idx| {
         const tree_path = try indexTreePath(engine, idx.label_id, idx.property_key);
         defer engine.allocator.free(tree_path);
-        try idx.tree.saveToFile(engine.allocator, tree_path);
+        try idx.tree.saveToFileWith(engine.allocator, tree_path, cptr);
     }
 
     engine.property_catalog_dirty = false;
@@ -362,7 +368,12 @@ pub fn load(engine: *GraphEngine) !void {
     const path = try catalogPath(engine);
     defer engine.allocator.free(path);
 
-    set.catalog.loadFromFile(path) catch |err| switch (err) {
+    var cipher = engine_persist.sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
+    const policy = engine_persist.sideReadPolicy(engine, if (cipher) |*c| c else null);
+    // SONNY-6590: a sealed catalog without the key, or one that fails
+    // authentication, refuses the open like a corrupt one.
+    set.catalog.loadFromFileWith(path, policy) catch |err| switch (err) {
         error.FileNotFound => return, // opt-in: no catalog → no indexes
         else => return err,
     };
@@ -374,12 +385,45 @@ pub fn load(engine: *GraphEngine) !void {
         const tree_path = try indexTreePath(engine, def.label_id, def.property_key);
         defer engine.allocator.free(tree_path);
 
-        var idx = loadOrRebuild(engine, def.label_id, def.property_key, tree_path) catch |err| {
+        var idx = loadOrRebuild(engine, def.label_id, def.property_key, tree_path, policy) catch |err| {
             return err;
         };
         errdefer idx.deinit();
         try set.live.append(set.allocator, idx);
     }
+}
+
+/// SONNY-6590: upgrade step of `engine_persist.sealLegacySideFiles` — rewrite
+/// a plaintext props.catalog and every plaintext declared propidx_*.btree
+/// sealed with `cipher` from the state `load` just read (temp + fsync +
+/// rename each, then a directory fsync). Returns true when it rewrote
+/// anything.
+pub fn sealLegacy(engine: *GraphEngine, cipher: *const side_file_crypto.Cipher) !bool {
+    const set = &engine.property_index_set;
+    const path = try catalogPath(engine);
+    defer engine.allocator.free(path);
+    var did = false;
+    if (try engine_persist.plaintextFileOnDisk(path)) {
+        try set.catalog.saveToFileWith(path, cipher);
+        try engine_persist.syncGraphDir(engine);
+        try side_file_crypto.faultPoint(.catalog_sealed);
+        did = true;
+    }
+    var trees = false;
+    for (set.live.items) |*idx| {
+        const tree_path = try indexTreePath(engine, idx.label_id, idx.property_key);
+        defer engine.allocator.free(tree_path);
+        if (try engine_persist.plaintextFileOnDisk(tree_path)) {
+            try idx.tree.saveToFileWith(engine.allocator, tree_path, cipher);
+            trees = true;
+        }
+    }
+    if (trees) {
+        try engine_persist.syncGraphDir(engine);
+        try side_file_crypto.faultPoint(.btree_sealed);
+        did = true;
+    }
+    return did;
 }
 
 /// Load a single index's B+tree from disk; on any missing/invalid snapshot,
@@ -390,14 +434,21 @@ fn loadOrRebuild(
     label_id: LabelId,
     property_key: []const u8,
     tree_path: []const u8,
+    policy: side_file_crypto.ReadPolicy,
 ) !PropertyIndex {
     const BTree = property_index_mod.BPlusTreeU64U64;
-    const loaded_tree = BTree.loadFromFile(engine.allocator, tree_path) catch |err| switch (err) {
-        // Missing or unverifiable snapshot → rebuild + mark dirty.
+    const loaded_tree = BTree.loadFromFileWith(engine.allocator, tree_path, policy) catch |err| switch (err) {
+        // Missing or unverifiable snapshot → rebuild + mark dirty. A sealed
+        // tree that fails authentication, or a plaintext one where sealed
+        // trees are required, is unverifiable too (SONNY-6590).
         error.FileNotFound,
         error.InvalidFormat,
         error.UnexpectedEndOfFile,
         error.FileTooLarge,
+        error.SideFileAuthFailed,
+        error.SideFileNotSealed,
+        error.SideFileTruncated,
+        error.SideFileUnsupportedVersion,
         => {
             engine.property_catalog_dirty = true;
             return buildIndexTree(engine, label_id, property_key);

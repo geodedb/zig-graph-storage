@@ -32,6 +32,17 @@ pub const MANIFEST_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'M', 'N', 'F', '0', '1' };
 /// existing read-only-or-IncompatibleVersion policy (recovery.zig).
 pub const MANIFEST_VERSION: u32 = 4;
 
+/// V5 (SONNY-6590): the format_version of a store under at-rest encryption
+/// whose side files (labels.dict, props.idx, ordered_propidx.snap,
+/// props.catalog, propidx_*.btree) are sealed. The manifest's byte layout is
+/// IDENTICAL to V4; only the value differs. Under a key it is authenticated
+/// by the manifest HMAC (SEC-0043), so it is the durable, tamper-evident
+/// record that a plaintext side file must be refused rather than adopted
+/// (V4 under a key = a store written by <= 0.4.16, upgraded at open). The
+/// bump doubles as a downgrade gate: graph_storage <= 0.4.16 refuses a V5
+/// manifest with `error.IncompatibleVersion`. Stores without a key stay V4.
+pub const MANIFEST_VERSION_SEALED_SIDE_FILES: u32 = 5;
+
 /// SEC-0043: When Transparent Data Encryption is enabled (an encryption key is
 /// configured), the manifest carries a keyed HMAC-SHA256 trailer in addition to
 /// the CRC32 footer. The trailer is appended after the CRC-only body, so its

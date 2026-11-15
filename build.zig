@@ -969,6 +969,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_txn_abort_undo.step);
     // The encrypted-page tail guards (SONNY-6441) likewise.
     integration_step.dependOn(&run_tde_page_tail.step);
+    // Schema names in plaintext under at-rest encryption (SONNY-6590).
+    integration_step.dependOn(&run_tde_schema_names.step);
     integration_step.dependOn(&run_adj_tail_repair.step);
     integration_step.dependOn(&run_page_checksum.step);
     integration_step.dependOn(&run_free_store_offline.step);

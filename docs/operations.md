@@ -282,6 +282,55 @@ Pass a 32-byte key via `GraphConfig.encryption_key` when creating or opening
 the graph. The key is used for AES-256-GCM page encryption and optionally for
 HMAC-SHA256 backup integrity.
 
+### What the key covers
+
+Encrypted: every store page, the WAL, and (since SONNY-6590) the side files
+that hold schema names or indexed values — `labels.dict`, `props.idx`,
+`ordered_propidx.snap`, `props.catalog`, `propidx_*.btree`
+(`docs/format-spec.md` §1.6). The manifests are authenticated (HMAC-SHA256),
+not encrypted. Not encrypted: `labels.idx`, `edges.idx`, `edges_exist.idx`,
+`prop_rev.idx` and `free.store` hold ids, counts and checksums only, but
+`edges.idx`/`edges_exist.idx` reveal which nodes are connected and by which
+relationship-type id. File sizes and modification times are visible.
+
+A sealed side file that fails authentication refuses the open (wrong key,
+modified, or copied from another graph or shard: `error.SideFileAuthFailed`);
+opening without the key fails with `error.SideFileEncrypted`. Derived
+snapshots (`props.idx`, `propidx_*.btree`) that fail are rebuilt from the
+pages instead, as a corrupt snapshot always was.
+
+### Upgrading a store written by graph_storage <= 0.4.16 under a key
+
+Those versions wrote the side files above in plaintext. Open the store with
+>= the release carrying SONNY-6590 and the same key; no other step is needed.
+The open:
+
+1. removes a stale `labels.dict.tmp` (an older binary killed mid-save left
+   the names there in plaintext);
+2. rewrites `labels.dict` sealed (temp file, fsync, rename, directory fsync);
+3. empties a plaintext `props.idx` (rebuilt from the pages on first use,
+   saved sealed at the next full checkpoint);
+4. rewrites `ordered_propidx.snap`, `props.catalog` and each declared
+   `propidx_*.btree` sealed (temp file, fsync, rename, directory fsync);
+5. records manifest format_version 5, written by the next checkpoint or
+   `close()`.
+
+Until 5 is written, a plaintext side file is still accepted, so a crash at
+any step reopens and resumes (`tests/tde_schema_names.zig` kills the open
+after each step). From 5 on, a plaintext side file is refused
+(`error.SideFileNotSealed`): an older binary or an attacker can no longer
+substitute a plaintext dictionary that remaps label ids.
+
+The plaintext files are replaced, not scrubbed: their old blocks may persist
+on the device (journal, snapshots, SSD remapping, backups taken before the
+upgrade). Treat earlier backups and disk images as holding the names in
+plaintext.
+
+**Downgrade.** graph_storage <= 0.4.16 refuses a store whose manifest says
+5 (`error.IncompatibleVersion`) and refuses a sealed `labels.dict` before
+that (`error.InvalidData`: it reads an entry count of 0 followed by bytes it
+does not expect). There is no supported downgrade of a sealed store.
+
 ### Key zeroing
 
 Call `GraphConfig.zeroKey()` during shutdown to securely clear the key from

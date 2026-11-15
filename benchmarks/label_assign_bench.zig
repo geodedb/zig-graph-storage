@@ -14,11 +14,19 @@
 //   zig build bench-label-assign -- /path/on/real/disk
 //
 // No assertion: this is a measurement, not a gate.
+//
+// SONNY-6590: the same runs under at-rest encryption (labels.dict sealed with
+// AES-256-GCM on every write), and the open time of a store whose dictionary
+// holds OPEN_LABELS names, plaintext vs sealed.
 
 const std = @import("std");
 const gs = @import("graph_storage");
 
 const LABELS: usize = 30;
+const OPEN_LABELS: usize = 20_000;
+const OPEN_RUNS: usize = 9;
+// Benchmark-only key; never a real key.
+const BENCH_KEY: [32]u8 = [_]u8{0x42} ** 32;
 
 fn nowNs() u64 {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -74,15 +82,53 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("SONNY-6524 new label name latency, {d} names, data dir {s}\n", .{ LABELS, data_dir });
 
-    {
-        const eng = try gs.ShardedGraphEngine.create(allocator, data_dir, [_]u8{0x65} ** 16, .{});
-        defer eng.close() catch {};
-        report("ShardedGraphEngine (16 shards) new", try timeNewNames(eng, "L"));
-        report("ShardedGraphEngine (16 shards) existing", try timeNewNames(eng, "L"));
+    inline for (.{ false, true }) |encrypted| {
+        const cfg: gs.GraphConfig = if (encrypted) .{ .encryption_key = BENCH_KEY } else .{};
+        const tag = if (encrypted) " [TDE]" else "";
+        const salt: u8 = if (encrypted) 0x10 else 0;
+        {
+            const eng = try gs.ShardedGraphEngine.create(allocator, data_dir, [_]u8{0x65 + salt} ** 16, cfg);
+            defer eng.close() catch {};
+            report("ShardedGraphEngine (16 shards) new" ++ tag, try timeNewNames(eng, "L"));
+            report("ShardedGraphEngine (16 shards) existing" ++ tag, try timeNewNames(eng, "L"));
+        }
+        {
+            const eng = try gs.GraphEngine.create(allocator, data_dir, [_]u8{0x66 + salt} ** 16, cfg);
+            defer eng.close() catch {};
+            report("GraphEngine new" ++ tag, try timeNewNames(eng, "L"));
+        }
     }
-    {
-        const eng = try gs.GraphEngine.create(allocator, data_dir, [_]u8{0x66} ** 16, .{});
-        defer eng.close() catch {};
-        report("GraphEngine new", try timeNewNames(eng, "L"));
+
+    // Open time with a large dictionary. The dictionary is written once (a
+    // name per getOrAssignLabel would cost OPEN_LABELS fsync pairs).
+    std.debug.print("open + close of a GraphEngine whose labels.dict holds {d} names ({d} runs):\n", .{ OPEN_LABELS, OPEN_RUNS });
+    inline for (.{ false, true }) |encrypted| {
+        const cfg: gs.GraphConfig = if (encrypted) .{ .encryption_key = BENCH_KEY } else .{};
+        const uuid = [_]u8{if (encrypted) 0x78 else 0x77} ** 16;
+        var dict_path_buf: [600]u8 = undefined;
+        var dict_path: []const u8 = undefined;
+        {
+            const eng = try gs.GraphEngine.create(allocator, data_dir, uuid, cfg);
+            defer eng.close() catch {};
+            dict_path = try std.fmt.bufPrint(&dict_path_buf, "{s}/labels.dict", .{eng.graph_dir.path});
+        }
+        {
+            var d = gs.label_dict.LabelDictionary.init(allocator);
+            defer d.deinit();
+            var nb: [64]u8 = undefined;
+            for (0..OPEN_LABELS) |i| _ = try d.getOrAssign(try std.fmt.bufPrint(&nb, "BenchLabel{d}", .{i}));
+            var cipher = gs.side_file_crypto.Cipher.forKey(cfg.encryption_key, uuid);
+            defer if (cipher) |*c| c.deinit();
+            try d.saveToFileWith(dict_path, if (cipher) |*c| c else null);
+        }
+        var samples: [OPEN_RUNS]u64 = undefined;
+        for (&samples) |*s| {
+            const t0 = nowNs();
+            const eng = try gs.GraphEngine.open(allocator, data_dir, uuid, cfg);
+            s.* = nowNs() - t0;
+            if (eng.label_dict.count() != OPEN_LABELS) return error.BenchDictionaryNotLoaded;
+            eng.close() catch {};
+        }
+        report(if (encrypted) "open [TDE, sealed labels.dict]" else "open [plaintext labels.dict]", summarize(&samples));
     }
 }

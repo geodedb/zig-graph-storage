@@ -249,7 +249,10 @@ pub const Recovery = struct {
 
         // Validate manifest format version compatibility
         var upgraded_from_v2 = false;
-        if (m.format_version != manifest_mod.MANIFEST_VERSION) {
+        // SONNY-6590: V5 has the V4 layout (it records sealed side files).
+        if (m.format_version != manifest_mod.MANIFEST_VERSION and
+            m.format_version != manifest_mod.MANIFEST_VERSION_SEALED_SIDE_FILES)
+        {
             if (m.format_version == manifest_mod.MANIFEST_VERSION_V1) {
                 if (self.legacy_policy == .read_only) {
                     std.log.warn("V1 graph format detected — opening in read-only mode (mutations will be rejected)", .{});

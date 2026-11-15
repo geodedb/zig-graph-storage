@@ -3,11 +3,15 @@
 
 const std = @import("std");
 const scoped_file = @import("scoped_file.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
 const Allocator = std.mem.Allocator;
 // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
 // for on-disk format; not authentication.
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const owner_only_file_mode = 0o600;
+/// The dictionary's file name in a graph directory. Bound into the sealed
+/// envelope's associated data (SONNY-6590).
+pub const FILE_NAME = "labels.dict";
 
 pub const LabelDictionary = struct {
     allocator: Allocator,
@@ -113,9 +117,17 @@ pub const LabelDictionary = struct {
         return @intCast(self.name_to_id.count());
     }
 
-    /// Save to file.
+    /// Save to file in the plaintext layout (no at-rest encryption).
     /// Format: count(4) + repeated [name_len(4) + name_bytes + id(4)] + CRC32(4)
     pub fn saveToFile(self: *const LabelDictionary, path: []const u8) !void {
+        return self.saveToFileWith(path, null);
+    }
+
+    /// SONNY-6590: save, sealed with `cipher` (the store's side-file cipher)
+    /// when at-rest encryption is on, else in the plaintext layout. Written
+    /// atomically: `<path>.tmp`, fsync, rename (the caller fsyncs the
+    /// directory, see engine_persist.saveLabelDictionaryDurable).
+    pub fn saveToFileWith(self: *const LabelDictionary, path: []const u8, cipher: ?*const side_file_crypto.Cipher) !void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
@@ -135,55 +147,87 @@ pub const LabelDictionary = struct {
         const crc = Crc32.hash(buf.items);
         try appendU32(&buf, self.allocator, crc);
 
+        const disk = try side_file_crypto.encode(self.allocator, cipher, .label_dict, FILE_NAME, buf.items);
+        defer self.allocator.free(disk);
+        // The plaintext copy of the names is not left in freed memory.
+        if (cipher != null) std.crypto.secureZero(u8, buf.items);
+
         // Write atomically
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
-        // SEC-0052: resolve_beneath prevents symlink traversal out of the
-        // label dictionary directory via a crafted path.  exclusive is omitted
-        // because a stale .tmp file from a previous crashed write may exist.
-        const tmp_file = try scoped_file.create(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
-            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
-            .resolve_beneath = true,
-        });
-        defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
-        try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), buf.items);
-        try tmp_file.sync(std.Io.Threaded.global_single_threaded.io());
+        {
+            // SEC-0052: resolve_beneath prevents symlink traversal out of the
+            // label dictionary directory via a crafted path.  exclusive is
+            // omitted because a stale .tmp file from a previous crashed write
+            // may exist.
+            const tmp_file = try scoped_file.create(std.Io.Threaded.global_single_threaded.io(), tmp_path, .{
+                .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+                .resolve_beneath = true,
+            });
+            defer tmp_file.close(std.Io.Threaded.global_single_threaded.io());
+            try tmp_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), disk);
+            try tmp_file.sync(std.Io.Threaded.global_single_threaded.io());
+        }
+        if (cipher != null) try side_file_crypto.faultPoint(.label_dict_tmp_written);
 
         try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, std.Io.Threaded.global_single_threaded.io());
     }
 
-    /// Load from file.
+    /// Load a plaintext-layout file. A sealed file (written under at-rest
+    /// encryption) is refused with `error.SideFileEncrypted`.
     pub fn loadFromFile(self: *LabelDictionary, path: []const u8) !void {
-        var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        _ = try self.loadFromFileWith(path, .{ .cipher = null, .require_sealed = false });
+    }
 
-        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
-        const file_size = std.math.cast(usize, stat.size) orelse return error.FileTooLarge;
-        if (file_size < 8) return error.InvalidData;
+    /// SONNY-6590: load under `policy`. Returns true when the file was in the
+    /// plaintext layout (a store written by <= 0.4.16 under a key: the caller
+    /// rewrites it sealed). A sealed file that fails authentication is
+    /// `error.SideFileAuthFailed`; nothing is loaded on any error.
+    pub fn loadFromFileWith(self: *LabelDictionary, path: []const u8, policy: side_file_crypto.ReadPolicy) !bool {
+        const raw = try side_file_crypto.readWholeFile(self.allocator, path);
+        const decoded = try side_file_crypto.decode(self.allocator, policy, .label_dict, FILE_NAME, raw);
+        defer {
+            std.crypto.secureZero(u8, decoded.bytes);
+            self.allocator.free(decoded.bytes);
+        }
 
         var next = LabelDictionary.init(self.allocator);
         errdefer next.deinit();
+        const max_id = try parseInto(&next, decoded.bytes);
 
-        var remaining = file_size - 4;
+        self.deinit();
+        self.* = next;
+        self.next_id = max_id;
+        return decoded.was_plaintext;
+    }
+
+    /// Parse the plaintext layout into the empty dictionary `next`; returns
+    /// the next id to assign.
+    fn parseInto(next: *LabelDictionary, data: []const u8) !u32 {
+        const allocator = next.allocator;
+        if (data.len < 8) return error.InvalidData;
+
+        var remaining = data.len - 4;
         var crc = Crc32.init();
         var u32_buf: [4]u8 = undefined;
-        var file_offset: u64 = 0;
+        var offset: usize = 0;
 
-        try readTracked(&file, &file_offset, &remaining, &crc, &u32_buf);
+        try readTracked(data, &offset, &remaining, &crc, &u32_buf);
         const entry_count = std.mem.readInt(u32, &u32_buf, .little);
 
         var max_id: u32 = 0;
         for (0..entry_count) |_| {
-            try readTracked(&file, &file_offset, &remaining, &crc, &u32_buf);
+            try readTracked(data, &offset, &remaining, &crc, &u32_buf);
             const name_len = std.mem.readInt(u32, &u32_buf, .little);
+            if (name_len > remaining) return error.InvalidData;
 
-            const owned = try self.allocator.alloc(u8, name_len);
+            const owned = try allocator.alloc(u8, name_len);
             // owned is freed here on any error before it is adopted into next.name_to_id.
-            errdefer self.allocator.free(owned);
-            try readTracked(&file, &file_offset, &remaining, &crc, owned);
+            errdefer allocator.free(owned);
+            try readTracked(data, &offset, &remaining, &crc, owned);
 
-            try readTracked(&file, &file_offset, &remaining, &crc, &u32_buf);
+            try readTracked(data, &offset, &remaining, &crc, &u32_buf);
             const id = std.mem.readInt(u32, &u32_buf, .little);
 
             // Reject duplicate names.  If found_existing the errdefer above
@@ -214,32 +258,18 @@ pub const LabelDictionary = struct {
 
         if (remaining != 0) return error.InvalidData;
 
-        const stored_crc = try readU32FromFile(&file, &file_offset);
+        const stored_crc = std.mem.readInt(u32, data[offset..][0..4], .little);
         if (stored_crc != crc.final()) return error.ChecksumMismatch;
-
-        self.deinit();
-        self.* = next;
-        self.next_id = max_id;
+        return max_id;
     }
 };
 
-fn readTracked(file: *std.Io.File, offset: *u64, remaining: *usize, crc: *Crc32, buf: []u8) !void {
+fn readTracked(data: []const u8, offset: *usize, remaining: *usize, crc: *Crc32, buf: []u8) !void {
     if (buf.len > remaining.*) return error.InvalidData;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const bytes_read = try file.readPositionalAll(io, buf, offset.*);
-    if (bytes_read != buf.len) return error.InvalidData;
+    @memcpy(buf, data[offset.*..][0..buf.len]);
     crc.update(buf);
     offset.* += buf.len;
     remaining.* -= buf.len;
-}
-
-fn readU32FromFile(file: *std.Io.File, offset: *u64) !u32 {
-    var buf: [4]u8 = undefined;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const bytes_read = try file.readPositionalAll(io, &buf, offset.*);
-    if (bytes_read != buf.len) return error.InvalidData;
-    offset.* += buf.len;
-    return std.mem.readInt(u32, &buf, .little);
 }
 
 fn appendU32(buf: *std.ArrayList(u8), allocator: Allocator, value: u32) !void {
