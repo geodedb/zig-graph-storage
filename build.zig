@@ -826,6 +826,20 @@ fn addIntegrationTests(
     const run_tde_residuals = b.addRunArtifact(tde_residuals_tests);
     tde_residuals_step.dependOn(&run_tde_residuals.step);
 
+    // SONNY-6622: the graph WAL is never truncated or rewritten for being in
+    // the wrong key mode, under the wrong key, or damaged (wal 0.1.24): the
+    // verify tool checks a private copy under the key; a WAL that does not
+    // decode under the key is EncryptionKeyMismatch and kept; a refused
+    // checkpoint compaction is not fatal.
+    const wal_fail_closed_step = b.step("test-wal-fail-closed", "Run WAL fail-closed tests: VerifyTool checks an encrypted WAL under the key and never modifies it (with, without and with another key); a WAL of another key or a plaintext WAL in an encrypted store refuses the open with EncryptionKeyMismatch and is kept; a checkpoint whose WAL compaction is refused completes and the engine keeps working");
+    const wal_fail_closed_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/wal_fail_closed.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_wal_fail_closed = b.addRunArtifact(wal_fail_closed_tests);
+    wal_fail_closed_step.dependOn(&run_wal_fail_closed.step);
+
     // SONNY-6461: restore the adjacency entries a <= 0.4.11 encrypted store
     // lost to the AES-GCM tag tail, from the same edge's other-direction copy.
     const adj_tail_repair_step = b.step("test-adj-tail-repair", "Run legacy TDE page-tail adjacency repair tests: entries lost by <= 0.4.11 encrypted stores (v3 at 4 KiB, v1 at 8 KiB) are restored from their mirror; unrepairable ones are reported");
@@ -986,6 +1000,8 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_tde_schema_names.step);
     // ... and their residuals (SONNY-6616).
     integration_step.dependOn(&run_tde_residuals.step);
+    // WAL fail-closed opens and verify (SONNY-6622).
+    integration_step.dependOn(&run_wal_fail_closed.step);
     integration_step.dependOn(&run_adj_tail_repair.step);
     integration_step.dependOn(&run_page_checksum.step);
     integration_step.dependOn(&run_free_store_offline.step);
