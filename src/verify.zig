@@ -323,7 +323,11 @@ pub const VerifyTool = struct {
         const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         var dict = LabelDictionary.init(self.allocator);
         defer dict.deinit();
-        dict.loadFromFile(path) catch |err| {
+        // SONNY-6590: a sealed dictionary is authenticated with the store's
+        // key (without one it reports SideFileEncrypted).
+        var cipher = @import("side_file_crypto.zig").Cipher.forKey(self.encryption_key, graph_dir.graph_uuid);
+        defer if (cipher) |*c| c.deinit();
+        _ = dict.loadFromFileWith(path, .{ .cipher = if (cipher) |*c| c else null, .require_sealed = false }) catch |err| {
             const msg = try std.fmt.allocPrint(self.allocator, "labels.dict: invalid ({s})", .{@errorName(err)});
             try result.addError(msg);
             try result.addArtifact(.{

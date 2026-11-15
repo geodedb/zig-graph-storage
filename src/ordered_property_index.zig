@@ -56,6 +56,7 @@ const types = @import("types.zig");
 const ordered_encoding = @import("ordered_encoding.zig");
 const ordered_btree = @import("ordered_btree.zig");
 const index_snapshot = @import("index_snapshot.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
 
 const LabelId = types.LabelId;
 const NodeId = types.NodeId;
@@ -76,7 +77,6 @@ pub const SNAPSHOT_FILE_NAME = "ordered_propidx.snap";
 /// the registration is then re-declared / rebuilt, never silently misparsed.
 /// Never reuse a retired magic ("GSORDIX1"/"GSORDIX2"/"GSORDIX3").
 pub const SNAPSHOT_MAGIC = "GSORDIX4";
-const owner_only_file_mode = 0o600;
 
 fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -340,6 +340,15 @@ pub const OrderedPropertyIndex = struct {
     /// (GAP-0050). A no-op leaves a valid empty snapshot (item_count == 0) so a
     /// clean reopen still loads cleanly.
     pub fn saveToFile(self: *Self, dir_path: []const u8, checkpoint_epoch: u64, covered_lsn: u64) !void {
+        return self.saveToFileWith(dir_path, checkpoint_epoch, covered_lsn, null);
+    }
+
+    /// SONNY-6590: save, sealed with `cipher` under at-rest encryption (the
+    /// snapshot holds property-key names and the indexed values). Written
+    /// atomically (temp file, fsync, rename): a crash mid-save keeps the
+    /// previous snapshot instead of a torn one that would drop every
+    /// registration at the next open.
+    pub fn saveToFileWith(self: *Self, dir_path: []const u8, checkpoint_epoch: u64, covered_lsn: u64, cipher: ?*const side_file_crypto.Cipher) !void {
         const path = try self.snapshotPath(dir_path);
         defer self.allocator.free(path);
 
@@ -363,13 +372,10 @@ pub const OrderedPropertyIndex = struct {
             try w.writeBytes(blob);
         }
 
-        const file = try std.Io.Dir.cwd().createFile(io(), path, .{
-            .read = true,
-            .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
-        });
-        defer file.close(io());
-        try w.finalize(file);
+        const seal: ?index_snapshot.Seal = if (cipher) |c| .{ .cipher = c, .kind = .ordered_index, .name = SNAPSHOT_FILE_NAME } else null;
+        const bytes = try w.finish(seal);
+        defer if (seal != null) self.allocator.free(bytes);
+        try side_file_crypto.writeAtomic(self.allocator, path, bytes);
     }
 
     /// Load the snapshot from `<dir_path>/ordered_propidx.snap`, replacing the
@@ -382,6 +388,13 @@ pub const OrderedPropertyIndex = struct {
     /// manifest.last_checkpoint_lsn`; else keep the registration (already loaded
     /// here) but rebuild the trees from a live scan (crash-safety gate).
     pub fn loadFromFile(self: *Self, dir_path: []const u8) !?index_snapshot.Stamp {
+        return self.loadFromFileWith(dir_path, .{ .cipher = null, .require_sealed = false });
+    }
+
+    /// SONNY-6590: load under `policy` (side_file_crypto.ReadPolicy): a sealed
+    /// snapshot is authenticated and decrypted; a plaintext one under a
+    /// cipher is accepted only while upgrading a <= 0.4.16 store.
+    pub fn loadFromFileWith(self: *Self, dir_path: []const u8, policy: side_file_crypto.ReadPolicy) !?index_snapshot.Stamp {
         const path = try self.snapshotPath(dir_path);
         defer self.allocator.free(path);
 
@@ -391,7 +404,10 @@ pub const OrderedPropertyIndex = struct {
         };
         defer file.close(io());
 
-        var loaded = (try index_snapshot.loadPayload(self.allocator, &file, SNAPSHOT_MAGIC, 0)) orelse return null;
+        var loaded = (if (policy.cipher != null)
+            try index_snapshot.loadPayloadWith(self.allocator, &file, SNAPSHOT_MAGIC, 0, policy, .ordered_index, SNAPSHOT_FILE_NAME)
+        else
+            try index_snapshot.loadPayload(self.allocator, &file, SNAPSHOT_MAGIC, 0)) orelse return null;
         defer loaded.deinit();
 
         self.clearAll();

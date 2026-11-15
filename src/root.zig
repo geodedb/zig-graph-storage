@@ -112,6 +112,8 @@ pub const engine_property_index = @import("engine_property_index.zig");
 
 // Encryption and integrity
 pub const encryption = @import("encryption.zig");
+/// SONNY-6590: sealing of the side files that hold schema names under at-rest encryption.
+pub const side_file_crypto = @import("side_file_crypto.zig");
 pub const integrity = @import("integrity.zig");
 pub const verify = @import("verify.zig");
 
@@ -161,7 +163,7 @@ pub const LabelDictReport = config.LabelDictReport;
 pub const AbortUndoPolicy = config.AbortUndoPolicy;
 pub const Metrics = metrics.Metrics;
 
-pub const version = "0.4.16";
+pub const version = "0.4.17";
 
 // ============================================================================
 // Unit Tests
@@ -182,7 +184,7 @@ test "re-exported types match source types" {
 }
 
 test "version is set" {
-    try std.testing.expectEqualStrings("0.4.16", version);
+    try std.testing.expectEqualStrings("0.4.17", version);
 }
 
 test {

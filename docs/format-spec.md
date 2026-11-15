@@ -472,6 +472,50 @@ The represented value is `coeff * 10^(-scale)`.
 
 Total: **7 + N bytes**.
 
+### 1.6 Sealed Side Files (SONNY-6590)
+
+With `GraphConfig.encryption_key` set, the side files that hold schema names
+or indexed values are sealed whole: `labels.dict` (label and
+relationship-type names), `props.idx` (property-key names, value hashes),
+`ordered_propidx.snap` (property-key names and the indexed values),
+`props.catalog` (property-key names of declared indexes) and every
+`propidx_*.btree` (value hashes). Up to 0.4.16 they were written in plaintext
+under a key. Source: `src/side_file_crypto.zig`.
+
+| Bytes        | Content                                                |
+|--------------|--------------------------------------------------------|
+| 0..8         | magic `00 00 00 00 'G' 'S' 'E' 'F'`                    |
+| 8            | envelope version (1)                                   |
+| 9            | kind: 1 labels.dict, 2 props.idx, 3 ordered_propidx.snap, 4 props.catalog, 5 propidx_*.btree |
+| 10..12       | reserved, zero                                         |
+| 12..24       | nonce (96 bits, OS CSPRNG, fresh for every write)      |
+| 24..n-16     | AES-256-GCM ciphertext of the file's plaintext layout (CRC32C included) |
+| n-16..n      | AES-256-GCM tag                                        |
+
+- **Key:** HKDF-SHA256 of the configured key (salt `graph-storage side-file
+  key (SONNY-6590)`, info `aes-256-gcm v1`). Pages and the WAL keep using
+  the configured key; the side-file key is never used for anything else, so
+  the random side-file nonces cannot collide with the page nonce scheme
+  (§1.5).
+- **Nonce:** random per write. Side files are rewritten whole and can be
+  restored or copied, so a persisted counter could repeat; with random
+  96-bit nonces n writes collide with probability below n²/2⁹⁷ (2⁻³³ at
+  2³² writes, the SP 800-38D bound).
+- **Associated data:** bytes 0..24 ‖ the graph's uuid (16 bytes; every shard
+  has its own) ‖ the file's base name. A file moved to another graph, shard
+  or file name, or relabelled as another kind, fails authentication
+  (`error.SideFileAuthFailed`), as does a wrong key or any modified byte.
+- **Downgrade:** the first four bytes are the entry count a <= 0.4.16
+  `labels.dict` parser reads; zero entries and trailing bytes make it refuse
+  the file (`error.InvalidData`). The other formats start with an 8-byte
+  magic the envelope does not match. A <= 0.4.16 binary also refuses the
+  manifest of a sealed store (format_version 5, §5.1).
+
+Not sealed (ids, counts and checksums only, no names or values):
+`labels.idx`, `edges.idx`, `edges_exist.idx` (memory-mapped), `prop_rev.idx`,
+`free.store`, the manifests and `wal/graph.uuid`. `edges.idx` and
+`edges_exist.idx` reveal the graph's topology and relationship-type ids.
+
 ---
 
 ## 5. Manifest Format
@@ -487,7 +531,8 @@ strategy for crash-safe updates.
 | Name               | Value                        |
 |--------------------|------------------------------|
 | `MANIFEST_MAGIC`   | `GEOMNF01` (8 bytes ASCII)   |
-| `MANIFEST_VERSION` | 1 (u32)                      |
+| `MANIFEST_VERSION` | 4 (u32)                      |
+| `MANIFEST_VERSION_SEALED_SIDE_FILES` | 5 (u32): a store under at-rest encryption whose side files are sealed (§1.6). Same layout as 4. Under a key, 4 means a store written by <= 0.4.16: its plaintext side files are sealed at open and the next checkpoint writes 5; at 5 a plaintext side file is refused (`error.SideFileNotSealed`). graph_storage <= 0.4.16 refuses 5 (`error.IncompatibleVersion`). |
 | `FIELD_SIZE`       | 148 bytes                    |
 | `SERIALIZED_SIZE`  | 160 bytes (8 + 148 + 4)      |
 

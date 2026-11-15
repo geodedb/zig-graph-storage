@@ -22,6 +22,7 @@ const index_snapshot_mod = @import("index_snapshot.zig");
 const label_index_mod = @import("label_index.zig");
 const property_chain_index_mod = @import("property_chain_index.zig");
 const file_manager_mod = @import("file_manager.zig");
+const engine_persist = @import("engine_persist.zig");
 
 /// File names of the two sorted edge snapshots, shared with FileManager so
 /// the atomic-replace save (tmp + rename) and the fd reopen target the same
@@ -459,7 +460,11 @@ pub fn tryLoadDerivedIndexes(engine: *GraphEngine) !LoadOutcome {
     }
 
     const label_stamp = try engine.label_index.loadFromFile(label_file) orelse return .rebuild;
-    const prop_stamp = try engine.property_index.loadFromFile(prop_file) orelse return .rebuild;
+    // SONNY-6590: sealed under at-rest encryption; a plaintext or tampered
+    // props.idx is an error here → the caller rebuilds from the pages.
+    var cipher = engine_persist.sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
+    const prop_stamp = try engine.property_index.loadFromFileWith(prop_file, if (cipher) |*c| c else null) orelse return .rebuild;
     const edge_stamp = try loadEdgeIndex(engine, edge_file) orelse return .rebuild;
     // A pre-Phase-3 graph has an empty/absent existence snapshot → load returns
     // null → rebuild. A present-but-stale snapshot fails the epoch check below.
@@ -713,8 +718,10 @@ pub fn saveDerivedIndexes(engine: *GraphEngine, covered_lsn: u64) !void {
     const label_file = engine.file_manager.getFile(.label_idx) orelse return error.LabelIndexFileNotOpen;
     const prop_file = engine.file_manager.getFile(.prop_idx) orelse return error.PropertyIndexFileNotOpen;
     const epoch = engine.manifest.checkpoint_epoch;
+    var cipher = engine_persist.sideCipher(engine);
+    defer if (cipher) |*c| c.deinit();
     try engine.label_index.saveToFile(label_file, epoch, covered_lsn);
-    try engine.property_index.saveToFile(prop_file, epoch, covered_lsn);
+    try engine.property_index.saveToFileWith(prop_file, epoch, covered_lsn, if (cipher) |*c| c else null);
     try saveEdgeIndex(engine, covered_lsn);
     try saveEdgeExistIndex(engine, covered_lsn);
     // PHASE G reverse map (by-path snapshot, like the ordered index).
@@ -738,7 +745,9 @@ pub fn saveDerivedIndexesConditional(
     }
     if (property_dirty) {
         const prop_file = engine.file_manager.getFile(.prop_idx) orelse return error.PropertyIndexFileNotOpen;
-        try engine.property_index.saveToFile(prop_file, epoch, covered_lsn);
+        var cipher = engine_persist.sideCipher(engine);
+        defer if (cipher) |*c| c.deinit();
+        try engine.property_index.saveToFileWith(prop_file, epoch, covered_lsn, if (cipher) |*c| c else null);
     }
     if (edge_dirty) {
         try saveEdgeIndex(engine, covered_lsn);
@@ -805,9 +814,19 @@ pub fn restampCleanDerivedSnapshots(
     }
     if (property_clean) {
         if (engine.file_manager.getFile(.prop_idx)) |f| {
-            if (try index_snapshot_mod.restampStamps(f, property_chain_index_mod.SNAPSHOT_MAGIC, epoch, covered_lsn)) {
-                engine.metrics.derived_index_restamps += 1;
-            }
+            // SONNY-6590: a sealed props.idx is re-sealed with the new stamps
+            // (the tag covers every byte, so no in-place patch).
+            var cipher = engine_persist.sideCipher(engine);
+            defer if (cipher) |*c| c.deinit();
+            const restamped = if (cipher) |*c|
+                try index_snapshot_mod.restampSealed(engine.allocator, f, property_chain_index_mod.SNAPSHOT_MAGIC, epoch, covered_lsn, .{
+                    .cipher = c,
+                    .kind = .prop_chain_index,
+                    .name = property_chain_index_mod.FILE_NAME,
+                })
+            else
+                try index_snapshot_mod.restampStamps(f, property_chain_index_mod.SNAPSHOT_MAGIC, epoch, covered_lsn);
+            if (restamped) engine.metrics.derived_index_restamps += 1;
         }
     }
     if (edge_clean) {

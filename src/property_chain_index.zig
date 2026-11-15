@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const index_snapshot_mod = @import("index_snapshot.zig");
+const side_file_crypto = @import("side_file_crypto.zig");
 
 const Allocator = std.mem.Allocator;
 // WAL-aware derived-index durability: the header now carries
@@ -12,6 +13,9 @@ const Allocator = std.mem.Allocator;
 /// pub so engine_index.restampCleanDerivedSnapshots can validate the file
 /// before an in-place stamp restamp.
 pub const SNAPSHOT_MAGIC = "GSPIDX3\x00";
+/// The snapshot's file name in a graph directory, bound into the sealed
+/// envelope under at-rest encryption (SONNY-6590).
+pub const FILE_NAME = "props.idx";
 
 // SEC-0044/SEC-0048: smallest bytes a single chain record consumes on disk
 // (prop_head u64 + entry_count u32, with zero entries).
@@ -188,6 +192,12 @@ pub const PropertyChainIndex = struct {
     ///     repeated entry_count times:
     ///       [u16 key_len][key bytes][u64 value_hash]
     pub fn saveToFile(self: *const PropertyChainIndex, file: *std.Io.File, checkpoint_epoch: u64, covered_lsn: u64) !void {
+        return self.saveToFileWith(file, checkpoint_epoch, covered_lsn, null);
+    }
+
+    /// SONNY-6590: save, sealed with `cipher` under at-rest encryption (the
+    /// digests hold property-key names and value hashes).
+    pub fn saveToFileWith(self: *const PropertyChainIndex, file: *std.Io.File, checkpoint_epoch: u64, covered_lsn: u64, cipher: ?*const side_file_crypto.Cipher) !void {
         // PERF-0052: serialize the whole snapshot into one in-memory buffer and
         // flush it with a single positional write instead of ~3 syscalls per
         // chain entry. Byte layout and trailing CRC32 (SEC-0051) are unchanged.
@@ -208,17 +218,27 @@ pub const PropertyChainIndex = struct {
             }
         }
 
-        try w.finalize(file.*);
+        try w.finalizeWith(file.*, if (cipher) |c| .{ .cipher = c, .kind = .prop_chain_index, .name = FILE_NAME } else null);
     }
 
     /// Load a previously persisted props.idx snapshot.
     /// Returns the (checkpoint_epoch, covered_lsn) stamp embedded in the
     /// snapshot, or null when the file is empty.
     pub fn loadFromFile(self: *PropertyChainIndex, file: *std.Io.File) !?index_snapshot_mod.Stamp {
+        return self.loadFromFileWith(file, null);
+    }
+
+    /// SONNY-6590: load under at-rest encryption. With a cipher only a sealed
+    /// snapshot is accepted (a plaintext one is `error.SideFileNotSealed`: the
+    /// index is derived, so the caller rebuilds it from the pages).
+    pub fn loadFromFileWith(self: *PropertyChainIndex, file: *std.Io.File, cipher: ?*const side_file_crypto.Cipher) !?index_snapshot_mod.Stamp {
         // PERF-0052: read + validate the whole snapshot once (CRC32 per SEC-0051,
         // chain_count bounded vs payload per SEC-0044/0048), then walk the
         // resident payload instead of ~3 positional reads per chain entry.
-        var snapshot = (try index_snapshot_mod.loadPayload(self.allocator, file, SNAPSHOT_MAGIC, CHAIN_RECORD_MIN_SIZE)) orelse return null;
+        var snapshot = (if (cipher) |c|
+            try index_snapshot_mod.loadPayloadWith(self.allocator, file, SNAPSHOT_MAGIC, CHAIN_RECORD_MIN_SIZE, .{ .cipher = c, .require_sealed = true }, .prop_chain_index, FILE_NAME)
+        else
+            try index_snapshot_mod.loadPayload(self.allocator, file, SNAPSHOT_MAGIC, CHAIN_RECORD_MIN_SIZE)) orelse return null;
         defer snapshot.deinit();
 
         self.clear();

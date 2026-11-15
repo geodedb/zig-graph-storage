@@ -366,6 +366,13 @@ pub const GraphEngine = struct {
             .next_node_id = 1,
             .next_edge_id = 1,
             .next_txn_id = 1,
+            // SONNY-6590: under at-rest encryption every side file of a new
+            // store is sealed from the start, and format_version 5 records it
+            // (a plaintext side file is then refused, never adopted).
+            .format_version = if (cfg.encryption_key != null)
+                manifest_mod.MANIFEST_VERSION_SEALED_SIDE_FILES
+            else
+                manifest_mod.MANIFEST_VERSION,
         };
 
         if (cfg.base_shard_index) |base| {
@@ -689,12 +696,25 @@ pub const GraphEngine = struct {
             }
         }
 
-        // 6. Load persisted label dictionary if it exists
+        // 6. Load persisted label dictionary if it exists. SONNY-6590: sealed
+        // under at-rest encryption; a sealed dictionary without the key
+        // (`error.SideFileEncrypted`), one that fails authentication (wrong
+        // key, modified, or another graph's/shard's: `error.SideFileAuthFailed`)
+        // or a plaintext one in a sealed store (`error.SideFileNotSealed`)
+        // refuses the open — loading it would remap every label id.
         const labels_path = try std.fmt.allocPrint(allocator, "{s}/labels.dict", .{self.graph_dir.path});
         defer allocator.free(labels_path);
-        self.label_dict.loadFromFile(labels_path) catch |err| switch (err) {
-            error.FileNotFound => {}, // Expected on fresh graphs
-            else => return err,
+        const label_dict_was_plaintext = blk: {
+            var cipher = engine_persist.sideCipher(self);
+            defer if (cipher) |*c| c.deinit();
+            const policy = engine_persist.sideReadPolicy(self, if (cipher) |*c| c else null);
+            break :blk self.label_dict.loadFromFileWith(labels_path, policy) catch |err| switch (err) {
+                error.FileNotFound => false, // Expected on fresh graphs
+                else => {
+                    std.log.warn("graph-storage: refusing to open: {s} is unreadable ({s}); a sealed dictionary needs this store's encryption key and graph (SONNY-6590)", .{ labels_path, @errorName(err) });
+                    return err;
+                },
+            };
         };
         // SONNY-6491: graph_storage <= 0.4.13 saved labels.dict after the
         // manifest; a crash in between leaves fewer names than the manifest
@@ -739,7 +759,12 @@ pub const GraphEngine = struct {
         // OF SCOPE (needs a node->old-ordered-key reverse map the PropRevIndex
         // does not carry — GAP-0050 crash-leg follow-up); the tail leg REBUILDS.
         var ordered_loaded = false;
-        const ordered_snapshot_stamp = self.ordered_property_index.loadFromFile(self.graph_dir.path) catch null;
+        const ordered_snapshot_stamp = blk: {
+            var cipher = engine_persist.sideCipher(self);
+            defer if (cipher) |*c| c.deinit();
+            const policy = engine_persist.sideReadPolicy(self, if (cipher) |*c| c else null);
+            break :blk self.ordered_property_index.loadFromFileWith(self.graph_dir.path, policy) catch null;
+        };
         if (ordered_snapshot_stamp) |stamp| {
             if (stamp.epoch == self.manifest.checkpoint_epoch and
                 stamp.covered_lsn == self.manifest.last_checkpoint_lsn)
@@ -750,6 +775,12 @@ pub const GraphEngine = struct {
                 self.ordered_index_dirty = true;
             }
         }
+
+        // 7d. SONNY-6590: a store written by <= 0.4.16 under at-rest
+        // encryption has its side files in plaintext; seal them now (each
+        // step crash-safe) and mark the manifest format_version 5 (persisted
+        // by the next checkpoint or close: the store is marked dirty below).
+        const sealed_now = try engine_persist.sealLegacySideFiles(self, label_dict_was_plaintext, ordered_snapshot_stamp);
 
         // 8. Wire metrics and thread pool into buffer pool
         self.metrics = .{};
@@ -771,7 +802,7 @@ pub const GraphEngine = struct {
         // Initialize owned-or-borrowed thread pool (see initThreadPool).
         try self.initThreadPool(allocator, cfg);
         self.buffer_pool.setThreadPool(self.thread_pool);
-        self.persistence_dirty.store(false, .release);
+        self.persistence_dirty.store(sealed_now, .release);
 
         return self;
     }
@@ -1324,10 +1355,13 @@ pub const GraphEngine = struct {
                 };
             }
             if (close_err == null) {
-                self.ordered_property_index.saveToFile(
+                var cipher = engine_persist.sideCipher(self);
+                defer if (cipher) |*c| c.deinit();
+                self.ordered_property_index.saveToFileWith(
                     self.graph_dir.path,
                     self.manifest.checkpoint_epoch,
                     self.manifest.last_checkpoint_lsn,
+                    if (cipher) |*c| c else null,
                 ) catch |err| {
                     if (close_err == null) close_err = err;
                 };

@@ -416,6 +416,10 @@ flowchart LR
 ```
 
 - Per-page encryption (not whole-file)
+- The side files holding schema names or indexed values (`labels.dict`,
+  `props.idx`, `ordered_propidx.snap`, `props.catalog`, `propidx_*.btree`)
+  are sealed whole with a key derived from the same key (SONNY-6590,
+  `docs/format-spec.md` §1.6); id-only snapshots stay plaintext
 - Key provided via `GraphConfig.encryption_key`
 - `GraphConfig.zeroKey()` securely clears key material
 - Backup format v2 adds HMAC-SHA256 authentication

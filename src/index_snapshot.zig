@@ -4,6 +4,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const side_file_crypto = @import("side_file_crypto.zig");
 
 /// Same CRC used by the manifest (manifest.zig) for on-disk integrity.
 // fips-exempt: non-security — CRC32C record-integrity (corruption detection)
@@ -118,6 +119,14 @@ pub fn loadFile(allocator: Allocator, file: *std.Io.File, expected_magic: []cons
     const bytes_read = try file.readPositionalAll(io, data, 0);
     if (bytes_read != size) return error.UnexpectedEndOfFile;
 
+    return try parseLoaded(allocator, data, expected_magic);
+}
+
+/// Validate a whole snapshot already in memory (magic, trailing CRC32) and
+/// wrap it. Takes ownership of `data` on success only.
+fn parseLoaded(allocator: Allocator, data: []u8, expected_magic: []const u8) !LoadedSnapshot {
+    const size = data.len;
+    if (size < expected_magic.len + HEADER_FIELDS_SIZE + CHECKSUM_SIZE) return error.InvalidFormat;
     if (!std.mem.eql(u8, data[0..expected_magic.len], expected_magic)) {
         return error.InvalidFormat;
     }
@@ -137,6 +146,89 @@ pub fn loadFile(allocator: Allocator, file: *std.Io.File, expected_magic: []cons
         .payload_offset = payload_offset,
         .payload_size = size - payload_offset - CHECKSUM_SIZE,
     };
+}
+
+/// SONNY-6590: how a snapshot that may be sealed (at-rest encryption) is
+/// written and read: the store's side-file cipher, the file kind and base
+/// name bound into the envelope.
+pub const Seal = struct {
+    cipher: *const side_file_crypto.Cipher,
+    kind: side_file_crypto.Kind,
+    name: []const u8,
+};
+
+/// SONNY-6590: `loadPayload` for a snapshot that may be sealed. The whole
+/// file is read, decoded under `policy` (a sealed file is authenticated and
+/// decrypted; see side_file_crypto.decode), then validated exactly as
+/// `loadPayload` validates a plaintext one. Null when the file is empty.
+pub fn loadPayloadWith(
+    allocator: Allocator,
+    file: *std.Io.File,
+    expected_magic: []const u8,
+    min_record_size: usize,
+    policy: side_file_crypto.ReadPolicy,
+    kind: side_file_crypto.Kind,
+    name: []const u8,
+) !?LoadedSnapshot {
+    if (expected_magic.len != 8) return error.InvalidMagicLength;
+    const raw = try side_file_crypto.readWholeOpenFile(allocator, file.*);
+    if (raw.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+    const decoded = try side_file_crypto.decode(allocator, policy, kind, name, raw);
+    errdefer allocator.free(decoded.bytes);
+    const loaded = try parseLoaded(allocator, decoded.bytes, expected_magic);
+
+    if (min_record_size != 0) {
+        const max_items = loaded.payload_size / min_record_size;
+        if (loaded.item_count > max_items) return error.InvalidFormat;
+    }
+    return loaded;
+}
+
+/// SONNY-6590: `restampStamps` for a SEALED snapshot. The envelope's tag
+/// covers every byte, so the stamps cannot be patched in place: the file is
+/// read, authenticated, re-stamped (CRC32 recomputed), sealed under a fresh
+/// nonce and rewritten — O(file), unlike the plaintext restamp. A crash
+/// mid-rewrite leaves an empty or torn file (load → null / auth failure →
+/// rebuild). Returns false (file untouched) when the file is empty, not
+/// sealed, fails authentication or has another magic.
+pub fn restampSealed(
+    allocator: Allocator,
+    file: *std.Io.File,
+    expected_magic: []const u8,
+    new_epoch: u64,
+    new_covered_lsn: u64,
+    seal: Seal,
+) !bool {
+    if (expected_magic.len != 8) return error.InvalidMagicLength;
+    const raw = try side_file_crypto.readWholeOpenFile(allocator, file.*);
+    defer allocator.free(raw);
+    if (!side_file_crypto.isSealed(raw)) return false;
+    const plain = seal.cipher.open(allocator, seal.kind, seal.name, raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer allocator.free(plain);
+    if (plain.len < expected_magic.len + HEADER_FIELDS_SIZE + CHECKSUM_SIZE) return false;
+    if (!std.mem.eql(u8, plain[0..8], expected_magic)) return false;
+    const old_epoch = std.mem.readInt(u64, plain[8..16], .little);
+    const old_covered = std.mem.readInt(u64, plain[16..24], .little);
+    if (old_epoch == new_epoch and old_covered == new_covered_lsn) return true;
+
+    std.mem.writeInt(u64, plain[8..16], new_epoch, .little);
+    std.mem.writeInt(u64, plain[16..24], new_covered_lsn, .little);
+    const body_len = plain.len - CHECKSUM_SIZE;
+    std.mem.writeInt(u32, plain[body_len..][0..CHECKSUM_SIZE], Crc32.hash(plain[0..body_len]), .little);
+
+    const sealed = try seal.cipher.seal(allocator, seal.kind, seal.name, plain);
+    defer allocator.free(sealed);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try file.setLength(io, 0);
+    try file.writePositionalAll(io, sealed, 0);
+    try file.sync(io);
+    return true;
 }
 
 /// Read and validate the snapshot header, verify its CRC32, and bound the
@@ -431,14 +523,31 @@ pub const SnapshotWriter = struct {
     /// SEC-0051: append the CRC32 trailer over the accumulated bytes and flush
     /// the entire snapshot to `file` with a single positional write.
     pub fn finalize(self: *SnapshotWriter, file: std.Io.File) !void {
+        return self.finalizeWith(file, null);
+    }
+
+    /// SONNY-6590: `finalize`, sealing the snapshot when `seal` is set.
+    pub fn finalizeWith(self: *SnapshotWriter, file: std.Io.File, seal: ?Seal) !void {
+        const bytes = try self.finish(seal);
+        defer if (seal != null) self.allocator.free(bytes);
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try file.setLength(io, 0);
+        try file.writePositionalAll(io, bytes, 0);
+    }
+
+    /// Append the CRC32 trailer and return the bytes to write: the buffer
+    /// itself (owned by the writer) when `seal` is null, else a sealed copy
+    /// the caller frees.
+    pub fn finish(self: *SnapshotWriter, seal: ?Seal) ![]u8 {
         const crc = Crc32.hash(self.buf.items);
         var crc_buf: [CHECKSUM_SIZE]u8 = undefined;
         std.mem.writeInt(u32, &crc_buf, crc, .little);
         try self.buf.appendSlice(self.allocator, &crc_buf);
-
-        const io = std.Io.Threaded.global_single_threaded.io();
-        try file.setLength(io, 0);
-        try file.writePositionalAll(io, self.buf.items, 0);
+        const s = seal orelse return self.buf.items;
+        const sealed = try s.cipher.seal(self.allocator, s.kind, s.name, self.buf.items);
+        std.crypto.secureZero(u8, self.buf.items);
+        return sealed;
     }
 };
 

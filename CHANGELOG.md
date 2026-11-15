@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.17] - 2026-11-15
+
+### Security
+
+- **On-disk format change.** Under at-rest encryption
+  (`GraphConfig.encryption_key`) the side files that hold schema names or
+  indexed values are sealed with AES-256-GCM (SONNY-6590): `labels.dict`
+  (label and relationship-type names, every shard), `props.idx`
+  (property-key names, value hashes), `ordered_propidx.snap` (property-key
+  names and the indexed values), `props.catalog` (key names of declared
+  indexes) and `propidx_*.btree`. They used to be written in plaintext next
+  to the encrypted pages and WAL. Key: HKDF-SHA256 of the configured key;
+  nonce: 96 random bits per write; associated data: envelope header, the
+  graph's (shard's) uuid and the file name, so a file copied from another
+  graph, shard or file fails authentication (`docs/format-spec.md` §1.6).
+  A sealed side file that fails authentication refuses the open
+  (`error.SideFileAuthFailed`) instead of being adopted — a foreign
+  `labels.dict` used to remap every label id silently; derived snapshots
+  that fail are rebuilt. Opening without the key fails with
+  `error.SideFileEncrypted`.
+- **Manifest format_version 5** (same layout as 4) marks a store under a key
+  whose side files are sealed; from then on a plaintext side file is refused
+  (`error.SideFileNotSealed`). Stores without a key stay at 4. A store
+  written by <= 0.4.16 under a key is upgraded at open (stale
+  `labels.dict.tmp` removed, `labels.dict` / `ordered_propidx.snap` /
+  `props.catalog` / `propidx_*.btree` rewritten sealed, plaintext
+  `props.idx` emptied and rebuilt) and the next checkpoint or `close()`
+  writes 5; a crash at any step reopens and resumes. graph_storage <= 0.4.16
+  refuses a sealed store (`error.IncompatibleVersion` on the manifest,
+  `error.InvalidData` on `labels.dict`). Plaintext copies in older backups
+  and freed disk blocks are not scrubbed (`docs/operations.md`).
+
+### Added
+
+- `side_file_crypto` (`Cipher`, `ReadPolicy`, `Kind`, `isSealed`,
+  `UpgradeStep` test fault points), `manifest.MANIFEST_VERSION_SEALED_SIDE_FILES`,
+  `LabelDictionary.saveToFileWith` / `loadFromFileWith`,
+  `PropertyChainIndex.saveToFileWith` / `loadFromFileWith`,
+  `OrderedPropertyIndex.saveToFileWith` / `loadFromFileWith`,
+  `IndexCatalog.saveToFileWith` / `loadFromFileWith`,
+  `BPlusTree.saveToFileWith` / `loadFromFileWith`,
+  `index_snapshot.loadPayloadWith` / `restampSealed` /
+  `SnapshotWriter.finalizeWith` / `finish` (SONNY-6590).
+- `zig build test-tde-schema-names` (also under `test-integration`): every
+  file of single and sharded encrypted stores is scanned for schema names
+  and indexed values after close, crash and reopen; upgrade with a crash at
+  each step; tampered, foreign and keyless opens; sealed shard dictionary
+  reconciliation (SONNY-6590).
+
+### Changed
+
+- `ordered_propidx.snap`, `props.catalog` and `propidx_*.btree` are written
+  atomically (temp file, fsync, rename) with or without a key; they were
+  truncated and rewritten in place without an fsync, so a crash mid-save
+  could leave a torn file (an unreadable ordered snapshot drops every
+  ordered-index registration at the next open) (SONNY-6590).
+- `LabelDictionary.loadFromFile` reads the whole file and refuses an entry
+  whose declared name length exceeds the bytes left before allocating it
+  (a corrupt length used to allocate up to 4 GiB first) (SONNY-6590).
+- Under a key, the checkpoint restamp of a clean `props.idx` re-seals the
+  file (O(file)) instead of patching the stamp in place (SONNY-6590).
+
 ## [0.4.16] - 2026-11-14
 
 ### Added
@@ -520,7 +582,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.16...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.17...HEAD
+[0.4.17]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.16...v0.4.17
 [0.4.16]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.15...v0.4.16
 [0.4.15]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.14...v0.4.15
 [0.4.14]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.13...v0.4.14
