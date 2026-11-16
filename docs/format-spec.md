@@ -486,7 +486,7 @@ under a key. Source: `src/side_file_crypto.zig`.
 |--------------|--------------------------------------------------------|
 | 0..8         | magic `00 00 00 00 'G' 'S' 'E' 'F'`                    |
 | 8            | envelope version (1)                                   |
-| 9            | kind: 1 labels.dict, 2 props.idx, 3 ordered_propidx.snap, 4 props.catalog, 5 propidx_*.btree, 6 edges.idx, 7 edges_exist.idx, 8 graph_registry.dat (SONNY-6616); 9..127 reserved for graph-storage, 128..255 the consumer's (`Kind.consumer(n)`), 0 never |
+| 9            | kind: 1 labels.dict, 2 props.idx, 3 ordered_propidx.snap, 4 props.catalog, 5 propidx_*.btree, 6 edges.idx, 7 edges_exist.idx, 8 graph_registry.dat (SONNY-6616), 9 data_dir.identity (SONNY-6635); 10..127 reserved for graph-storage, 128..255 the consumer's (`Kind.consumer(n)`), 0 never |
 | 10..12       | reserved, zero                                         |
 | 12..24       | nonce (96 bits, OS CSPRNG, fresh for every write)      |
 | 24..n-16     | AES-256-GCM ciphertext of the file's plaintext layout (CRC32C included) |
@@ -524,12 +524,31 @@ checkpoint; one that fails authentication is rebuilt the same way. They
 are derived, so manifest format_version stays 5 and 0.4.17 rebuilds (and
 rewrites in plaintext) a sealed one it cannot read. `GraphRegistry` (a
 data directory's `graph_registry.dat`: graph names, uuids, node and edge
-counts) is sealed when the caller saves it with `saveToFileWith`
-(`registry.SEAL_UUID` unless the caller binds another uuid).
+counts) is sealed when the caller saves it with `saveToFileWith`, under the
+data directory's identity (below).
+
+**Data-directory identity (SONNY-6635).** `data_dir.identity`, in the data
+directory, owner-only: magic `GEODDID1` (8) ‖ version u32 (1) ‖ flags u32
+(bit 0: the registry has been sealed under this identity; the other bits
+zero) ‖ uuid (16, OS CSPRNG, made once) ‖ CRC32C u32 over the preceding 32
+bytes. Under a key the file is sealed (kind 9, associated-data uuid
+`registry.SEAL_UUID`, all zero, since the identity is what is being read)
+and a plaintext one is refused (`error.SideFileNotSealed`): no build wrote
+one under a key, and its flag must not be forgeable. The registry's cipher
+is bound to the identity's uuid (`DataDirIdentity.cipher`), so a registry
+sealed in another data directory fails authentication. 0.4.20 to 0.4.25
+sealed the registry under `SEAL_UUID`, which every data directory shares;
+the consumer reads such a registry only while the identity's bit 0 is
+clear, and reseals it. The identity does not detect a directory's own
+earlier registry put back, or the identity file copied along with the
+registry.
 
 Not sealed (ids, counts and checksums only, no names or values):
-`labels.idx`, `prop_rev.idx`, `free.store`, the manifests and
-`wal/graph.uuid`.
+`labels.idx` (node ids per label id; the names are in the sealed
+`labels.dict`), `prop_rev.idx`, `free.store` (free-page bitmaps), the
+manifests (authenticated, §5.1) and `wal/graph.uuid`. They reveal sizes and
+id membership, not names or values; see docs/operations.md, "What the key
+covers".
 
 ---
 

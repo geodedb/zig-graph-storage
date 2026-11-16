@@ -372,10 +372,29 @@ that hold schema names or indexed values — `labels.dict`, `props.idx`,
 `ordered_propidx.snap`, `props.catalog`, `propidx_*.btree` — and (since
 SONNY-6616, 0.4.19) the topology snapshots `edges.idx` and `edges_exist.idx`
 (`docs/format-spec.md` §1.6). A consumer that saves its `GraphRegistry` with
-`saveToFileWith` gets `graph_registry.dat` (graph names) sealed too. The
-manifests are authenticated (HMAC-SHA256), not encrypted. Not encrypted:
-`labels.idx`, `prop_rev.idx` and `free.store` (ids, counts and checksums
-only). File sizes and modification times are visible.
+`saveToFileWith` gets `graph_registry.dat` (graph names) sealed too, under
+the data directory's own identity (`registry.DataDirIdentity`,
+`data_dir.identity`, since SONNY-6635): a sealed registry copied from
+another data directory under the same key fails authentication. The
+manifests are authenticated (HMAC-SHA256), not encrypted. File sizes and
+modification times are visible.
+
+Not encrypted, and why (SONNY-6635):
+
+- `labels.idx`: for each label *id*, the ids of the nodes that carry it.
+  The names are in `labels.dict`, which is sealed; what is visible is which
+  nodes share a label id and how many there are, which the sealed store
+  pages' sizes and the node count already bound.
+- `prop_rev.idx`: node id to property-chain position; no names or values.
+- `free.store`: one bitmap of free pages per paged file; page numbers only.
+- The manifests (`manifest.a`/`.b`): the graph uuid, counters, page counts
+  and node and edge counts. Read at open before anything else, so they are
+  authenticated, not encrypted: a forged or rolled-back manifest is refused
+  (SEC-0043); its counts reveal no more than the store's file sizes.
+- `wal/graph.uuid`: the graph's uuid, also in the directory name.
+
+None of them holds a name, a property value or an edge's endpoints; sealing
+them would hide only sizes the file system shows anyway.
 
 Under a key the topology snapshots are decrypted into memory when a graph
 opens instead of being memory-mapped: the open reads the whole file, and
@@ -391,7 +410,12 @@ authenticates under the key. A store whose manifests are absent is still
 open with the same error and is left as it is (SONNY-6622); a WAL with a
 bad record followed by valid ones is `error.WalCorrupted`. The offline
 verify tool (`VerifyTool`) checks a private copy of the WAL under the key
-and never modifies the store's.
+and never modifies the store's. The copy is made in a new 0700 directory
+inside the graph's directory (`.verify-wal-<random>`, files 0600) and
+removed when the check ends (SONNY-6635: it was made under `$TMPDIR` or
+`/tmp`, where without a key the log's copy was plaintext on another
+filesystem). A process killed during the check can leave that directory;
+it is safe to delete.
 
 A sealed side file that fails authentication refuses the open (wrong key,
 modified, or copied from another graph or shard: `error.SideFileAuthFailed`);
