@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.23] - 2026-11-16
+
+### Fixed
+
+- The bytes of a transaction that had not ended could reach the store
+  files, where recovery (redo of committed transactions only) left them
+  after a crash: eviction wrote dirty pages back mid-transaction, a
+  checkpoint or light checkpoint during the transaction flushed them and
+  moved the frontier past it, `close` checkpointed with it open, and a crash
+  in the middle of an abort left whatever had been written. The buffer pool
+  now holds every page dirtied while a transaction is open (no-steal) until
+  none is open; checkpoints are deferred meanwhile
+  (`Metrics.checkpoints_deferred`); `close` aborts open transactions first;
+  after an abort that cannot be undone its pages are never written. A
+  transaction that dirties more pages than the pool holds now fails with
+  `error.BufferPoolFull` (abort restores it). Under `sync_mode = .deferred`
+  a committed page is written back only after its COMMIT record is synced
+  (`Metrics.evict_wal_syncs`) (SONNY-6648, SONNY-6558 #5).
+- Node writes made before the derived indexes were hydrated (`putNodeTxn`,
+  `deleteNodeTxn` and their undo) skipped the reverse map (prop_head ->
+  owner), and hydration usually loads a snapshot that does not know them,
+  so the map kept a moved chain's old owner and a deleted node's chain.
+  They are now queued and replayed by the hydration (a node scan when more
+  than 65,536 are queued) (SONNY-6648).
+
 ## [0.4.22] - 2026-11-15
 
 ### Fixed
@@ -736,7 +761,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.23...HEAD
+[0.4.23]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...v0.4.23
 [0.4.22]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.21...v0.4.22
 [0.4.21]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.20...v0.4.21
 [0.4.20]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.18...v0.4.20

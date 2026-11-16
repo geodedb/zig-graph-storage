@@ -78,6 +78,9 @@ stages:
 .install-zig: &install-zig
   - apt-get update && apt-get install -y curl xz-utils python3
   - |
+    if [ "$(uname -s)" = Linux ] && [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+      apt-get update && apt-get install -y --no-install-recommends ca-certificates
+    fi
     # Reuse a cached/artifact Zig only if it runs on this runner: jobs land on
     # both x86_64 and aarch64 runners, so a binary from another job can be the
     # wrong architecture ("cannot execute binary file: Exec format error").

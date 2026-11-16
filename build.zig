@@ -773,6 +773,29 @@ fn addIntegrationTests(
     const run_sonny6558 = b.addRunArtifact(sonny6558_tests);
     sonny6558_step.dependOn(&run_sonny6558.step);
 
+    // SONNY-6648: no-steal. An open transaction's pages never reach the store
+    // files (eviction, checkpoint, close, a crash mid-abort), and under
+    // deferred sync a committed page is written only after its COMMIT is synced.
+    const sonny6648_step = b.step("test-sonny6648-no-steal", "Run SONNY-6648 no-steal tests: an open transaction's pages are not written by eviction, checkpoint or close, a crash mid-abort leaves the prior state, deferred-sync commits are synced before eviction");
+    const sonny6648_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/sonny6648_no_steal.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_sonny6648 = b.addRunArtifact(sonny6648_tests);
+    sonny6648_step.dependOn(&run_sonny6648.step);
+
+    // SONNY-6648: node writes made before the derived indexes are hydrated
+    // reach the reverse map (committed, aborted, crash, queue overflow).
+    const sonny6648_rev_step = b.step("test-sonny6648-rev-map", "Run SONNY-6648 reverse-map tests: node writes before hydration (committed, aborted, crashed) reach the reverse map");
+    const sonny6648_rev_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/sonny6648_rev_map.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_sonny6648_rev = b.addRunArtifact(sonny6648_rev_tests);
+    sonny6648_rev_step.dependOn(&run_sonny6648_rev.step);
+
     // SONNY-6529: abortTxn undoes the transaction's writes (node create /
     // update / delete, labels, properties on new chains, edge add / remove /
     // first property) in memory and across checkpoint + reopen and crash +
@@ -1017,6 +1040,8 @@ fn addIntegrationTests(
     // Recovery WAL truncation crash points (SONNY-6599) likewise.
     integration_step.dependOn(&run_recovery_wal_drain.step);
     integration_step.dependOn(&run_sonny6558.step);
+    integration_step.dependOn(&run_sonny6648.step);
+    integration_step.dependOn(&run_sonny6648_rev.step);
     // Shard label dictionaries (SONNY-6524) are the same lost-name class.
     integration_step.dependOn(&run_label_dict_shards.step);
     // Aborted writes made durable (SONNY-6529) are the same silent-corruption class.

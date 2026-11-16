@@ -8,6 +8,21 @@ pub const PageId = types.PageId;
 pub const FileId = types.FileId;
 pub const Lsn = types.Lsn;
 
+/// SONNY-6648: why a dirty frame may not be written to its store file yet.
+pub const Hold = enum(u8) {
+    /// Writable whenever it is dirty.
+    none,
+    /// It was dirtied while a transaction was open: it may hold bytes of a
+    /// transaction that has not ended. Recovery has no undo, so those bytes
+    /// must not reach disk (no-steal). Released when no transaction is open.
+    open_txn,
+    /// Its transactions committed under `sync_mode = .deferred`, whose
+    /// COMMIT records may not be synced yet. Written only after a WAL sync
+    /// (`BufferPool.wal_sync_hook`), so disk never holds part of a
+    /// transaction the log lost.
+    unsynced,
+};
+
 /// A buffer pool frame holding one page's data in memory.
 pub const PageFrame = struct {
     file_id: FileId,
@@ -59,6 +74,9 @@ pub const PageFrame = struct {
     // under the pool mutex.
     evicting: bool = false,
     valid: bool = false, // true if frame contains actual page data (not empty slot)
+    /// SONNY-6648: see `Hold`. A held frame is neither evicted nor flushed.
+    /// Always mutated under the pool mutex.
+    hold: Hold = .none,
     lsn: Lsn = 0,
     // LRU doubly-linked list pointers (index-based, not pointer-based)
     lru_prev: ?u32 = null, // index into frames array
@@ -85,9 +103,11 @@ pub const PageFrame = struct {
     /// it with a CAS(0 -> PIN_EVICTING), so even if a fast-path pin increments it
     /// between this scan and the claim, the claim fails and eviction aborts — this
     /// load only needs to be correct, not exclusive, so the atomic suffices.
+    ///
+    /// SONNY-6648: a held frame (`hold != .none`) is not evictable either.
     pub fn isEvictable(self: *const PageFrame) bool {
         return @atomicLoad(u32, &self.pin_count, .acquire) == 0 and
-            self.valid and !self.loading and !self.evicting;
+            self.valid and !self.loading and !self.evicting and self.hold == .none;
     }
 };
 

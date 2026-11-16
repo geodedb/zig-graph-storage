@@ -114,10 +114,37 @@ the same way, in memory only (no other transaction can have committed in
 between, so nothing durable carries it), which also works when the failure
 was running out of memory.
 
-Known limits: a page another transaction commits while this one is still
-open carries this one's uncommitted bytes in its image, and a dirty page
-evicted to disk mid-transaction keeps them on disk; both are reverted by the
-undo's own logged images, but not if the process dies before the abort.
+An open transaction's bytes never reach the store files (no-steal, 0.4.23,
+SONNY-6648). Recovery redoes committed transactions only and has no undo, so
+while any transaction is open on an engine:
+
+- a page dirtied in that time stays in the buffer pool: eviction skips it,
+  and it is written back once no transaction is open (after the commit, or
+  after the abort's undo). A transaction can therefore dirty at most about
+  `buffer_pool_pages` distinct pages; past that its next write fails with
+  `error.BufferPoolFull`, and `abortTxn` restores what it wrote. The
+  default pool (1,024 pages, auto-sized up to 65,536 on open) holds far
+  more than one statement writes;
+- `checkpoint` and `checkpointLight` do nothing and count
+  `Metrics.checkpoints_deferred`; the next one after the transaction ends
+  runs in full (committed writes are in the WAL meanwhile);
+- `close` aborts the open transactions (newest first) and then closes
+  normally; an abort that cannot be undone takes the `AbortNotUndone` path
+  above.
+
+A crash at any point before the COMMIT record, including in the middle of
+an abort, so recovers the state before the transaction. After an abort that
+could not be undone (`.fail_closed`) its pages are never written. Under
+`sync_mode = .deferred` a committed page is written back only after the WAL
+holding its COMMIT record is synced: eviction syncs it once the pool holds
+nothing else it could evict (`Metrics.evict_wal_syncs`, also counting the
+sync a checkpoint makes first), so disk never holds part of a transaction
+the log lost.
+
+Known limit: a page another transaction commits while this one is still
+open carries this one's uncommitted bytes in its full-page image, and
+recovery replays that image. Keep one transaction open per engine at a time
+(geode opens at most one statement transaction per shard).
 
 ---
 
@@ -129,6 +156,10 @@ manifest to the alternate A/B slot:
 ```zig
 try engine.checkpoint();
 ```
+
+While a transaction is open the checkpoint is deferred (it returns without
+doing anything, `Metrics.checkpoints_deferred`): flushing would write that
+transaction's bytes (SONNY-6648, see Transactions).
 
 Each step is durable before the next one starts (SONNY-6491):
 

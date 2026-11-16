@@ -29,6 +29,14 @@ pub const Metrics = struct {
     /// SONNY-6529: aborts that could not undo the transaction's writes
     /// (`error.AbortNotUndone` under `abort_undo = .fail_closed`).
     txn_aborts_not_undone: u64 = 0,
+    /// SONNY-6648: checkpoints that did nothing because a transaction was
+    /// open (its pages must not reach disk); the next one after it ends runs.
+    checkpoints_deferred: u64 = 0,
+    /// SONNY-6648: WAL syncs the buffer pool made before writing back pages
+    /// of transactions committed under `sync_mode = .deferred` whose COMMIT
+    /// record was not synced yet: by eviction, once nothing else could be
+    /// evicted, and by a checkpoint's flush.
+    evict_wal_syncs: u64 = 0,
 
     // Open
     /// SONNY-6599: 1 when this open's crash recovery truncated the WAL it

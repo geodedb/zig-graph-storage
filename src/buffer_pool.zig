@@ -12,6 +12,7 @@ const metrics_mod = @import("metrics.zig");
 
 const Allocator = std.mem.Allocator;
 const PageFrame = page_frame_mod.PageFrame;
+const Hold = page_frame_mod.Hold;
 const Pager = pager_mod.Pager;
 const Metrics = metrics_mod.Metrics;
 const PageId = types.PageId;
@@ -22,6 +23,12 @@ const FILE_COUNT = @typeInfo(FileId).@"enum".fields.len;
 pub const BufferPoolError = error{
     BufferPoolFull,
     NoPagerRegistered,
+    /// SONNY-6648: a durability flush (`flushAll`, `flushDirty`) found a
+    /// frame holding bytes of a transaction that has not ended. The engine
+    /// does not checkpoint while a transaction is open.
+    OpenTransactionPagesHeld,
+    /// SONNY-6648: frames wait for a WAL sync and no `wal_sync_hook` is set.
+    WalSyncHookMissing,
 };
 
 /// The single-threaded blocking Io used for all lock primitives in this file
@@ -251,6 +258,36 @@ pub const BufferPool = struct {
     pin_waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // Optional thread pool for parallel page flushes
     thread_pool: ?*tp.ThreadPool = null,
+    /// SONNY-6648 (no-steal): transactions open on the engine that owns this
+    /// pool (`beginTxnHold` / `endTxnHold`). While non-zero, `unpin` holds
+    /// every frame it dirties (`Hold.open_txn`): recovery redoes committed
+    /// transactions only, so a page carrying an open transaction's bytes must
+    /// not reach its store file.
+    open_txns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// SONNY-6648: indices of the held frames (`hold != .none`), each once.
+    /// Sized to `capacity` at init, so holding a frame never allocates.
+    /// Under `mutex`.
+    held: std.ArrayListUnmanaged(u32) = .empty,
+    /// SONNY-6648: syncs the WAL (set by the engine). Called, with `mutex`
+    /// held, before `Hold.unsynced` frames are written.
+    wal_sync_hook: ?WalSyncHook = null,
+
+    pub const WalSyncHook = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque) anyerror!void,
+    };
+
+    /// SONNY-6648: what the end of the last open transaction does to the
+    /// frames it held (`endTxnHold`).
+    pub const TxnEnd = enum {
+        /// Its writes are committed and synced, or undone: writable again.
+        release,
+        /// Committed under `sync_mode = .deferred`: writable after the next
+        /// WAL sync (`Hold.unsynced`).
+        after_wal_sync,
+        /// An abort could not undo them: they stay off disk for good.
+        keep,
+    };
 
     /// Initialize a buffer pool with the given capacity (number of frames).
     pub fn init(allocator: Allocator, page_size: u32, capacity: u32) !BufferPool {
@@ -303,7 +340,11 @@ pub const BufferPool = struct {
         var page_table = std.AutoHashMap(PageKey, u32).init(allocator);
         try page_table.ensureTotalCapacity(@intCast(capacity));
 
+        // SONNY-6648: every frame can be held at once.
+        const held = try std.ArrayListUnmanaged(u32).initCapacity(allocator, capacity);
+
         return BufferPool{
+            .held = held,
             .allocator = allocator,
             .page_size = page_size,
             .capacity = capacity,
@@ -323,6 +364,7 @@ pub const BufferPool = struct {
     pub fn deinit(self: *BufferPool) void {
         self.page_table.deinit();
         self.free_list.deinit(self.allocator);
+        self.held.deinit(self.allocator);
         self.allocator.free(self.frames);
         // page_buf is an anonymous mmap (see init), not an allocator allocation.
         std.posix.munmap(@alignCast(self.page_buf));
@@ -855,6 +897,17 @@ pub const BufferPool = struct {
         const frame = &self.frames[frame_idx];
 
         if (dirty) {
+            // SONNY-6648: hold the frame BEFORE it is published dirty and
+            // unpinned, so no eviction or flush sees it dirty and unheld.
+            // Mutex only for the first dirtying of a frame per transaction
+            // scope; outside a transaction unpin stays lock-free.
+            if (self.open_txns.load(.acquire) != 0 and
+                @atomicLoad(Hold, &frame.hold, .acquire) != .open_txn)
+            {
+                self.mutex.lockUncancelable(io);
+                self.holdLocked(frame_idx);
+                self.mutex.unlock(io);
+            }
             @atomicStore(bool, &frame.dirty, true, .monotonic);
         }
         const prev = @atomicRmw(u32, &frame.pin_count, .Sub, 1, .acq_rel);
@@ -895,6 +948,89 @@ pub const BufferPool = struct {
         }
     }
 
+    /// SONNY-6648: a transaction opened on the owning engine. From here until
+    /// the last open transaction ends, frames dirtied through `unpin` are held.
+    pub fn beginTxnHold(self: *BufferPool) void {
+        _ = self.open_txns.fetchAdd(1, .acq_rel);
+    }
+
+    /// SONNY-6648: a transaction ended. When it was the last one open, its
+    /// held frames are released as `how` says (and parked pinners woken: an
+    /// eviction that found only held frames can make progress now).
+    pub fn endTxnHold(self: *BufferPool, how: TxnEnd) void {
+        const prev = self.open_txns.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev != 1) return;
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        switch (how) {
+            .release => self.releaseHeldLocked(.open_txn),
+            .after_wal_sync => for (self.held.items) |idx| {
+                @atomicStore(Hold, &self.frames[idx].hold, .unsynced, .release);
+            },
+            .keep => {},
+        }
+        self.wakeFrameWaiters();
+    }
+
+    /// SONNY-6648: frames held now (`hold != .none`). Caller-side check for
+    /// tests and diagnostics.
+    pub fn heldFrameCount(self: *BufferPool) usize {
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.held.items.len;
+    }
+
+    /// Hold frame `idx` for the open transactions. Caller holds `mutex`.
+    fn holdLocked(self: *BufferPool, idx: u32) void {
+        const frame = &self.frames[idx];
+        // `held` has room for every frame and lists each held frame once.
+        if (frame.hold == .none) self.held.appendAssumeCapacity(idx);
+        @atomicStore(Hold, &frame.hold, .open_txn, .release);
+    }
+
+    /// Release the held frames in state `state`. Caller holds `mutex`.
+    fn releaseHeldLocked(self: *BufferPool, state: Hold) void {
+        var i: usize = 0;
+        while (i < self.held.items.len) {
+            const frame = &self.frames[self.held.items[i]];
+            if (frame.hold == state) {
+                @atomicStore(Hold, &frame.hold, .none, .release);
+                _ = self.held.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
+    fn hasHeldLocked(self: *const BufferPool, state: Hold) bool {
+        for (self.held.items) |idx| {
+            if (self.frames[idx].hold == state) return true;
+        }
+        return false;
+    }
+
+    /// SONNY-6648: sync the WAL and release the `Hold.unsynced` frames.
+    /// Returns false when there are none. The mutex stays held across the
+    /// sync, so no frame becomes `unsynced` after the sync and is released
+    /// with it (`endTxnHold` waits). Caller holds `mutex`.
+    fn syncUnsyncedLocked(self: *BufferPool) !bool {
+        if (!self.hasHeldLocked(.unsynced)) return false;
+        const hook = self.wal_sync_hook orelse return error.WalSyncHookMissing;
+        try hook.run(hook.ctx);
+        self.releaseHeldLocked(.unsynced);
+        if (self.metrics) |m| m.evict_wal_syncs += 1;
+        return true;
+    }
+
+    /// SONNY-6648: a durability flush writes every dirty frame, so it may run
+    /// only when none holds an open transaction's bytes; frames waiting for
+    /// a WAL sync get it first. Caller holds `mutex`.
+    fn prepareDurabilityFlushLocked(self: *BufferPool) !void {
+        if (self.hasHeldLocked(.open_txn)) return error.OpenTransactionPagesHeld;
+        _ = try self.syncUnsyncedLocked();
+    }
+
     /// Flush all dirty frames with LSN <= up_to_lsn to disk.
     /// SONNY-6632: also waits for the writes other flushes have in flight,
     /// before the pass (their frames are clean but not on disk) and after it
@@ -903,6 +1039,7 @@ pub const BufferPool = struct {
         const io = bpio();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        try self.prepareDurabilityFlushLocked();
         self.waitAllWrites(io);
         for (self.frames, 0..) |*frame, i| {
             _ = i;
@@ -923,6 +1060,7 @@ pub const BufferPool = struct {
         const io = bpio();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        try self.prepareDurabilityFlushLocked();
         // SONNY-6632: as `flushDirty`.
         self.waitAllWrites(io);
         for (self.frames) |*frame| {
@@ -958,6 +1096,12 @@ pub const BufferPool = struct {
         // one would be copied and could be written before it (the older copy
         // landing last). The selection below then runs under one hold of the
         // mutex, so no other flush starts a write in between.
+        // SONNY-6648: never an open transaction's pages; deferred commits'
+        // pages only after their WAL sync.
+        self.prepareDurabilityFlushLocked() catch |err| {
+            self.mutex.unlock(io);
+            return err;
+        };
         self.waitAllWrites(io);
 
         // Count dirty frames
@@ -1148,7 +1292,10 @@ pub const BufferPool = struct {
             const frame = &self.frames[idx];
             // Walk via lru_prev before we potentially modify the frame
             const prev = frame.lru_prev;
-            if (frame.dirty and frame.valid and @atomicLoad(u32, &frame.pin_count, .acquire) == 0) {
+            // SONNY-6648: best effort, so held frames are skipped.
+            if (frame.dirty and frame.valid and frame.hold == .none and
+                @atomicLoad(u32, &frame.pin_count, .acquire) == 0)
+            {
                 try self.flushFrame(frame);
                 flushed += 1;
             }
@@ -1395,6 +1542,11 @@ pub const BufferPool = struct {
                 // victim, matching the prior `continue :restart` semantics).
                 if (made_progress2) continue;
             }
+
+            // SONNY-6648: every other frame is pinned or held. Frames held
+            // only for their deferred commits' WAL sync become victims once
+            // the WAL is synced (one sync releases all of them).
+            if (try self.syncUnsyncedLocked()) continue;
 
             return error.BufferPoolFull;
         }
