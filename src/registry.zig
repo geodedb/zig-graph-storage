@@ -15,7 +15,118 @@ pub const REGISTRY_VERSION: u32 = 1;
 
 /// SONNY-6616: the uuid a data directory's registry cipher is bound to when
 /// the caller has none of its own (`Cipher.forKey(key, SEAL_UUID)`).
+///
+/// SONNY-6635: it is the same in every data directory, so a registry sealed
+/// under it in one directory authenticates in any other under the same key.
+/// A registry is now sealed under its directory's `DataDirIdentity`; this
+/// uuid seals only the identity file itself, and reads a registry sealed by
+/// 0.4.20 to 0.4.25 (to be resealed under the identity).
 pub const SEAL_UUID: [16]u8 = [_]u8{0} ** 16;
+
+/// SONNY-6635: the file, in the data directory, that holds its identity.
+pub const IDENTITY_FILE_NAME = "data_dir.identity";
+pub const IDENTITY_MAGIC: [8]u8 = .{ 'G', 'E', 'O', 'D', 'D', 'I', 'D', '1' };
+pub const IDENTITY_VERSION: u32 = 1;
+const IDENTITY_SIZE: usize = 8 + 4 + 4 + 16 + 4; // magic, version, flags, uuid, crc
+const IDENTITY_FLAG_REGISTRY_BOUND: u32 = 1;
+
+/// SONNY-6635: a data directory's own identity: a random uuid made once,
+/// which its registry (and any other file of the directory, not of one
+/// graph) is sealed under (`cipher`), so a sealed registry copied from
+/// another data directory fails authentication, and `registry_bound`, the
+/// record that the registry has been sealed under it, so a plaintext
+/// registry (or one sealed under `SEAL_UUID`) is refused from then on.
+///
+/// `data_dir.identity`, owner-only: magic(8) "GEODDID1" + version(4) +
+/// flags(4) + uuid(16) + CRC32C(4). Under at-rest encryption it is sealed
+/// (`Kind.data_dir_identity`, bound to `SEAL_UUID` and the file name), so its
+/// flags are authenticated, and a plaintext identity file is refused: no
+/// build ever wrote one under a key. Without a key it is plaintext.
+///
+/// Limits: copying the identity file together with the registry carries the
+/// identity across (a restore of the directory's own files); the identity
+/// binds a registry to the directory it was written in, it does not stop a
+/// directory's own earlier registry from being put back.
+pub const DataDirIdentity = struct {
+    uuid: [16]u8,
+    registry_bound: bool = false,
+
+    /// A new identity with a random uuid (OS CSPRNG), not yet bound.
+    pub fn generate() !DataDirIdentity {
+        var id = DataDirIdentity{ .uuid = undefined };
+        try std.Io.Threaded.global_single_threaded.io().randomSecure(&id.uuid);
+        return id;
+    }
+
+    /// The cipher of the directory's own files under `key`; null without one.
+    /// The caller deinits it.
+    pub fn cipher(self: DataDirIdentity, key: ?[32]u8) ?side_file_crypto.Cipher {
+        return side_file_crypto.Cipher.forKey(key, self.uuid);
+    }
+
+    /// Load `dir_path`'s identity; null when it has none. A file that does
+    /// not parse, or (under `key`) is not sealed or does not authenticate, is
+    /// an error.
+    pub fn load(allocator: Allocator, dir_path: []const u8, key: ?[32]u8) !?DataDirIdentity {
+        const path = try identityPath(allocator, dir_path);
+        defer allocator.free(path);
+        const raw = side_file_crypto.readWholeFile(allocator, path) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        var c = side_file_crypto.Cipher.forKey(key, SEAL_UUID);
+        defer if (c) |*cc| cc.deinit();
+        const decoded = try side_file_crypto.decode(allocator, .{ .cipher = if (c) |*cc| cc else null, .require_sealed = true }, .data_dir_identity, IDENTITY_FILE_NAME, raw);
+        defer {
+            std.crypto.secureZero(u8, decoded.bytes);
+            allocator.free(decoded.bytes);
+        }
+        const data = decoded.bytes;
+        if (data.len != IDENTITY_SIZE) return error.InvalidData;
+        if (!std.mem.eql(u8, data[0..8], &IDENTITY_MAGIC)) return error.InvalidMagic;
+        if (readU32(data, IDENTITY_SIZE - 4) != Crc32.hash(data[0 .. IDENTITY_SIZE - 4])) return error.ChecksumMismatch;
+        if (readU32(data, 8) != IDENTITY_VERSION) return error.UnsupportedVersion;
+        const flags = readU32(data, 12);
+        if (flags & ~IDENTITY_FLAG_REGISTRY_BOUND != 0) return error.InvalidData;
+        var id = DataDirIdentity{ .uuid = undefined, .registry_bound = flags & IDENTITY_FLAG_REGISTRY_BOUND != 0 };
+        @memcpy(&id.uuid, data[16..32]);
+        return id;
+    }
+
+    /// Write the identity to `dir_path` (sealed under `key`): atomically,
+    /// owner-only, the directory fsynced so the rename is durable.
+    pub fn save(self: DataDirIdentity, allocator: Allocator, dir_path: []const u8, key: ?[32]u8) !void {
+        var buf: [IDENTITY_SIZE]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
+        @memcpy(buf[0..8], &IDENTITY_MAGIC);
+        std.mem.writeInt(u32, buf[8..12], IDENTITY_VERSION, .little);
+        std.mem.writeInt(u32, buf[12..16], if (self.registry_bound) IDENTITY_FLAG_REGISTRY_BOUND else 0, .little);
+        @memcpy(buf[16..32], &self.uuid);
+        std.mem.writeInt(u32, buf[32..36], Crc32.hash(buf[0..32]), .little);
+
+        var c = side_file_crypto.Cipher.forKey(key, SEAL_UUID);
+        defer if (c) |*cc| cc.deinit();
+        const disk = try side_file_crypto.encode(allocator, if (c) |*cc| cc else null, .data_dir_identity, IDENTITY_FILE_NAME, &buf);
+        defer allocator.free(disk);
+        const path = try identityPath(allocator, dir_path);
+        defer allocator.free(path);
+        try side_file_crypto.writeAtomic(allocator, path, disk);
+        try syncDir(dir_path);
+    }
+
+    fn identityPath(allocator: Allocator, dir_path: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}/" ++ IDENTITY_FILE_NAME, .{dir_path});
+    }
+};
+
+fn syncDir(path: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // `.iterate = true`: a real O_RDONLY|O_DIRECTORY fd (O_PATH cannot fsync).
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    const dir_file = std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+    try dir_file.sync(io);
+}
 
 pub const GraphEntry = struct {
     name: []const u8, // owned by registry
@@ -100,8 +211,9 @@ pub const GraphRegistry = struct {
     /// in the plaintext layout. The registry names every graph (and counts
     /// its nodes and edges). The envelope binds the file's base name and
     /// `Kind.graph_registry`; the registry belongs to a data directory, not a
-    /// graph, so the caller picks the uuid the cipher is bound to
-    /// (`SEAL_UUID` unless it has a better one).
+    /// graph, so the caller picks the uuid the cipher is bound to: the
+    /// directory's `DataDirIdentity` (SONNY-6635: `identity.cipher(key)`),
+    /// not `SEAL_UUID`, which every data directory shares.
     pub fn saveToFileWith(self: *const GraphRegistry, path: []const u8, cipher: ?*const side_file_crypto.Cipher) !void {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer {
@@ -384,7 +496,7 @@ test "empty registry save/load" {
 
 const TEST_KEY_6635 = [_]u8{0x35} ** 32;
 
-fn tmpRealPath(allocator: Allocator, tmp_dir: *std.testing.TmpDir) ![]u8 {
+fn tmpRealPath(allocator: Allocator, tmp_dir: *std.testing.TmpDir) ![:0]u8 {
     return tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
 }
 

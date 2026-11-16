@@ -408,7 +408,9 @@ pub const VerifyTool = struct {
         // encrypted log read as a torn tail and was truncated to nothing.
         // The wal library has no read-only open, so the log is copied into a
         // private temporary directory and validated there, under the key.
-        var scratch = WalScratch.create(result.allocator, wal_dir) catch |err| {
+        // SONNY-6635: that directory is inside the graph's own directory,
+        // not under $TMPDIR or /tmp.
+        var scratch = WalScratch.create(result.allocator, graph_dir.path, wal_dir) catch |err| {
             const msg = try std.fmt.allocPrint(result.allocator, "wal/graph.wal: could not be copied for checking ({s})", .{@errorName(err)});
             try result.addError(msg);
             try result.addArtifact(.{ .name = "wal/graph.wal", .status = .invalid, .bytes_checked = wal_stat.size, .issue_count = 1 });
@@ -465,35 +467,48 @@ pub const VerifyTool = struct {
 };
 
 /// SONNY-6622: a private copy of a graph's WAL directory (`graph.wal`, its
-/// checkpoint sidecar and `graph.uuid`) in a new directory under $TMPDIR (or
-/// /tmp), for a check that must not modify the store. Files are 0600; the
-/// directory is removed by `destroy`. Under at-rest encryption the copied
-/// log is ciphertext; without it, it is as plaintext as the store.
+/// checkpoint sidecar and `graph.uuid`), for a check that must not modify the
+/// store. `destroy` removes it.
+///
+/// SONNY-6635: the copy is made in a new directory inside the graph's own
+/// directory (`<graph dir>/.verify-wal-<random>`, mode 0700, created
+/// exclusively and opened without following a link; files 0600). It was made
+/// under $TMPDIR or /tmp, where without a key it put a plaintext copy of the
+/// log on another filesystem, with other permissions and retention. Inside
+/// the graph's directory it is as protected as the log itself.
 const WalScratch = struct {
     allocator: Allocator,
     path: []u8,
     dir: std.Io.Dir,
 
     const files = [_][]const u8{ "graph.wal", "graph.wal.ckpt", "graph.uuid" };
+    pub const prefix = ".verify-wal-";
 
-    fn create(allocator: Allocator, src: std.Io.Dir) !WalScratch {
+    fn create(allocator: Allocator, parent_path: []const u8, src: std.Io.Dir) !WalScratch {
         const io = std.Io.Threaded.global_single_threaded.io();
         var rnd: [8]u8 = undefined;
         io.random(&rnd);
-        const base = if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp";
-        const path = try std.fmt.allocPrint(allocator, "{s}/graph-storage-verify-{x}", .{ base, &rnd });
+        var name_buf: [prefix.len + 16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, prefix ++ "{x}", .{&rnd}) catch unreachable;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent_path, name });
         errdefer allocator.free(path);
-        try std.Io.Dir.cwd().createDirPath(io, path);
-        errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-        var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+        var parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
+        defer parent.close(io);
+        // Exclusive: an existing entry (a link planted at the name) is an error.
+        try parent.createDir(io, name, std.Io.File.Permissions.fromMode(0o700));
+        errdefer parent.deleteTree(io, name) catch {};
+        var dir = try parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false });
         errdefer dir.close(io);
-        for (files) |name| {
-            const in = src.openFile(io, name, .{}) catch |err| switch (err) {
+        // The umask can only have narrowed it; set it exactly.
+        const dir_file = std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+        try dir_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
+        for (files) |fname| {
+            const in = src.openFile(io, fname, .{}) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             defer in.close(io);
-            const out = try dir.createFile(io, name, .{
+            const out = try dir.createFile(io, fname, .{
                 .exclusive = true,
                 .permissions = std.Io.File.Permissions.fromMode(0o600),
             });

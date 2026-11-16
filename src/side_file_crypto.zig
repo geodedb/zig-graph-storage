@@ -77,6 +77,9 @@ pub const Kind = enum(u8) {
     edge_exist_index = 7,
     /// SONNY-6616: `graph_registry.dat` (graph names, uuids, counts).
     graph_registry = 8,
+    /// SONNY-6635: `data_dir.identity` (a data directory's own uuid, which
+    /// the registry is sealed under, and whether it has been).
+    data_dir_identity = 9,
     _,
 
     pub const consumer_first: u8 = 128;
