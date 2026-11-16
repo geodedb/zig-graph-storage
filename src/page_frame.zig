@@ -43,9 +43,11 @@ pub const PageFrame = struct {
     dirty: bool = false,
     /// SONNY-6605: flushes that have copied this frame (and cleared `dirty`)
     /// and whose write has not completed: while non-zero the bytes on disk
-    /// may still be older than the frame's. A count, not a flag: a frame
-    /// dirtied again during one flush's write can be taken by another flush
-    /// before the first write lands. Always mutated under the pool mutex.
+    /// may still be older than the frame's. SONNY-6632: a flush waits for
+    /// it to reach zero before it copies the frame, so writes of a frame land
+    /// in copy order (at most one is in flight); a count for the pool-wide
+    /// total (`BufferPool.writes_in_flight_total`). Always mutated under the
+    /// pool mutex.
     writes_in_flight: u16 = 0,
     loading: bool = false,
     // True while this frame is being torn down for reuse by eviction: its
