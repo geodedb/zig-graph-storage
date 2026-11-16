@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `error.BufferPoolFull` (abort restores it). Under `sync_mode = .deferred`
   a committed page is written back only after its COMMIT record is synced
   (`Metrics.evict_wal_syncs`) (SONNY-6648, SONNY-6558 #5).
+- Node writes made before the derived indexes were hydrated (`putNodeTxn`,
+  `deleteNodeTxn` and their undo) skipped the reverse map (prop_head ->
+  owner), and hydration usually loads a snapshot that does not know them,
+  so the map kept a moved chain's old owner and a deleted node's chain.
+  They are now queued and replayed by the hydration (a node scan when more
+  than 65,536 are queued) (SONNY-6648).
 
 ## [0.4.22] - 2026-11-15
 

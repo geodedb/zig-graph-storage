@@ -410,7 +410,6 @@ fn writeSlot(engine: *GraphEngine, txn: u64, id: NodeId, rec: NodeRec) !void {
 }
 
 fn undoNodePut(engine: *GraphEngine, txn: u64, id: NodeId, before: ?NodeRec, after: NodeRec) !void {
-    const hydrated = engine.derived_hydrated.load(.acquire);
     const cur = (try engine.node_store.getRawSlot(id)) orelse std.mem.zeroes(NodeRec);
     const b = before orelse {
         // A create: the slot goes back to empty and allocNode's count and
@@ -418,8 +417,8 @@ fn undoNodePut(engine: *GraphEngine, txn: u64, id: NodeId, before: ?NodeRec, aft
         // chains the transaction hung off it were all its own and are
         // already emptied by the inverses applied before this one; their
         // bytes leak until compaction.
-        if (hydrated and cur.prop_head != 0) engine.prop_rev_index.remove(cur.prop_head);
-        if (hydrated and cur.prop_head != 0) engine.prop_rev_index_dirty = true;
+        // Queued before hydration (SONNY-6648, `GraphEngine.revMapRemove`).
+        engine.revMapRemove(cur.prop_head);
         try writeSlot(engine, txn, id, std.mem.zeroes(NodeRec));
         if (!node_mod.isEmpty(&cur) and !node_mod.isDeleted(&cur) and engine.manifest.node_count > 0)
             engine.manifest.node_count -= 1;
@@ -440,10 +439,9 @@ fn undoNodePut(engine: *GraphEngine, txn: u64, id: NodeId, before: ?NodeRec, aft
     // (recordNodePut), unless the node is the transaction's own, which the
     // create's inverse empties.
     if (std.mem.eql(u8, std.mem.asBytes(&rec), std.mem.asBytes(&cur))) return;
-    if (hydrated and rec.prop_head != cur.prop_head) {
-        engine.prop_rev_index.remove(cur.prop_head);
-        try engine.prop_rev_index.put(rec.prop_head, id);
-        engine.prop_rev_index_dirty = true;
+    if (rec.prop_head != cur.prop_head) {
+        engine.revMapRemove(cur.prop_head);
+        try engine.revMapPut(rec.prop_head, id);
     }
     try writeSlot(engine, txn, id, rec);
     if (engine.ordered_property_index.count() > 0) engine.ordered_index_stale = true;
@@ -454,10 +452,7 @@ fn undoNodeDelete(engine: *GraphEngine, txn: u64, id: NodeId, counted: bool) !vo
     if (node_mod.isDeleted(&rec)) {
         rec.flags &= ~node_mod.NODE_FLAG_DELETED;
         try writeSlot(engine, txn, id, rec);
-        if (engine.derived_hydrated.load(.acquire) and rec.prop_head != 0) {
-            try engine.prop_rev_index.put(rec.prop_head, id);
-            engine.prop_rev_index_dirty = true;
-        }
+        try engine.revMapPut(rec.prop_head, id);
     }
     if (counted) engine.manifest.node_count += 1;
     if (engine.ordered_property_index.count() > 0) engine.ordered_index_stale = true;
