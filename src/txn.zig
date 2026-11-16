@@ -21,9 +21,20 @@ pub const TxnState = enum {
 };
 
 /// Tracks active transactions and coordinates WAL writes.
+///
+/// THREADING (SONNY-6558): single-writer. Every method here is reached only
+/// from the engine's write paths, which the caller serializes (one writer
+/// per engine, see `GraphEngine`). `active_txns`, `journals`,
+/// `spare_journal` and the WAL batch and LSN state they drive are NOT
+/// locked; `txn_id_mutex` guards only the id counter and does not make
+/// `begin` / `commit` / `abort` / `logPageUpdate` safe to call from two
+/// threads at once. A caller that needs concurrent writers must serialize
+/// them above this type.
 pub const TxnManager = struct {
     next_txn_id: u64,
+    /// Guards `next_txn_id` only (see THREADING above).
     txn_id_mutex: std.Io.Mutex,
+    /// Not locked: single-writer (see THREADING above).
     active_txns: std.AutoHashMap(u64, TxnState),
     wal: *WalManager,
     allocator: Allocator,
@@ -39,6 +50,16 @@ pub const TxnManager = struct {
     /// One emptied journal kept for the next `begin`, so a transaction's
     /// journaling allocates nothing in the steady state.
     spare_journal: ?UndoJournal = null,
+    /// SONNY-6558: run by `commit` once the COMMIT record is written (and
+    /// synced under `sync_each_commit`), with the transaction's journal,
+    /// before the journal is dropped. The engine frees the overflow chains
+    /// the transaction's property writes deferred.
+    commit_hook: ?CommitHook = null,
+
+    pub const CommitHook = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque, journal: *UndoJournal) void,
+    };
 
     /// Initialize the transaction manager. Defaults to `sync_each_commit`
     /// (per-commit fsync). Callers that opt into a relaxed policy should set
@@ -189,6 +210,9 @@ pub const TxnManager = struct {
             .deferred => {},
         }
 
+        if (self.commit_hook) |hook| {
+            if (self.journals.getPtr(txn_id)) |j| hook.run(hook.ctx, j);
+        }
         _ = self.active_txns.remove(txn_id);
         self.dropJournal(txn_id);
     }

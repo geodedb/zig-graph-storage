@@ -319,6 +319,12 @@ pub const PropStore = struct {
     /// that keeps every error exit's surviving stub pointing at a LIVE chain.
     freed_var_refs: [MAX_TOUCHED_VAR_REFS]u64 = undefined,
     freed_var_len: u8 = 0,
+    /// SONNY-6558: set by the engine around a write inside a journaled
+    /// transaction. `freePendingVarRefs` then leaves the outgoing chains
+    /// allocated; the engine takes `freedVarRefs()` into the transaction's
+    /// journal and frees them at COMMIT, so an abort that restores the old
+    /// stub finds its chain intact.
+    defer_var_frees: bool = false,
 
     pub const MAX_TOUCHED_PAGES: usize = 16;
     pub const MAX_TOUCHED_VAR_REFS: usize = 4;
@@ -407,6 +413,7 @@ pub const PropStore = struct {
     /// record, which the label write paths rely on owning (PropStore and
     /// LabelStore share one VarStore).
     fn freePendingVarRefs(self: *PropStore) !void {
+        if (self.defer_var_frees) return; // SONNY-6558: freed at commit
         for (self.freed_var_refs[0..self.freed_var_len]) |ref| {
             try self.var_store.free(ref);
         }

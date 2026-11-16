@@ -551,7 +551,13 @@ fn wrapEdgeIterator(comptime RealIter: type, concrete_iter: RealIter, allocator:
         }
     };
 
-    const state = try allocator.create(State);
+    // SONNY-6558: this function owns `concrete_iter` (it may hold a pinned
+    // page); release it when the state cannot be boxed.
+    const state = allocator.create(State) catch |err| {
+        var it = concrete_iter;
+        it.deinit();
+        return err;
+    };
     state.* = .{
         .iter = concrete_iter,
         .alloc = allocator,
@@ -593,7 +599,13 @@ fn wrapPropIterator(comptime RealIter: type, concrete_iter: RealIter, allocator:
         }
     };
 
-    const state = try allocator.create(State);
+    // SONNY-6558: this function owns `concrete_iter` (it may hold a pinned
+    // page); release it when the state cannot be boxed.
+    const state = allocator.create(State) catch |err| {
+        var it = concrete_iter;
+        it.deinit();
+        return err;
+    };
     state.* = .{
         .iter = concrete_iter,
         .alloc = allocator,
@@ -635,7 +647,13 @@ pub fn wrapPropIteratorView(comptime RealIter: type, concrete_iter: RealIter, al
         }
     };
 
-    const state = try allocator.create(State);
+    // SONNY-6558: this function owns `concrete_iter` (it may hold a pinned
+    // page); release it when the state cannot be boxed.
+    const state = allocator.create(State) catch |err| {
+        var it = concrete_iter;
+        it.deinit();
+        return err;
+    };
     state.* = .{ .iter = concrete_iter, .alloc = allocator };
 
     return PropertyIteratorView{
@@ -666,7 +684,13 @@ fn wrapNodeIterator(comptime RealIter: type, concrete_iter: RealIter, allocator:
         }
     };
 
-    const state = try allocator.create(State);
+    // SONNY-6558: this function owns `concrete_iter` (it may hold a pinned
+    // page); release it when the state cannot be boxed.
+    const state = allocator.create(State) catch |err| {
+        var it = concrete_iter;
+        it.deinit();
+        return err;
+    };
     state.* = .{
         .iter = concrete_iter,
         .alloc = allocator,
@@ -704,7 +728,12 @@ fn sliceToEdgeIterator(slice: []EdgeEntry, allocator: Allocator) anyerror!EdgeIt
         }
     };
 
-    const state = try allocator.create(State);
+    // SONNY-6558: this function owns `slice`; free it when the state
+    // cannot be boxed.
+    const state = allocator.create(State) catch |err| {
+        allocator.free(slice);
+        return err;
+    };
     state.* = .{
         .entries = slice,
         .index = 0,
@@ -741,7 +770,12 @@ fn sliceToNodeIterator(slice: []NodeId, allocator: Allocator) anyerror!NodeItera
         }
     };
 
-    const state = try allocator.create(State);
+    // SONNY-6558: this function owns `slice`; free it when the state
+    // cannot be boxed.
+    const state = allocator.create(State) catch |err| {
+        allocator.free(slice);
+        return err;
+    };
     state.* = .{
         .entries = slice,
         .index = 0,

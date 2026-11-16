@@ -87,6 +87,9 @@ pub fn indexNodeProperties(engine: *GraphEngine, rec: NodeRec) !void {
     defer iter.deinit();
     while (try iter.next()) |entry| {
         try engine.refreshPropertyChainIndex(entry.prop_head);
+        // SONNY-6558: the reverse map records edge chains too (tagged), so
+        // the tail resolution skips their slots instead of rebuilding.
+        try engine.prop_rev_index.putEdge(entry.prop_head, entry.edge_id);
     }
 }
 
@@ -133,6 +136,15 @@ pub fn rebuildLabelIndex(engine: *GraphEngine) !void {
     if (ctx.err) |e| return e;
 }
 
+/// SONNY-6558: record the property chain of every out-edge of `rec` in the
+/// reverse map (tagged as an edge chain).
+fn putEdgeChains(engine: *GraphEngine, rec: NodeRec) !void {
+    if (rec.out_head == 0) return;
+    var iter = engine.adj_out.expand(rec.out_head, null);
+    defer iter.deinit();
+    while (try iter.next()) |entry| try engine.prop_rev_index.putEdge(entry.prop_head, entry.edge_id);
+}
+
 /// Rebuild the property chain index from all live nodes and their edges.
 /// PERF-0030: Uses scanNodes batch API instead of per-ID getNode.
 /// PHASE G: rebuilds the reverse map (prop_head -> node_id) in the SAME scan.
@@ -176,6 +188,11 @@ pub fn buildPropRevIndexFromScan(engine: *GraphEngine) !void {
         fn callback(self: *@This(), node_id: NodeId, rec: NodeRec) void {
             if (self.err != null) return;
             self.engine.prop_rev_index.put(rec.prop_head, node_id) catch |e| {
+                self.err = e;
+                return;
+            };
+            // SONNY-6558: and this node's out-edges' chains, tagged.
+            putEdgeChains(self.engine, rec) catch |e| {
                 self.err = e;
             };
         }
@@ -704,6 +721,7 @@ fn removeNodeOldEdges(engine: *GraphEngine, node_id: NodeId) !void {
             // not index it). Look it up BEFORE removing the edge_index record.
             if (try cc.engine.edge_index.get(edge_id)) |e| {
                 if (e.prop_head != 0) cc.engine.property_index.removeChain(e.prop_head);
+                cc.engine.prop_rev_index.removeEdge(e.prop_head, edge_id);
             }
             try cc.engine.edge_exist_index.remove(cc.from, rel_type, to, edge_id);
             try cc.engine.edge_index.remove(edge_id);

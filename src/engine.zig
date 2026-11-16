@@ -720,8 +720,12 @@ pub const GraphEngine = struct {
         // manifest; a crash in between leaves fewer names than the manifest
         // counted. The lost names cannot be re-derived (label blocks hold only
         // ids), so report it; ids without a name read back as unnamed.
-        if (self.label_dict.count() < self.manifest.label_count) {
+        // SONNY-6558: also counted in `Metrics.label_names_lost` and sent to
+        // the configured `log_fn`, not only to std.log.
+        const label_names_lost: u64 = self.manifest.label_count -| self.label_dict.count();
+        if (label_names_lost != 0) {
             std.log.warn("labels.dict holds {d} label names but the manifest recorded {d}: names assigned before a crash during a <= 0.4.13 checkpoint are lost", .{ self.label_dict.count(), self.manifest.label_count });
+            if (cfg.log_fn) |log| log(.warn, "labels.dict holds fewer label names than the manifest recorded: names assigned before a crash during a <= 0.4.13 checkpoint are lost");
         }
 
         // 7. Phase A (engine early-ready): the O(nodes+edges) derived-index
@@ -798,6 +802,7 @@ pub const GraphEngine = struct {
                 self.metrics.ordered_index_rebuilds = 1;
             }
         }
+        self.metrics.label_names_lost = label_names_lost;
         self.metrics.recovery_wal_truncated = @intFromBool(recovery.wal_truncated);
         self.buffer_pool.setMetrics(&self.metrics);
         // Initialize owned-or-borrowed thread pool (see initThreadPool).
@@ -1543,6 +1548,13 @@ pub const GraphEngine = struct {
     /// value-change and ingest checkpoint-boundary fill-page cases that the
     /// nodes-page pass alone could not. The reverse map is loaded on demand from
     /// its covered_lsn snapshot when this runs before hydration.
+    ///
+    /// EDGE chains (SONNY-6558) live on the same slab props pages but belong to
+    /// no node, so they are not part of the result. A live slot is skipped as an
+    /// edge's chain when a tail adjacency page (`.adj_out` / `.in_idx`) names
+    /// its head, or when the reverse-map snapshot, stamped exactly at the
+    /// pre-tail frontier, records it as an edge chain. Before, any such slot
+    /// was unresolvable and forced the full rebuild.
     pub fn resolveTailAffectedNodeIds(self: *GraphEngine, allocator: Allocator) !?[]NodeId {
         const had_tail = self.manifest.last_checkpoint_lsn > self.tail_pre_recovery_lsn;
         const pages = self.tail_affected_pages orelse {
@@ -1584,8 +1596,48 @@ pub const GraphEngine = struct {
                 break;
             }
         }
+        // SONNY-6558: the reverse map's EDGE entries are trusted only from a
+        // snapshot stamped exactly at the pre-tail frontier (it then describes
+        // every chain as of the records this tail follows). A hydrated map can
+        // hold entries written before hydration was complete; a stale stamp
+        // can hold entries a later session overwrote. Unresolvable is always
+        // the safe answer (rebuild); skipping a slot is only sound on positive
+        // evidence that an edge owns it.
+        var trust_edge_entries = false;
         if (has_props and !self.derived_hydrated.load(.acquire)) {
-            _ = self.prop_rev_index.loadFromFile(self.graph_dir.path) catch {};
+            if (self.prop_rev_index.loadFromFile(self.graph_dir.path) catch null) |stamp| {
+                trust_edge_entries = stamp.epoch == self.manifest.checkpoint_epoch and
+                    stamp.covered_lsn == self.tail_pre_recovery_lsn;
+            }
+        }
+
+        // Pass 1b (SONNY-6558) — every entry on a tail adjacency page is the
+        // CURRENT state of that page, so its non-zero prop_head is an edge's
+        // chain now: a slab slot holding it belongs to no node. Covers edge
+        // chains created or moved in the tail (setEdgePropertyTxn images the
+        // rewritten adjacency page of both copies).
+        var edge_heads: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer edge_heads.deinit(allocator);
+        if (has_props) {
+            for (pages) |p| {
+                const store: *AdjStore = switch (p.file_id) {
+                    .adj_out => &self.adj_out,
+                    .in_idx => &self.adj_in_remote,
+                    else => continue,
+                };
+                const EdgeCtx = struct {
+                    heads: *std.AutoHashMapUnmanaged(u64, void),
+                    allocator: Allocator,
+                    fn f(c: *const @This(), entry: EdgeEntry) anyerror!void {
+                        if (entry.prop_head != 0) try c.heads.put(c.allocator, entry.prop_head, {});
+                    }
+                };
+                const ec = EdgeCtx{ .heads = &edge_heads, .allocator = allocator };
+                store.forEachEntryOnPage(p.page_id, &ec, EdgeCtx.f) catch |e| switch (e) {
+                    error.NotAdjPage => return null, // undecodable → rebuild
+                    else => return e,
+                };
+            }
         }
 
         // Pass 2 — props pages: attribute every LIVE slab slot to a node. It is
@@ -1598,14 +1650,18 @@ pub const GraphEngine = struct {
             if (p.file_id != .props) continue;
             const Ctx = struct {
                 heads: *std.AutoHashMapUnmanaged(u64, void),
+                edge_heads: *std.AutoHashMapUnmanaged(u64, void),
                 rev: *PropRevIndex,
+                trust_edge_entries: bool,
                 node_set: *std.AutoHashMapUnmanaged(NodeId, void),
                 allocator: Allocator,
                 ok: bool,
             };
             var ctx = Ctx{
                 .heads = &head_set,
+                .edge_heads = &edge_heads,
                 .rev = &self.prop_rev_index,
+                .trust_edge_entries = trust_edge_entries,
                 .node_set = &node_set,
                 .allocator = allocator,
                 .ok = true,
@@ -1614,10 +1670,15 @@ pub const GraphEngine = struct {
                 fn f(c: *Ctx, prop_head: u64, live: bool) anyerror!void {
                     if (!live) return;
                     if (c.heads.contains(prop_head)) return; // already in N (tail-new/relocated)
-                    if (c.rev.get(prop_head)) |owner| {
-                        try c.node_set.put(c.allocator, owner, {}); // existing owner
-                        return;
-                    }
+                    // SONNY-6558: an edge's chain (no node owns it).
+                    if (c.edge_heads.contains(prop_head)) return;
+                    if (c.rev.owner(prop_head)) |owner| switch (owner) {
+                        .node => |n| {
+                            try c.node_set.put(c.allocator, n, {}); // existing owner
+                            return;
+                        },
+                        .edge => if (c.trust_edge_entries) return,
+                    };
                     c.ok = false; // unresolvable → rebuild (safe fallback)
                 }
             }.f) catch |e| switch (e) {
@@ -1857,6 +1918,11 @@ pub const GraphEngine = struct {
     /// Delete a node within an existing transaction (no auto-commit).
     pub fn deleteNodeTxn(self: *GraphEngine, id: NodeId, txn: TxnId) anyerror!void {
         try self.ensureWritable();
+        // SONNY-6558: deleting a node that is already deleted changes nothing.
+        // It used to decrement `node_count` a second time (under-count).
+        if (try self.node_store.getRawSlot(id)) |cur| {
+            if (node_mod.isDeleted(&cur)) return;
+        }
         // H3-P1: before the record is gone, remove the node's entries from any
         // ordered index whose label it carries. Gated on a registered ordered
         // index existing, so the common path adds no extra read.
@@ -2328,9 +2394,12 @@ pub const GraphEngine = struct {
     /// Edge co-location (Phase C): a co-located edge `(from)-[r]->(to)` lives
     /// ENTIRELY on shard(from) — out-adjacency, edge_index, the existence index
     /// AND the incoming adjacency (in THIS shard's `adj_in_remote`, keyed by `to`
-    /// via `in_head_dir`). So removal is a single-shard delete and never touches
+    /// via `in_head_dir`). So removal is a single-shard delete and never writes
     /// `to`'s node record (which is not resident here for a cross-endpoint edge).
-    /// Idempotent: removing an absent edge_id is a no-op on every store.
+    /// An edge added through the legacy `addEdgeTxn` also has an in-entry in
+    /// `adj_in` under a resident `to.in_head`; that entry is removed as well
+    /// (SONNY-6558). Idempotent: removing an absent edge_id is a no-op on every
+    /// store.
     pub fn removeEdgeTxn(self: *GraphEngine, from: NodeId, to: NodeId, edge_id: EdgeId, txn: TxnId) anyerror!void {
         try self.ensureWritable();
         // Phase A: reads/mutates edge_index + edge_exist_index — materialize
@@ -2351,6 +2420,18 @@ pub const GraphEngine = struct {
         const in_mutated = try self.adj_in_remote.removeEdge(in_head, edge_id);
         if (in_mutated != null) engine_undo.markEdgeRemove(self, txn, undo_idx, idx_entry_opt != null, .in_removed);
 
+        // SONNY-6558: an edge added through the legacy `addEdgeTxn` has its
+        // in-entry in `adj_in` under `to.in_head` (what `expandIn` reads), not
+        // in `adj_in_remote`. Remove it there too when `to` is resident on
+        // this engine; a sharded member's foreign `to` reads as an empty slot.
+        var legacy_in_mutated: ?u64 = null;
+        if (try self.node_store.getRawSlot(to)) |to_rec| {
+            if (to_rec.in_head != 0) {
+                legacy_in_mutated = try self.adj_in.removeEdge(to_rec.in_head, edge_id);
+                if (legacy_in_mutated != null) engine_undo.markEdgeRemove(self, txn, undo_idx, idx_entry_opt != null, .legacy_in_removed);
+            }
+        }
+
         // GAP-ENT-0032: WAL-image exactly the block each removal MUTATED.
         // The entry may live in ANY block of the chain (removeEdge is a
         // same-block swap-with-last + count--), not just the head — imaging
@@ -2362,6 +2443,7 @@ pub const GraphEngine = struct {
         // page and logs nothing.
         if (out_mutated) |p| try self.logPage(txn, .adj_out, p);
         if (in_mutated) |p| try self.logPage(txn, .in_idx, p);
+        if (legacy_in_mutated) |p| try self.logPage(txn, .adj_in, p);
 
         // WAL-aware derived-index durability Phase 3: also log `from`'s node
         // page. removeEdge leaves `from.out_head` unchanged, so this images an
@@ -2383,6 +2465,11 @@ pub const GraphEngine = struct {
         if (idx_entry_opt) |idx_entry| {
             try self.edge_exist_index.remove(from, idx_entry.rel_type, to, edge_id);
             self.edge_exist_index_dirty = true;
+            // SONNY-6558: the removed edge no longer owns its chain.
+            if (idx_entry.prop_head != 0) {
+                self.prop_rev_index.removeEdge(idx_entry.prop_head, edge_id);
+                self.prop_rev_index_dirty = true;
+            }
         }
 
         // Remove from in-memory edge index
@@ -2500,6 +2587,9 @@ pub const GraphEngine = struct {
         try self.ensureDerivedHydrated();
         // SONNY-6529: the chain as it was, for the undo record.
         const pre = try engine_undo.capturePropertyChain(self, txn, owner);
+        // SONNY-6558: a replaced overflow value is freed at commit, not here.
+        self.prop_store.defer_var_frees = engine_undo.defersVarFrees(self, txn);
+        defer self.prop_store.defer_var_frees = false;
         const new_head = (if (allow_slab)
             self.prop_store.putProperty(owner, key, val)
         else
@@ -2630,6 +2720,9 @@ pub const GraphEngine = struct {
         const pre = try engine_undo.capturePropertyChain(self, txn, owner);
         {
             errdefer if (pre) |b| self.allocator.free(b);
+            // SONNY-6558: a removed overflow value is freed at commit.
+            self.prop_store.defer_var_frees = engine_undo.defersVarFrees(self, txn);
+            defer self.prop_store.defer_var_frees = false;
             try self.prop_store.removeProperty(owner, key);
         }
         engine_undo.notePropertyWrite(self, txn, owner, owner, pre);

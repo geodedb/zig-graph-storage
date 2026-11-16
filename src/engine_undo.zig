@@ -122,7 +122,7 @@ pub fn recordEdgeRemove(engine: *GraphEngine, txn: u64, from: NodeId, to: NodeId
     } });
 }
 
-pub const EdgeRemoveStep = enum { out_removed, in_removed, counted };
+pub const EdgeRemoveStep = enum { out_removed, in_removed, legacy_in_removed, counted };
 
 /// A removal step happened. A removed chain entry the edge index did not
 /// describe cannot be re-inserted: the transaction is then not undoable.
@@ -135,6 +135,7 @@ pub fn markEdgeRemove(engine: *GraphEngine, txn: u64, idx: ?usize, known: bool, 
     switch (step) {
         .out_removed => r.edge_remove.out_removed = true,
         .in_removed => r.edge_remove.in_removed = true,
+        .legacy_in_removed => r.edge_remove.legacy_in_removed = true,
         .counted => r.edge_remove.counted = true,
     }
 }
@@ -154,6 +155,9 @@ pub fn recordLabel(engine: *GraphEngine, txn: u64, node: NodeId, label: u32, add
 pub fn capturePropertyChain(engine: *GraphEngine, txn: u64, owner: u64) !?[]u8 {
     const j = journalFor(engine, txn) orelse return null;
     try j.reserve(engine.allocator);
+    // SONNY-6558: room for the overflow chains this write may release (at
+    // most one per op; the store's bound), so deferring them cannot fail.
+    try j.deferred_var_frees.ensureUnusedCapacity(engine.allocator, @import("prop_store.zig").PropStore.MAX_TOUCHED_VAR_REFS);
     if (owner == 0 or j.chainCreatedHere(owner) or j.not_undoable != null) return null;
     return engine.prop_store.slabBlobCopy(engine.allocator, owner);
 }
@@ -163,23 +167,22 @@ pub fn capturePropertyChain(engine: *GraphEngine, txn: u64, owner: u64) !?[]u8 {
 /// here from now on). A new chain (`owner == 0`) or one this transaction
 /// created is referenced by nothing outside the transaction, so undoing it
 /// only retires it. A slab chain that existed before is restored from `pre`.
-/// A legacy chain, or a replaced value whose overflow chain the write freed,
-/// cannot be put back: not undoable.
+/// A legacy chain cannot be put back: not undoable. SONNY-6558: an overflow
+/// (var-store) chain whose stub the write replaced or removed is not freed by
+/// the write (`deferVarFrees`) but at commit, so the restored blob's stub
+/// still points at a live chain.
 pub fn notePropertyWrite(engine: *GraphEngine, txn: u64, owner: u64, new_head: u64, pre: ?[]u8) void {
     const j = journalFor(engine, txn) orelse {
         if (pre) |b| engine.allocator.free(b);
         return;
     };
+    // Capacity was reserved by `capturePropertyChain` (same journal).
+    for (engine.prop_store.freedVarRefs()) |ref| j.deferred_var_frees.appendAssumeCapacity(ref);
     if (owner != 0 and !j.chainCreatedHere(owner)) {
         const blob = pre orelse {
             j.fail(engine.allocator, .property_on_existing_chain);
             return;
         };
-        if (engine.prop_store.freedVarRefs().len != 0) {
-            engine.allocator.free(blob);
-            j.fail(engine.allocator, .property_on_existing_chain);
-            return;
-        }
         if (new_head != owner) j.noteCreatedChain(engine.allocator, new_head);
         _ = j.push(engine.allocator, .{ .prop_restore = .{ .owner = owner, .new_head = new_head, .old_blob = blob } });
         return;
@@ -188,6 +191,26 @@ pub fn notePropertyWrite(engine: *GraphEngine, txn: u64, owner: u64, new_head: u
     if (new_head == 0 or j.chainCreatedHere(new_head)) return;
     j.noteCreatedChain(engine.allocator, new_head);
     _ = j.push(engine.allocator, .{ .prop_chain = .{ .head = new_head } });
+}
+
+/// SONNY-6558: whether a property write in `txn` must leave the overflow
+/// chains it releases allocated (the engine sets `PropStore.defer_var_frees`
+/// to this around the write). True exactly when the write is journaled.
+pub fn defersVarFrees(engine: *GraphEngine, txn: u64) bool {
+    return journalFor(engine, txn) != null;
+}
+
+/// SONNY-6558: `TxnManager.commit_hook`. The transaction committed: release
+/// the overflow chains its property writes replaced or removed. A failure
+/// leaves the chain allocated (unreferenced) until compaction.
+pub fn onCommit(ctx: *anyopaque, j: *UndoJournal) void {
+    const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
+    for (j.deferred_var_frees.items) |ref| {
+        engine.prop_store.var_store.free(ref) catch |err| {
+            std.log.warn("graph-storage: freeing a replaced overflow value at commit failed ({s}); its pages stay allocated until compaction (SONNY-6558)", .{@errorName(err)});
+        };
+    }
+    j.deferred_var_frees.clearRetainingCapacity();
 }
 
 pub fn recordEdgePropHead(engine: *GraphEngine, txn: u64, from: NodeId, to: NodeId, edge_id: u64, old_head: u64) void {
@@ -323,7 +346,7 @@ fn retireChain(engine: *GraphEngine, txn: u64, head: u64) !void {
     engine.property_index.removeChain(head);
     engine.property_index_dirty = true;
     if (engine.derived_hydrated.load(.acquire)) {
-        if (engine.prop_rev_index.get(head) != null) {
+        if (engine.prop_rev_index.owner(head) != null) {
             engine.prop_rev_index.remove(head);
             engine.prop_rev_index_dirty = true;
         }
@@ -458,6 +481,25 @@ fn undoEdgeRemove(engine: *GraphEngine, txn: u64, r: @FieldType(UndoRec, "edge_r
         try engine.logTouchedAdj(txn, .in_idx, &engine.adj_in_remote);
         try engine.logPage(txn, .in_dir, dir_page);
     }
+    if (r.legacy_in_removed) {
+        // SONNY-6558: back into the legacy `adj_in` chain of `to`.
+        const in_entry = edge_mod.EdgeEntry{
+            .neighbor = r.from,
+            .edge_id = r.edge_id,
+            .rel_type = r.rel_type,
+            .prop_head = r.prop_head,
+            .public_id = r.public_id,
+        };
+        var to_rec = (try engine.node_store.getRawSlot(r.to)) orelse return error.NodeNotFound;
+        const new_head = try engine.adj_in.addEdge(to_rec.in_head, in_entry);
+        errdefer engine.adj_in.undoLastSlabTombstone() catch {};
+        if (new_head != to_rec.in_head) {
+            to_rec.in_head = new_head;
+            try engine.node_store.putNode(r.to, to_rec);
+        }
+        try engine.logTouchedAdj(txn, .adj_in, &engine.adj_in);
+        try engine.logPage(txn, .nodes, engine.nodePageId(r.to));
+    }
     // The index held the edge (else the record was refused): put it back
     // (idempotent when the removal failed before taking it out).
     {
@@ -471,6 +513,11 @@ fn undoEdgeRemove(engine: *GraphEngine, txn: u64, r: @FieldType(UndoRec, "edge_r
         engine.edge_index_dirty = true;
         try engine.edge_exist_index.put(r.from, r.rel_type, r.to, r.edge_id);
         engine.edge_exist_index_dirty = true;
+        // SONNY-6558: the edge owns its chain again.
+        if (r.prop_head != 0 and engine.derived_hydrated.load(.acquire)) {
+            try engine.prop_rev_index.putEdge(r.prop_head, r.edge_id);
+            engine.prop_rev_index_dirty = true;
+        }
     }
     if (r.counted) engine.manifest.edge_count += 1;
     engine.markDirty();
@@ -484,6 +531,12 @@ fn undoEdgePropHead(engine: *GraphEngine, txn: u64, from: NodeId, to: NodeId, ed
     const in_head = try engine.in_head_dir.getHead(to);
     if (try engine.adj_in_remote.updateEdgePropHead(in_head, edge_id, old_head)) |p|
         try engine.logPage(txn, .in_idx, p);
+    // SONNY-6558: move the reverse map's edge entry back to `old_head`.
+    if (engine.derived_hydrated.load(.acquire)) {
+        if (try engine.edge_index.get(edge_id)) |e| engine.prop_rev_index.removeEdge(e.prop_head, edge_id);
+        try engine.prop_rev_index.putEdge(old_head, edge_id);
+        engine.prop_rev_index_dirty = true;
+    }
     try engine.edge_index.updatePropHead(edge_id, old_head);
     engine.edge_index_dirty = true;
     if (old_head != 0) try engine.refreshPropertyChainIndex(old_head);

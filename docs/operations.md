@@ -47,11 +47,16 @@ that does not decode; the next checkpoint truncates it.
 
 ## Transactions
 
-All mutations require an explicit transaction:
+Every mutation runs in a transaction. The plain calls (`putNode`, `addEdge`,
+`putProperty`, ...) begin and commit one of their own; the `*Txn` variants
+join a transaction the caller holds:
 
 ```zig
 const txn = try engine.beginTxn();
-try engine.putNode(txn, node_id, &rec);
+errdefer engine.abortTxn(txn) catch {};
+const id = try engine.allocNode();
+try engine.putNodeTxn(id, rec, txn);
+_ = try engine.addEdgeColocatedTxn(id, other_id, rel_type, txn);
 try engine.commitTxn(txn);
 ```
 
@@ -83,13 +88,16 @@ state before the transaction and a crash after it replays the undo. Undone:
   live chain has taken those bytes since);
 - `addEdgeTxn`, `addEdgeColocatedTxn*` (edge id given back when last);
 - `removeEdgeTxn` (the entry is re-inserted with its id, type, property
-  head and public id; its position in the chain may change);
+  head and public id; its position in the chain may change; an edge added
+  through the legacy `addEdgeTxn` also gets its `adj_in` entry back);
 - `setEdgePropertyTxn` giving an edge its first property.
 
 Space the undone writes took (a new chain, a moved run) is not reused until
-compaction. Not undoable: a property change on a legacy (non-slab) chain
-that existed before the transaction, or one that replaced a value stored in
-an overflow chain (the write frees it), a `putNodeTxn` that changes
+compaction. A value stored in an overflow chain that a write replaces or
+removes is freed when the transaction commits, not by the write, so such a
+write is undone too (0.4.22, SONNY-6558). Not undoable: a property change on
+a legacy (non-slab) chain that existed before the transaction, a
+`putNodeTxn` that changes
 `out_head`, `in_head`, `label_head` or `label_count` of an existing node, a
 page the caller imaged itself (`logPagePublic`, `zeroPageLogged`), and a
 transaction past 1,048,576 writes. With `GraphConfig.abort_undo = .fail_closed` (default)

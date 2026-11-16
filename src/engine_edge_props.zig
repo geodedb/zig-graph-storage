@@ -115,6 +115,13 @@ pub fn setEdgePropertyTxn(engine: *GraphEngine, from: NodeId, to: NodeId, edge_i
         // content, and the next open silently loses the property linkage
         // (blessed-stale, the 0018-class silent-loss shape).
         engine.edge_index_dirty = true;
+        // SONNY-6558: keep the reverse map's edge-chain entry on the current
+        // head (only when hydrated, like the node entries in putNodeTxn).
+        if (engine.derived_hydrated.load(.acquire)) {
+            engine.prop_rev_index.removeEdge(found_prop_head, edge_id);
+            try engine.prop_rev_index.putEdge(new_head, edge_id);
+            engine.prop_rev_index_dirty = true;
+        }
     }
 }
 

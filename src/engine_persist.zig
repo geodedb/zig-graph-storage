@@ -526,6 +526,9 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
         cfg.sync_mode,
     );
     errdefer self.txn_manager.deinit();
+    // SONNY-6558: overflow chains released by a journaled property write are
+    // freed when its transaction commits (see engine_undo.onCommit).
+    self.txn_manager.commit_hook = .{ .ctx = self, .run = @import("engine_undo.zig").onCommit };
 
     // Data stores (non-fallible but clean up if a later init fails)
     self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);

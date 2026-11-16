@@ -34,6 +34,10 @@ pub const Metrics = struct {
     /// SONNY-6599: 1 when this open's crash recovery truncated the WAL it
     /// replayed (or a leftover one at or below the checkpoint frontier).
     recovery_wal_truncated: u64 = 0,
+    /// SONNY-6558: label names this open found missing from `labels.dict`
+    /// against the manifest's `label_count` (a crash during a <= 0.4.13
+    /// checkpoint). Their ids read back unnamed.
+    label_names_lost: u64 = 0,
 
     // Operations
     nodes_created: u64 = 0,
