@@ -98,6 +98,14 @@ pub const PropRevIndex = struct {
         _ = self.map.remove(prop_head);
     }
 
+    /// SONNY-6657: drop `prop_head` only while it is recorded as node
+    /// `node_id`'s chain. A head another owner has taken since is left alone.
+    pub fn removeIfNode(self: *PropRevIndex, prop_head: u64, node_id: NodeId) void {
+        if (prop_head == 0) return;
+        const v = self.map.get(prop_head) orelse return;
+        if (v == node_id) _ = self.map.remove(prop_head);
+    }
+
     /// The node that currently owns `prop_head`, or null when unknown or
     /// owned by an edge.
     pub fn get(self: *const PropRevIndex, prop_head: u64) ?NodeId {

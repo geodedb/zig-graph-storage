@@ -548,7 +548,7 @@ fn undoNodePut(engine: *GraphEngine, txn: u64, id: NodeId, before: ?NodeRec, aft
         // already emptied by the inverses applied before this one; their
         // bytes leak until compaction.
         // Queued before hydration (SONNY-6648, `GraphEngine.revMapRemove`).
-        engine.revMapRemove(cur.prop_head);
+        engine.revMapRemoveOwned(cur.prop_head, id);
         try writeSlot(engine, txn, id, std.mem.zeroes(NodeRec));
         if (!node_mod.isEmpty(&cur) and !node_mod.isDeleted(&cur) and engine.manifest.node_count > 0)
             engine.manifest.node_count -= 1;
@@ -570,7 +570,7 @@ fn undoNodePut(engine: *GraphEngine, txn: u64, id: NodeId, before: ?NodeRec, aft
     // create's inverse empties.
     if (std.mem.eql(u8, std.mem.asBytes(&rec), std.mem.asBytes(&cur))) return;
     if (rec.prop_head != cur.prop_head) {
-        engine.revMapRemove(cur.prop_head);
+        engine.revMapRemoveOwned(cur.prop_head, id);
         try engine.revMapPut(rec.prop_head, id);
     }
     try writeSlot(engine, txn, id, rec);

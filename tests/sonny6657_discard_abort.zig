@@ -18,6 +18,9 @@
 // transaction was open at any time during this one (a held page could carry
 // the other's bytes); otherwise it still fails closed.
 //
+// Also: a node whose property chain moves (or goes away) left the old chain
+// mapped to it in the reverse map.
+//
 // Real stores and real eviction (a 64-frame pool), no mocks.
 
 const std = @import("std");
@@ -327,4 +330,86 @@ test "SONNY-6657: with another transaction open meanwhile, the abort still fails
     try eng.commitTxn(other);
     try testing.expectError(error.AbortNotUndone, eng.abortTxn(txn));
     try testing.expectEqual(@as(u64, 0), eng.metrics.txn_aborts_discarded);
+}
+
+// ---------------------------------------------------------------------------
+// Reverse map: a chain moving off a node
+// ---------------------------------------------------------------------------
+
+fn setProp(eng: *GraphEngine, id: u64, key: []const u8, v: i64) !void {
+    var rec = (try eng.getNode(id)).?;
+    const head = try eng.putProperty(rec.prop_head, key, .{ .int = v });
+    if (head != rec.prop_head) {
+        rec.prop_head = head;
+        try eng.putNode(id, rec);
+    }
+}
+
+fn ownerOf(eng: *GraphEngine, head: u64) ?u64 {
+    const o = eng.prop_rev_index.owner(head) orelse return null;
+    return switch (o) {
+        .node => |n| n,
+        .edge => null,
+    };
+}
+
+test "SONNY-6657: a chain moving off a node drops its reverse-map entry (both orders, before and after hydration)" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{ 0x66, 0x57, 0x06 } ++ [_]u8{0x46} ** 13;
+    const cfg = test_support.testConfig();
+
+    var a: u64 = 0;
+    var c: u64 = 0;
+    var h: u64 = 0;
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.deinit();
+        a = try eng.allocNode();
+        try eng.putNode(a, test_support.emptyNode(BASE));
+        c = try eng.allocNode();
+        try eng.putNode(c, test_support.emptyNode(BASE));
+        try setProp(eng, a, "k", 1);
+        h = (try eng.getNode(a)).?.prop_head;
+        // Hydrated: a's chain goes away. The entry must go with it.
+        var ra = (try eng.getNode(a)).?;
+        ra.prop_head = 0;
+        try eng.putNode(a, ra);
+        try testing.expectEqual(@as(?u64, null), ownerOf(eng, h));
+        // Put it back for the next part.
+        ra.prop_head = h;
+        try eng.putNode(a, ra);
+        try testing.expectEqual(@as(?u64, a), ownerOf(eng, h));
+        try eng.checkpoint();
+        try eng.close();
+    }
+    for ([_]bool{ true, false }) |a_first| {
+        const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try testing.expect(!eng.derived_hydrated.load(.acquire));
+        // Before hydration: the chain moves from a to c, in either order.
+        var ra = (try eng.getNode(a)).?;
+        var rc = (try eng.getNode(c)).?;
+        const from_a = ra.prop_head == h;
+        const src = if (from_a) a else c;
+        const dst = if (from_a) c else a;
+        var rs = if (from_a) ra else rc;
+        var rd = if (from_a) rc else ra;
+        rs.prop_head = 0;
+        rd.prop_head = h;
+        const txn = try eng.beginTxn();
+        if (a_first) {
+            try eng.putNodeTxn(src, rs, txn);
+            try eng.putNodeTxn(dst, rd, txn);
+        } else {
+            try eng.putNodeTxn(dst, rd, txn);
+            try eng.putNodeTxn(src, rs, txn);
+        }
+        try eng.commitTxn(txn);
+        try eng.ensureDerivedHydrated();
+        try testing.expectEqual(@as(?u64, dst), ownerOf(eng, h));
+        _ = &ra;
+        _ = &rc;
+    }
 }

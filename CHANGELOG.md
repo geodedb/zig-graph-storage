@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discarded. Only when no other transaction overlapped it and the WAL tail
   holds no cross-shard record; otherwise it fails closed as before
   (SONNY-6657, SONNY-6558 #4).
+- A node whose property chain moved or went away stayed mapped to the old
+  chain in the reverse map. The old entry is now dropped when it is still
+  the node's (another node that took the chain over keeps it), also for
+  writes queued before hydration and in undo (SONNY-6657).
 
 ## [0.4.23] - 2026-11-16
 

@@ -120,7 +120,8 @@ pub const TxnCounts = struct { node_count: u64 = 0, edge_count: u64 = 0 };
 pub const RevMapOp = struct {
     head: u64,
     node: NodeId,
-    kind: enum { put, remove },
+    /// `remove_owned` (SONNY-6657): drop `head` only while `node` owns it.
+    kind: enum { put, remove, remove_owned },
 };
 
 /// The central GraphEngine that wires everything together and implements
@@ -1090,6 +1091,7 @@ pub const GraphEngine = struct {
             for (self.rev_map_pending.items) |op| switch (op.kind) {
                 .put => try self.prop_rev_index.put(op.head, op.node),
                 .remove => self.prop_rev_index.remove(op.head),
+                .remove_owned => self.prop_rev_index.removeIfNode(op.head, op.node),
             };
         }
         self.prop_rev_index_dirty = true;
@@ -1112,6 +1114,16 @@ pub const GraphEngine = struct {
         if (head == 0) return;
         if (self.queueRevMapOp(.{ .head = head, .node = 0, .kind = .remove })) return;
         self.prop_rev_index.remove(head);
+        self.prop_rev_index_dirty = true;
+    }
+
+    /// SONNY-6657: drop property chain `head` from the reverse map when it is
+    /// recorded as node `node`'s (the node no longer points at it; a node
+    /// that took the chain over keeps its entry). Queued before hydration.
+    pub fn revMapRemoveOwned(self: *GraphEngine, head: u64, node: NodeId) void {
+        if (head == 0) return;
+        if (self.queueRevMapOp(.{ .head = head, .node = node, .kind = .remove_owned })) return;
+        self.prop_rev_index.removeIfNode(head, node);
         self.prop_rev_index_dirty = true;
     }
 
@@ -2062,6 +2074,11 @@ pub const GraphEngine = struct {
         // forces a hydration on the write path. A prop_head of 0 is not
         // recorded; overwriting is exactly the rebuild result for slab-slot
         // reuse. In-memory only — no write amplification.
+        // SONNY-6657: and drop the chain it no longer points at, unless another
+        // node has taken it over (it used to stay mapped to this node).
+        if (before) |b| {
+            if (b.prop_head != rec.prop_head) self.revMapRemoveOwned(b.prop_head, id);
+        }
         try self.revMapPut(rec.prop_head, id);
         self.markDirty();
     }
@@ -2122,7 +2139,7 @@ pub const GraphEngine = struct {
         // PHASE G reverse map: drop this node's prop_head -> id before the record
         // is tombstoned (deleteNode keeps prop_head, but read it now to be
         // explicit). Queued before hydration (see putNodeTxn). In-memory only.
-        if (try self.node_store.getRawSlot(id)) |rec| self.revMapRemove(rec.prop_head);
+        if (try self.node_store.getRawSlot(id)) |rec| self.revMapRemoveOwned(rec.prop_head, id);
         try engine_undo.reserve(self, txn);
         try self.node_store.deleteNode(id);
         const undo_idx = engine_undo.recordNodeDelete(self, txn, id);
