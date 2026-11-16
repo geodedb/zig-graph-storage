@@ -153,10 +153,20 @@ nothing else it could evict (`Metrics.evict_wal_syncs`, also counting the
 sync a checkpoint makes first), so disk never holds part of a transaction
 the log lost.
 
-Known limit: a page another transaction commits while this one is still
-open carries this one's uncommitted bytes in its full-page image, and
-recovery replays that image. Keep one transaction open per engine at a time
-(geode opens at most one statement transaction per shard).
+A page has at most one open writer (SONNY-6659). The WAL holds full-page
+images, so an image taken by one transaction carries every other open
+transaction's bytes on that page, and recovery would replay them. A write by
+a second open transaction to a page another open one has written therefore
+fails with `error.WriteConflict` (`Metrics.write_conflicts`) before its image
+is logged: that transaction cannot commit (`commitTxn` returns the same
+error) and must be aborted, which undoes it in memory. While its bytes are on
+the page, the first writer's writes to it are refused too, so abort the
+refused transaction first; then end the first one (or let it continue) and
+retry. A transaction that overlapped another is always aborted in memory
+(nothing it wrote was committed or reached disk). There is no waiting: the
+engine has one writer, so blocking would deadlock it. Keep one transaction
+open per engine at a time to avoid conflicts entirely (geode opens at most
+one statement transaction per shard).
 
 ---
 

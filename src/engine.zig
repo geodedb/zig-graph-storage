@@ -115,6 +115,30 @@ pub const default_owned_pool_max_threads: u32 = 4;
 /// SONNY-6657: see `GraphEngine.txn_counts_at_begin`.
 pub const TxnCounts = struct { node_count: u64 = 0, edge_count: u64 = 0 };
 
+/// SONNY-6659: the open transactions whose bytes are on a page (its writers
+/// while transactions are open). More than `ids.len` at once: `overflow`,
+/// the page conflicts for every writer until no transaction is open.
+pub const PageWriters = struct {
+    ids: [4]u64 = .{ 0, 0, 0, 0 },
+    len: u8 = 0,
+    overflow: bool = false,
+
+    fn has(self: *const PageWriters, txn: u64) bool {
+        for (self.ids[0..self.len]) |id| if (id == txn) return true;
+        return false;
+    }
+
+    fn add(self: *PageWriters, txn: u64) void {
+        if (self.has(txn)) return;
+        if (self.len == self.ids.len) {
+            self.overflow = true;
+            return;
+        }
+        self.ids[self.len] = txn;
+        self.len += 1;
+    }
+};
+
 /// SONNY-6648: a reverse-map (prop_head -> node) change queued before the
 /// derived indexes are hydrated (`GraphEngine.rev_map_pending`).
 pub const RevMapOp = struct {
@@ -244,6 +268,9 @@ pub const GraphEngine = struct {
     /// SONNY-6657: set while a discard-abort ends its transaction (its
     /// deferred page frees are dropped, not applied).
     discarding_txn: bool = false,
+    /// SONNY-6659: per page, the open transactions whose bytes are on it
+    /// (`claimPage`). Cleared when no transaction is open.
+    page_writers: std.AutoHashMapUnmanaged(buffer_pool_mod.PageKey, PageWriters) = .empty,
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     /// PHASE G reverse map: set when a record write moved/added/removed a
@@ -391,6 +418,7 @@ pub const GraphEngine = struct {
         if (builtin.is_test) self.test_discard_crash_at = null;
         self.txn_counts_at_begin = .{};
         self.discarding_txn = false;
+        self.page_writers = .empty;
         // P2: all four dirty flags are true → the clean-snapshot invariant
         // holds vacuously (see the field doc).
         self.derived_snapshots_trusted = true;
@@ -558,6 +586,7 @@ pub const GraphEngine = struct {
         if (builtin.is_test) self.test_discard_crash_at = null;
         self.txn_counts_at_begin = .{};
         self.discarding_txn = false;
+        self.page_writers = .empty;
         // P2: the on-disk snapshots are UNKNOWN until the counter gate runs
         // (they may be crash-stale behind clean dirty flags) — restamping is
         // forbidden until materializeDerivedIndexes establishes the invariant.
@@ -1424,6 +1453,7 @@ pub const GraphEngine = struct {
         self.property_index.deinit();
         self.prop_rev_index.deinit();
         self.rev_map_pending.deinit(self.allocator);
+        self.page_writers.deinit(self.allocator);
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -1630,6 +1660,7 @@ pub const GraphEngine = struct {
         self.property_index.deinit();
         self.prop_rev_index.deinit();
         self.rev_map_pending.deinit(self.allocator);
+        self.page_writers.deinit(self.allocator);
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -1928,10 +1959,43 @@ pub const GraphEngine = struct {
     /// `logPagePublic`, which also marks the transaction not undoable.
     pub fn logPage(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
         if (self.undo_no_log) return;
+        try self.claimPage(txn_id, file_id, page_id);
         const frame = try self.buffer_pool.pin(file_id, page_id);
         const frame_idx = self.buffer_pool.frameIndex(frame);
         defer self.buffer_pool.unpin(frame_idx, false);
         _ = try self.txn_manager.logPageUpdate(txn_id, @intFromEnum(file_id), page_id, frame.dataSlice());
+    }
+
+    /// SONNY-6659: `txn_id` is about to log a full image of the page. The WAL
+    /// holds page after-images, so the image would carry the bytes of every
+    /// other open transaction on the page, and replaying it after a crash
+    /// would make them durable although they never committed. A page
+    /// therefore has one open writer: a second one's write is refused
+    /// (`error.WriteConflict`) before anything is logged. Its bytes are on
+    /// the page in memory now, so it stays a writer of the page (the page
+    /// conflicts for the first writer too until it is gone) and it may not
+    /// commit; its abort undoes it in memory (`engine_undo.abort`).
+    fn claimPage(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) !void {
+        const key = buffer_pool_mod.PageKey{ .file_id = file_id, .page_id = page_id };
+        const gop = try self.page_writers.getOrPut(self.allocator, key);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const w = gop.value_ptr;
+        // Writers that ended no longer have bytes on the page.
+        var n: u8 = 0;
+        for (w.ids[0..w.len]) |id| {
+            if (self.txn_manager.isActive(id)) {
+                w.ids[n] = id;
+                n += 1;
+            }
+        }
+        w.len = n;
+        const others = w.overflow or (w.len > @intFromBool(w.has(txn_id)));
+        w.add(txn_id);
+        if (others) {
+            self.metrics.write_conflicts += 1;
+            if (self.txn_manager.journal(txn_id)) |j| j.conflict = true;
+            return error.WriteConflict;
+        }
     }
 
     /// GAP adjacency slab packing (P2): WAL-image every page an AdjStore
@@ -1996,6 +2060,7 @@ pub const GraphEngine = struct {
     /// dst->head mapping. Crash-durable because the zeroed image is WAL-logged.
     pub fn zeroPageLogged(self: *GraphEngine, txn_id: u64, file_id: FileId, page_id: u64) anyerror!void {
         engine_undo.markNotUndoable(self, txn_id, .caller_page_image);
+        try self.claimPage(txn_id, file_id, page_id);
         const frame = try self.buffer_pool.pin(file_id, page_id);
         const frame_idx = self.buffer_pool.frameIndex(frame);
         @memset(frame.dataSlice(), 0);

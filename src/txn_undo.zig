@@ -120,6 +120,11 @@ pub const UndoJournal = struct {
     /// so this transaction cannot be aborted by discarding them. Kept by
     /// `fail`.
     overlapped: bool = false,
+    /// SONNY-6659: one of this transaction's writes landed on a page that
+    /// another open transaction had written (`error.WriteConflict`). Its
+    /// bytes are on that page in memory but were not logged: it cannot
+    /// commit, and its abort undoes it in memory only. Kept by `fail`.
+    conflict: bool = false,
 
     pub fn deinit(self: *UndoJournal, allocator: Allocator) void {
         self.freeBlobs(allocator);
@@ -155,6 +160,7 @@ pub const UndoJournal = struct {
         self.deferred_var_frees.clearRetainingCapacity();
         self.not_undoable = null;
         self.overlapped = false;
+        self.conflict = false;
     }
 
     /// Buffers large enough that keeping them for reuse would pin memory a

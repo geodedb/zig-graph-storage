@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A full-page WAL image committed by one transaction carried the bytes of
+  another transaction still open on the same page, and recovery restored
+  them after a crash: an uncommitted write became durable (SONNY-2979
+  probe). A page now has one open writer: a second open transaction's write
+  to it fails with `error.WriteConflict` before its image is logged
+  (`Metrics.write_conflicts`); that transaction cannot commit and its abort
+  undoes it in memory, and while its bytes are on the page the first
+  writer's writes there are refused too. A transaction that overlapped
+  another is aborted in memory (ABORT record, no inverse images). Callers
+  that kept two transactions open on one engine and wrote the same page now
+  get the error instead of silent corruption (SONNY-6659).
+
 ## [0.4.24] - 2026-11-16
 
 ### Fixed

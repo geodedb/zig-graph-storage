@@ -808,6 +808,18 @@ fn addIntegrationTests(
     const run_sonny6657 = b.addRunArtifact(sonny6657_tests);
     sonny6657_step.dependOn(&run_sonny6657.step);
 
+    // SONNY-6659: a page has at most one open writer; a second open
+    // transaction's write is refused, so no committed page image carries
+    // another transaction's uncommitted bytes (real crash with t1 open).
+    const sonny6659_step = b.step("test-sonny6659-page-writer-conflict", "Run SONNY-6659 tests: a second open transaction's write to a page is refused (WriteConflict); crash with t1 open leaves none of its bytes");
+    const sonny6659_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/sonny6659_page_writer_conflict.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_sonny6659 = b.addRunArtifact(sonny6659_tests);
+    sonny6659_step.dependOn(&run_sonny6659.step);
+
     // SONNY-6529: abortTxn undoes the transaction's writes (node create /
     // update / delete, labels, properties on new chains, edge add / remove /
     // first property) in memory and across checkpoint + reopen and crash +
@@ -1055,6 +1067,7 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_sonny6648.step);
     integration_step.dependOn(&run_sonny6648_rev.step);
     integration_step.dependOn(&run_sonny6657.step);
+    integration_step.dependOn(&run_sonny6659.step);
     // Shard label dictionaries (SONNY-6524) are the same lost-name class.
     integration_step.dependOn(&run_label_dict_shards.step);
     // Aborted writes made durable (SONNY-6529) are the same silent-corruption class.
