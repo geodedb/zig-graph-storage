@@ -1021,6 +1021,62 @@ test "SEC-0043: verifyGraph without key passes on plaintext manifest (regression
     try testing.expect(result.isClean());
 }
 
+test "SONNY-6635: the WAL copy is made in a private directory inside the graph's directory and removed" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var uuid: [16]u8 = undefined;
+    @memset(&uuid, 0x66);
+    var gd = try GraphDir.create(allocator, tmp_path, uuid);
+    defer gd.deinit();
+    try setupWalArtifacts(allocator, gd.path, uuid);
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}/wal", .{gd.path});
+    defer allocator.free(wal_path);
+    var wal_dir = try std.Io.Dir.cwd().openDir(io, wal_path, .{});
+    defer wal_dir.close(io);
+
+    var scratch = try WalScratch.create(allocator, gd.path, wal_dir);
+    var destroyed = false;
+    defer if (!destroyed) scratch.destroy();
+    // Inside the graph's directory (the store's own filesystem and
+    // permissions), never under $TMPDIR or /tmp.
+    try testing.expect(std.mem.startsWith(u8, scratch.path, gd.path));
+    try testing.expectEqualStrings(gd.path, std.fs.path.dirname(scratch.path).?);
+    const st = try std.Io.Dir.cwd().statFile(io, scratch.path, .{ .follow_symlinks = false });
+    try testing.expectEqual(std.Io.File.Kind.directory, st.kind);
+    try testing.expectEqual(@as(u32, 0o700), st.permissions.toMode() & 0o7777);
+    const copied = try scratch.dir.statFile(io, "graph.uuid", .{});
+    try testing.expectEqual(@as(u32, 0o600), copied.permissions.toMode() & 0o7777);
+    const scratch_path = try allocator.dupe(u8, scratch.path);
+    defer allocator.free(scratch_path);
+    scratch.destroy();
+    destroyed = true;
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, scratch_path, .{}));
+
+    // A whole verification leaves nothing behind in the graph's directory.
+    const m = Manifest{ .graph_uuid = uuid, .page_size = 4096, .counter = 1 };
+    const path_a = try gd.manifestPath(allocator, .a);
+    defer allocator.free(path_a);
+    try m.writeToFile(allocator, path_a);
+    const path_b = try gd.manifestPath(allocator, .b);
+    defer allocator.free(path_b);
+    try m.writeToFile(allocator, path_b);
+    var tool = VerifyTool.init(allocator);
+    var result = try tool.verifyGraph(&gd, 4096);
+    defer result.deinit();
+    var gdir = try std.Io.Dir.cwd().openDir(io, gd.path, .{ .iterate = true });
+    defer gdir.close(io);
+    var it = gdir.iterate();
+    while (try it.next(io)) |e| {
+        try testing.expect(!std.mem.startsWith(u8, e.name, WalScratch.prefix));
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

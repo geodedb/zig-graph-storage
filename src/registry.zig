@@ -382,6 +382,103 @@ test "empty registry save/load" {
     try std.testing.expectEqual(@as(usize, 0), reg2.graphCount());
 }
 
+const TEST_KEY_6635 = [_]u8{0x35} ** 32;
+
+fn tmpRealPath(allocator: Allocator, tmp_dir: *std.testing.TmpDir) ![]u8 {
+    return tmp_dir.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+}
+
+test "SONNY-6635: a registry sealed in one data directory does not authenticate in another" {
+    const allocator = std.testing.allocator;
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const dir_a = try tmpRealPath(allocator, &tmp_a);
+    defer allocator.free(dir_a);
+    const dir_b = try tmpRealPath(allocator, &tmp_b);
+    defer allocator.free(dir_b);
+
+    const id_a = try DataDirIdentity.generate();
+    const id_b = try DataDirIdentity.generate();
+    try std.testing.expect(!std.mem.eql(u8, &id_a.uuid, &id_b.uuid));
+    try std.testing.expect(!std.mem.eql(u8, &id_a.uuid, &SEAL_UUID));
+
+    var reg = GraphRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.addGraph("tenant_a", [_]u8{0x0A} ** 16);
+    const path_a = try std.fmt.allocPrint(allocator, "{s}/graph_registry.dat", .{dir_a});
+    defer allocator.free(path_a);
+    {
+        var c = id_a.cipher(TEST_KEY_6635).?;
+        defer c.deinit();
+        try reg.saveToFileWith(path_a, &c);
+    }
+    // The same file in data directory B (same key, B's identity).
+    const raw = try side_file_crypto.readWholeFile(allocator, path_a);
+    defer allocator.free(raw);
+    const path_b = try std.fmt.allocPrint(allocator, "{s}/graph_registry.dat", .{dir_b});
+    defer allocator.free(path_b);
+    try side_file_crypto.writeAtomic(allocator, path_b, raw);
+
+    var in_b = GraphRegistry.init(allocator);
+    defer in_b.deinit();
+    var cb = id_b.cipher(TEST_KEY_6635).?;
+    defer cb.deinit();
+    try std.testing.expectError(error.SideFileAuthFailed, in_b.loadFromFileWith(path_b, .{ .cipher = &cb, .require_sealed = true }));
+    // In A, under A's identity, it loads.
+    var in_a = GraphRegistry.init(allocator);
+    defer in_a.deinit();
+    var ca = id_a.cipher(TEST_KEY_6635).?;
+    defer ca.deinit();
+    try std.testing.expect(!try in_a.loadFromFileWith(path_a, .{ .cipher = &ca, .require_sealed = true }));
+    try std.testing.expect(in_a.findByName("tenant_a") != null);
+}
+
+test "SONNY-6635: the data-directory identity round-trips sealed, private, and records the bound registry" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpRealPath(allocator, &tmp);
+    defer allocator.free(dir);
+
+    try std.testing.expect((try DataDirIdentity.load(allocator, dir, TEST_KEY_6635)) == null);
+
+    var id = try DataDirIdentity.generate();
+    try std.testing.expect(!id.registry_bound);
+    try id.save(allocator, dir, TEST_KEY_6635);
+    id.registry_bound = true;
+    try id.save(allocator, dir, TEST_KEY_6635);
+
+    const got = (try DataDirIdentity.load(allocator, dir, TEST_KEY_6635)).?;
+    try std.testing.expectEqualSlices(u8, &id.uuid, &got.uuid);
+    try std.testing.expect(got.registry_bound);
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/" ++ IDENTITY_FILE_NAME, .{dir});
+    defer allocator.free(path);
+    const raw = try side_file_crypto.readWholeFile(allocator, path);
+    defer allocator.free(raw);
+    try std.testing.expect(side_file_crypto.isSealed(raw));
+    try std.testing.expect(std.mem.indexOf(u8, raw, &id.uuid) == null);
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    try std.testing.expectEqual(@as(u32, owner_only_file_mode), (try f.stat(io)).permissions.toMode() & 0o7777);
+
+    // Without the key it is sealed; under another key it does not authenticate.
+    try std.testing.expectError(error.SideFileEncrypted, DataDirIdentity.load(allocator, dir, null));
+    try std.testing.expectError(error.SideFileAuthFailed, DataDirIdentity.load(allocator, dir, [_]u8{0x36} ** 32));
+
+    // Under a key a plaintext identity (one that could say "not bound") is refused.
+    var plain = id;
+    plain.registry_bound = false;
+    try plain.save(allocator, dir, null);
+    try std.testing.expectError(error.SideFileNotSealed, DataDirIdentity.load(allocator, dir, TEST_KEY_6635));
+    // Without a key a plaintext identity loads.
+    const p = (try DataDirIdentity.load(allocator, dir, null)).?;
+    try std.testing.expect(!p.registry_bound);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
