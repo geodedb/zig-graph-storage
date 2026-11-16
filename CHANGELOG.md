@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.26] - 2026-11-16
+
+### Security
+
+- A sealed `graph_registry.dat` copied from another data directory under
+  the same key authenticated: the registry cipher was bound to
+  `registry.SEAL_UUID`, the same in every data directory. A data directory
+  now has its own identity, `registry.DataDirIdentity`
+  (`data_dir.identity`, owner-only; under a key sealed as
+  `side_file_crypto.Kind.data_dir_identity` and a plaintext one refused): a
+  random uuid made once, which the registry is sealed under
+  (`DataDirIdentity.cipher`), and a flag recording that it has been, so a
+  consumer can refuse a plaintext or `SEAL_UUID`-sealed registry from then
+  on. A registry sealed by 0.4.20 to 0.4.25 is read under `SEAL_UUID` by the
+  consumer while the flag is clear, and resealed (SONNY-6635).
+- `VerifyTool` copied a graph's WAL into a new directory under `$TMPDIR` or
+  `/tmp`, where without a key the copy was plaintext on another filesystem
+  with other permissions and retention. The copy is now made in a new
+  directory inside the graph's own directory (`.verify-wal-<random>`, 0700,
+  created exclusively, opened without following a link; files 0600) and
+  removed when the check ends (SONNY-6635).
+
+### Added
+
+- `registry.DataDirIdentity` (`generate`, `load`, `save`, `cipher`),
+  `registry.IDENTITY_FILE_NAME` and `side_file_crypto.Kind.data_dir_identity`
+  (kind 9) (SONNY-6635).
+
+### Documentation
+
+- docs/operations.md, "What the key covers", and docs/format-spec.md list
+  each file left unencrypted under a key and why: `labels.idx`,
+  `prop_rev.idx`, `free.store`, the manifests (authenticated) and
+  `wal/graph.uuid` hold ids, counts and checksums only (SONNY-6635).
+
 ## [0.4.25] - 2026-11-16
 
 ### Fixed
@@ -801,7 +836,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.25...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.26...HEAD
+[0.4.26]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.25...v0.4.26
 [0.4.25]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.24...v0.4.25
 [0.4.24]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.23...v0.4.24
 [0.4.23]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...v0.4.23
