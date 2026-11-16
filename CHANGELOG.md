@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The bytes of a transaction that had not ended could reach the store
+  files, where recovery (redo of committed transactions only) left them
+  after a crash: eviction wrote dirty pages back mid-transaction, a
+  checkpoint or light checkpoint during the transaction flushed them and
+  moved the frontier past it, `close` checkpointed with it open, and a crash
+  in the middle of an abort left whatever had been written. The buffer pool
+  now holds every page dirtied while a transaction is open (no-steal) until
+  none is open; checkpoints are deferred meanwhile
+  (`Metrics.checkpoints_deferred`); `close` aborts open transactions first;
+  after an abort that cannot be undone its pages are never written. A
+  transaction that dirties more pages than the pool holds now fails with
+  `error.BufferPoolFull` (abort restores it). Under `sync_mode = .deferred`
+  a committed page is written back only after its COMMIT record is synced
+  (`Metrics.evict_wal_syncs`) (SONNY-6648, SONNY-6558 #5).
+
 ## [0.4.22] - 2026-11-15
 
 ### Fixed

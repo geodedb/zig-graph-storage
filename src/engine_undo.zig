@@ -12,12 +12,14 @@
 //! engine's single-writer contract, like the writes it records.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const engine_mod = @import("engine.zig");
 const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
 const types = @import("types.zig");
 const txn_undo = @import("txn_undo.zig");
+const BufferPool = @import("buffer_pool.zig").BufferPool;
 
 const GraphEngine = engine_mod.GraphEngine;
 const NodeRec = node_mod.NodeRec;
@@ -213,6 +215,35 @@ pub fn onCommit(ctx: *anyopaque, j: *UndoJournal) void {
     j.deferred_var_frees.clearRetainingCapacity();
 }
 
+/// SONNY-6648: `TxnManager.txn_hook`. A transaction began: hold the pages
+/// it dirties (and every page dirtied while it is open) off disk.
+pub fn onTxnBegan(ctx: *anyopaque) void {
+    const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
+    engine.buffer_pool.beginTxnHold();
+}
+
+/// SONNY-6648: `TxnManager.txn_hook`. A transaction ended. When none is
+/// open any more the held pages are committed or undone: writable again,
+/// after a WAL sync under deferred commits. After an abort that could not
+/// undo its writes (the engine is poisoned, set BEFORE the transaction is
+/// ended) they stay held: those bytes must never reach disk.
+pub fn onTxnEnded(ctx: *anyopaque) void {
+    const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
+    const how: BufferPool.TxnEnd = if (engine.abort_not_undone != null)
+        .keep
+    else switch (engine.txn_manager.sync_mode) {
+        .sync_each_commit => .release,
+        .deferred => .after_wal_sync,
+    };
+    engine.buffer_pool.endTxnHold(how);
+}
+
+/// SONNY-6648: `BufferPool.wal_sync_hook`.
+pub fn syncWalForPool(ctx: *anyopaque) anyerror!void {
+    const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
+    try engine.wal.sync();
+}
+
 pub fn recordEdgePropHead(engine: *GraphEngine, txn: u64, from: NodeId, to: NodeId, edge_id: u64, old_head: u64) void {
     _ = push(engine, txn, .{ .edge_prop_head = .{ .from = from, .to = to, .edge_id = edge_id, .old_head = old_head } });
 }
@@ -236,8 +267,11 @@ pub fn abort(engine: *GraphEngine, txn: u64) !void {
     }
 
     if (j.not_undoable) |reason| {
+        // SONNY-6648: poison (fail_closed) BEFORE the transaction ends, so
+        // its pages stay held (`onTxnEnded`).
+        const refused = refuse(engine, reason);
         try engine.txn_manager.abort(txn);
-        return refuse(engine, reason);
+        return refused;
     }
 
     // Apply the inverses in reverse order, logged under `txn`, then end it
@@ -245,22 +279,36 @@ pub fn abort(engine: *GraphEngine, txn: u64) !void {
     engine.undo_applying = true;
     defer engine.undo_applying = false;
     var i = j.records.items.len;
+    var applied: usize = 0;
     while (i > 0) {
+        try testCrashPoint(engine, applied);
         i -= 1;
         applyOne(engine, txn, j.records.items[i]) catch |err| {
+            // Poisoned before the transaction ends (SONNY-6648, `onTxnEnded`).
+            engine.abort_not_undone = .undo_failed;
             engine.txn_manager.abort(txn) catch {};
             std.log.warn("graph-storage: undoing aborted transaction {d} failed ({s}); refusing further writes and checkpoints (SONNY-6529)", .{ txn, @errorName(err) });
-            engine.abort_not_undone = .undo_failed;
             return error.AbortNotUndone;
         };
+        applied += 1;
     }
+    try testCrashPoint(engine, applied);
     engine.txn_manager.commit(txn) catch |err| {
+        engine.abort_not_undone = .undo_failed;
         engine.txn_manager.abort(txn) catch {};
         std.log.warn("graph-storage: ending undone transaction {d} failed ({s}); refusing further writes and checkpoints (SONNY-6529)", .{ txn, @errorName(err) });
-        engine.abort_not_undone = .undo_failed;
         return error.AbortNotUndone;
     };
     engine.metrics.txn_aborts_undone += 1;
+}
+
+/// SONNY-6648 (tests only): stop the abort after `applied` inverses, as a
+/// process dying there would (see `GraphEngine.test_abort_crash_after`).
+fn testCrashPoint(engine: *const GraphEngine, applied: usize) error{TestCrashInjected}!void {
+    if (comptime !builtin.is_test) return;
+    if (engine.test_abort_crash_after) |n| {
+        if (n == applied) return error.TestCrashInjected;
+    }
 }
 
 /// End `txn` after one of the engine's auto-commit writes failed inside it

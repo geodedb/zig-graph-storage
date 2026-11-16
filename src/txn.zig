@@ -55,11 +55,25 @@ pub const TxnManager = struct {
     /// before the journal is dropped. The engine frees the overflow chains
     /// the transaction's property writes deferred.
     commit_hook: ?CommitHook = null,
+    /// SONNY-6648: told when a transaction becomes active and when it stops
+    /// being active (committed or aborted), so the engine's buffer pool keeps
+    /// the pages of open transactions off disk (no-steal).
+    txn_hook: ?TxnHook = null,
 
     pub const CommitHook = struct {
         ctx: *anyopaque,
         run: *const fn (ctx: *anyopaque, journal: *UndoJournal) void,
     };
+
+    pub const TxnHook = struct {
+        ctx: *anyopaque,
+        began: *const fn (ctx: *anyopaque) void,
+        ended: *const fn (ctx: *anyopaque) void,
+    };
+
+    fn notifyEnded(self: *TxnManager) void {
+        if (self.txn_hook) |h| h.ended(h.ctx);
+    }
 
     /// Initialize the transaction manager. Defaults to `sync_each_commit`
     /// (per-commit fsync). Callers that opt into a relaxed policy should set
@@ -168,6 +182,7 @@ pub const TxnManager = struct {
         };
         errdefer if (self.journals.fetchRemove(txn_id)) |kv| self.recycleJournal(kv.value);
         try self.active_txns.put(txn_id, .active);
+        if (self.txn_hook) |h| h.began(h.ctx);
         return txn_id;
     }
 
@@ -215,6 +230,7 @@ pub const TxnManager = struct {
         }
         _ = self.active_txns.remove(txn_id);
         self.dropJournal(txn_id);
+        self.notifyEnded();
     }
 
     /// Abort a transaction. Writes an ABORT record to the WAL.
@@ -245,6 +261,12 @@ pub const TxnManager = struct {
 
         _ = self.active_txns.remove(txn_id);
         self.dropJournal(txn_id);
+        self.notifyEnded();
+    }
+
+    /// SONNY-6648: transactions that have begun and not ended.
+    pub fn activeCount(self: *const TxnManager) usize {
+        return self.active_txns.count();
     }
 
     /// Check if a transaction is currently active.

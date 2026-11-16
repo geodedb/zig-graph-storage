@@ -216,6 +216,10 @@ pub const GraphEngine = struct {
     /// `abort_undo = .fail_closed`; every later write, commit and checkpoint
     /// then fails with `error.AbortNotUndone` (the store must be reopened).
     abort_not_undone: ?txn_undo.Reason = null,
+    /// SONNY-6648 (tests only): `abortTxn` stops with
+    /// `error.TestCrashInjected` after applying this many inverses, before
+    /// the COMMIT record that ends the undone transaction (a crash mid-abort).
+    test_abort_crash_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     /// PHASE G reverse map: set when a record write moved/added/removed a
@@ -345,6 +349,8 @@ pub const GraphEngine = struct {
         self.derived_hydrated = std.atomic.Value(bool).init(true);
         self.derived_hydrate_mutex = std.Io.Mutex.init;
         self.derived_materialize_runs = 0;
+        // SONNY-6648.
+        if (builtin.is_test) self.test_abort_crash_after = null;
         // P2: all four dirty flags are true → the clean-snapshot invariant
         // holds vacuously (see the field doc).
         self.derived_snapshots_trusted = true;
@@ -504,6 +510,8 @@ pub const GraphEngine = struct {
         self.derived_hydrated = std.atomic.Value(bool).init(false);
         self.derived_hydrate_mutex = std.Io.Mutex.init;
         self.derived_materialize_runs = 0;
+        // SONNY-6648.
+        if (builtin.is_test) self.test_abort_crash_after = null;
         // P2: the on-disk snapshots are UNKNOWN until the counter gate runs
         // (they may be crash-stale behind clean dirty flags) — restamping is
         // forbidden until materializeDerivedIndexes establishes the invariant.
@@ -1261,7 +1269,23 @@ pub const GraphEngine = struct {
         self.ordered_property_index.deinit();
     }
 
+    /// SONNY-6648: abort every transaction still open, newest first.
+    fn abortOpenTxns(self: *GraphEngine) void {
+        while (self.txn_manager.activeCount() != 0) {
+            var newest: u64 = 0;
+            var it = self.txn_manager.active_txns.keyIterator();
+            while (it.next()) |id| newest = @max(newest, id.*);
+            std.log.warn("graph-storage: closing with transaction {d} open; rolling it back (SONNY-6648)", .{newest});
+            engine_undo.abort(self, newest) catch {};
+            // Every abort path ends the transaction; stop rather than spin
+            // if one did not.
+            if (self.txn_manager.isActive(newest)) return;
+        }
+    }
+
     /// Close the engine (flush, checkpoint, close files).
+    ///
+    /// SONNY-6648: transactions still open are aborted first (rolled back).
     ///
     /// Returns an error if the final checkpoint or label dictionary save fails.
     /// Resources are always cleaned up regardless of errors.
@@ -1274,6 +1298,20 @@ pub const GraphEngine = struct {
 
         // Track the first error encountered during close
         var close_err: ?anyerror = null;
+
+        // SONNY-6648: transactions still open are rolled back (undone), as a
+        // crash would roll them back; their pages must not reach disk. The
+        // close then checkpoints the committed state. An abort that cannot
+        // undo its transaction poisons the engine (handled just below).
+        self.abortOpenTxns();
+        if (self.txn_manager.activeCount() != 0 and self.abort_not_undone == null) {
+            // Not ended (an abort failed without poisoning): close like a crash.
+            self.wal.sync() catch |err| {
+                close_err = err;
+            };
+            self.cleanupResources(allocator);
+            return close_err orelse error.TransactionStillOpen;
+        }
 
         // SONNY-6529: an abort could not undo its writes (`abort_undo =
         // .fail_closed`). They are in the buffer pool, so no checkpoint may

@@ -529,6 +529,15 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     // SONNY-6558: overflow chains released by a journaled property write are
     // freed when its transaction commits (see engine_undo.onCommit).
     self.txn_manager.commit_hook = .{ .ctx = self, .run = @import("engine_undo.zig").onCommit };
+    // SONNY-6648: no-steal. The pool keeps the pages of open transactions off
+    // disk, and under deferred sync writes committed pages only after a WAL
+    // sync (see engine_undo.onTxnBegan / onTxnEnded / syncWalForPool).
+    self.txn_manager.txn_hook = .{
+        .ctx = self,
+        .began = @import("engine_undo.zig").onTxnBegan,
+        .ended = @import("engine_undo.zig").onTxnEnded,
+    };
+    self.buffer_pool.wal_sync_hook = .{ .ctx = self, .run = @import("engine_undo.zig").syncWalForPool };
 
     // Data stores (non-fallible but clean up if a later init fails)
     self.node_store = NodeStore.init(&self.buffer_pool, &self.free_space_nodes, cfg.page_size);
@@ -665,6 +674,15 @@ pub fn checkpointLight(engine: *GraphEngine) anyerror!void {
 /// flags are PRESERVED so a later full checkpoint (e.g. clean shutdown) still
 /// persists them.
 pub fn checkpointEx(engine: *GraphEngine, save_derived: bool) anyerror!void {
+    // SONNY-6648: a checkpoint writes every dirty page and moves the recovery
+    // frontier past the open transaction's records; recovery has no undo, so
+    // its bytes would stay if it never commits. Defer: nothing is lost (the
+    // committed writes are in the WAL) and the next checkpoint after the
+    // transaction ends runs in full.
+    if (engine.txn_manager.activeCount() != 0) {
+        engine.metrics.checkpoints_deferred += 1;
+        return;
+    }
     // Lever B: a FULL checkpoint (save_derived=true) must still run when any
     // derived-index dirty flag is set, even if pages are clean
     // (persistence_dirty==false). A trailing checkpointLight clears
