@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.25] - 2026-11-16
+
 ### Fixed
 
 - A full-page WAL image committed by one transaction carried the bytes of
@@ -799,7 +801,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.24...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.25...HEAD
+[0.4.25]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.24...v0.4.25
 [0.4.24]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.23...v0.4.24
 [0.4.23]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...v0.4.23
 [0.4.22]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.21...v0.4.22
