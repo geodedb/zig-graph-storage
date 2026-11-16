@@ -162,7 +162,9 @@ is logged: that transaction cannot commit (`commitTxn` returns the same
 error) and must be aborted, which undoes it in memory. While its bytes are on
 the page, the first writer's writes to it are refused too, so abort the
 refused transaction first; then end the first one (or let it continue) and
-retry. A transaction that overlapped another is always aborted in memory
+retry. "Page" includes the shared slab blocks property, label and
+adjacency writes fill, so two open transactions writing unrelated records
+can conflict too. A transaction that overlapped another is always aborted in memory
 (nothing it wrote was committed or reached disk). There is no waiting: the
 engine has one writer, so blocking would deadlock it. Keep one transaction
 open per engine at a time to avoid conflicts entirely (geode opens at most

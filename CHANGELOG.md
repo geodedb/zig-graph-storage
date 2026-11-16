@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undoes it in memory, and while its bytes are on the page the first
   writer's writes there are refused too. A transaction that overlapped
   another is aborted in memory (ABORT record, no inverse images). Callers
-  that kept two transactions open on one engine and wrote the same page now
-  get the error instead of silent corruption (SONNY-6659).
+  that kept two transactions open on one engine and wrote the same page
+  (shared slab fill pages included) now get the error instead of silent
+  corruption (SONNY-6659).
 
 ## [0.4.24] - 2026-11-16
 
