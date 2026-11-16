@@ -32,7 +32,16 @@ defer engine.close() catch {};
 ```
 
 `GraphEngine.open()` reads the manifest (A/B), runs crash recovery if needed,
-rebuilds the label index, and loads the index catalog.
+and loads the index catalog. The derived indexes (label, property chain,
+edge, edge existence) are loaded or rebuilt on first use.
+
+Crash recovery replays the committed WAL tail, flushes and fsyncs the pages,
+writes both manifests with the advanced `last_checkpoint_lsn`, fsyncs the
+graph directory and then truncates the WAL (since 0.4.22, SONNY-6599; before,
+the replayed tail stayed on disk until the shard was next written and
+checkpointed). The WAL is left in place when it holds cross-shard 2PC records
+(the sharded reconcile reads them after every shard has opened) or a record
+that does not decode; the next checkpoint truncates it.
 
 ---
 

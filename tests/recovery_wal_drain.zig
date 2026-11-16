@@ -184,6 +184,7 @@ fn runDrainOnOpen(comptime E: type, tde: bool) !void {
             std.debug.print("SONNY-6599 {s} tde={}: {d} WAL bytes of a {d}-byte replayed tail survive recovery\n", .{ @typeName(E), tde, after_open, tail });
             return error.ReplayedWalNotTruncated;
         }
+        for (O.engines(&eng)) |g| try testing.expectEqual(@as(u64, 1), g.metrics.recovery_wal_truncated);
         try O.expectBatch(alloc, eng, &a, "after recovery");
         try eng.close();
     }
@@ -205,6 +206,240 @@ fn runDrainOnOpen(comptime E: type, tde: bool) !void {
         try O.expectBatch(alloc, eng, &a, "second crash, batch A");
         try O.expectBatch(alloc, eng, &b, "second crash, batch B");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Crash at every durable step of recovery
+// ---------------------------------------------------------------------------
+
+const FaultPoint = gs.recovery.FaultPoint;
+
+/// What a crash at the fault point leaves besides the process dying.
+const Extra = enum {
+    none,
+    /// Power loss: renames whose directory entry was not fsynced are lost,
+    /// so the manifests read back as they were before recovery. Only valid
+    /// up to `post_manifest_b`: from `post_dir_sync` on the renames are
+    /// durable.
+    lose_unsynced_renames,
+    /// The wal library's compaction died after writing its temp file and
+    /// before renaming it over the log.
+    compaction_temp_left,
+};
+
+/// Owned copies of `manifest.a` / `manifest.b` of every directory.
+fn saveManifests(alloc: Allocator, dirs: []const []const u8) ![][2][]u8 {
+    const out = try alloc.alloc([2][]u8, dirs.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |pair| for (pair) |x| alloc.free(x);
+        alloc.free(out);
+    }
+    for (dirs, 0..) |d, i| {
+        for ([_][]const u8{ "manifest.a", "manifest.b" }, 0..) |name, k| {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const p = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ d, name });
+            out[i][k] = try std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .unlimited);
+        }
+        done += 1;
+    }
+    return out;
+}
+
+fn restoreManifests(alloc: Allocator, dirs: []const []const u8, saved: [][2][]u8) !void {
+    for (dirs, saved) |d, pair| {
+        for ([_][]const u8{ "manifest.a", "manifest.b" }, 0..) |name, k| {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const p = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ d, name });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = pair[k] });
+        }
+    }
+    freeManifests(alloc, saved);
+}
+
+fn freeManifests(alloc: Allocator, saved: [][2][]u8) void {
+    for (saved) |pair| for (pair) |x| alloc.free(x);
+    alloc.free(saved);
+}
+
+fn leaveCompactionTemp(dirs: []const []const u8) !void {
+    for (dirs) |d| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const p = try std.fmt.bufPrint(&path_buf, "{s}/wal/graph.wal.tmp", .{d});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = "partial compaction output" });
+    }
+}
+
+/// Lowest `last_checkpoint_lsn` of the two on-disk manifests of every dir.
+fn minDurableFrontier(alloc: Allocator, dirs: []const []const u8, key: ?[32]u8) !u64 {
+    var lowest: u64 = std.math.maxInt(u64);
+    for (dirs) |d| {
+        for ([_][]const u8{ "manifest.a", "manifest.b" }) |name| {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const p = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ d, name });
+            const m = (try gs.manifest.Manifest.readFromFileWithKey(alloc, p, key)) orelse return error.ManifestMissing;
+            lowest = @min(lowest, m.last_checkpoint_lsn);
+        }
+    }
+    return lowest;
+}
+
+fn isBefore(a: FaultPoint, b: FaultPoint) bool {
+    return @intFromEnum(a) < @intFromEnum(b);
+}
+
+fn runCrashPoint(comptime E: type, point: FaultPoint, extra: Extra, tde: bool) !void {
+    const O = Ops(E);
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{ 0x65, 0x99, 0xC0, @intFromBool(E == ShardedGraphEngine), @intFromEnum(point), @intFromEnum(extra), @intFromBool(tde) } ++ [_]u8{0x42} ** 9;
+    const cfg = config(tde);
+
+    var a: [O.n_nodes]u64 = undefined;
+    var b: [O.n_nodes]u64 = undefined;
+    var c: [O.n_nodes]u64 = undefined;
+    const dirs = try crashWithTail(E, alloc, td.path, uuid, cfg, &a);
+    defer freeDirs(alloc, dirs);
+    const tail = try walBytes(dirs);
+    try testing.expect(tail > 0);
+    const frontier_before = try minDurableFrontier(alloc, dirs, cfg.encryption_key);
+    const saved = try saveManifests(alloc, dirs);
+    var saved_owned = true;
+    defer if (saved_owned) freeManifests(alloc, saved);
+
+    // Recovery dies right after `point`.
+    gs.recovery.test_fault = point;
+    {
+        defer gs.recovery.test_fault = null;
+        if (E.open(alloc, td.path, uuid, cfg)) |eng| {
+            eng.deinit();
+            return error.FaultPointNotReached;
+        } else |err| if (err != error.TestCrashInjected) return err;
+    }
+    try dropSidecars(dirs);
+
+    // Ordering: the WAL is intact until the advanced manifests are durable,
+    // and by the time it is truncated they are on disk.
+    if (isBefore(point, .post_wal_truncate)) {
+        try testing.expectEqual(tail, try walBytes(dirs));
+    } else {
+        try testing.expectEqual(@as(u64, 0), try walBytes(dirs));
+    }
+    if (!isBefore(point, .post_manifest_b)) {
+        try testing.expect(try minDurableFrontier(alloc, dirs, cfg.encryption_key) > frontier_before);
+    }
+
+    switch (extra) {
+        .none => {},
+        .lose_unsynced_renames => {
+            std.debug.assert(isBefore(point, .post_dir_sync));
+            saved_owned = false;
+            try restoreManifests(alloc, dirs, saved);
+        },
+        .compaction_temp_left => try leaveCompactionTemp(dirs),
+    }
+
+    // The next open loses nothing and drains the WAL (its replay path, or
+    // its clean path when the manifests already advanced).
+    {
+        const eng = try E.open(alloc, td.path, uuid, cfg);
+        errdefer eng.deinit();
+        const left = try walBytes(dirs);
+        if (left != 0) {
+            std.debug.print("SONNY-6599 {s} tde={} crash after {s} ({s}): {d} WAL bytes left by the next open\n", .{ @typeName(E), tde, @tagName(point), @tagName(extra), left });
+            return error.ReplayedWalNotTruncated;
+        }
+        try O.expectBatch(alloc, eng, &a, "after crash in recovery");
+        try O.writeBatch(alloc, eng, &b);
+        try eng.close();
+    }
+    // A second crash with a tail written after the drained open.
+    {
+        const eng = try E.open(alloc, td.path, uuid, cfg);
+        try O.writeBatch(alloc, eng, &c);
+        eng.deinit();
+        try dropSidecars(dirs);
+    }
+    {
+        const eng = try E.open(alloc, td.path, uuid, cfg);
+        defer eng.close() catch {};
+        try testing.expectEqual(@as(u64, 0), try walBytes(dirs));
+        try O.expectBatch(alloc, eng, &a, "final, batch A");
+        try O.expectBatch(alloc, eng, &b, "final, batch B");
+        try O.expectBatch(alloc, eng, &c, "final, batch C");
+    }
+}
+
+fn runRecoveryCrashMatrix(comptime E: type, tde: bool) !void {
+    var failures: usize = 0;
+    inline for (std.meta.fields(FaultPoint)) |f| {
+        const point: FaultPoint = @enumFromInt(f.value);
+        const extras: []const Extra = switch (point) {
+            .post_manifest_a, .post_manifest_b => &.{ .none, .lose_unsynced_renames },
+            .post_dir_sync => &.{ .none, .compaction_temp_left },
+            else => &.{.none},
+        };
+        for (extras) |extra| {
+            runCrashPoint(E, point, extra, tde) catch |err| {
+                std.debug.print("SONNY-6599 {s} tde={} crash after {s} ({s}): {s}\n", .{ @typeName(E), tde, @tagName(point), @tagName(extra), @errorName(err) });
+                failures += 1;
+            };
+        }
+    }
+    if (failures != 0) return error.RecoveryCrashLosesDataOrKeepsWal;
+}
+
+/// A crash in the CLEAN path's drain: the first recovery made its manifests
+/// durable and died before truncating; the second finds nothing past the
+/// frontier and dies after its own truncation; the third opens drained.
+fn runCleanPathCrash(comptime E: type, tde: bool) !void {
+    const O = Ops(E);
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{ 0x65, 0x99, 0xC1, @intFromBool(E == ShardedGraphEngine), @intFromBool(tde) } ++ [_]u8{0x43} ** 11;
+    const cfg = config(tde);
+
+    var a: [O.n_nodes]u64 = undefined;
+    const dirs = try crashWithTail(E, alloc, td.path, uuid, cfg, &a);
+    defer freeDirs(alloc, dirs);
+    const tail = try walBytes(dirs);
+
+    for ([_]FaultPoint{ .post_dir_sync, .post_wal_truncate }) |point| {
+        gs.recovery.test_fault = point;
+        defer gs.recovery.test_fault = null;
+        if (E.open(alloc, td.path, uuid, cfg)) |eng| {
+            eng.deinit();
+            return error.FaultPointNotReached;
+        } else |err| if (err != error.TestCrashInjected) return err;
+        try dropSidecars(dirs);
+        try testing.expectEqual(if (point == .post_dir_sync) tail else 0, try walBytes(dirs));
+    }
+    const eng = try E.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    try testing.expectEqual(@as(u64, 0), try walBytes(dirs));
+    try O.expectBatch(alloc, eng, &a, "after clean-path crashes");
+}
+
+test "SONNY-6599: GraphEngine, crash at every step of recovery's WAL drain" {
+    try runRecoveryCrashMatrix(GraphEngine, false);
+}
+test "SONNY-6599: GraphEngine TDE, crash at every step of recovery's WAL drain" {
+    try runRecoveryCrashMatrix(GraphEngine, true);
+}
+test "SONNY-6599: ShardedGraphEngine, crash at every step of recovery's WAL drain" {
+    try runRecoveryCrashMatrix(ShardedGraphEngine, false);
+}
+test "SONNY-6599: ShardedGraphEngine TDE, crash at every step of recovery's WAL drain" {
+    try runRecoveryCrashMatrix(ShardedGraphEngine, true);
+}
+test "SONNY-6599: GraphEngine, crash in the clean path's drain" {
+    try runCleanPathCrash(GraphEngine, false);
+    try runCleanPathCrash(GraphEngine, true);
+}
+test "SONNY-6599: ShardedGraphEngine, crash in the clean path's drain" {
+    try runCleanPathCrash(ShardedGraphEngine, false);
 }
 
 test "SONNY-6599: GraphEngine recovery truncates the replayed WAL" {

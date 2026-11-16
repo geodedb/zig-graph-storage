@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const buffer_pool_mod = @import("buffer_pool.zig");
@@ -29,6 +30,37 @@ const WalRecord = wal_record_mod.WalRecord;
 const WalRecordType = wal_record_mod.WalRecordType;
 const FileId = types.FileId;
 const ReplayFailure = wal_mod.ReplayFailure;
+
+/// SONNY-6599: TEST-ONLY crash points of recovery's durable steps. A test sets
+/// `test_fault`; `recover` then stops with `error.TestCrashInjected` right
+/// after the named step, leaving on disk what a process killed at that moment
+/// leaves. A module-level variable (not a field) because the engine creates
+/// its `Recovery` inside `open`. Outside test builds it is `void` and every
+/// check compiles to nothing.
+pub const FaultPoint = enum {
+    /// Replayed pages flushed and store files fsynced.
+    post_page_sync,
+    /// `free.store` emptied and fsynced (the rebuild signal).
+    post_free_store,
+    /// Manifest A renamed into place (its directory entry not yet fsynced).
+    post_manifest_a,
+    /// Manifest B renamed into place (directory entries not yet fsynced).
+    post_manifest_b,
+    /// Graph directory fsynced: the advanced manifests are durable; the WAL
+    /// is untouched.
+    post_dir_sync,
+    /// WAL truncated to the advanced frontier.
+    post_wal_truncate,
+};
+
+pub var test_fault: if (builtin.is_test) ?FaultPoint else void = if (builtin.is_test) null else {};
+
+fn faultPoint(p: FaultPoint) error{TestCrashInjected}!void {
+    if (comptime !builtin.is_test) return;
+    if (test_fault) |f| {
+        if (f == p) return error.TestCrashInjected;
+    }
+}
 
 /// Transaction state during recovery.
 const TxnRecoveryState = enum {
@@ -66,6 +98,9 @@ pub const Recovery = struct {
     /// engine.open rebuilds the free-space bitmaps from on-disk file sizes
     /// instead of loading the checkpoint-era snapshot.
     applied_committed_pages: bool = false,
+    /// SONNY-6599: true when this recovery truncated the WAL to the advanced
+    /// `last_checkpoint_lsn` (see `drainWal`).
+    wal_truncated: bool = false,
     /// WAL-recovery counter staleness: the manifest id counters
     /// (`next_node_id`, `next_edge_id`, `next_txn_id`) are persisted at
     /// CHECKPOINT time only, so after replaying a committed WAL tail they
@@ -204,6 +239,8 @@ pub const Recovery = struct {
     /// 6. Discard uncommitted transaction records
     /// 7. Flush buffer pool
     /// 8. Write fresh checkpoint
+    /// 9. fsync the graph directory, then truncate the WAL to the advanced
+    ///    frontier (SONNY-6599, `drainWal`)
     /// Returns the recovered manifest.
     pub fn recover(
         self: *Recovery,
@@ -387,6 +424,11 @@ pub const Recovery = struct {
                 defer self.allocator.free(upath_b);
                 try m.writeToFileWithKey(self.allocator, upath_b, self.encryption_key);
             }
+            // SONNY-6599: nothing past the frontier, but the log can still hold
+            // records at or below it: a crash after an earlier recovery's
+            // manifests were durable but before its truncation, or a store
+            // left by graph_storage <= 0.4.21 (which never truncated here).
+            try self.drainWal(&wal, graph_dir, m.last_checkpoint_lsn);
             return m;
         }
 
@@ -534,6 +576,7 @@ pub const Recovery = struct {
 
         // 8. Write fresh checkpoint
         try file_manager.syncAll();
+        try faultPoint(.post_page_sync);
 
         // GAP-ENT-0011 (review F-1): when committed tail images were applied,
         // the persisted checkpoint-era free.store is STALE with respect to the
@@ -566,6 +609,7 @@ pub const Recovery = struct {
             try free_file.setLength(io, 0);
             try free_file.sync(io);
         }
+        try faultPoint(.post_free_store);
 
         // Counter healing: re-derive the manifest id counters from the ids
         // actually observed in the replayed committed images (+ the WAL
@@ -640,12 +684,72 @@ pub const Recovery = struct {
         const manifest_path_a = try graph_dir.manifestPath(self.allocator, .a);
         defer self.allocator.free(manifest_path_a);
         try m.writeToFileWithKey(self.allocator, manifest_path_a, self.encryption_key);
+        try faultPoint(.post_manifest_a);
 
         const manifest_path_b = try graph_dir.manifestPath(self.allocator, .b);
         defer self.allocator.free(manifest_path_b);
         try m.writeToFileWithKey(self.allocator, manifest_path_b, self.encryption_key);
+        try faultPoint(.post_manifest_b);
+
+        // 9. SONNY-6599: every record in the log is now at or below the
+        // advanced frontier and is never replayed again; drop it.
+        try self.drainWal(&wal, graph_dir, m.last_checkpoint_lsn);
 
         return m;
+    }
+
+    /// SONNY-6599: truncate the WAL to `frontier` once the manifests that
+    /// carry it are durable. Before this, recovery left the replayed tail in
+    /// the file and the engine opened clean, so it stayed on disk until the
+    /// shard was next written and checkpointed.
+    ///
+    /// ORDER (each step durable before the next, as in
+    /// `Checkpointer.doCheckpointWith`): replayed pages fsynced -> both
+    /// manifests written (tmp, fsync, rename) -> graph directory fsynced
+    /// HERE, so the renames survive a power loss -> WAL truncated (the wal
+    /// library writes the kept suffix to a temp file, fsyncs it and renames
+    /// it over the log). Truncating before the directory fsync could leave,
+    /// after a power loss, the previous manifest (old frontier) next to a log
+    /// that no longer holds the tail it needs: committed writes lost. A crash
+    /// anywhere before the truncation leaves the log intact, and the next
+    /// recovery finds nothing past the frontier and drains it on its clean
+    /// path. A crash inside or after it leaves the old log or the emptied
+    /// one, both consistent with the durable manifest; an emptied log whose
+    /// sidecar a dead process never rewrote is re-anchored at the frontier by
+    /// `WalManager.init` (SONNY-6424).
+    ///
+    /// The log is LEFT IN PLACE when it holds:
+    ///   * a cross-shard 2PC record: `sharded_recovery.reconcilePendingPrepares`
+    ///     reads every shard's log from LSN 0 after all shards have recovered,
+    ///     and a legacy dangling prepare below the frontier is what tells it
+    ///     to re-apply a committed edge. Those logs are retired by the next
+    ///     checkpoint, after the reconcile, as before;
+    ///   * a record that does not decode: it may be one of the above;
+    ///   * a store opened read-only (legacy V1 policy).
+    ///
+    /// Reclaiming space is not needed for correctness (the records are below
+    /// the frontier), so a failure here other than a test crash is logged and
+    /// the open goes on with the log in place.
+    fn drainWal(self: *Recovery, wal: *WalManager, graph_dir: *const GraphDir, frontier: u64) error{TestCrashInjected}!void {
+        if (self.read_only) return;
+        self.drainWalSteps(wal, graph_dir, frontier) catch |err| switch (err) {
+            error.TestCrashInjected => return error.TestCrashInjected,
+            else => std.log.warn("graph-storage: recovery left the replayed WAL of {s} in place ({s}); its records are below the checkpoint frontier and the next checkpoint or recovery truncates them (SONNY-6599)", .{ graph_dir.path, @errorName(err) }),
+        };
+    }
+
+    fn drainWalSteps(self: *Recovery, wal: *WalManager, graph_dir: *const GraphDir, frontier: u64) !void {
+        const held = try wal.contents(self.allocator);
+        if (held.records == 0 or held.cross_shard or held.undecodable) return;
+        try Checkpointer.syncDir(graph_dir.path);
+        try faultPoint(.post_dir_sync);
+        if (frontier == 0) return;
+        const refused_before = wal.compactions_refused;
+        try wal.truncate(frontier);
+        // A refusal (the log no longer validates) is counted and logged by
+        // `truncate`; the log keeps its records and the next open reports it.
+        self.wal_truncated = wal.compactions_refused == refused_before;
+        try faultPoint(.post_wal_truncate);
     }
 
     /// Counter healing: extract the maximum node id / edge id present in a

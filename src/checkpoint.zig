@@ -172,7 +172,8 @@ pub const Checkpointer = struct {
         config_mod.emitEvent(self.log_fn, .checkpoint_end);
     }
 
-    fn syncDir(path: []const u8) !void {
+    /// fsync directory `path`, making the renames into it durable.
+    pub fn syncDir(path: []const u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
         // `.iterate = true`: a real O_RDONLY|O_DIRECTORY fd (O_PATH cannot fsync).
         var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });

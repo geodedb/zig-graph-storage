@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Crash recovery left the WAL tail it replayed on disk: it advanced
+  `last_checkpoint_lsn` past every record in both manifests but never
+  truncated the file, and the engine opens clean, so the tail stayed until
+  the shard was next written and checkpointed (geode
+  `test-sonny6595-wal-drain`). Recovery now fsyncs the graph directory
+  after the manifest renames and then truncates the WAL to the advanced
+  frontier; its clean path drains a log that only holds records at or below
+  the frontier (a crash between those steps, or a store left by <= 0.4.21).
+  The log is kept when it holds cross-shard 2PC records, which the sharded
+  reconcile reads from LSN 0 after every shard has opened, or a record that
+  does not decode. `Metrics.recovery_wal_truncated` reports it (SONNY-6599).
+
 ## [0.4.21] - 2026-11-15
 
 ### Fixed

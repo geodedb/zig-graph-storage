@@ -798,6 +798,7 @@ pub const GraphEngine = struct {
                 self.metrics.ordered_index_rebuilds = 1;
             }
         }
+        self.metrics.recovery_wal_truncated = @intFromBool(recovery.wal_truncated);
         self.buffer_pool.setMetrics(&self.metrics);
         // Initialize owned-or-borrowed thread pool (see initThreadPool).
         try self.initThreadPool(allocator, cfg);
