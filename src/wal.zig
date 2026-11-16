@@ -440,6 +440,40 @@ pub const WalManager = struct {
         }
     }
 
+    /// What the whole log holds, for recovery's truncation decision
+    /// (SONNY-6599).
+    pub const Contents = struct {
+        /// Records in the inner log, at any LSN.
+        records: u64 = 0,
+        /// A record that does not decode as a graph-storage record.
+        undecodable: bool = false,
+        /// A cross-shard 2PC record. `sharded_recovery` reads these from LSN 0
+        /// AFTER every shard has recovered, so they must outlive recovery.
+        cross_shard: bool = false,
+    };
+
+    /// Scan the whole inner log once (every LSN) and summarise it.
+    pub fn contents(self: *WalManager, allocator: Allocator) !Contents {
+        var out = Contents{};
+        var iter = try self.inner.iterator(0);
+        defer iter.deinit();
+        while (try iter.next()) |entry_val| {
+            var entry = entry_val;
+            defer entry.deinit();
+            out.records += 1;
+            const result = WalRecord.deserialize(allocator, entry.payload) catch {
+                out.undecodable = true;
+                continue;
+            };
+            defer result.record.deinit(allocator);
+            switch (result.record.record_type) {
+                .cross_shard_prepare, .cross_shard_commit, .cross_shard_abort => out.cross_shard = true,
+                else => {},
+            }
+        }
+        return out;
+    }
+
     /// Truncate WAL: compact entries up to the given LSN.
     ///
     /// SONNY-6622: wal 0.1.24 validates the whole log before it compacts and

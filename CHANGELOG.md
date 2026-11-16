@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.22] - 2026-11-15
+
+### Fixed
+
+- Crash recovery left the WAL tail it replayed on disk: it advanced
+  `last_checkpoint_lsn` past every record in both manifests but never
+  truncated the file, and the engine opens clean, so the tail stayed until
+  the shard was next written and checkpointed (geode
+  `test-sonny6595-wal-drain`). Recovery now fsyncs the graph directory
+  after the manifest renames and then truncates the WAL to the advanced
+  frontier; its clean path drains a log that only holds records at or below
+  the frontier (a crash between those steps, or a store left by <= 0.4.21).
+  The log is kept when it holds cross-shard 2PC records, which the sharded
+  reconcile reads from LSN 0 after every shard has opened, or a record that
+  does not decode. `Metrics.recovery_wal_truncated` reports it (SONNY-6599).
+- Deleting an already-deleted node decremented `node_count` again
+  (SONNY-6558).
+- `removeEdgeTxn` removed only the co-located in-entry, so an edge added
+  through the legacy `addEdgeTxn` kept its `adj_in` entry and
+  `GraphEngine.expandIn` still returned it, also after a crash. The legacy
+  entry is now removed, WAL-imaged and restored by an abort (SONNY-6558).
+- `resolveTailAffectedNodeIds` returned null (a full external rebuild)
+  whenever the WAL tail touched an edge-property slab chain. Edge chains
+  are now recognised from the tail's adjacency pages and from the reverse
+  map, which records edge chains too (snapshot `GSRVIX2`; version 1 files
+  are still read, and older binaries reject version 2 and rebuild)
+  (SONNY-6558).
+- An abort failed closed (`AbortNotUndone`) after a property write that
+  replaced or removed a value stored in an overflow chain. The chain is now
+  freed when the transaction commits, so the abort restores the old stub
+  with its value intact (SONNY-6558).
+- The interface's iterator wrappers leaked the slice or concrete iterator
+  they own, and left a page pinned, when boxing their state ran out of
+  memory (SONNY-6558).
+- `labels.dict` holding fewer names than the manifest recorded was reported
+  only through `std.log`; it is now also counted in
+  `Metrics.label_names_lost` and sent to `GraphConfig.log_fn` (SONNY-6558).
+
+### Changed
+
+- `TxnManager` documents its single-writer contract: `txn_id_mutex` guards
+  only the id counter (SONNY-6558).
+- `docs/operations.md`: the Transactions example uses the current API.
+- `benchmarks/results/ci-baseline.json` regenerated (its `label_scan` median
+  of 0.15 ns failed every comparison) (SONNY-6558).
+
 ## [0.4.21] - 2026-11-15
 
 ### Fixed
@@ -690,7 +736,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.21...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...HEAD
+[0.4.22]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.21...v0.4.22
 [0.4.21]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.20...v0.4.21
 [0.4.20]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.18...v0.4.20
 [0.4.18]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.17...v0.4.18

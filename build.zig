@@ -749,6 +749,30 @@ fn addIntegrationTests(
     const run_ckpt_side_crash = b.addRunArtifact(ckpt_side_crash_tests);
     ckpt_side_crash_step.dependOn(&run_ckpt_side_crash.step);
 
+    // SONNY-6599: recovery truncates the WAL it replayed once the advanced
+    // manifests are durable; a crash at every step of that sequence loses
+    // nothing and the next open drains the WAL.
+    const recovery_wal_drain_step = b.step("test-recovery-wal-drain", "Run recovery WAL-drain tests: recovery truncates the replayed WAL, and a crash before or after each fsync/rename of the sequence loses no committed write");
+    const recovery_wal_drain_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/recovery_wal_drain.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_recovery_wal_drain = b.addRunArtifact(recovery_wal_drain_tests);
+    recovery_wal_drain_step.dependOn(&run_recovery_wal_drain.step);
+
+    // SONNY-6558: double delete keeps node_count, removing a legacy edge
+    // removes its adj_in entry, edge-property tail slots resolve without a
+    // full rebuild, interface iterator wrappers release what they own on OOM.
+    const sonny6558_step = b.step("test-sonny6558-residuals", "Run SONNY-6558 residual tests: double delete, legacy adj_in removal, edge-chain tail resolution, iterator wrapper OOM cleanup");
+    const sonny6558_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/sonny6558_residuals.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_sonny6558 = b.addRunArtifact(sonny6558_tests);
+    sonny6558_step.dependOn(&run_sonny6558.step);
+
     // SONNY-6529: abortTxn undoes the transaction's writes (node create /
     // update / delete, labels, properties on new chains, edge add / remove /
     // first property) in memory and across checkpoint + reopen and crash +
@@ -990,6 +1014,9 @@ fn addIntegrationTests(
     integration_step.dependOn(&run_batch_replay_order.step);
     // Checkpoint crash points (SONNY-6491) are the same silent-loss class.
     integration_step.dependOn(&run_ckpt_side_crash.step);
+    // Recovery WAL truncation crash points (SONNY-6599) likewise.
+    integration_step.dependOn(&run_recovery_wal_drain.step);
+    integration_step.dependOn(&run_sonny6558.step);
     // Shard label dictionaries (SONNY-6524) are the same lost-name class.
     integration_step.dependOn(&run_label_dict_shards.step);
     // Aborted writes made durable (SONNY-6529) are the same silent-corruption class.

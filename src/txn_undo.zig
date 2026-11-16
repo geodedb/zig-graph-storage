@@ -36,8 +36,9 @@ pub const MAX_RECORDS: usize = 1 << 20;
 /// Why a transaction cannot be undone.
 pub const Reason = enum {
     /// A property write changed a chain that existed before the transaction
-    /// and that cannot be put back byte for byte: a legacy (non-slab) chain,
-    /// or a replaced value whose overflow chain the write freed.
+    /// and that cannot be put back byte for byte: a legacy (non-slab) chain.
+    /// (A replaced overflow value no longer is: its chain is freed at commit,
+    /// SONNY-6558.)
     property_on_existing_chain,
     /// `putNodeTxn` changed `out_head`, `in_head`, `label_head` or
     /// `label_count` of a node that existed before the transaction (the
@@ -75,6 +76,9 @@ pub const UndoRec = union(enum) {
         public_id: u64,
         out_removed: bool,
         in_removed: bool,
+        /// SONNY-6558: the legacy `adj_in` entry (under `to.in_head`) of an
+        /// edge added through `addEdgeTxn` was removed.
+        legacy_in_removed: bool = false,
         counted: bool,
     },
     /// `addLabelTxn` that added `label`.
@@ -105,12 +109,19 @@ pub const UndoJournal = struct {
     /// Node ids this transaction created (empty slot → record).
     created_nodes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     not_undoable: ?Reason = null,
+    /// SONNY-6558: overflow (var-store) chains whose stubs this transaction's
+    /// property writes replaced or removed. They stay allocated until COMMIT
+    /// (`TxnManager.commit_hook`), so an abort can put the old stub back.
+    /// Kept by `fail`: a not-undoable transaction that commits still frees
+    /// them; one that is aborted leaks them until compaction.
+    deferred_var_frees: std.ArrayListUnmanaged(u64) = .empty,
 
     pub fn deinit(self: *UndoJournal, allocator: Allocator) void {
         self.freeBlobs(allocator);
         self.records.deinit(allocator);
         self.created_chains.deinit(allocator);
         self.created_nodes.deinit(allocator);
+        self.deferred_var_frees.deinit(allocator);
         self.* = .{};
     }
 
@@ -136,6 +147,7 @@ pub const UndoJournal = struct {
         self.records.clearRetainingCapacity();
         self.created_chains.clearRetainingCapacity();
         self.created_nodes.clearRetainingCapacity();
+        self.deferred_var_frees.clearRetainingCapacity();
         self.not_undoable = null;
     }
 
@@ -143,7 +155,7 @@ pub const UndoJournal = struct {
     /// big transaction needed once.
     pub fn oversized(self: *const UndoJournal) bool {
         return self.records.capacity > 4096 or self.created_chains.capacity() > 4096 or
-            self.created_nodes.capacity() > 4096;
+            self.created_nodes.capacity() > 4096 or self.deferred_var_frees.capacity > 4096;
     }
 
     fn freeBlobs(self: *UndoJournal, allocator: Allocator) void {

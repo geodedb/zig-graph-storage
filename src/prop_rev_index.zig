@@ -20,9 +20,11 @@
 //! crash (a value change does NOT move `prop_head`, so only inserts/deletes/
 //! relocations touch the map — exactly the nodes-page tail set).
 //!
-//! Only NODE prop chains are recorded (edge prop chains are irrelevant to the
-//! node-id contract and are simply absent). A `prop_head == 0` node (no props)
-//! is not recorded.
+//! NODE prop chains map to their node. SONNY-6558: EDGE prop chains are
+//! recorded too, tagged (`EDGE_TAG`), so the tail resolution can tell a slab
+//! slot that belongs to an edge (no node owns it: skip) from one it cannot
+//! attribute (rebuild). `get` returns node owners only. A `prop_head == 0`
+//! (no chain) is never recorded.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -33,7 +35,18 @@ const NodeId = types.NodeId;
 
 /// Magic (exactly 8 bytes) for the reverse-map snapshot. Distinct from every
 /// other derived-index magic so a foreign/old file is cleanly rejected.
-pub const SNAPSHOT_MAGIC = "GSRVIX1\x00";
+/// SONNY-6558: version 2 adds tagged edge-chain entries; a binary that only
+/// knows version 1 rejects the file and rebuilds from a scan instead of
+/// reading an edge entry as a node id. Version 1 files are still read.
+pub const SNAPSHOT_MAGIC = "GSRVIX2\x00";
+pub const SNAPSHOT_MAGIC_V1 = "GSRVIX1\x00";
+
+/// SONNY-6558: set on the stored value of an edge-chain entry (value =
+/// `EDGE_TAG | edge_id`). Node and edge ids stay far below 2^63.
+pub const EDGE_TAG: u64 = @as(u64, 1) << 63;
+
+/// Who owns a recorded chain.
+pub const Owner = union(enum) { node: NodeId, edge: u64 };
 
 /// On-disk file name under the graph directory (by-path, like the ordered
 /// index — no FileId / buffer-pool registration; the snapshot is written
@@ -85,9 +98,35 @@ pub const PropRevIndex = struct {
         _ = self.map.remove(prop_head);
     }
 
-    /// The node that currently owns `prop_head`, or null when unknown.
+    /// The node that currently owns `prop_head`, or null when unknown or
+    /// owned by an edge.
     pub fn get(self: *const PropRevIndex, prop_head: u64) ?NodeId {
-        return self.map.get(prop_head);
+        const v = self.map.get(prop_head) orelse return null;
+        if (v & EDGE_TAG != 0) return null;
+        return v;
+    }
+
+    /// SONNY-6558: the recorded owner of `prop_head`, node or edge.
+    pub fn owner(self: *const PropRevIndex, prop_head: u64) ?Owner {
+        const v = self.map.get(prop_head) orelse return null;
+        if (v & EDGE_TAG != 0) return .{ .edge = v & ~EDGE_TAG };
+        return .{ .node = v };
+    }
+
+    /// SONNY-6558: record edge `edge_id`'s property chain `prop_head`.
+    /// Overwrites any mapping for the head (slab-slot reuse).
+    pub fn putEdge(self: *PropRevIndex, prop_head: u64, edge_id: u64) !void {
+        if (prop_head == 0) return;
+        try self.map.put(self.allocator, prop_head, edge_id | EDGE_TAG);
+    }
+
+    /// SONNY-6558: drop `prop_head` when it is recorded as edge `edge_id`'s
+    /// chain (the edge was removed or its chain moved). A head another owner
+    /// has taken since is left alone.
+    pub fn removeEdge(self: *PropRevIndex, prop_head: u64, edge_id: u64) void {
+        if (prop_head == 0) return;
+        const v = self.map.get(prop_head) orelse return;
+        if (v == (edge_id | EDGE_TAG)) _ = self.map.remove(prop_head);
     }
 
     fn snapshotPath(allocator: Allocator, dir_path: []const u8) ![]u8 {
@@ -109,7 +148,7 @@ pub const PropRevIndex = struct {
         var it = self.map.iterator();
         while (it.next()) |e| {
             try w.writeU64(e.key_ptr.*); // prop_head
-            try w.writeU64(e.value_ptr.*); // node_id
+            try w.writeU64(e.value_ptr.*); // node_id, or EDGE_TAG | edge_id
         }
 
         const file = try std.Io.Dir.cwd().createFile(io(), path, .{
@@ -128,13 +167,11 @@ pub const PropRevIndex = struct {
         const path = try snapshotPath(self.allocator, dir_path);
         defer self.allocator.free(path);
 
-        var file = std.Io.Dir.cwd().openFile(io(), path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return null,
+        var loaded = (loadWithMagic(self.allocator, path, SNAPSHOT_MAGIC) catch |err| switch (err) {
+            // Not version 2: a version 1 file (node entries only) is read as is.
+            error.InvalidFormat => try loadWithMagic(self.allocator, path, SNAPSHOT_MAGIC_V1),
             else => return err,
-        };
-        defer file.close(io());
-
-        var loaded = (try index_snapshot.loadPayload(self.allocator, &file, SNAPSHOT_MAGIC, RECORD_SIZE)) orelse return null;
+        }) orelse return null;
         defer loaded.deinit();
 
         self.map.clearRetainingCapacity();
@@ -152,6 +189,15 @@ pub const PropRevIndex = struct {
         return .{ .epoch = loaded.checkpoint_epoch, .covered_lsn = loaded.covered_lsn };
     }
 
+    fn loadWithMagic(allocator: Allocator, path: []const u8, magic: []const u8) !?index_snapshot.LoadedSnapshot {
+        var file = std.Io.Dir.cwd().openFile(io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close(io());
+        return index_snapshot.loadPayload(allocator, &file, magic, RECORD_SIZE);
+    }
+
     /// Cheap header-only re-stamp of a CLEAN (unchanged) snapshot to the new
     /// `(epoch, covered_lsn)` — mirrors the other derived indexes so a partial
     /// checkpoint does not epoch-invalidate the untouched map. Returns false
@@ -164,7 +210,8 @@ pub const PropRevIndex = struct {
             else => return err,
         };
         defer file.close(io());
-        return index_snapshot.restampStamps(&file, SNAPSHOT_MAGIC, new_epoch, new_covered_lsn);
+        if (try index_snapshot.restampStamps(&file, SNAPSHOT_MAGIC, new_epoch, new_covered_lsn)) return true;
+        return index_snapshot.restampStamps(&file, SNAPSHOT_MAGIC_V1, new_epoch, new_covered_lsn);
     }
 };
 
@@ -188,6 +235,67 @@ test "PropRevIndex put/get/remove" {
     idx.remove(200);
     try testing.expectEqual(@as(?NodeId, null), idx.get(200));
     try testing.expectEqual(@as(usize, 1), idx.count());
+}
+
+test "SONNY-6558: PropRevIndex edge entries are tagged, round-trip, and never read as nodes" {
+    const testing = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    var idx = PropRevIndex.init(testing.allocator);
+    defer idx.deinit();
+    try idx.put(0x8000_0000_0000_0001, 3);
+    try idx.putEdge(0x8000_0000_0000_0002, 77);
+    try testing.expectEqual(@as(?NodeId, null), idx.get(0x8000_0000_0000_0002));
+    try testing.expectEqual(Owner{ .edge = 77 }, idx.owner(0x8000_0000_0000_0002).?);
+    try testing.expectEqual(Owner{ .node = 3 }, idx.owner(0x8000_0000_0000_0001).?);
+
+    // removeEdge only drops the head while that edge still owns it.
+    idx.removeEdge(0x8000_0000_0000_0001, 3);
+    try testing.expectEqual(@as(?NodeId, 3), idx.get(0x8000_0000_0000_0001));
+    idx.removeEdge(0x8000_0000_0000_0002, 78);
+    try testing.expect(idx.owner(0x8000_0000_0000_0002) != null);
+
+    try idx.saveToFile(dir_path, 4, 40);
+    var loaded = PropRevIndex.init(testing.allocator);
+    defer loaded.deinit();
+    _ = (try loaded.loadFromFile(dir_path)).?;
+    try testing.expectEqual(Owner{ .edge = 77 }, loaded.owner(0x8000_0000_0000_0002).?);
+    try testing.expectEqual(@as(?NodeId, 3), loaded.get(0x8000_0000_0000_0001));
+    loaded.removeEdge(0x8000_0000_0000_0002, 77);
+    try testing.expectEqual(@as(?Owner, null), loaded.owner(0x8000_0000_0000_0002));
+}
+
+test "SONNY-6558: PropRevIndex still reads and restamps a version 1 snapshot" {
+    const testing = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    // A file written by graph_storage <= 0.4.21.
+    {
+        var w = index_snapshot.SnapshotWriter.init(testing.allocator);
+        defer w.deinit();
+        try w.writeHeader(SNAPSHOT_MAGIC_V1, 5, 50, 1);
+        try w.writeU64(0x8000_0000_0000_0009);
+        try w.writeU64(12);
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir_path, SNAPSHOT_FILE_NAME });
+        defer testing.allocator.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io(), path, .{ .read = true, .truncate = true });
+        defer file.close(io());
+        try w.finalize(file);
+    }
+    var idx = PropRevIndex.init(testing.allocator);
+    defer idx.deinit();
+    const stamp = (try idx.loadFromFile(dir_path)).?;
+    try testing.expectEqual(@as(u64, 50), stamp.covered_lsn);
+    try testing.expectEqual(@as(?NodeId, 12), idx.get(0x8000_0000_0000_0009));
+    try testing.expect(try idx.restampFile(dir_path, 6, 60));
+    const again = (try idx.loadFromFile(dir_path)).?;
+    try testing.expectEqual(@as(u64, 60), again.covered_lsn);
 }
 
 test "PropRevIndex save/load round-trip preserves entries and (epoch, covered_lsn) stamp" {

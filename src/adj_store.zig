@@ -1058,6 +1058,24 @@ pub const AdjStore = struct {
         ctx: anytype,
         comptime f: fn (@TypeOf(ctx), edge_id: EdgeId) anyerror!void,
     ) !void {
+        const Adapter = struct {
+            inner: @TypeOf(ctx),
+            fn each(a: *const @This(), entry: EdgeEntry) anyerror!void {
+                return f(a.inner, entry.edge_id);
+            }
+        };
+        const adapter = Adapter{ .inner = ctx };
+        return self.forEachEntryOnPage(page_id, &adapter, Adapter.each);
+    }
+
+    /// SONNY-6558: as `forEachEdgeIdOnPage`, yielding each whole entry (the
+    /// tail resolution needs its `prop_head`).
+    pub fn forEachEntryOnPage(
+        self: *AdjStore,
+        page_id: PageId,
+        ctx: anytype,
+        comptime f: fn (@TypeOf(ctx), entry: EdgeEntry) anyerror!void,
+    ) !void {
         if (page_id == 0 or !self.free_space.isAllocated(page_id)) return;
         const frame = try self.buffer_pool.pin(self.file_id, page_id);
         defer self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
@@ -1069,7 +1087,7 @@ pub const AdjStore = struct {
                 const checked = self.readBlockHeader(data) catch return error.NotAdjPage;
                 var i: u16 = 0;
                 while (i < checked.count) : (i += 1) {
-                    try f(ctx, self.readEntry(data, i, checked.entry_format).edge_id);
+                    try f(ctx, self.readEntry(data, i, checked.entry_format));
                 }
             },
             edge_mod.ENTRY_FORMAT_SLAB, edge_mod.ENTRY_FORMAT_SLAB_V3 => {
@@ -1081,7 +1099,7 @@ pub const AdjStore = struct {
                     const run = self.resolveSlabRun(data, slot) catch return error.NotAdjPage;
                     var i: u32 = 0;
                     while (i < run.entry_count) : (i += 1) {
-                        try f(ctx, readSlabRunEntry(data, run.offset, i, run.fmt).edge_id);
+                        try f(ctx, readSlabRunEntry(data, run.offset, i, run.fmt));
                     }
                 }
             },
