@@ -97,15 +97,18 @@ test "SONNY-6473: a committed write survives when an older overlapping batched t
         y = try eng.allocNode();
         try eng.putNodeTxn(y, test_support.emptyNode(2), a);
 
-        // An auto-commit write on the same node page while A is open: X now
-        // heads a fresh property chain with v = 2. Its node-page image (new
-        // head, plus A's Y) is numbered and written after A's.
+        // An auto-commit write on the same node page while A is open would
+        // image that page with A's uncommitted Y in it (SONNY-6659): it is
+        // refused now, so two open transactions never image one page and
+        // their images cannot land out of order.
         var xr = (try eng.getNode(x)).?;
         xr.prop_head = try eng.putProperty(0, "v", .{ .int = 2 });
-        try eng.putNode(x, xr);
+        try testing.expectError(error.WriteConflict, eng.putNode(x, xr));
+        try expectInt(alloc, eng, x, "v", 1, "after the refused write");
 
-        // A commits last, so its older image lands after the newer one.
+        // A commits; the write is retried and commits after it.
         try eng.commitTxn(a);
+        try eng.putNode(x, xr);
 
         try expectInt(alloc, eng, x, "v", 2, "before crash");
         try simulateProcessExit(alloc, eng);
@@ -143,12 +146,19 @@ test "SONNY-6473: geode SONNY-2978 shape — batched creates, overlapping remova
             head.* = rec.prop_head;
             try eng.putNodeTxn(id.*, rec, t);
         }
-        // Removal: point each node at an empty property chain, committed
-        // immediately on its own txn.
+        // Removal as separate auto-commit writes on the creating txn's pages
+        // is refused (SONNY-6659): their images would carry t's uncommitted
+        // creates, which a crash before t's commit would bring back. The
+        // removal belongs to t: it runs inside it.
+        {
+            var rec = (try eng.getNode(ids[0])).?;
+            rec.prop_head = 0;
+            try testing.expectError(error.WriteConflict, eng.putNode(ids[0], rec));
+        }
         for (ids) |id| {
             var rec = (try eng.getNode(id)).?;
             rec.prop_head = 0;
-            try eng.putNode(id, rec);
+            try eng.putNodeTxn(id, rec, t);
         }
         try eng.commitTxn(t);
 

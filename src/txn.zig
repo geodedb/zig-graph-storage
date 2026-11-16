@@ -207,6 +207,11 @@ pub const TxnManager = struct {
         const state = self.active_txns.get(txn_id) orelse return error.TxnNotFound;
         if (state == .committed) return error.TxnAlreadyCommitted;
         if (state == .aborted) return error.TxnAlreadyAborted;
+        // SONNY-6659: a refused write left unlogged bytes in memory; only
+        // an abort may end this transaction.
+        if (self.journals.getPtr(txn_id)) |j| {
+            if (j.conflict) return error.WriteConflict;
+        }
 
         // GAP-0900: flush this txn's batched page-update records to the log
         // (one syscall) BEFORE the commit record, preserving on-disk order

@@ -360,20 +360,29 @@ test "SONNY-6529: an aborted create on a node page another transaction commits i
         errdefer eng.deinit();
         base = try buildBase(eng);
 
-        // T1 creates a node, then T2 creates one on the SAME node page and
-        // commits: T2's committed image of that page carries T1's record.
+        // T1 creates a node, then T2 creates one on the SAME node page.
+        // T2's image of that page would carry T1's record, so (SONNY-6659)
+        // T2's write is refused while T1 is open; T2 retries after T1 ends.
         const t1 = try eng.beginTxn();
         aborted = try eng.allocNode();
         try eng.putNodeTxn(aborted, emptyNode(), t1);
         const t2 = try eng.beginTxn();
         kept = try eng.allocNode();
-        try eng.putNodeTxn(kept, emptyNode(), t2);
-        try eng.commitTxn(t2);
+        try testing.expectError(error.WriteConflict, eng.putNodeTxn(kept, emptyNode(), t2));
+        try testing.expectError(error.WriteConflict, eng.commitTxn(t2));
+        // T1 first: its abort must not be refused because T2's bytes are
+        // still on the page.
         try eng.abortTxn(t1);
+        try eng.abortTxn(t2);
+        // The aborts gave both ids back; T3 allocates its own.
+        const t3 = try eng.beginTxn();
+        kept = try eng.allocNode();
+        try eng.putNodeTxn(kept, emptyNode(), t3);
+        try eng.commitTxn(t3);
 
         try testing.expect((try eng.getNode(aborted)) == null);
         try testing.expect((try eng.getNode(kept)) != null);
-        eng.deinit(); // crash: recovery replays T2's page image
+        eng.deinit(); // crash: recovery replays T3's page image
     }
 
     const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
