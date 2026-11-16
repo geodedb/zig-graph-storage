@@ -68,11 +68,11 @@ pub const TxnManager = struct {
     pub const TxnHook = struct {
         ctx: *anyopaque,
         began: *const fn (ctx: *anyopaque) void,
-        ended: *const fn (ctx: *anyopaque) void,
+        ended: *const fn (ctx: *anyopaque, txn_id: u64) void,
     };
 
-    fn notifyEnded(self: *TxnManager) void {
-        if (self.txn_hook) |h| h.ended(h.ctx);
+    fn notifyEnded(self: *TxnManager, txn_id: u64) void {
+        if (self.txn_hook) |h| h.ended(h.ctx, txn_id);
     }
 
     /// Initialize the transaction manager. Defaults to `sync_each_commit`
@@ -241,7 +241,7 @@ pub const TxnManager = struct {
         }
         _ = self.active_txns.remove(txn_id);
         self.dropJournal(txn_id);
-        self.notifyEnded();
+        self.notifyEnded(txn_id);
     }
 
     /// Abort a transaction. Writes an ABORT record to the WAL.
@@ -272,7 +272,7 @@ pub const TxnManager = struct {
 
         _ = self.active_txns.remove(txn_id);
         self.dropJournal(txn_id);
-        self.notifyEnded();
+        self.notifyEnded(txn_id);
     }
 
     /// SONNY-6648: transactions that have begun and not ended.

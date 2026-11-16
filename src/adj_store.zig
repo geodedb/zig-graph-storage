@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const page_mod = @import("page.zig");
 const edge_mod = @import("edge.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
+const FillHook = buffer_pool_mod.FillHook;
 const free_space_mod = @import("free_space.zig");
 
 const Allocator = std.mem.Allocator;
@@ -148,6 +149,8 @@ pub const AdjStore = struct {
     /// append state (slot count, next free offset) is always re-derived from
     /// the block itself, never cached, so a stale value cannot corrupt a page.
     current_fill_page: ?PageId = null,
+    /// SONNY-6659: set by the engine; see `buffer_pool.FillHook`.
+    fill_hook: ?FillHook = null,
 
     /// P2 (WAL slab-awareness, prop-store P4 discipline): page ids DIRTIED by
     /// the CURRENT mutating op (`addEdge` / `removeEdge` / `updateEdgePropHead`),
@@ -174,6 +177,17 @@ pub const AdjStore = struct {
     pub const MAX_TOUCHED_PAGES: usize = 16;
 
     const SlabTombstoneUndo = struct { page_id: PageId, slot: u32, offset: u32, entry_count: u32 };
+
+    /// SONNY-6659: the fill page to append to (see `buffer_pool.FillHook`).
+    fn fillPage(self: *const @This()) ?PageId {
+        if (self.fill_hook) |h| return h.get(h.ctx, self.file_id);
+        return self.current_fill_page;
+    }
+
+    fn setFillPage(self: *@This(), page: ?PageId) void {
+        if (self.fill_hook) |h| return h.set(h.ctx, self.file_id, page);
+        self.current_fill_page = page;
+    }
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, file_id: FileId, page_size: u32) AdjStore {
         return .{
@@ -458,7 +472,7 @@ pub const AdjStore = struct {
         // v2 fill block, and vice versa). Within one session wide_heads is
         // constant so this always matches; the guard protects the wide-entry-
         // in-a-non-wide-session case (colocation rebuild of a widened edge).
-        if (self.current_fill_page) |fill_page| {
+        if (self.fillPage()) |fill_page| {
             const frame = try self.buffer_pool.pin(self.file_id, fill_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = frame.dataSlice();
@@ -483,7 +497,7 @@ pub const AdjStore = struct {
             }
             // Full (or slot indices exhausted, or format mismatch): retire it.
             self.buffer_pool.unpin(frame_idx, false);
-            self.current_fill_page = null;
+            self.setFillPage(null);
         }
 
         // Start a fresh slab fill block.
@@ -513,7 +527,7 @@ pub const AdjStore = struct {
         });
         self.writeSlabRun(data, edge_mod.SLAB_RUNS_OFFSET, 0, entries, want_fmt);
         self.buffer_pool.unpin(frame_idx, true);
-        self.current_fill_page = new_page;
+        self.setFillPage(new_page);
         return head;
     }
 

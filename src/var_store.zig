@@ -5,6 +5,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const page_mod = @import("page.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
+const FillHook = buffer_pool_mod.FillHook;
+const FileId = @import("types.zig").FileId;
 const free_space_mod = @import("free_space.zig");
 
 const Allocator = std.mem.Allocator;
@@ -198,6 +200,8 @@ pub const VarStore = struct {
     /// can never corrupt a page because append state is re-derived from the
     /// page itself, never cached).
     current_fill_page: ?PageId = null,
+    /// SONNY-6659: set by the engine; see `buffer_pool.FillHook`.
+    fill_hook: ?FillHook = null,
 
     /// GAP-ENT-0022(b): undo record for the slab-slot tombstone written by the
     /// CURRENT top-level op (at most one — a var-chain free tombstones exactly
@@ -209,6 +213,19 @@ pub const VarStore = struct {
     last_slab_tombstone: ?SlabTombstoneUndo = null,
 
     const SlabTombstoneUndo = struct { page_id: PageId, slot: u32, offset: u32, byte_len: u32 };
+
+    const FILL_FILE: FileId = .var_store;
+
+    /// SONNY-6659: the fill page to append to (see `buffer_pool.FillHook`).
+    fn fillPage(self: *const @This()) ?PageId {
+        if (self.fill_hook) |h| return h.get(h.ctx, FILL_FILE);
+        return self.current_fill_page;
+    }
+
+    fn setFillPage(self: *@This(), page: ?PageId) void {
+        if (self.fill_hook) |h| return h.set(h.ctx, FILL_FILE, page);
+        self.current_fill_page = page;
+    }
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, page_size: u32) VarStore {
         return .{
@@ -292,7 +309,7 @@ pub const VarStore = struct {
         const run_len: u32 = @intCast(data.len);
 
         // Try the current fill block first.
-        if (self.current_fill_page) |fill_page| {
+        if (self.fillPage()) |fill_page| {
             const frame = try self.buffer_pool.pin(.var_store, fill_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const page_data = frame.dataSlice();
@@ -314,7 +331,7 @@ pub const VarStore = struct {
             }
             // Full (or slot indices exhausted): retire it — no mutation.
             self.buffer_pool.unpin(frame_idx, false);
-            self.current_fill_page = null;
+            self.setFillPage(null);
         }
 
         // Start a fresh slab fill block.
@@ -336,7 +353,7 @@ pub const VarStore = struct {
         if (run_len > 0) @memcpy(page_data[VAR_SLAB_RUNS_OFFSET..][0..run_len], data);
         writeVarSlabSlot(page_data, self.tail_reserve, 0, .{ .offset = VAR_SLAB_RUNS_OFFSET, .byte_len = run_len });
         self.buffer_pool.unpin(frame_idx, true);
-        self.current_fill_page = new_page;
+        self.setFillPage(new_page);
         return encodeSlabHead(new_page, 0);
     }
 

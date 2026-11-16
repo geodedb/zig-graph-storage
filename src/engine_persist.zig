@@ -548,6 +548,15 @@ pub fn initSubsystems(self: *GraphEngine, allocator: Allocator, graph_uuid: [16]
     self.in_head_dir = InHeadDir.init(&self.buffer_pool, &self.free_space_in_dir, .in_dir, cfg.page_size);
     self.var_store = VarStore.init(&self.buffer_pool, &self.free_space_var, cfg.page_size);
     self.prop_store = PropStore.init(&self.buffer_pool, &self.free_space_props, &self.var_store, cfg.page_size);
+    // SONNY-6659: each open transaction gets its own slab fill pages.
+    {
+        const hook = @import("buffer_pool.zig").FillHook{ .ctx = self, .get = GraphEngine.fillHookGet, .set = GraphEngine.fillHookSet };
+        self.prop_store.fill_hook = hook;
+        self.var_store.fill_hook = hook;
+        self.adj_out.fill_hook = hook;
+        self.adj_in.fill_hook = hook;
+        self.adj_in_remote.fill_hook = hook;
+    }
     // SEC: before SONNY-6441 the pager wrote the per-page AES-GCM tag into the
     // final TAG_SIZE bytes of an encrypted page, so the backward-growing
     // directories below reserve that tail. The pager now keeps the tag in the

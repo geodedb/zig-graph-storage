@@ -6,6 +6,8 @@ const types = @import("types.zig");
 const page_mod = @import("page.zig");
 const property_mod = @import("property.zig");
 const buffer_pool_mod = @import("buffer_pool.zig");
+const FillHook = buffer_pool_mod.FillHook;
+const FileId = @import("types.zig").FileId;
 const free_space_mod = @import("free_space.zig");
 const var_store_mod = @import("var_store.zig");
 const interface_mod = @import("interface.zig");
@@ -272,6 +274,8 @@ pub const PropStore = struct {
     /// byte) is always re-derived from the page itself, never cached, so a
     /// stale or copied PropStore value cannot corrupt a page.
     current_fill_page: ?PageId = null,
+    /// SONNY-6659: set by the engine; see `buffer_pool.FillHook`.
+    fill_hook: ?FillHook = null,
 
     /// P4 (WAL slab-awareness): page ids DIRTIED by the CURRENT top-level
     /// mutating op (`putProperty` / `removeProperty`), deduplicated, in
@@ -462,6 +466,19 @@ pub const PropStore = struct {
             }
             try f(ctx, encodeSlabHead(page_id, i), live);
         }
+    }
+
+    const FILL_FILE: FileId = .props;
+
+    /// SONNY-6659: the fill page to append to (see `buffer_pool.FillHook`).
+    fn fillPage(self: *const @This()) ?PageId {
+        if (self.fill_hook) |h| return h.get(h.ctx, FILL_FILE);
+        return self.current_fill_page;
+    }
+
+    fn setFillPage(self: *@This(), page: ?PageId) void {
+        if (self.fill_hook) |h| return h.set(h.ctx, FILL_FILE, page);
+        self.current_fill_page = page;
     }
 
     pub fn init(buffer_pool: *BufferPool, free_space: *FreeSpaceManager, var_store: *VarStore, page_size: u32) PropStore {
@@ -834,7 +851,7 @@ pub const PropStore = struct {
         const blob_len: u32 = @intCast(blob.len);
 
         // Try the current fill page first.
-        if (self.current_fill_page) |fill_page| {
+        if (self.fillPage()) |fill_page| {
             const frame = try self.buffer_pool.pin(.props, fill_page);
             const frame_idx = self.buffer_pool.frameIndex(frame);
             const data = self.logical(frame.dataSlice());
@@ -863,7 +880,7 @@ pub const PropStore = struct {
             }
             // Full (or slot indices exhausted): retire it as the fill page.
             self.buffer_pool.unpin(frame_idx, false);
-            self.current_fill_page = null;
+            self.setFillPage(null);
         }
 
         // Start a fresh slab fill page.
@@ -895,7 +912,7 @@ pub const PropStore = struct {
         writeSlabSlot(data, 0, SLAB_DATA_OFFSET, blob_len);
         writeSlabSlotCount(data, 1);
         self.buffer_pool.unpin(frame_idx, true);
-        self.current_fill_page = new_page;
+        self.setFillPage(new_page);
         return encodeSlabHead(new_page, 0);
     }
 

@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer's writes there are refused too. A transaction that overlapped
   another is aborted in memory (ABORT record, no inverse images). Callers
   that kept two transactions open on one engine and wrote the same page
-  (shared slab fill pages included) now get the error instead of silent
-  corruption (SONNY-6659).
+  now get the error instead of silent corruption. Unrelated writes do not
+  conflict: each open transaction fills slab pages of its own, and the new
+  `allocNodeTxn` (GraphEngine, ShardedGraphEngine) gives it node ids from
+  its own node page (SONNY-6659).
 
 ## [0.4.24] - 2026-11-16
 

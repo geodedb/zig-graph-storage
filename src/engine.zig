@@ -49,6 +49,7 @@ const EdgeId = types.EdgeId;
 const TxnId = types.TxnId;
 const LabelId = types.LabelId;
 const FileId = types.FileId;
+const PageId = types.PageId;
 const PropertyValue = types.PropertyValue;
 const GraphConfig = config_mod.GraphConfig;
 const GraphStorage = interface_mod.GraphStorage;
@@ -114,6 +115,17 @@ pub const default_owned_pool_max_threads: u32 = 4;
 
 /// SONNY-6657: see `GraphEngine.txn_counts_at_begin`.
 pub const TxnCounts = struct { node_count: u64 = 0, edge_count: u64 = 0 };
+
+/// SONNY-6659: the slab stores whose fill page is per transaction, by slot.
+pub const FILL_FILES = [_]FileId{ .props, .var_store, .adj_out, .adj_in, .in_idx };
+
+fn fillSlot(file: FileId) ?usize {
+    for (FILL_FILES, 0..) |f, i| if (f == file) return i;
+    return null;
+}
+
+/// SONNY-6659: node ids reserved for one transaction (one node page).
+pub const NodeRange = struct { next: u64, end: u64 };
 
 /// SONNY-6659: the open transactions whose bytes are on a page (its writers
 /// while transactions are open). More than `ids.len` at once: `overflow`,
@@ -271,6 +283,19 @@ pub const GraphEngine = struct {
     /// SONNY-6659: per page, the open transactions whose bytes are on it
     /// (`claimPage`). Cleared when no transaction is open.
     page_writers: std.AutoHashMapUnmanaged(buffer_pool_mod.PageKey, PageWriters) = .empty,
+    /// SONNY-6659: the transaction whose write is running (set where every
+    /// journaled write starts, `engine_undo.reserve`); 0 when none is open.
+    current_write_txn: u64 = 0,
+    /// SONNY-6659: each open transaction's own fill page per slab store
+    /// (`FILL_FILES`), so unrelated writers never share a page.
+    fill_by_txn: std.AutoHashMapUnmanaged(u64, [FILL_FILES.len]?PageId) = .empty,
+    /// SONNY-6659: partly filled pages of ended transactions, adopted by the
+    /// next transaction that needs a fill page (bounds the space cost).
+    fill_free: [FILL_FILES.len]std.ArrayListUnmanaged(PageId) = [_]std.ArrayListUnmanaged(PageId){.empty} ** FILL_FILES.len,
+    /// SONNY-6659: each open transaction's reserved node ids (`allocNodeTxn`).
+    node_ranges: std.AutoHashMapUnmanaged(u64, NodeRange) = .empty,
+    /// SONNY-6659: unused reserved ids of ended transactions, reused first.
+    node_range_free: std.ArrayListUnmanaged(NodeRange) = .empty,
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     /// PHASE G reverse map: set when a record write moved/added/removed a
@@ -419,6 +444,11 @@ pub const GraphEngine = struct {
         self.txn_counts_at_begin = .{};
         self.discarding_txn = false;
         self.page_writers = .empty;
+        self.current_write_txn = 0;
+        self.fill_by_txn = .empty;
+        self.fill_free = [_]std.ArrayListUnmanaged(PageId){.empty} ** FILL_FILES.len;
+        self.node_ranges = .empty;
+        self.node_range_free = .empty;
         // P2: all four dirty flags are true → the clean-snapshot invariant
         // holds vacuously (see the field doc).
         self.derived_snapshots_trusted = true;
@@ -587,6 +617,11 @@ pub const GraphEngine = struct {
         self.txn_counts_at_begin = .{};
         self.discarding_txn = false;
         self.page_writers = .empty;
+        self.current_write_txn = 0;
+        self.fill_by_txn = .empty;
+        self.fill_free = [_]std.ArrayListUnmanaged(PageId){.empty} ** FILL_FILES.len;
+        self.node_ranges = .empty;
+        self.node_range_free = .empty;
         // P2: the on-disk snapshots are UNKNOWN until the counter gate runs
         // (they may be crash-stale behind clean dirty flags) — restamping is
         // forbidden until materializeDerivedIndexes establishes the invariant.
@@ -1192,6 +1227,9 @@ pub const GraphEngine = struct {
             s.current_fill_page = null;
             s.last_slab_tombstone = null;
         }
+        // SONNY-6659: the per-transaction cursors may point into such pages too.
+        self.fill_by_txn.clearRetainingCapacity();
+        for (&self.fill_free) |*l| l.clearRetainingCapacity();
         self.manifest.node_count = self.txn_counts_at_begin.node_count;
         self.manifest.edge_count = self.txn_counts_at_begin.edge_count;
         if (self.derived_hydrated.load(.acquire)) {
@@ -1454,6 +1492,10 @@ pub const GraphEngine = struct {
         self.prop_rev_index.deinit();
         self.rev_map_pending.deinit(self.allocator);
         self.page_writers.deinit(self.allocator);
+        self.fill_by_txn.deinit(self.allocator);
+        for (&self.fill_free) |*l| l.deinit(self.allocator);
+        self.node_ranges.deinit(self.allocator);
+        self.node_range_free.deinit(self.allocator);
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -1661,6 +1703,10 @@ pub const GraphEngine = struct {
         self.prop_rev_index.deinit();
         self.rev_map_pending.deinit(self.allocator);
         self.page_writers.deinit(self.allocator);
+        self.fill_by_txn.deinit(self.allocator);
+        for (&self.fill_free) |*l| l.deinit(self.allocator);
+        self.node_ranges.deinit(self.allocator);
+        self.node_range_free.deinit(self.allocator);
         self.edge_index.deinit();
         self.edge_exist_index.deinit();
         self.property_index_set.deinit();
@@ -2180,6 +2226,132 @@ pub const GraphEngine = struct {
         self.markDirty();
         observability.endOperationSpan(__obs_span, true, "");
         return id;
+    }
+
+    /// SONNY-6659: allocate a node id for a node `txn` is about to create.
+    /// While other transactions are open, `txn` gets ids from a node page of
+    /// its own, so its creates never share a node page with another open
+    /// transaction (which would make one of them `WriteConflict`). Alone, it
+    /// allocates exactly as `allocNode` does. Unused reserved ids go back
+    /// to a free list when the transaction ends.
+    pub fn allocNodeTxn(self: *GraphEngine, txn: TxnId) anyerror!NodeId {
+        if (!self.txn_manager.isActive(txn)) return error.TxnNotFound;
+        if (self.txn_manager.activeCount() <= 1 and !self.node_ranges.contains(txn)) return self.allocNode();
+        try self.ensureWritable();
+        const gop = try self.node_ranges.getOrPut(self.allocator, txn);
+        if (!gop.found_existing or gop.value_ptr.next >= gop.value_ptr.end) {
+            gop.value_ptr.* = self.node_range_free.pop() orelse self.reserveNodePage();
+        }
+        const stride = self.idStride();
+        const id = gop.value_ptr.next;
+        gop.value_ptr.next += stride;
+        self.manifest.node_count += 1;
+        self.metrics.nodes_created += 1;
+        self.markDirty();
+        return id;
+    }
+
+    /// SONNY-6659: the ids of the next whole node page (this engine's id
+    /// class); `next_node_id` moves past it. Ids skipped up to the page
+    /// boundary stay unused.
+    fn reserveNodePage(self: *GraphEngine) NodeRange {
+        const per: u64 = self.node_store.nodes_per_page;
+        const stride = self.idStride();
+        const start = self.manifest.next_node_id;
+        const class = start % stride;
+        const first = ((start + per - 1) / per) * per;
+        const end = first + per;
+        const inClass = struct {
+            fn at(x: u64, c: u64, s: u64) u64 {
+                return x + (c + s - x % s) % s;
+            }
+        }.at;
+        self.manifest.next_node_id = inClass(end, class, stride);
+        return .{ .next = inClass(first, class, stride), .end = end };
+    }
+
+    /// SONNY-6659: the store cursor that is not any open transaction's.
+    fn sharedFillCursor(self: *GraphEngine, file: FileId) ?*?PageId {
+        return switch (file) {
+            .props => &self.prop_store.current_fill_page,
+            .var_store => &self.var_store.current_fill_page,
+            .adj_out => &self.adj_out.current_fill_page,
+            .adj_in => &self.adj_in.current_fill_page,
+            .in_idx => &self.adj_in_remote.current_fill_page,
+            else => null,
+        };
+    }
+
+    /// SONNY-6659: no open transaction other than `txn` has bytes on the page.
+    fn pageFreeFor(self: *GraphEngine, file: FileId, page: PageId, txn: u64) bool {
+        const w = self.page_writers.get(.{ .file_id = file, .page_id = page }) orelse return true;
+        if (w.overflow) return false;
+        for (w.ids[0..w.len]) |id| {
+            if (id != txn and self.txn_manager.isActive(id)) return false;
+        }
+        return true;
+    }
+
+    /// SONNY-6659: `buffer_pool.FillHook.get`. The running transaction's own
+    /// fill page; one it has none yet adopts the shared cursor or a spare
+    /// page that no other open transaction has bytes on, else a fresh one.
+    pub fn fillHookGet(ctx: *anyopaque, file: FileId) ?PageId {
+        const self: *GraphEngine = @ptrCast(@alignCast(ctx));
+        const shared = self.sharedFillCursor(file) orelse return null;
+        const slot = fillSlot(file) orelse return shared.*;
+        const txn = self.current_write_txn;
+        if (txn == 0 or !self.txn_manager.isActive(txn)) return shared.*;
+        const gop = self.fill_by_txn.getOrPut(self.allocator, txn) catch return null;
+        if (!gop.found_existing) gop.value_ptr.* = [_]?PageId{null} ** FILL_FILES.len;
+        if (gop.value_ptr[slot]) |p| return p;
+        if (shared.*) |p| {
+            if (self.pageFreeFor(file, p, txn)) {
+                shared.* = null;
+                gop.value_ptr[slot] = p;
+                return p;
+            }
+        }
+        while (self.fill_free[slot].pop()) |p| {
+            if (self.pageFreeFor(file, p, txn)) {
+                gop.value_ptr[slot] = p;
+                return p;
+            }
+        }
+        return null; // the store starts a fresh page and `set`s it
+    }
+
+    /// SONNY-6659: `buffer_pool.FillHook.set`.
+    pub fn fillHookSet(ctx: *anyopaque, file: FileId, page: ?PageId) void {
+        const self: *GraphEngine = @ptrCast(@alignCast(ctx));
+        const shared = self.sharedFillCursor(file) orelse return;
+        const slot = fillSlot(file) orelse {
+            shared.* = page;
+            return;
+        };
+        const txn = self.current_write_txn;
+        if (txn != 0 and self.txn_manager.isActive(txn)) {
+            if (self.fill_by_txn.getPtr(txn)) |set| {
+                set[slot] = page;
+                return;
+            }
+        }
+        shared.* = page;
+    }
+
+    /// SONNY-6659: `txn` ended: its fill pages and unused node ids are free
+    /// for the next transaction (or lost to a leak when out of memory).
+    pub fn releaseTxnPlacement(self: *GraphEngine, txn: u64) void {
+        if (self.fill_by_txn.fetchRemove(txn)) |kv| {
+            for (kv.value, 0..) |maybe, slot| {
+                const p = maybe orelse continue;
+                const shared = self.sharedFillCursor(FILL_FILES[slot]).?;
+                if (shared.* == null) shared.* = p else self.fill_free[slot].append(self.allocator, p) catch {};
+            }
+        }
+        if (self.node_ranges.fetchRemove(txn)) |kv| {
+            if (kv.value.next < kv.value.end) self.node_range_free.append(self.allocator, kv.value) catch {};
+        }
+        if (self.txn_manager.activeCount() == 0) self.current_write_txn = 0;
     }
 
     /// Delete a node within an existing transaction (no auto-commit).

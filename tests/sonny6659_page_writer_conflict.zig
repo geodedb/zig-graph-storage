@@ -337,3 +337,208 @@ test "SONNY-6659: while a refused writer's bytes are on the page, the first writ
     try testing.expectEqual(@as(u64, 3), (try eng.getNode(a)).?.txn_stamp);
     try testing.expectEqual(@as(u64, 1), (try eng.getNode(b)).?.txn_stamp);
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent sessions: unrelated writers never share a page
+// ---------------------------------------------------------------------------
+
+const SESSIONS = 8;
+const PER_SESSION = 40; // nodes per session: more than one node page
+
+const Session = struct {
+    txn: gs.TxnId = 0,
+    nodes: [PER_SESSION]u64 = undefined,
+    edges: usize = 0,
+};
+
+/// SESSIONS transactions open at once on one engine, interleaved write by
+/// write (as geode's sessions interleave on one shard), each creating its
+/// own nodes with a property, a label and an edge to its previous node.
+fn runSessions(eng: *GraphEngine, sessions: *[SESSIONS]Session, label: gs.LabelId) !void {
+    for (sessions) |*s| s.txn = try eng.beginTxn();
+    var i: usize = 0;
+    while (i < PER_SESSION) : (i += 1) {
+        for (sessions, 0..) |*s, k| {
+            const id = try eng.allocNodeTxn(s.txn);
+            s.nodes[i] = id;
+            var rec = test_support.emptyNode(k + 1);
+            rec.prop_head = try eng.putPropertyTxn(0, "session", .{ .int = @intCast(k) }, s.txn);
+            try eng.putNodeTxn(id, rec, s.txn);
+            try eng.addLabelTxn(id, label, s.txn);
+            if (i > 0) {
+                _ = try eng.addEdgeTxn(s.nodes[i - 1], id, 7, s.txn);
+                s.edges += 1;
+            }
+        }
+    }
+}
+
+fn expectSession(alloc: Allocator, eng: *GraphEngine, s: *const Session, k: usize, labelled: []const u64) !void {
+    for (s.nodes, 0..) |id, i| {
+        const rec = (try eng.getNode(id)) orelse return error.SessionNodeMissing;
+        try testing.expectEqual(@as(u64, k + 1), rec.txn_stamp);
+        const v = (try eng.getProperty(rec.prop_head, "session", alloc)) orelse return error.SessionPropertyMissing;
+        try testing.expectEqual(@as(i64, @intCast(k)), v.int);
+        var found = false;
+        for (labelled) |l| found = found or l == id;
+        if (!found) return error.SessionLabelMissing;
+        if (i + 1 < s.nodes.len) {
+            const out = try eng.expandOut(id, 7, alloc);
+            defer alloc.free(out);
+            try testing.expectEqual(@as(usize, 1), out.len);
+            try testing.expectEqual(s.nodes[i + 1], out[0].neighbor);
+        }
+    }
+}
+
+test "SONNY-6659: concurrent sessions writing unrelated nodes, properties, labels and edges never conflict" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{ 0x66, 0x59, 0x08 } ++ [_]u8{0x58} ** 13;
+    const cfg = test_support.testConfig();
+
+    var sessions = [_]Session{.{}} ** SESSIONS;
+    var label: gs.LabelId = 0;
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.deinit();
+        label = try eng.getOrAssignLabel("Session");
+        try eng.checkpoint();
+        try runSessions(eng, &sessions, label);
+        try testing.expectEqual(@as(u64, 0), eng.metrics.write_conflicts);
+        // Half commit; the other half are still open at the crash.
+        for (sessions[0 .. SESSIONS / 2]) |*s| try eng.commitTxn(s.txn);
+        try testing.expectEqual(@as(u64, 0), eng.metrics.write_conflicts);
+        try crash(eng, alloc);
+    }
+    const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    const labelled = try eng.scanLabel(label, alloc);
+    defer alloc.free(labelled);
+    try testing.expectEqual(@as(usize, SESSIONS / 2 * PER_SESSION), labelled.len);
+    for (sessions[0 .. SESSIONS / 2], 0..) |*s, k| try expectSession(alloc, eng, s, k, labelled);
+    for (sessions[SESSIONS / 2 ..]) |*s| {
+        for (s.nodes) |id| try testing.expect(!try present(eng, id));
+    }
+}
+
+test "SONNY-6659: two transactions updating the same node conflict" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = [_]u8{ 0x66, 0x59, 0x09 } ++ [_]u8{0x59} ** 13;
+    const eng = try GraphEngine.create(alloc, td.path, uuid, test_support.testConfig());
+    defer eng.close() catch {};
+    const n = try eng.allocNode();
+    try eng.putNode(n, test_support.emptyNode(1));
+    const t1 = try eng.beginTxn();
+    const t2 = try eng.beginTxn();
+    try eng.putNodeTxn(n, test_support.emptyNode(2), t1);
+    try testing.expectError(error.WriteConflict, eng.putNodeTxn(n, test_support.emptyNode(3), t2));
+    try testing.expectEqual(@as(u64, 1), eng.metrics.write_conflicts);
+    try eng.abortTxn(t2);
+    try eng.commitTxn(t1);
+    try testing.expectEqual(@as(u64, 2), (try eng.getNode(n)).?.txn_stamp);
+}
+
+fn allocatedPages(eng: *GraphEngine) u64 {
+    var total: u64 = 0;
+    inline for (.{ "free_space_nodes", "free_space_adj_out", "free_space_adj_in", "free_space_in_idx", "free_space_in_dir", "free_space_props", "free_space_var" }) |f| {
+        total += @field(eng, f).allocatedCount();
+    }
+    return total;
+}
+
+test "SONNY-6659: space cost of per-transaction fill pages, and the conflict rate of updates to existing nodes" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const cfg = test_support.testConfig();
+
+    // The same work, once serially (one transaction at a time) and once
+    // interleaved across SESSIONS open transactions.
+    var pages: [2]u64 = undefined;
+    var nodes_pages: [2]u64 = undefined;
+    for ([_]bool{ false, true }, 0..) |interleaved, round| {
+        const sub = try std.fmt.allocPrint(alloc, "{s}/r{d}", .{ td.path, round });
+        defer alloc.free(sub);
+        try std.Io.Dir.cwd().createDirPath(io, sub);
+        const subz = try alloc.dupeZ(u8, sub);
+        defer alloc.free(subz);
+        const uuid = [_]u8{ 0x66, 0x59, 0x0A, @intCast(round) } ++ [_]u8{0x5A} ** 12;
+        const eng = try GraphEngine.create(alloc, subz, uuid, cfg);
+        defer eng.close() catch {};
+        const label = try eng.getOrAssignLabel("Session");
+        const before = allocatedPages(eng);
+        const before_nodes = eng.free_space_nodes.allocatedCount();
+        var sessions = [_]Session{.{}} ** SESSIONS;
+        if (interleaved) {
+            try runSessions(eng, &sessions, label);
+            for (&sessions) |*s| try eng.commitTxn(s.txn);
+        } else {
+            for (&sessions, 0..) |*s, k| {
+                s.txn = try eng.beginTxn();
+                var i: usize = 0;
+                while (i < PER_SESSION) : (i += 1) {
+                    const id = try eng.allocNodeTxn(s.txn);
+                    s.nodes[i] = id;
+                    var rec = test_support.emptyNode(k + 1);
+                    rec.prop_head = try eng.putPropertyTxn(0, "session", .{ .int = @intCast(k) }, s.txn);
+                    try eng.putNodeTxn(id, rec, s.txn);
+                    try eng.addLabelTxn(id, label, s.txn);
+                    if (i > 0) _ = try eng.addEdgeTxn(s.nodes[i - 1], id, 7, s.txn);
+                }
+                try eng.commitTxn(s.txn);
+            }
+        }
+        try testing.expectEqual(@as(u64, 0), eng.metrics.write_conflicts);
+        pages[round] = allocatedPages(eng) - before;
+        nodes_pages[round] = eng.free_space_nodes.allocatedCount() - before_nodes;
+    }
+    std.debug.print("\nSONNY-6659 space: {d} sessions x {d} nodes: serial {d} pages ({d} node pages), interleaved {d} pages ({d} node pages)\n", .{ SESSIONS, PER_SESSION, pages[0], nodes_pages[0], pages[1], nodes_pages[1] });
+    // Bound: at most one partly filled block per session and store (5
+    // slab stores) plus one partly used node page per session.
+    try testing.expect(pages[1] <= pages[0] + SESSIONS * 6);
+
+    // Updates of EXISTING nodes by concurrent sessions: two sessions that
+    // touch nodes on the same node page conflict (a genuinely shared page).
+    // Measure how often, for random updates over a graph of 100 node pages.
+    const sub = try std.fmt.allocPrint(alloc, "{s}/upd", .{td.path});
+    defer alloc.free(sub);
+    try std.Io.Dir.cwd().createDirPath(io, sub);
+    const subz = try alloc.dupeZ(u8, sub);
+    defer alloc.free(subz);
+    const eng = try GraphEngine.create(alloc, subz, [_]u8{ 0x66, 0x59, 0x0B } ++ [_]u8{0x5B} ** 13, cfg);
+    defer eng.close() catch {};
+    const total: u64 = 100 * eng.node_store.nodes_per_page;
+    {
+        const t = try eng.beginTxn();
+        var i: u64 = 0;
+        while (i < total) : (i += 1) try eng.putNodeTxn(try eng.allocNode(), test_support.emptyNode(1), t);
+        try eng.commitTxn(t);
+    }
+    var prng = std.Random.DefaultPrng.init(0x6659);
+    const rnd = prng.random();
+    var attempts: u64 = 0;
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        var txns: [SESSIONS]gs.TxnId = undefined;
+        for (&txns) |*t| t.* = try eng.beginTxn();
+        var refused = [_]bool{false} ** SESSIONS;
+        var w: usize = 0;
+        while (w < 4) : (w += 1) {
+            for (txns, 0..) |t, k| {
+                if (refused[k]) continue;
+                attempts += 1;
+                const id = 1 + rnd.uintLessThan(u64, total);
+                eng.putNodeTxn(id, test_support.emptyNode(2), t) catch |err| switch (err) {
+                    error.WriteConflict => refused[k] = true,
+                    else => return err,
+                };
+            }
+        }
+        for (txns, 0..) |t, k| if (refused[k]) try eng.abortTxn(t) else try eng.commitTxn(t);
+    }
+    std.debug.print("SONNY-6659 updates of existing nodes: {d} sessions x 4 random updates over 100 node pages, {d} rounds: {d} conflicts in {d} writes\n", .{ SESSIONS, round, eng.metrics.write_conflicts, attempts });
+}

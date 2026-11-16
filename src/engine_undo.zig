@@ -43,6 +43,7 @@ pub fn journalFor(engine: *GraphEngine, txn: u64) ?*UndoJournal {
 /// mutates anything (see `UndoJournal.reserve`). An out-of-memory error
 /// fails the write cleanly.
 pub fn reserve(engine: *GraphEngine, txn: u64) !void {
+    engine.current_write_txn = txn; // SONNY-6659: whose fill pages to use
     const j = journalFor(engine, txn) orelse return;
     try j.reserve(engine.allocator);
 }
@@ -159,6 +160,7 @@ pub fn recordLabel(engine: *GraphEngine, txn: u64, node: NodeId, label: u32, add
 /// until handed to `notePropertyWrite`). Null for a new chain, a chain the
 /// transaction created, a legacy chain, or when nothing is journaled.
 pub fn capturePropertyChain(engine: *GraphEngine, txn: u64, owner: u64) !?[]u8 {
+    engine.current_write_txn = txn; // SONNY-6659: whose fill pages to use
     const j = journalFor(engine, txn) orelse return null;
     try j.reserve(engine.allocator);
     // SONNY-6558: room for the overflow chains this write may release (at
@@ -237,8 +239,9 @@ pub fn onTxnBegan(ctx: *anyopaque) void {
 /// after a WAL sync under deferred commits. After an abort that could not
 /// undo its writes (the engine is poisoned, set BEFORE the transaction is
 /// ended) they stay held: those bytes must never reach disk.
-pub fn onTxnEnded(ctx: *anyopaque) void {
+pub fn onTxnEnded(ctx: *anyopaque, txn: u64) void {
     const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
+    engine.releaseTxnPlacement(txn);
     const how: BufferPool.TxnEnd = if (engine.abort_not_undone != null)
         .keep
     else switch (engine.txn_manager.sync_mode) {
