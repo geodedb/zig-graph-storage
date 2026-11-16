@@ -100,7 +100,19 @@ a legacy (non-slab) chain that existed before the transaction, a
 `putNodeTxn` that changes
 `out_head`, `in_head`, `label_head` or `label_count` of an existing node, a
 page the caller imaged itself (`logPagePublic`, `zeroPageLogged`), and a
-transaction past 1,048,576 writes. With `GraphConfig.abort_undo = .fail_closed` (default)
+transaction past 1,048,576 writes. Such a transaction is aborted instead by
+discarding its pages (SONNY-6657): since no-steal they were never written,
+so every page it held gets back its latest committed WAL image after the
+checkpoint frontier, or is reloaded from its store file (what crash
+recovery would rebuild); the node and edge counts as of its begin, the
+stores' in-memory cursors and the derived indexes (rebuilt, O(graph)) are
+restored, and the ABORT record is written (`Metrics.txn_aborts_discarded`).
+Pages freed while a transaction is open stay allocated until it ends, so
+a discarded free never happened. Allocated ids are not given back. A crash
+at any step recovers the state before the transaction. This needs that no
+other transaction was open at any time while it was (a held page could
+carry the other's bytes) and no cross-shard 2PC record in the WAL tail;
+otherwise, with `GraphConfig.abort_undo = .fail_closed` (default),
 aborting such a transaction returns `error.AbortNotUndone`, and every later
 write, commit and checkpoint on that engine fails the same way: the aborted
 writes are in memory and must never reach a checkpoint. `close` then syncs

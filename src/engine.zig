@@ -112,12 +112,16 @@ pub const DerivedDigests = struct {
 /// See docs/2026-04-25-shared-engine-thread-pool.md §5.2 and §9.
 pub const default_owned_pool_max_threads: u32 = 4;
 
+/// SONNY-6657: see `GraphEngine.txn_counts_at_begin`.
+pub const TxnCounts = struct { node_count: u64 = 0, edge_count: u64 = 0 };
+
 /// SONNY-6648: a reverse-map (prop_head -> node) change queued before the
 /// derived indexes are hydrated (`GraphEngine.rev_map_pending`).
 pub const RevMapOp = struct {
     head: u64,
     node: NodeId,
-    kind: enum { put, remove },
+    /// `remove_owned` (SONNY-6657): drop `head` only while `node` owns it.
+    kind: enum { put, remove, remove_owned },
 };
 
 /// The central GraphEngine that wires everything together and implements
@@ -126,6 +130,9 @@ pub const RevMapOp = struct {
 /// The engine owns all component structs and coordinates their interactions.
 /// It supports creating new graphs and opening existing ones with crash recovery.
 pub const GraphEngine = struct {
+    /// SONNY-6657: see `engine_undo.DiscardStep`.
+    pub const DiscardStep = engine_undo.DiscardStep;
+
     allocator: Allocator,
     config: GraphConfig,
     graph_uuid: [16]u8,
@@ -228,6 +235,15 @@ pub const GraphEngine = struct {
     /// `error.TestCrashInjected` after applying this many inverses, before
     /// the COMMIT record that ends the undone transaction (a crash mid-abort).
     test_abort_crash_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// SONNY-6657 (tests only): a discard-abort stops with
+    /// `error.TestCrashInjected` after this step.
+    test_discard_crash_at: if (builtin.is_test) ?DiscardStep else void = if (builtin.is_test) null else {},
+    /// SONNY-6657: the manifest node and edge counts when the only open
+    /// transaction began; a discard-abort puts them back.
+    txn_counts_at_begin: TxnCounts = .{},
+    /// SONNY-6657: set while a discard-abort ends its transaction (its
+    /// deferred page frees are dropped, not applied).
+    discarding_txn: bool = false,
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     /// PHASE G reverse map: set when a record write moved/added/removed a
@@ -372,6 +388,9 @@ pub const GraphEngine = struct {
         self.rev_map_pending_lost = false;
         self.rev_map_pending_cap = 1 << 16;
         if (builtin.is_test) self.test_abort_crash_after = null;
+        if (builtin.is_test) self.test_discard_crash_at = null;
+        self.txn_counts_at_begin = .{};
+        self.discarding_txn = false;
         // P2: all four dirty flags are true → the clean-snapshot invariant
         // holds vacuously (see the field doc).
         self.derived_snapshots_trusted = true;
@@ -536,6 +555,9 @@ pub const GraphEngine = struct {
         self.rev_map_pending_lost = false;
         self.rev_map_pending_cap = 1 << 16;
         if (builtin.is_test) self.test_abort_crash_after = null;
+        if (builtin.is_test) self.test_discard_crash_at = null;
+        self.txn_counts_at_begin = .{};
+        self.discarding_txn = false;
         // P2: the on-disk snapshots are UNKNOWN until the counter gate runs
         // (they may be crash-stale behind clean dirty flags) — restamping is
         // forbidden until materializeDerivedIndexes establishes the invariant.
@@ -1069,6 +1091,7 @@ pub const GraphEngine = struct {
             for (self.rev_map_pending.items) |op| switch (op.kind) {
                 .put => try self.prop_rev_index.put(op.head, op.node),
                 .remove => self.prop_rev_index.remove(op.head),
+                .remove_owned => self.prop_rev_index.removeIfNode(op.head, op.node),
             };
         }
         self.prop_rev_index_dirty = true;
@@ -1094,6 +1117,16 @@ pub const GraphEngine = struct {
         self.prop_rev_index_dirty = true;
     }
 
+    /// SONNY-6657: drop property chain `head` from the reverse map when it is
+    /// recorded as node `node`'s (the node no longer points at it; a node
+    /// that took the chain over keeps its entry). Queued before hydration.
+    pub fn revMapRemoveOwned(self: *GraphEngine, head: u64, node: NodeId) void {
+        if (head == 0) return;
+        if (self.queueRevMapOp(.{ .head = head, .node = node, .kind = .remove_owned })) return;
+        self.prop_rev_index.removeIfNode(head, node);
+        self.prop_rev_index_dirty = true;
+    }
+
     /// Queue `op` for hydration and return true, or return false when the
     /// derived indexes are hydrated (the caller applies it). Checked under
     /// `derived_hydrate_mutex`, so a hydration running on another thread
@@ -1112,6 +1145,40 @@ pub const GraphEngine = struct {
         }
         self.rev_map_pending.append(self.allocator, op) catch self.dropRevMapPending();
         return true;
+    }
+
+    /// SONNY-6657: a discard-abort put the committed page state back
+    /// (`BufferPool.discardOpenTxnFrames`); restore what is not in pages:
+    /// the store cursors (they may point into a page whose bytes went back),
+    /// the node and edge counts as of the transaction's begin, and the
+    /// derived indexes (rebuilt from the pages; before hydration, the queued
+    /// reverse-map changes include the discarded writes, so it rescans).
+    /// Allocation ids are not given back: they are never reused.
+    pub fn restoreAfterDiscard(self: *GraphEngine) !void {
+        self.prop_store.current_fill_page = null;
+        self.prop_store.last_slab_tombstone = null;
+        self.var_store.current_fill_page = null;
+        self.var_store.last_slab_tombstone = null;
+        inline for (.{ &self.adj_out, &self.adj_in, &self.adj_in_remote }) |s| {
+            s.current_fill_page = null;
+            s.last_slab_tombstone = null;
+        }
+        self.manifest.node_count = self.txn_counts_at_begin.node_count;
+        self.manifest.edge_count = self.txn_counts_at_begin.edge_count;
+        if (self.derived_hydrated.load(.acquire)) {
+            try engine_index.rebuildDerivedIndexes(self);
+            self.markDerivedIndexesDirty();
+            if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
+        } else {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            self.derived_hydrate_mutex.lockUncancelable(io);
+            defer self.derived_hydrate_mutex.unlock(io);
+            if (self.derived_hydrated.load(.acquire)) {
+                try engine_index.rebuildDerivedIndexes(self);
+                self.markDerivedIndexesDirty();
+            } else self.dropRevMapPending();
+        }
+        self.markDirty();
     }
 
     fn dropRevMapPending(self: *GraphEngine) void {
@@ -2007,6 +2074,11 @@ pub const GraphEngine = struct {
         // forces a hydration on the write path. A prop_head of 0 is not
         // recorded; overwriting is exactly the rebuild result for slab-slot
         // reuse. In-memory only — no write amplification.
+        // SONNY-6657: and drop the chain it no longer points at, unless another
+        // node has taken it over (it used to stay mapped to this node).
+        if (before) |b| {
+            if (b.prop_head != rec.prop_head) self.revMapRemoveOwned(b.prop_head, id);
+        }
         try self.revMapPut(rec.prop_head, id);
         self.markDirty();
     }
@@ -2067,7 +2139,7 @@ pub const GraphEngine = struct {
         // PHASE G reverse map: drop this node's prop_head -> id before the record
         // is tombstoned (deleteNode keeps prop_head, but read it now to be
         // explicit). Queued before hydration (see putNodeTxn). In-memory only.
-        if (try self.node_store.getRawSlot(id)) |rec| self.revMapRemove(rec.prop_head);
+        if (try self.node_store.getRawSlot(id)) |rec| self.revMapRemoveOwned(rec.prop_head, id);
         try engine_undo.reserve(self, txn);
         try self.node_store.deleteNode(id);
         const undo_idx = engine_undo.recordNodeDelete(self, txn, id);

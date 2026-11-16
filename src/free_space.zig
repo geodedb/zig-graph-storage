@@ -39,6 +39,13 @@ pub const FreeSpaceManager = struct {
     /// Hint for where to start scanning for the next free page.
     /// Updated after each allocation to avoid re-scanning already-full regions.
     next_free_hint: usize = 1,
+    /// SONNY-6657: pages freed while a transaction is open on the owning
+    /// engine (`BufferPool.open_txns`). They stay allocated until it ends:
+    /// `applyDeferredFrees` when its writes stand, `dropDeferredFrees` when
+    /// they are discarded (the pages then hold live data again). A free that
+    /// cannot be recorded (out of memory) is dropped: the page leaks, it is
+    /// never handed out while something may still reference it.
+    deferred_frees: std.ArrayListUnmanaged(PageId) = .empty,
 
     pub fn init(allocator: Allocator, buffer_pool: *BufferPool, file_id: FileId) !FreeSpaceManager {
         var bitmap = try std.DynamicBitSet.initEmpty(allocator, 64);
@@ -71,6 +78,7 @@ pub const FreeSpaceManager = struct {
     }
 
     pub fn deinit(self: *FreeSpaceManager) void {
+        self.deferred_frees.deinit(self.allocator);
         self.bitmap.deinit();
     }
 
@@ -116,17 +124,44 @@ pub const FreeSpaceManager = struct {
         return error.OutOfMemory;
     }
 
-    /// Free a previously allocated page.
+    /// Free a previously allocated page. SONNY-6657: deferred while a
+    /// transaction is open (see `deferred_frees`).
     pub fn freePage(self: *FreeSpaceManager, page_id: PageId) !void {
         const idx: usize = @intCast(page_id);
         if (idx >= self.total_pages) return error.InvalidPageId;
         if (idx == 0) return error.InvalidPageId; // Cannot free reserved page 0
+        if (self.buffer_pool) |bp| {
+            if (bp.open_txns.load(.acquire) != 0) {
+                self.deferred_frees.append(self.allocator, page_id) catch {};
+                return;
+            }
+        }
+        self.releasePage(idx);
+    }
+
+    fn releasePage(self: *FreeSpaceManager, idx: usize) void {
         self.bitmap.unset(idx);
         // Move hint back if the freed page is before the current hint,
         // so the next allocation can reuse it without a full wrap-around.
         if (idx < self.next_free_hint) {
             self.next_free_hint = idx;
         }
+    }
+
+    /// SONNY-6657: the transactions that freed `deferred_frees` ended with
+    /// their writes standing: free the pages now.
+    pub fn applyDeferredFrees(self: *FreeSpaceManager) void {
+        for (self.deferred_frees.items) |page_id| {
+            const idx: usize = @intCast(page_id);
+            if (idx != 0 and idx < self.total_pages) self.releasePage(idx);
+        }
+        self.deferred_frees.clearRetainingCapacity();
+    }
+
+    /// SONNY-6657: the transaction that freed `deferred_frees` was discarded:
+    /// its frees never happened.
+    pub fn dropDeferredFrees(self: *FreeSpaceManager) void {
+        self.deferred_frees.clearRetainingCapacity();
     }
 
     /// Check if a page is allocated.
@@ -344,6 +379,36 @@ test "freePage + allocPage reuses freed page" {
     // Next alloc should reuse page 1
     const p3 = try fsm.allocPage();
     try testing.expectEqual(p1, p3);
+}
+
+test "SONNY-6657: a page freed while a transaction is open stays allocated until it ends" {
+    var pool = try BufferPool.init(testing.allocator, 4096, 4);
+    defer pool.deinit();
+    var fsm = try FreeSpaceManager.init(testing.allocator, &pool, .nodes);
+    defer fsm.deinit();
+
+    const p1 = try fsm.allocPage();
+    const p2 = try fsm.allocPage();
+
+    // Writes stand: the free happens when the transaction ends.
+    pool.beginTxnHold();
+    try fsm.freePage(p1);
+    try testing.expect(fsm.isAllocated(p1));
+    try testing.expect((try fsm.allocPage()) != p1); // not handed out meanwhile
+    pool.endTxnHold(.release);
+    fsm.applyDeferredFrees();
+    try testing.expect(!fsm.isAllocated(p1));
+
+    // Discarded: the free never happens (the page holds live data again).
+    pool.beginTxnHold();
+    try fsm.freePage(p2);
+    pool.endTxnHold(.release);
+    fsm.dropDeferredFrees();
+    try testing.expect(fsm.isAllocated(p2));
+
+    // No transaction open: immediate, as before.
+    try fsm.freePage(p2);
+    try testing.expect(!fsm.isAllocated(p2));
 }
 
 test "isAllocated reports correctly" {

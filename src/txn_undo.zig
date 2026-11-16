@@ -115,6 +115,11 @@ pub const UndoJournal = struct {
     /// Kept by `fail`: a not-undoable transaction that commits still frees
     /// them; one that is aborted leaks them until compaction.
     deferred_var_frees: std.ArrayListUnmanaged(u64) = .empty,
+    /// SONNY-6657: another transaction was open on the engine at some time
+    /// while this one was. Its held pages may then carry that one's bytes,
+    /// so this transaction cannot be aborted by discarding them. Kept by
+    /// `fail`.
+    overlapped: bool = false,
 
     pub fn deinit(self: *UndoJournal, allocator: Allocator) void {
         self.freeBlobs(allocator);
@@ -149,6 +154,7 @@ pub const UndoJournal = struct {
         self.created_nodes.clearRetainingCapacity();
         self.deferred_var_frees.clearRetainingCapacity();
         self.not_undoable = null;
+        self.overlapped = false;
     }
 
     /// Buffers large enough that keeping them for reuse would pin memory a
