@@ -29,6 +29,10 @@ pub const Metrics = struct {
     /// SONNY-6529: aborts that could not undo the transaction's writes
     /// (`error.AbortNotUndone` under `abort_undo = .fail_closed`).
     txn_aborts_not_undone: u64 = 0,
+    /// SONNY-6657: aborts the journal could not undo that were completed by
+    /// discarding the transaction's pages and redoing the committed state
+    /// (a subset of `txn_aborted`).
+    txn_aborts_discarded: u64 = 0,
     /// SONNY-6648: checkpoints that did nothing because a transaction was
     /// open (its pages must not reach disk); the next one after it ends runs.
     checkpoints_deferred: u64 = 0,

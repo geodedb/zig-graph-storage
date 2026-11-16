@@ -376,6 +376,10 @@ test "SONNY-6648: an abort that cannot be undone keeps its pages off disk" {
         try put(eng, s.onPage(0), OPEN, txn);
         // A caller-imaged page: the engine cannot undo the transaction.
         try eng.logPagePublic(txn, .nodes, eng.nodePageId(s.onPage(0)));
+        // SONNY-6657: with another transaction open meanwhile the abort
+        // cannot discard the pages instead; it fails closed.
+        const other = try eng.beginTxn();
+        try eng.commitTxn(other);
         try testing.expectError(error.AbortNotUndone, eng.abortTxn(txn));
         // Reads keep working and evict everything else; the page stays.
         const writes_before = eng.metrics.page_writes;

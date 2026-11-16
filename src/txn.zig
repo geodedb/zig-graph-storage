@@ -174,8 +174,14 @@ pub const TxnManager = struct {
         };
         errdefer self.wal.abortBatchFor(txn_id);
 
-        const fresh = self.spare_journal orelse UndoJournal{};
+        var fresh = self.spare_journal orelse UndoJournal{};
         self.spare_journal = null;
+        // SONNY-6657: this transaction and every one still open overlap.
+        if (self.journals.count() != 0) {
+            fresh.overlapped = true;
+            var it = self.journals.valueIterator();
+            while (it.next()) |j| j.overlapped = true;
+        }
         self.journals.put(self.allocator, txn_id, fresh) catch |err| {
             self.spare_journal = fresh;
             return err;

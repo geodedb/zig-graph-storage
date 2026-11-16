@@ -974,6 +974,74 @@ pub const BufferPool = struct {
         self.wakeFrameWaiters();
     }
 
+    /// SONNY-6657: committed page images by page, for `discardOpenTxnFrames`.
+    pub const ImageMap = std.AutoHashMapUnmanaged(PageKey, []const u8);
+
+    /// SONNY-6657: throw away the bytes of the open transaction(s) held in
+    /// the pool: every `Hold.open_txn` frame gets back the committed state,
+    /// as crash recovery would rebuild it. A page in `images` (its latest
+    /// committed WAL image after the checkpoint frontier) gets that image,
+    /// stays resident and dirty (the store file may be older), held as
+    /// `.unsynced` when `deferred_sync` (its COMMIT may not be synced yet);
+    /// any other page is dropped from the pool, so the next pin reads it
+    /// from its store file, which held page bytes never reached.
+    ///
+    /// All or nothing: `error.HeldPagePinned` (nothing changed) when a held
+    /// frame is pinned. Caller: the engine's single writer, with the
+    /// transaction's journal unusable (discard-abort).
+    pub fn discardOpenTxnFrames(self: *BufferPool, images: *const ImageMap, deferred_sync: bool) !void {
+        const io = bpio();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.held.items) |idx| {
+            const frame = &self.frames[idx];
+            if (frame.hold != .open_txn) continue;
+            if (@atomicLoad(u32, &frame.pin_count, .acquire) != 0 or frame.writes_in_flight != 0)
+                return error.HeldPagePinned;
+        }
+        var i: usize = 0;
+        while (i < self.held.items.len) {
+            const idx = self.held.items[i];
+            const frame = &self.frames[idx];
+            if (frame.hold != .open_txn) {
+                i += 1;
+                continue;
+            }
+            const key = PageKey{ .file_id = frame.file_id, .page_id = frame.page_id };
+            if (images.get(key)) |img| {
+                const data = frame.dataSlice();
+                std.debug.assert(img.len == data.len);
+                // SEC-0037 (as recovery): never let the page's AES-GCM write
+                // count go back, or a later write would reuse a nonce.
+                const wc = @max(page_mod.readWriteCount(data), page_mod.readWriteCount(img));
+                @memcpy(data, img);
+                const encrypted = if (self.pagers[@intFromEnum(frame.file_id)]) |p| p.encryption != null else false;
+                if (encrypted) page_mod.writeWriteCount(data, wc);
+                @atomicStore(bool, &frame.dirty, true, .monotonic);
+                if (deferred_sync) {
+                    @atomicStore(Hold, &frame.hold, .unsynced, .release);
+                    i += 1;
+                    continue;
+                }
+                @atomicStore(Hold, &frame.hold, .none, .release);
+            } else {
+                self.beginTableWrite();
+                _ = self.page_table.remove(key);
+                self.decrResident(frame.file_id);
+                self.removeFromLru(idx);
+                frame.valid = false;
+                frame.dirty = false;
+                frame.referenced = 0;
+                frame.lsn = 0;
+                @atomicStore(Hold, &frame.hold, .none, .release);
+                self.endTableWrite();
+                self.free_list.appendAssumeCapacity(idx);
+            }
+            _ = self.held.swapRemove(i);
+        }
+        self.wakeFrameWaiters();
+    }
+
     /// SONNY-6648: frames held now (`hold != .none`). Caller-side check for
     /// tests and diagnostics.
     pub fn heldFrameCount(self: *BufferPool) usize {

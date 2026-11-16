@@ -112,6 +112,9 @@ pub const DerivedDigests = struct {
 /// See docs/2026-04-25-shared-engine-thread-pool.md §5.2 and §9.
 pub const default_owned_pool_max_threads: u32 = 4;
 
+/// SONNY-6657: see `GraphEngine.txn_counts_at_begin`.
+pub const TxnCounts = struct { node_count: u64 = 0, edge_count: u64 = 0 };
+
 /// SONNY-6648: a reverse-map (prop_head -> node) change queued before the
 /// derived indexes are hydrated (`GraphEngine.rev_map_pending`).
 pub const RevMapOp = struct {
@@ -126,6 +129,9 @@ pub const RevMapOp = struct {
 /// The engine owns all component structs and coordinates their interactions.
 /// It supports creating new graphs and opening existing ones with crash recovery.
 pub const GraphEngine = struct {
+    /// SONNY-6657: see `engine_undo.DiscardStep`.
+    pub const DiscardStep = engine_undo.DiscardStep;
+
     allocator: Allocator,
     config: GraphConfig,
     graph_uuid: [16]u8,
@@ -228,6 +234,15 @@ pub const GraphEngine = struct {
     /// `error.TestCrashInjected` after applying this many inverses, before
     /// the COMMIT record that ends the undone transaction (a crash mid-abort).
     test_abort_crash_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// SONNY-6657 (tests only): a discard-abort stops with
+    /// `error.TestCrashInjected` after this step.
+    test_discard_crash_at: if (builtin.is_test) ?DiscardStep else void = if (builtin.is_test) null else {},
+    /// SONNY-6657: the manifest node and edge counts when the only open
+    /// transaction began; a discard-abort puts them back.
+    txn_counts_at_begin: TxnCounts = .{},
+    /// SONNY-6657: set while a discard-abort ends its transaction (its
+    /// deferred page frees are dropped, not applied).
+    discarding_txn: bool = false,
     label_index_dirty: bool = true,
     property_index_dirty: bool = true,
     /// PHASE G reverse map: set when a record write moved/added/removed a
@@ -372,6 +387,9 @@ pub const GraphEngine = struct {
         self.rev_map_pending_lost = false;
         self.rev_map_pending_cap = 1 << 16;
         if (builtin.is_test) self.test_abort_crash_after = null;
+        if (builtin.is_test) self.test_discard_crash_at = null;
+        self.txn_counts_at_begin = .{};
+        self.discarding_txn = false;
         // P2: all four dirty flags are true → the clean-snapshot invariant
         // holds vacuously (see the field doc).
         self.derived_snapshots_trusted = true;
@@ -536,6 +554,9 @@ pub const GraphEngine = struct {
         self.rev_map_pending_lost = false;
         self.rev_map_pending_cap = 1 << 16;
         if (builtin.is_test) self.test_abort_crash_after = null;
+        if (builtin.is_test) self.test_discard_crash_at = null;
+        self.txn_counts_at_begin = .{};
+        self.discarding_txn = false;
         // P2: the on-disk snapshots are UNKNOWN until the counter gate runs
         // (they may be crash-stale behind clean dirty flags) — restamping is
         // forbidden until materializeDerivedIndexes establishes the invariant.
@@ -1112,6 +1133,40 @@ pub const GraphEngine = struct {
         }
         self.rev_map_pending.append(self.allocator, op) catch self.dropRevMapPending();
         return true;
+    }
+
+    /// SONNY-6657: a discard-abort put the committed page state back
+    /// (`BufferPool.discardOpenTxnFrames`); restore what is not in pages:
+    /// the store cursors (they may point into a page whose bytes went back),
+    /// the node and edge counts as of the transaction's begin, and the
+    /// derived indexes (rebuilt from the pages; before hydration, the queued
+    /// reverse-map changes include the discarded writes, so it rescans).
+    /// Allocation ids are not given back: they are never reused.
+    pub fn restoreAfterDiscard(self: *GraphEngine) !void {
+        self.prop_store.current_fill_page = null;
+        self.prop_store.last_slab_tombstone = null;
+        self.var_store.current_fill_page = null;
+        self.var_store.last_slab_tombstone = null;
+        inline for (.{ &self.adj_out, &self.adj_in, &self.adj_in_remote }) |s| {
+            s.current_fill_page = null;
+            s.last_slab_tombstone = null;
+        }
+        self.manifest.node_count = self.txn_counts_at_begin.node_count;
+        self.manifest.edge_count = self.txn_counts_at_begin.edge_count;
+        if (self.derived_hydrated.load(.acquire)) {
+            try engine_index.rebuildDerivedIndexes(self);
+            self.markDerivedIndexesDirty();
+            if (self.ordered_property_index.count() > 0) self.ordered_index_stale = true;
+        } else {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            self.derived_hydrate_mutex.lockUncancelable(io);
+            defer self.derived_hydrate_mutex.unlock(io);
+            if (self.derived_hydrated.load(.acquire)) {
+                try engine_index.rebuildDerivedIndexes(self);
+                self.markDerivedIndexesDirty();
+            } else self.dropRevMapPending();
+        }
+        self.markDirty();
     }
 
     fn dropRevMapPending(self: *GraphEngine) void {

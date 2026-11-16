@@ -19,7 +19,11 @@ const node_mod = @import("node.zig");
 const edge_mod = @import("edge.zig");
 const types = @import("types.zig");
 const txn_undo = @import("txn_undo.zig");
-const BufferPool = @import("buffer_pool.zig").BufferPool;
+const buffer_pool_mod = @import("buffer_pool.zig");
+const BufferPool = buffer_pool_mod.BufferPool;
+const PageKey = buffer_pool_mod.PageKey;
+const WalRecord = @import("wal_record.zig").WalRecord;
+const FreeSpaceManager = @import("free_space.zig").FreeSpaceManager;
 
 const GraphEngine = engine_mod.GraphEngine;
 const NodeRec = node_mod.NodeRec;
@@ -220,6 +224,12 @@ pub fn onCommit(ctx: *anyopaque, j: *UndoJournal) void {
 pub fn onTxnBegan(ctx: *anyopaque) void {
     const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
     engine.buffer_pool.beginTxnHold();
+    // SONNY-6657: the counts a discard-abort of this transaction restores
+    // (only meaningful while it is the only one open).
+    if (engine.txn_manager.activeCount() == 1) engine.txn_counts_at_begin = .{
+        .node_count = engine.manifest.node_count,
+        .edge_count = engine.manifest.edge_count,
+    };
 }
 
 /// SONNY-6648: `TxnManager.txn_hook`. A transaction ended. When none is
@@ -236,6 +246,23 @@ pub fn onTxnEnded(ctx: *anyopaque) void {
         .deferred => .after_wal_sync,
     };
     engine.buffer_pool.endTxnHold(how);
+    // SONNY-6657: the page frees made while transactions were open happen
+    // now, unless their writes were discarded or must never reach disk
+    // (then the pages hold live data again, or may: they leak instead).
+    if (engine.txn_manager.activeCount() == 0) {
+        const drop = engine.discarding_txn or how == .keep;
+        for (freeSpaceManagers(engine)) |fsm| {
+            if (drop) fsm.dropDeferredFrees() else fsm.applyDeferredFrees();
+        }
+    }
+}
+
+fn freeSpaceManagers(engine: *GraphEngine) [7]*FreeSpaceManager {
+    return .{
+        &engine.free_space_nodes,  &engine.free_space_adj_out, &engine.free_space_adj_in,
+        &engine.free_space_in_idx, &engine.free_space_in_dir,  &engine.free_space_props,
+        &engine.free_space_var,
+    };
 }
 
 /// SONNY-6648: `BufferPool.wal_sync_hook`.
@@ -267,6 +294,15 @@ pub fn abort(engine: *GraphEngine, txn: u64) !void {
     }
 
     if (j.not_undoable) |reason| {
+        // SONNY-6657: discard the transaction's pages and redo the committed
+        // state instead. An error before anything changed falls through to
+        // failing closed.
+        if (canDiscard(engine, &j)) {
+            if (discardAbort(engine, txn)) |_| return else |err| switch (err) {
+                error.TestCrashInjected, error.AbortNotUndone => return err,
+                else => std.log.warn("graph-storage: discarding aborted transaction {d} was not possible ({s}) (SONNY-6657)", .{ txn, @errorName(err) }),
+            }
+        }
         // SONNY-6648: poison (fail_closed) BEFORE the transaction ends, so
         // its pages stay held (`onTxnEnded`).
         const refused = refuse(engine, reason);
@@ -301,6 +337,18 @@ pub fn abort(engine: *GraphEngine, txn: u64) !void {
     };
     engine.metrics.txn_aborts_undone += 1;
 }
+
+/// SONNY-6657: the steps of a discard-abort a test can stop after
+/// (`GraphEngine.test_discard_crash_at`), as a process dying there would.
+pub const DiscardStep = enum {
+    /// Before anything was changed.
+    before_discard,
+    /// The pages were discarded and redone, the in-memory state restored;
+    /// no ABORT record yet.
+    after_redo,
+    /// The ABORT record was written.
+    after_abort_record,
+};
 
 /// SONNY-6648 (tests only): stop the abort after `applied` inverses, as a
 /// process dying there would (see `GraphEngine.test_abort_crash_after`).
@@ -347,6 +395,88 @@ pub fn abortFailedWrite(engine: *GraphEngine, txn: u64) void {
         }
     }
     engine.txn_manager.abort(txn) catch {};
+}
+
+/// SONNY-6657: whether `txn`'s abort may discard its pages. Its pages are
+/// held off disk (SONNY-6648), so the state before it is the store files
+/// plus the committed WAL images: what crash recovery rebuilds. Only when no
+/// other transaction was open at any time during it (a held page could carry
+/// that one's bytes), the engine is not poisoned, and the policy is
+/// `fail_closed` (`keep_writes` asks for the writes to stay).
+fn canDiscard(engine: *const GraphEngine, j: *const UndoJournal) bool {
+    return !j.overlapped and engine.abort_not_undone == null and
+        engine.config.abort_undo == .fail_closed and !engine.read_only;
+}
+
+/// SONNY-6657: abort `txn` by discarding its pages and redoing the committed
+/// state (see `canDiscard`): every held page gets its latest committed WAL
+/// image after the checkpoint frontier, or is reloaded from its store file;
+/// the counts, store cursors and derived indexes are restored; then the
+/// ABORT record. Nothing durable is written before that record, and the
+/// transaction never committed, so a crash at any step recovers the state
+/// before it. Errors before the pages changed leave everything as it was.
+fn discardAbort(engine: *GraphEngine, txn: u64) !void {
+    try testDiscardPoint(engine, .before_discard);
+    const alloc = engine.allocator;
+    const records = try engine.wal.readFrom(engine.manifest.last_checkpoint_lsn + 1, alloc);
+    defer {
+        for (records) |*r| r.deinit(alloc);
+        alloc.free(records);
+    }
+    var images: BufferPool.ImageMap = .empty;
+    defer images.deinit(alloc);
+    try collectCommittedImages(alloc, records, engine.buffer_pool.page_size, &images);
+    try engine.buffer_pool.discardOpenTxnFrames(&images, engine.txn_manager.sync_mode == .deferred);
+
+    // From here the pages hold the committed state; the journal is not used.
+    engine.restoreAfterDiscard() catch |err| {
+        engine.abort_not_undone = .undo_failed;
+        engine.txn_manager.abort(txn) catch {};
+        std.log.warn("graph-storage: restoring state after discarding transaction {d} failed ({s}); refusing further writes and checkpoints (SONNY-6657)", .{ txn, @errorName(err) });
+        return error.AbortNotUndone;
+    };
+    try testDiscardPoint(engine, .after_redo);
+    engine.discarding_txn = true;
+    defer engine.discarding_txn = false;
+    engine.txn_manager.abort(txn) catch |err| {
+        engine.abort_not_undone = .undo_failed;
+        std.log.warn("graph-storage: ending discarded transaction {d} failed ({s}); refusing further writes and checkpoints (SONNY-6657)", .{ txn, @errorName(err) });
+        return error.AbortNotUndone;
+    };
+    engine.metrics.txn_aborts_discarded += 1;
+    try testDiscardPoint(engine, .after_abort_record);
+}
+
+/// SONNY-6657: the latest committed image of each page in `records` (the
+/// WAL after the checkpoint frontier). Records may be out of LSN order
+/// (SONNY-6473): the highest LSN wins. Cross-shard records have their own
+/// commit rule: refuse rather than guess.
+fn collectCommittedImages(alloc: std.mem.Allocator, records: []const WalRecord, page_size: u32, images: *BufferPool.ImageMap) !void {
+    var committed: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer committed.deinit(alloc);
+    for (records) |r| switch (r.record_type) {
+        .commit_txn => try committed.put(alloc, r.txn_id, {}),
+        .cross_shard_prepare, .cross_shard_commit, .cross_shard_abort => return error.CrossShardRecordsInTail,
+        else => {},
+    };
+    var lsns: std.AutoHashMapUnmanaged(PageKey, u64) = .empty;
+    defer lsns.deinit(alloc);
+    for (records) |r| {
+        if (r.record_type != .page_update or !committed.contains(r.txn_id)) continue;
+        if (r.payload.len != page_size) return error.DataCorruption;
+        const key = PageKey{ .file_id = std.enums.fromInt(types.FileId, r.file_id) orelse return error.DataCorruption, .page_id = r.page_id };
+        const gop = try lsns.getOrPut(alloc, key);
+        if (gop.found_existing and gop.value_ptr.* > r.lsn) continue;
+        gop.value_ptr.* = r.lsn;
+        try images.put(alloc, key, r.payload);
+    }
+}
+
+fn testDiscardPoint(engine: *const GraphEngine, step: DiscardStep) error{TestCrashInjected}!void {
+    if (comptime !builtin.is_test) return;
+    if (engine.test_discard_crash_at) |s| {
+        if (s == step) return error.TestCrashInjected;
+    }
 }
 
 fn refuse(engine: *GraphEngine, reason: Reason) !void {

@@ -405,6 +405,10 @@ test "SONNY-6529: an abort that cannot undo a write fails closed and the write i
         const page = (try eng.adj_out.updateEdgePropHead(ra.out_head, base.ab, h)).?;
         try eng.logPagePublic(txn, .adj_out, page);
         try eng.edge_index.updatePropHead(base.ab, h);
+        // SONNY-6657: another transaction was open meanwhile, so the abort
+        // cannot discard the pages instead (they could carry its bytes).
+        const other = try eng.beginTxn();
+        try eng.commitTxn(other);
         try testing.expectError(error.AbortNotUndone, eng.abortTxn(txn));
         try testing.expectEqual(@as(u64, 1), eng.metrics.txn_aborts_not_undone);
 
@@ -418,6 +422,36 @@ test "SONNY-6529: an abort that cannot undo a write fails closed and the write i
     const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
     defer eng.close() catch {};
     try expectBase(eng, alloc, &base, "after a refused abort and reopen");
+}
+
+test "SONNY-6657: the same abort with no other transaction open discards its pages and the engine stays writable" {
+    const alloc = testing.allocator;
+    var td = try test_support.TestDataDir.init(alloc);
+    defer td.deinit();
+    const uuid = uuidFor(40);
+    const cfg = test_support.testConfig();
+
+    var base: Base = undefined;
+    {
+        const eng = try GraphEngine.create(alloc, td.path, uuid, cfg);
+        errdefer eng.deinit();
+        base = try buildBase(eng);
+        const txn = try eng.beginTxn();
+        const ra = (try eng.getNode(base.a)).?;
+        const h = try eng.putPropertyTxn(0, "w", .{ .int = 99 }, txn);
+        const page = (try eng.adj_out.updateEdgePropHead(ra.out_head, base.ab, h)).?;
+        try eng.logPagePublic(txn, .adj_out, page);
+        try eng.edge_index.updatePropHead(base.ab, h);
+        try eng.abortTxn(txn);
+        try testing.expectEqual(@as(u64, 1), eng.metrics.txn_aborts_discarded);
+        try testing.expectEqual(@as(u64, 0), eng.metrics.txn_aborts_not_undone);
+        try expectBase(eng, alloc, &base, "after a discard-abort");
+        try eng.checkpoint();
+        eng.deinit(); // crash
+    }
+    const eng = try GraphEngine.open(alloc, td.path, uuid, cfg);
+    defer eng.close() catch {};
+    try expectBase(eng, alloc, &base, "after a discard-abort, checkpoint and crash");
 }
 
 test "SONNY-6529: abort_undo = .keep_writes keeps a write it cannot undo, as before, and stays writable" {
