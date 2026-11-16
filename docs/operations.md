@@ -114,7 +114,7 @@ the same way, in memory only (no other transaction can have committed in
 between, so nothing durable carries it), which also works when the failure
 was running out of memory.
 
-An open transaction's bytes never reach the store files (no-steal, 0.4.24,
+An open transaction's bytes never reach the store files (no-steal, 0.4.23,
 SONNY-6648). Recovery redoes committed transactions only and has no undo, so
 while any transaction is open on an engine:
 

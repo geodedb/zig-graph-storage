@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.23] - 2026-11-16
+
 ### Fixed
 
 - The bytes of a transaction that had not ended could reach the store
@@ -759,7 +761,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.23...HEAD
+[0.4.23]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...v0.4.23
 [0.4.22]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.21...v0.4.22
 [0.4.21]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.20...v0.4.21
 [0.4.20]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.18...v0.4.20
