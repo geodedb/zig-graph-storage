@@ -43,6 +43,7 @@ pub fn journalFor(engine: *GraphEngine, txn: u64) ?*UndoJournal {
 /// mutates anything (see `UndoJournal.reserve`). An out-of-memory error
 /// fails the write cleanly.
 pub fn reserve(engine: *GraphEngine, txn: u64) !void {
+    engine.current_write_txn = txn; // SONNY-6659: whose fill pages to use
     const j = journalFor(engine, txn) orelse return;
     try j.reserve(engine.allocator);
 }
@@ -159,6 +160,7 @@ pub fn recordLabel(engine: *GraphEngine, txn: u64, node: NodeId, label: u32, add
 /// until handed to `notePropertyWrite`). Null for a new chain, a chain the
 /// transaction created, a legacy chain, or when nothing is journaled.
 pub fn capturePropertyChain(engine: *GraphEngine, txn: u64, owner: u64) !?[]u8 {
+    engine.current_write_txn = txn; // SONNY-6659: whose fill pages to use
     const j = journalFor(engine, txn) orelse return null;
     try j.reserve(engine.allocator);
     // SONNY-6558: room for the overflow chains this write may release (at
@@ -237,8 +239,9 @@ pub fn onTxnBegan(ctx: *anyopaque) void {
 /// after a WAL sync under deferred commits. After an abort that could not
 /// undo its writes (the engine is poisoned, set BEFORE the transaction is
 /// ended) they stay held: those bytes must never reach disk.
-pub fn onTxnEnded(ctx: *anyopaque) void {
+pub fn onTxnEnded(ctx: *anyopaque, txn: u64) void {
     const engine: *GraphEngine = @ptrCast(@alignCast(ctx));
+    engine.releaseTxnPlacement(txn);
     const how: BufferPool.TxnEnd = if (engine.abort_not_undone != null)
         .keep
     else switch (engine.txn_manager.sync_mode) {
@@ -250,6 +253,11 @@ pub fn onTxnEnded(ctx: *anyopaque) void {
     // now, unless their writes were discarded or must never reach disk
     // (then the pages hold live data again, or may: they leak instead).
     if (engine.txn_manager.activeCount() == 0) {
+        // SONNY-6659: no open transaction has bytes on any page now.
+        if (engine.page_writers.capacity() > 1 << 16)
+            engine.page_writers.clearAndFree(engine.allocator)
+        else
+            engine.page_writers.clearRetainingCapacity();
         const drop = engine.discarding_txn or how == .keep;
         for (freeSpaceManagers(engine)) |fsm| {
             if (drop) fsm.dropDeferredFrees() else fsm.applyDeferredFrees();
@@ -291,6 +299,36 @@ pub fn abort(engine: *GraphEngine, txn: u64) !void {
         // Already failed closed: no inverse may be logged now.
         try engine.txn_manager.abort(txn);
         return error.AbortNotUndone;
+    }
+
+    // SONNY-6659: another transaction was open while this one was (and a
+    // write of this one may have been refused on a page that one had
+    // written, leaving unlogged bytes). Undo in memory only and end with
+    // ABORT: none of its records commits, its pages never reached disk
+    // (no-steal), and no committed image can carry its bytes, because a
+    // page has one open writer (`GraphEngine.claimPage`). Logging the
+    // inverses instead would image pages the other transaction may also
+    // have bytes on, and be refused.
+    if ((j.conflict or j.overlapped) and j.not_undoable == null) {
+        engine.undo_applying = true;
+        engine.undo_no_log = true;
+        defer {
+            engine.undo_applying = false;
+            engine.undo_no_log = false;
+        }
+        var k = j.records.items.len;
+        while (k > 0) {
+            k -= 1;
+            applyOne(engine, txn, j.records.items[k]) catch |err| {
+                engine.abort_not_undone = .undo_failed;
+                engine.txn_manager.abort(txn) catch {};
+                std.log.warn("graph-storage: undoing refused transaction {d} failed ({s}); refusing further writes and checkpoints (SONNY-6659)", .{ txn, @errorName(err) });
+                return error.AbortNotUndone;
+            };
+        }
+        try engine.txn_manager.abort(txn);
+        engine.metrics.txn_aborts_undone += 1;
+        return;
     }
 
     if (j.not_undoable) |reason| {

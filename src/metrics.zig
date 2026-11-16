@@ -33,6 +33,9 @@ pub const Metrics = struct {
     /// discarding the transaction's pages and redoing the committed state
     /// (a subset of `txn_aborted`).
     txn_aborts_discarded: u64 = 0,
+    /// SONNY-6659: writes refused because another open transaction had
+    /// already written the page (`error.WriteConflict`).
+    write_conflicts: u64 = 0,
     /// SONNY-6648: checkpoints that did nothing because a transaction was
     /// open (its pages must not reach disk); the next one after it ends runs.
     checkpoints_deferred: u64 = 0,

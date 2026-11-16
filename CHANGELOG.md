@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.25] - 2026-11-16
+
+### Fixed
+
+- A full-page WAL image committed by one transaction carried the bytes of
+  another transaction still open on the same page, and recovery restored
+  them after a crash: an uncommitted write became durable (SONNY-2979
+  probe). A page now has one open writer: a second open transaction's write
+  to it fails with `error.WriteConflict` before its image is logged
+  (`Metrics.write_conflicts`); that transaction cannot commit and its abort
+  undoes it in memory, and while its bytes are on the page the first
+  writer's writes there are refused too. A transaction that overlapped
+  another is aborted in memory (ABORT record, no inverse images). Callers
+  that kept two transactions open on one engine and wrote the same page
+  now get the error instead of silent corruption. Unrelated writes do not
+  conflict: each open transaction fills slab pages of its own, and the new
+  `allocNodeTxn` (GraphEngine, ShardedGraphEngine) gives it node ids from
+  its own node page (SONNY-6659).
+
 ## [0.4.24] - 2026-11-16
 
 ### Fixed
@@ -782,7 +801,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.24...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.25...HEAD
+[0.4.25]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.24...v0.4.25
 [0.4.24]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.23...v0.4.24
 [0.4.23]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.22...v0.4.23
 [0.4.22]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.21...v0.4.22

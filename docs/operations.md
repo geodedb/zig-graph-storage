@@ -153,10 +153,33 @@ nothing else it could evict (`Metrics.evict_wal_syncs`, also counting the
 sync a checkpoint makes first), so disk never holds part of a transaction
 the log lost.
 
-Known limit: a page another transaction commits while this one is still
-open carries this one's uncommitted bytes in its full-page image, and
-recovery replays that image. Keep one transaction open per engine at a time
-(geode opens at most one statement transaction per shard).
+A page has at most one open writer (SONNY-6659). The WAL holds full-page
+images, so an image taken by one transaction carries every other open
+transaction's bytes on that page, and recovery would replay them. A write by
+a second open transaction to a page another open one has written therefore
+fails with `error.WriteConflict` (`Metrics.write_conflicts`) before its image
+is logged: that transaction cannot commit (`commitTxn` returns the same
+error) and must be aborted, which undoes it in memory. While its bytes are on
+the page, the first writer's writes to it are refused too, so abort the
+refused transaction first; then end the first one (or let it continue) and
+retry. A transaction that overlapped another is always aborted in memory
+(nothing it wrote was committed or reached disk). There is no waiting: the
+engine has one writer, so blocking would deadlock it.
+
+Unrelated writes of concurrent transactions do not share pages: each open
+transaction appends properties, labels and adjacency entries to slab fill
+pages of its own (an ended one's partly filled pages are reused by the next),
+and `allocNodeTxn` (also on `ShardedGraphEngine`, by transaction id) gives it
+node ids from a node page of its own. Measured: 8 interleaved transactions
+creating 40 nodes each with a property, a label and an edge used 40 pages
+against 16 serially (3 more per transaction) and conflicted 0 times. What
+still conflicts is a page that holds records of both transactions: two
+updates of existing nodes on one node page (8 transactions updating random
+nodes of a 100-page graph: 55 conflicts in 570 writes), an in-place update
+of existing property or label chains in one slab block, an edge to or from
+another transaction's node (it writes that node's record), co-located
+in-edges whose destinations share an `in_dir` page, and nodes created with
+plain `allocNode` while another transaction is open.
 
 ---
 

@@ -119,6 +119,15 @@ pub const PageKey = struct {
     page_id: PageId,
 };
 
+/// SONNY-6659: where a slab store takes its fill page from (the engine gives
+/// each open transaction its own, so unrelated writers never share a page).
+/// Keyed by the store's file. Without a hook a store keeps one cursor.
+pub const FillHook = struct {
+    ctx: *anyopaque,
+    get: *const fn (ctx: *anyopaque, file: FileId) ?PageId,
+    set: *const fn (ctx: *anyopaque, file: FileId, page: ?PageId) void,
+};
+
 /// LRU buffer pool that caches pages in memory with dirty tracking and eviction.
 pub const BufferPool = struct {
     allocator: Allocator,

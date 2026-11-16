@@ -518,6 +518,15 @@ pub const ShardedGraphEngine = struct {
         return self.shards[idx].allocNode();
     }
 
+    /// SONNY-6659: a node id on the shard of `txn` (a `beginTxn` id), from a
+    /// node page of the transaction's own while others are open on that
+    /// shard (see `GraphEngine.allocNodeTxn`). Callers that create nodes
+    /// inside a transaction should use this instead of `allocNode`.
+    pub fn allocNodeTxn(self: *ShardedGraphEngine, txn: TxnId) anyerror!NodeId {
+        const d = decodeTxn(txn);
+        return self.shards[d.shard].allocNodeTxn(d.local);
+    }
+
     pub fn deleteNode(self: *ShardedGraphEngine, id: NodeId) anyerror!void {
         return self.shards[shard_count_mod.shardOfNode(id)].deleteNode(id);
     }

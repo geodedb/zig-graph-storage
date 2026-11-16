@@ -201,14 +201,21 @@ test "Phase 3: crash tail reconcile excludes uncommitted txns AND == full rebuil
         // pages no committed tail txn images below — so recovery observes U's
         // records (M's commits fsync the shared WAL) and DISCARDS them. A wrong
         // reconcile that applied U would leak GHOST_LABEL into the label index.
+        //
+        // SONNY-6659: M runs BEFORE U opens. M's label/property writes share
+        // slab fill pages with U's, and a page now has one open writer, so M
+        // could not write them while U is open (its image would carry U's
+        // bytes). The discipline is unchanged: the WAL holds committed M and
+        // uncommitted U; recovery replays M and discards U.
+        // COMMITTED tail M (auto-commit → fsyncs the WAL). Its new node lands on
+        // page 3; deletes/edits stay on page 0 / props / adj — none touch page 1
+        // (the far node's page).
+        xinfo = try applyTailM(eng, s);
+
         const txn_u = try eng.beginTxn();
         try eng.addLabelTxn(far, GHOST_LABEL, txn_u);
-        // ... no commitTxn(txn_u) — U is abandoned by the crash.
-
-        // COMMITTED tail M (auto-commit → fsyncs the WAL, flushing U's records).
-        // Its new node lands on page 3; deletes/edits stay on page 0 / props /
-        // adj — none touch page 1 (the far node's page).
-        xinfo = try applyTailM(eng, s);
+        // ... no commitTxn(txn_u) — U is abandoned by the crash; recovery
+        // discards whatever of it reached the log (no COMMIT record).
 
         // SIMULATED CRASH (deinit): no checkpoint, no close. The fsynced WAL
         // carries committed M AND uncommitted U; recovery replays M and discards
