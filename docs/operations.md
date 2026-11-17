@@ -387,7 +387,14 @@ freed without being cleared, so a superseded value stays in `props.store` /
 `scrubDeadSpace()` (on `GraphEngine` or `ShardedGraphEngine`) overwrites
 it in one logged transaction while no transaction is open; checkpoint after
 it to write the cleared pages and truncate the WAL that holds the old
-images.
+images. Since SONNY-6700 it first proves ownership by walking every live
+node (properties, labels) and out-edge (properties), following overflowed
+values into the var store, and aborts unchanged if any reference does not
+resolve. It then also clears freed runs in var-store slab blocks (labels,
+small values), tombstones slab slots no live record references, and zeroes
+and frees allocated pages no live record owns (leaks, crash leftovers). Run
+it with every writer excluded: a head a writer has not yet stored in a
+record is owned by nobody.
 
 Not encrypted, and why (SONNY-6635):
 
