@@ -165,7 +165,7 @@ pub const Metrics = metrics.Metrics;
 /// SONNY-6692: what `scrubDeadSpace` cleared.
 pub const ScrubReport = @import("engine_scrub.zig").ScrubReport;
 
-pub const version = "0.4.28";
+pub const version = "0.4.29";
 
 // ============================================================================
 // Unit Tests
@@ -186,7 +186,7 @@ test "re-exported types match source types" {
 }
 
 test "version is set" {
-    try std.testing.expectEqualStrings("0.4.28", version);
+    try std.testing.expectEqualStrings("0.4.29", version);
 }
 
 test {

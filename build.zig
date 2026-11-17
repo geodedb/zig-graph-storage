@@ -785,6 +785,16 @@ fn addIntegrationTests(
     const run_sonny6648 = b.addRunArtifact(sonny6648_tests);
     sonny6648_step.dependOn(&run_sonny6648.step);
 
+    // SONNY-6716: committed transactions must not exhaust a small buffer pool.
+    const sonny6716_step = b.step("test-sonny6716-pool-exhaustion", "Run SONNY-6716 tests: a long run of committed transactions outgrows a small buffer pool without BufferPoolFull; one transaction larger than the pool fails cleanly");
+    const sonny6716_tests = b.addTest(.{
+        .root_module = createModule(b, "tests/sonny6716_pool_exhaustion.zig", target, optimize, &.{
+            .{ .name = "graph_storage", .module = graph_storage_mod },
+        }),
+    });
+    const run_sonny6716 = b.addRunArtifact(sonny6716_tests);
+    sonny6716_step.dependOn(&run_sonny6716.step);
+
     // SONNY-6648: node writes made before the derived indexes are hydrated
     // reach the reverse map (committed, aborted, crash, queue overflow).
     const sonny6648_rev_step = b.step("test-sonny6648-rev-map", "Run SONNY-6648 reverse-map tests: node writes before hydration (committed, aborted, crashed) reach the reverse map");
