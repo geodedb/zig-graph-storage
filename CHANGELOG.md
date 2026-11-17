@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.27] - 2026-11-17
+
+### Security
+
+- Superseded property values stayed on disk until their space was reused:
+  a write that does not fit a record's slab slot moves the blob and
+  tombstones the old slot with its bytes intact (an open transaction's
+  undo reads them), and a value larger than a property page spills to a
+  var-store chain whose pages are freed without being cleared. New
+  `GraphEngine.scrubDeadSpace` / `ShardedGraphEngine.scrubDeadSpace`
+  overwrite that dead space in one logged transaction: the body of every
+  free property and var-store page that holds anything, and every byte of
+  an allocated slab page that no slot holds (pages of live legacy chains
+  are excluded; a page that does not validate as a slab page is left
+  alone). The next checkpoint writes the cleared pages and truncates the
+  WAL that held the old images. Refused while a transaction is open
+  (`error.TransactionsOpen`). Returns a `ScrubReport` (SONNY-6692).
+
 ## [0.4.26] - 2026-11-16
 
 ### Security
@@ -836,7 +854,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.26...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.27...HEAD
+[0.4.27]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.26...v0.4.27
 [0.4.26]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.25...v0.4.26
 [0.4.25]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.24...v0.4.25
 [0.4.24]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.23...v0.4.24
