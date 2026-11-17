@@ -468,55 +468,65 @@ pub const PropStore = struct {
         }
     }
 
-    /// SONNY-6692: zero the bytes of slab page `page_id` that no slot holds
-    /// (tombstoned blobs: a replaced or removed record's old properties, kept
-    /// for an open transaction's undo, and gaps). Live slots, the slot
-    /// directory and the page header are untouched. Returns the bytes changed
-    /// (0 also when the page does not validate as a slab page, which is left
-    /// as it is). Only while no transaction is open: a tombstone's undo reads
-    /// those bytes (`undoLastSlabTombstone`). The caller WAL-images the page
-    /// when this returns non-zero.
-    pub fn scrubDeadSlabBytes(self: *PropStore, page_id: PageId) !u64 {
+    /// SONNY-6700: the shared fill page new slab blobs append to (no
+    /// transaction open: the engine's shared placement).
+    pub fn currentFillPage(self: *const PropStore) ?PageId {
+        return self.fillPage();
+    }
+
+    /// SONNY-6700: scrub slab page `page_id` given the slots live records
+    /// own (`live`, from the ownership walk): every other slot that still
+    /// has a length (an orphaned copy) is tombstoned, and every byte no live
+    /// slot holds is zeroed. A live slot that is not live in the directory,
+    /// or a page that does not validate as a slab page, is an inconsistency
+    /// in the walk: `error.DataCorruption`, nothing changed. Returns the
+    /// bytes changed. Only while no transaction is open.
+    pub fn scrubSlabPageOwned(self: *PropStore, page_id: PageId, live: []const u32) !u64 {
         const frame = try self.buffer_pool.pin(.props, page_id);
         const frame_idx = self.buffer_pool.frameIndex(frame);
         var dirty = false;
         defer self.buffer_pool.unpin(frame_idx, dirty);
         const data = self.logical(frame.dataSlice());
-        if (data.len < SLAB_DATA_OFFSET + SLAB_SLOT_COUNT_SIZE) return 0;
-        if (data[SLAB_META_OFFSET] != SLAB_LAYOUT_VERSION) return 0;
+        if (data.len < SLAB_DATA_OFFSET + SLAB_SLOT_COUNT_SIZE) return error.DataCorruption;
+        if (data[SLAB_META_OFFSET] != SLAB_LAYOUT_VERSION) return error.DataCorruption;
         const count = readSlabSlotCount(data);
         const max_slots = (data.len - SLAB_DATA_OFFSET - SLAB_SLOT_COUNT_SIZE) / SLAB_SLOT_SIZE;
-        if (count > max_slots) return 0;
+        if (count > max_slots) return error.DataCorruption;
         const dir_start = data.len - SLAB_SLOT_COUNT_SIZE - @as(usize, count) * SLAB_SLOT_SIZE;
-        // Every slot with a length is live; validate them all first, so a
-        // page that is not a slab page is never written.
+        for (live) |slot_idx| {
+            if (slot_idx >= count) return error.DataCorruption;
+            const slot = readSlabSlot(data, slot_idx);
+            if (slot.len == 0 or slot.offset < SLAB_DATA_OFFSET or @as(usize, slot.offset) + slot.len > dir_start) return error.DataCorruption;
+        }
+        var changed: u64 = 0;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
+            if (std.mem.indexOfScalar(u32, live, i) != null) continue;
             const slot = readSlabSlot(data, i);
             if (slot.len == 0) continue;
-            if (slot.offset < SLAB_DATA_OFFSET or @as(usize, slot.offset) + slot.len > dir_start) return 0;
+            writeSlabSlot(data, i, slot.offset, 0);
+            changed += 1;
         }
-        var zeroed: u64 = 0;
         var pos: usize = SLAB_DATA_OFFSET;
         while (pos < dir_start) : (pos += 1) {
-            if (data[pos] == 0) continue;
-            var live = false;
-            i = 0;
-            while (i < count) : (i += 1) {
-                const slot = readSlabSlot(data, i);
-                if (slot.len != 0 and pos >= slot.offset and pos < @as(usize, slot.offset) + slot.len) {
-                    live = true;
-                    // Skip to the end of this live blob.
-                    pos = @as(usize, slot.offset) + slot.len - 1;
+            var held_until: ?usize = null;
+            for (live) |slot_idx| {
+                const slot = readSlabSlot(data, slot_idx);
+                if (pos >= slot.offset and pos < @as(usize, slot.offset) + slot.len) {
+                    held_until = @as(usize, slot.offset) + slot.len;
                     break;
                 }
             }
-            if (live) continue;
+            if (held_until) |end| {
+                pos = end - 1;
+                continue;
+            }
+            if (data[pos] == 0) continue;
             data[pos] = 0;
-            zeroed += 1;
+            changed += 1;
         }
-        dirty = zeroed != 0;
-        return zeroed;
+        dirty = changed != 0;
+        return changed;
     }
 
     /// SONNY-6692: the pages of the legacy (one-page-per-node) chain at
@@ -1383,6 +1393,10 @@ pub const PropStore = struct {
         /// from `store.buffer_pool.allocator`, reused per `next()` and freed
         /// by `deinit()`. Null while no overflowed entry has been yielded.
         scratch: ?[]u8 = null,
+        /// SONNY-6700: the var-store ref of the entry `next` returned last
+        /// when its value is an OVERFLOW STUB (null for an inline value): the
+        /// var-store pages that entry owns.
+        last_var_ref: ?u64 = null,
 
         pub fn deinit(self: *PropIterator) void {
             if (self.current_frame_idx) |idx| {
@@ -1405,9 +1419,11 @@ pub const PropStore = struct {
         /// The previous scratch buffer is released only AFTER the new read
         /// succeeds, so a failed resolve cannot dangle the last yielded slice.
         fn resolveValue(self: *PropIterator, raw: []const u8) ![]const u8 {
+            self.last_var_ref = null;
             if (!property_mod.isOverflowStub(raw)) return raw;
             const alloc = self.store.buffer_pool.allocator;
             const stub = property_mod.readOverflowStub(raw) catch return error.DataCorruption;
+            self.last_var_ref = stub.var_ref;
             const real = try self.store.var_store.read(stub.var_ref, alloc);
             errdefer alloc.free(real);
             if (real.len != stub.encoded_len) return error.DataCorruption;

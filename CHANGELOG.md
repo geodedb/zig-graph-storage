@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.28] - 2026-11-17
+
+### Security
+
+- `scrubDeadSpace` left two kinds of dead space: freed runs in var-store
+  slab blocks (labels and small values written to the var store) and
+  allocated pages no live record owns (a leak or a crash leftover). It now
+  proves ownership first: it walks every live node (property chain, labels)
+  and each out-edge (property chain), following every overflowed value into
+  the var store, and aborts before changing anything if a reference does
+  not resolve. Owned property slab pages and var-store slab blocks have the
+  slots no live record references tombstoned and every byte no live slot
+  holds zeroed; the shared fill page and block are emptied the same way;
+  every other allocated property or var-store page is zeroed and freed.
+  Pages of live legacy chains are never touched. `ScrubReport` gains
+  `var_slab_blocks_scrubbed`, `var_slab_bytes_zeroed` and
+  `orphan_pages_freed`. The caller must exclude every writer for the
+  duration (SONNY-6700).
+
+### Removed
+
+- `PropStore.scrubDeadSlabBytes` (superseded by
+  `PropStore.scrubSlabPageOwned`, which scrubs against the ownership walk's
+  live slots) (SONNY-6700).
+
 ## [0.4.27] - 2026-11-17
 
 ### Security
@@ -854,7 +879,8 @@ build concurrent structures on top of the engine.
 - Migration tooling
 - Backup/restore primitives
 
-[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.27...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.28...HEAD
+[0.4.28]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.27...v0.4.28
 [0.4.27]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.26...v0.4.27
 [0.4.26]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.25...v0.4.26
 [0.4.25]: https://gitlab.com/devnw/zig/graph-storage/-/compare/v0.4.24...v0.4.25

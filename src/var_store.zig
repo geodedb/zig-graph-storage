@@ -517,6 +517,72 @@ pub const VarStore = struct {
         return out;
     }
 
+    /// SONNY-6700: the shared fill block new slab runs append to (no
+    /// transaction open: the engine's shared placement).
+    pub fn currentFillPage(self: *const VarStore) ?PageId {
+        return self.fillPage();
+    }
+
+    /// SONNY-6700: the pages of the legacy chain `ref` (nothing for a slab
+    /// head or 0), added to `out`.
+    pub fn appendChainPages(self: *VarStore, allocator: Allocator, ref: u64, out: *std.AutoHashMapUnmanaged(PageId, void)) !void {
+        if (ref == 0 or isSlabHead(ref)) return;
+        var page = refFirstPage(ref);
+        var hops: u32 = 0;
+        while (page != 0) : (hops += 1) {
+            if (hops >= 100_000) return error.CircularChainDetected;
+            if ((try out.getOrPut(allocator, page)).found_existing) return;
+            page = try self.nextChainPage(page);
+        }
+    }
+
+    /// SONNY-6700: scrub slab block `page_id` given the slots live records
+    /// own (`live`): every other slot still pointing at a run is tombstoned,
+    /// and every byte of the run region no live slot holds is zeroed. A live
+    /// slot that does not resolve, or a block that does not validate, is an
+    /// inconsistency in the walk: `error.DataCorruption`, nothing changed.
+    /// Returns the bytes changed. Only while no transaction is open (a
+    /// tombstone's undo reads the run).
+    pub fn scrubSlabBlockOwned(self: *VarStore, page_id: PageId, live: []const u32) !u64 {
+        const frame = try self.buffer_pool.pin(.var_store, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        var dirty = false;
+        defer self.buffer_pool.unpin(frame_idx, dirty);
+        const data = frame.dataSlice();
+        const slot_count = try self.readSlabBlockHeader(data);
+        const dir_start = varSlabDirStart(data.len, self.tail_reserve, slot_count);
+        for (live) |slot_idx| _ = try self.resolveSlabRun(data, slot_idx);
+        var changed: u64 = 0;
+        var i: u32 = 0;
+        while (i < slot_count) : (i += 1) {
+            if (std.mem.indexOfScalar(u32, live, i) != null) continue;
+            const s = readVarSlabSlot(data, self.tail_reserve, i);
+            if (s.offset == VAR_SLAB_SLOT_TOMBSTONE) continue;
+            writeVarSlabSlot(data, self.tail_reserve, i, .{ .offset = VAR_SLAB_SLOT_TOMBSTONE, .byte_len = 0 });
+            changed += 1;
+        }
+        var pos: usize = VAR_SLAB_RUNS_OFFSET;
+        while (pos < dir_start) : (pos += 1) {
+            var held_until: ?usize = null;
+            for (live) |slot_idx| {
+                const s = readVarSlabSlot(data, self.tail_reserve, slot_idx);
+                if (pos >= s.offset and pos < @as(usize, s.offset) + s.byte_len) {
+                    held_until = @as(usize, s.offset) + s.byte_len;
+                    break;
+                }
+            }
+            if (held_until) |end| {
+                pos = end - 1;
+                continue;
+            }
+            if (data[pos] == 0) continue;
+            data[pos] = 0;
+            changed += 1;
+        }
+        dirty = changed != 0;
+        return changed;
+    }
+
     /// Parse + validate the header of a SLAB block reached via a tagged head.
     /// Rejects loudly (mirrors adj_store.readSlabBlockHeader): wrong marker (a
     /// tagged head must land on a slab block, and a legacy chain walk that
