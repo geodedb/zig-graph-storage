@@ -60,8 +60,38 @@ pub const ScrubReport = struct {
 pub fn scrubDeadSpace(engine: *GraphEngine) !ScrubReport {
     if (engine.txn_manager.activeCount() != 0) return error.TransactionsOpen;
 
-    // Not implemented yet: nothing is cleared.
-    return .{};
+    var report: ScrubReport = .{};
+    var legacy: std.AutoHashMapUnmanaged(PageId, void) = .empty;
+    defer legacy.deinit(engine.allocator);
+    try collectLiveLegacyPropPages(engine, &legacy);
+
+    const txn = try engine.beginTxn();
+    var committed = false;
+    errdefer if (!committed) engine.abortTxn(txn) catch {};
+    // The pages are changed directly, not through an undoable store op.
+    engine_undo.markNotUndoable(engine, txn, .caller_page_image);
+
+    try zeroFreePages(engine, txn, .props, &engine.free_space_props, &report);
+    try zeroFreePages(engine, txn, .var_store, &engine.free_space_var, &report);
+
+    const props_pages = try filePages(engine, .props, &engine.free_space_props);
+    var page: PageId = 1;
+    while (page < props_pages) : (page += 1) {
+        if (!engine.free_space_props.isAllocated(page)) continue;
+        if (legacy.contains(page)) continue;
+        const zeroed = try engine.prop_store.scrubDeadSlabBytes(page);
+        if (zeroed == 0) continue;
+        try engine.logPage(txn, .props, page);
+        report.slab_pages_scrubbed += 1;
+        report.slab_bytes_zeroed += zeroed;
+    }
+
+    try engine.commitTxn(txn);
+    committed = true;
+    // The next checkpoint writes the cleared pages (and truncates the WAL
+    // holding the old images) even when nothing else changed.
+    if (report.free_pages_zeroed != 0 or report.slab_bytes_zeroed != 0) engine.markPersistenceDirty();
+    return report;
 }
 
 /// Pages to consider in `file`: up to the larger of the file's page count
@@ -75,6 +105,7 @@ fn zeroFreePages(engine: *GraphEngine, txn: u64, file: FileId, fsm: anytype, rep
     const pager = engine.buffer_pool.pagers[@intFromEnum(file)] orelse return;
     const on_disk = try pager.pageCount();
     const total = @max(on_disk, fsm.total_pages);
+
     var page: PageId = 1;
     while (page < total) : (page += 1) {
         if (fsm.isAllocated(page)) continue;
@@ -150,7 +181,10 @@ fn dirContains(dir_path: []const u8, needle: []const u8) !bool {
         if (entry.kind != .file) continue;
         const data = dir.readFileAlloc(io, entry.path, testing.allocator, .limited(1 << 30)) catch continue;
         defer testing.allocator.free(data);
-        if (std.mem.indexOf(u8, data, needle) != null) return true;
+        if (std.mem.indexOf(u8, data, needle) != null) {
+            std.debug.print("'{s}' is in {s}\n", .{ needle, entry.path });
+            return true;
+        }
     }
     return false;
 }
@@ -176,10 +210,21 @@ test "SONNY-6692: scrubDeadSpace + checkpoint leaves no replaced, removed or spi
     var ra = test_support.emptyNode(1);
     try engine.putNode(a, ra);
     ra.prop_head = try engine.putProperty(ra.prop_head, "k", .{ .string = small_old });
-    ra.prop_head = try engine.putProperty(ra.prop_head, "k", .{ .string = small_live });
     ra.prop_head = try engine.putProperty(ra.prop_head, "g", .{ .string = gone });
-    try engine.removeProperty(ra.prop_head, "g");
     try engine.putNode(a, ra);
+    // Another record's blob after it on the slab page, so `a`'s cannot grow
+    // in place.
+    const c = try engine.allocNode();
+    var rc = test_support.emptyNode(1);
+    try engine.putNode(c, rc);
+    rc.prop_head = try engine.putProperty(rc.prop_head, "other", .{ .string = "SCRUB-6692-NEIGHBOUR" });
+    try engine.putNode(c, rc);
+    // On disk, then superseded: the longer value moves the blob to a new
+    // slot and tombstones the old one with its bytes.
+    try engine.checkpoint();
+    ra.prop_head = try engine.putProperty(ra.prop_head, "k", .{ .string = small_live });
+    try engine.putNode(a, ra);
+    try engine.removeProperty(ra.prop_head, "g");
 
     const b = try engine.allocNode();
     var rb = test_support.emptyNode(1);
@@ -189,19 +234,21 @@ test "SONNY-6692: scrubDeadSpace + checkpoint leaves no replaced, removed or spi
     try engine.putNode(b, rb);
     try engine.checkpoint();
 
-    for ([_][]const u8{ small_old, gone, "SCRUB-6692-BIG-OLD" }) |m| {
-        if (!try dirContains(td.path, m)) std.debug.print("precondition: '{s}' not on disk before the scrub\n", .{m});
-    }
+    // On disk before the scrub (the old blob in a tombstoned slot, the old
+    // spill in freed var pages).
+    for ([_][]const u8{ small_old, "SCRUB-6692-BIG-OLD" }) |m| try testing.expect(try dirContains(td.path, m));
 
     const report = try engine.scrubDeadSpace();
     try engine.checkpoint();
+    try testing.expect(report.slab_bytes_zeroed > 0);
+    try testing.expect(report.free_pages_zeroed > 0);
     for ([_][]const u8{ small_old, gone, "SCRUB-6692-BIG-OLD" }) |m| {
         if (try dirContains(td.path, m)) {
             std.debug.print("SONNY-6692: '{s}' is still on disk after scrubDeadSpace + checkpoint ({any})\n", .{ m, report });
             return error.DeadBytesRemain;
         }
     }
-    // Live values untouched, also after a reopen.
+    // Live values untouched.
     const ra2 = (try engine.getNode(a)).?;
     const got = (try engine.getProperty(ra2.prop_head, "k", testing.allocator)).?;
     defer @import("property.zig").freeDecoded(testing.allocator, got);
@@ -211,6 +258,10 @@ test "SONNY-6692: scrubDeadSpace + checkpoint leaves no replaced, removed or spi
     defer @import("property.zig").freeDecoded(testing.allocator, got_big);
     try testing.expectEqualStrings(big_live, got_big.string);
     try testing.expect(try dirContains(td.path, "SCRUB-6692-SMALL-LIVE"));
+    const rc2 = (try engine.getNode(c)).?;
+    const got_c = (try engine.getProperty(rc2.prop_head, "other", testing.allocator)).?;
+    defer @import("property.zig").freeDecoded(testing.allocator, got_c);
+    try testing.expectEqualStrings("SCRUB-6692-NEIGHBOUR", got_c.string);
 }
 
 test "SONNY-6692: scrubDeadSpace refuses while a transaction is open" {
