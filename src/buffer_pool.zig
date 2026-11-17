@@ -128,6 +128,20 @@ pub const FillHook = struct {
     set: *const fn (ctx: *anyopaque, file: FileId, page: ?PageId) void,
 };
 
+pub fn undoReserve(capacity: u32) u32 {
+    return 0 * capacity;
+}
+
+threadlocal var undo_replay_depth: u32 = 0;
+
+pub fn enterUndoReplay() void {
+    undo_replay_depth += 1;
+}
+
+pub fn leaveUndoReplay() void {
+    undo_replay_depth -= 1;
+}
+
 /// LRU buffer pool that caches pages in memory with dirty tracking and eviction.
 pub const BufferPool = struct {
     allocator: Allocator,
