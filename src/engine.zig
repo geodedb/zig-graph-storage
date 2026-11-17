@@ -39,6 +39,7 @@ const engine_persist = @import("engine_persist.zig");
 const engine_property_index = @import("engine_property_index.zig");
 const engine_adj_repair = @import("engine_adj_repair.zig");
 const engine_undo = @import("engine_undo.zig");
+const engine_scrub = @import("engine_scrub.zig");
 const txn_undo = @import("txn_undo.zig");
 const edge_exist_index_mod = @import("edge_exist_index.zig");
 const edge_index_map_mod = @import("edge_index_map.zig");
@@ -3341,6 +3342,15 @@ pub const GraphEngine = struct {
         return self.label_index.iterator(label, self.allocator);
     }
 
+    /// SONNY-6692: overwrite the dead space of the property and var stores
+    /// (freed pages, tombstoned slab blobs) in one logged transaction; the
+    /// caller checkpoints after it. `error.TransactionsOpen` while one is
+    /// open. See `engine_scrub.zig`.
+    pub fn scrubDeadSpace(self: *GraphEngine) anyerror!engine_scrub.ScrubReport {
+        try self.ensureWritable();
+        return engine_scrub.scrubDeadSpace(self);
+    }
+
     pub fn beginTxn(self: *GraphEngine) anyerror!TxnId {
         var __obs_span = observability.startOperationSpan("begin_txn");
         defer __obs_span.end(null);
@@ -3730,6 +3740,7 @@ pub const GraphEngine = struct {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("engine_test.zig");
+    _ = @import("engine_scrub.zig");
     _ = @import("engine_edge_props.zig");
     _ = @import("engine_integrity.zig");
     _ = @import("engine_index.zig");

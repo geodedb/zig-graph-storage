@@ -468,6 +468,73 @@ pub const PropStore = struct {
         }
     }
 
+    /// SONNY-6692: zero the bytes of slab page `page_id` that no slot holds
+    /// (tombstoned blobs: a replaced or removed record's old properties, kept
+    /// for an open transaction's undo, and gaps). Live slots, the slot
+    /// directory and the page header are untouched. Returns the bytes changed
+    /// (0 also when the page does not validate as a slab page, which is left
+    /// as it is). Only while no transaction is open: a tombstone's undo reads
+    /// those bytes (`undoLastSlabTombstone`). The caller WAL-images the page
+    /// when this returns non-zero.
+    pub fn scrubDeadSlabBytes(self: *PropStore, page_id: PageId) !u64 {
+        const frame = try self.buffer_pool.pin(.props, page_id);
+        const frame_idx = self.buffer_pool.frameIndex(frame);
+        var dirty = false;
+        defer self.buffer_pool.unpin(frame_idx, dirty);
+        const data = self.logical(frame.dataSlice());
+        if (data.len < SLAB_DATA_OFFSET + SLAB_SLOT_COUNT_SIZE) return 0;
+        if (data[SLAB_META_OFFSET] != SLAB_LAYOUT_VERSION) return 0;
+        const count = readSlabSlotCount(data);
+        const max_slots = (data.len - SLAB_DATA_OFFSET - SLAB_SLOT_COUNT_SIZE) / SLAB_SLOT_SIZE;
+        if (count > max_slots) return 0;
+        const dir_start = data.len - SLAB_SLOT_COUNT_SIZE - @as(usize, count) * SLAB_SLOT_SIZE;
+        // Every slot with a length is live; validate them all first, so a
+        // page that is not a slab page is never written.
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const slot = readSlabSlot(data, i);
+            if (slot.len == 0) continue;
+            if (slot.offset < SLAB_DATA_OFFSET or @as(usize, slot.offset) + slot.len > dir_start) return 0;
+        }
+        var zeroed: u64 = 0;
+        var pos: usize = SLAB_DATA_OFFSET;
+        while (pos < dir_start) : (pos += 1) {
+            if (data[pos] == 0) continue;
+            var live = false;
+            i = 0;
+            while (i < count) : (i += 1) {
+                const slot = readSlabSlot(data, i);
+                if (slot.len != 0 and pos >= slot.offset and pos < @as(usize, slot.offset) + slot.len) {
+                    live = true;
+                    // Skip to the end of this live blob.
+                    pos = @as(usize, slot.offset) + slot.len - 1;
+                    break;
+                }
+            }
+            if (live) continue;
+            data[pos] = 0;
+            zeroed += 1;
+        }
+        dirty = zeroed != 0;
+        return zeroed;
+    }
+
+    /// SONNY-6692: the pages of the legacy (one-page-per-node) chain at
+    /// `head`, appended to `out`. A slab head or 0 adds nothing.
+    pub fn appendLegacyChainPages(self: *PropStore, allocator: Allocator, head: u64, out: *std.AutoHashMapUnmanaged(PageId, void)) !void {
+        if (head == 0 or isSlabHead(head)) return;
+        var page: PageId = head;
+        var hops: u32 = 0;
+        while (page != 0) : (hops += 1) {
+            if (hops >= 1_000_000) return error.CircularChainDetected;
+            if ((try out.getOrPut(allocator, page)).found_existing) return;
+            const frame = try self.buffer_pool.pin(.props, page);
+            const next = readNextPage(frame.dataSlice());
+            self.buffer_pool.unpin(self.buffer_pool.frameIndex(frame), false);
+            page = next;
+        }
+    }
+
     const FILL_FILE: FileId = .props;
 
     /// SONNY-6659: the fill page to append to (see `buffer_pool.FillHook`).

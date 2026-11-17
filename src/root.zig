@@ -162,6 +162,8 @@ pub const LabelDictDiagnostic = config.LabelDictDiagnostic;
 pub const LabelDictReport = config.LabelDictReport;
 pub const AbortUndoPolicy = config.AbortUndoPolicy;
 pub const Metrics = metrics.Metrics;
+/// SONNY-6692: what `scrubDeadSpace` cleared.
+pub const ScrubReport = @import("engine_scrub.zig").ScrubReport;
 
 pub const version = "0.4.26";
 
