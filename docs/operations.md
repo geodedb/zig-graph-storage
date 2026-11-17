@@ -379,6 +379,16 @@ another data directory under the same key fails authentication. The
 manifests are authenticated (HMAC-SHA256), not encrypted. File sizes and
 modification times are visible.
 
+Dead space (SONNY-6692): a property write that does not fit its record's
+slab slot moves the blob and tombstones the old slot with its bytes intact,
+and a value larger than a property page spills to var-store pages that are
+freed without being cleared, so a superseded value stays in `props.store` /
+`var.store` (in the clear without a key) until its space is reused.
+`scrubDeadSpace()` (on `GraphEngine` or `ShardedGraphEngine`) overwrites
+it in one logged transaction while no transaction is open; checkpoint after
+it to write the cleared pages and truncate the WAL that holds the old
+images.
+
 Not encrypted, and why (SONNY-6635):
 
 - `labels.idx`: for each label *id*, the ids of the nodes that carry it.

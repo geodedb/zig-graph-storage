@@ -774,6 +774,20 @@ pub const ShardedGraphEngine = struct {
         return self.shards[d.shard].abortTxn(d.local);
     }
 
+    /// SONNY-6692: `GraphEngine.scrubDeadSpace` on every shard (all of them
+    /// are tried; the first error is returned), the reports summed.
+    pub fn scrubDeadSpace(self: *ShardedGraphEngine) anyerror!@import("engine_scrub.zig").ScrubReport {
+        var total: @import("engine_scrub.zig").ScrubReport = .{};
+        var first_err: ?anyerror = null;
+        for (self.shards) |eng| {
+            if (eng.scrubDeadSpace()) |r| total.add(r) else |err| {
+                if (first_err == null) first_err = err;
+            }
+        }
+        if (first_err) |err| return err;
+        return total;
+    }
+
     pub fn checkpoint(self: *ShardedGraphEngine) anyerror!void {
         var first_err: ?anyerror = null;
         for (self.shards) |eng| {
