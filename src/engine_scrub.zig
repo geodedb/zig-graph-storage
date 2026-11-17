@@ -10,22 +10,31 @@
 //! superseded values (field-level-encryption migration: the plaintext a
 //! value was migrated from) until the space happened to be reused.
 //!
-//! `scrubDeadSpace` runs one transaction that
+//! `scrubDeadSpace` first proves ownership (SONNY-6700): it walks every live
+//! node (property chain, labels) and each of its out-edges (property chain),
+//! following every overflowed value into the var store, and records the
+//! pages of live legacy chains and the live slots of slab pages. Any
+//! reference that does not resolve aborts the scrub before anything changes.
+//! Then one transaction
 //!   * zeroes the body of every FREE page of the property and var stores
 //!     that holds anything (in the file, or newer than the file in the
 //!     buffer pool);
-//!   * zeroes, on every allocated property page that validates as a slab
-//!     page and is not a page of a live legacy property chain, every byte no
-//!     slot with a length holds (tombstoned blobs and gaps);
+//!   * on every property slab page and var-store slab block a live record
+//!     owns, tombstones the slots no live record references (orphaned
+//!     copies) and zeroes every byte no live slot holds (tombstoned blobs and
+//!     runs, gaps); the shared fill page or block is emptied the same way;
+//!   * zeroes and frees every other allocated page of the two stores: no
+//!     live record owns it (a leak, a crash leftover);
 //! and WAL-images every page it changed, so a crash after the commit replays
 //! the cleared images. The caller then checkpoints: the pages reach the
 //! store files and the WAL that still holds the old images is truncated.
 //!
 //! Only while no transaction is open on the engine (`error.TransactionsOpen`):
-//! an open transaction's undo may read a tombstoned blob, and its pages are
-//! claimed. Allocated pages the walk does not attribute (an orphan) are left
-//! alone unless they validate as slab pages, where only unheld bytes are
-//! cleared, so a mis-attribution can never touch a live byte.
+//! an open transaction's undo may read a tombstoned blob, its pages are
+//! claimed, and its fill pages are its own. The caller excludes every writer
+//! for the duration (the engine is single-writer): a property or label head
+//! a writer holds but has not yet stored in a node record or edge entry is
+//! owned by nobody, and would be freed.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -46,26 +55,115 @@ const NodeRec = node_mod.NodeRec;
 pub const ScrubReport = struct {
     /// Free pages whose body held bytes and was zeroed.
     free_pages_zeroed: u64 = 0,
-    /// Slab pages on which dead bytes were zeroed.
+    /// Property slab pages on which dead bytes were zeroed.
     slab_pages_scrubbed: u64 = 0,
-    /// Dead slab bytes zeroed.
+    /// Property slab bytes zeroed (and orphaned slots tombstoned).
     slab_bytes_zeroed: u64 = 0,
+    /// SONNY-6700: var-store slab blocks scrubbed, and their bytes.
+    var_slab_blocks_scrubbed: u64 = 0,
+    var_slab_bytes_zeroed: u64 = 0,
+    /// SONNY-6700: allocated pages no live record owns, zeroed and freed.
+    orphan_pages_freed: u64 = 0,
 
     pub fn add(self: *ScrubReport, other: ScrubReport) void {
-        self.free_pages_zeroed += other.free_pages_zeroed;
-        self.slab_pages_scrubbed += other.slab_pages_scrubbed;
-        self.slab_bytes_zeroed += other.slab_bytes_zeroed;
+        inline for (@typeInfo(ScrubReport).@"struct".fields) |f| @field(self, f.name) += @field(other, f.name);
+    }
+};
+
+/// SONNY-6700: what every live record owns in the property and var stores,
+/// from a walk of every live node (its property chain, its labels) and each
+/// of its out-edges (their property chains; an edge's properties live in its
+/// source's store, beside the out-adjacency entry), and every property's
+/// overflow ref. Pages a walk does not reach are owned by nobody.
+const Ownership = struct {
+    allocator: std.mem.Allocator,
+    /// Pages of live legacy property chains.
+    props_pages: std.AutoHashMapUnmanaged(PageId, void) = .empty,
+    /// Live slots per property slab page.
+    props_slots: std.AutoHashMapUnmanaged(PageId, std.ArrayListUnmanaged(u32)) = .empty,
+    /// Pages of live legacy var-store chains (labels, overflowed values).
+    var_pages: std.AutoHashMapUnmanaged(PageId, void) = .empty,
+    /// Live runs per var-store slab block.
+    var_slots: std.AutoHashMapUnmanaged(PageId, std.ArrayListUnmanaged(u32)) = .empty,
+
+    fn deinit(self: *Ownership) void {
+        self.props_pages.deinit(self.allocator);
+        var it = self.props_slots.valueIterator();
+        while (it.next()) |l| l.deinit(self.allocator);
+        self.props_slots.deinit(self.allocator);
+        self.var_pages.deinit(self.allocator);
+        var vit = self.var_slots.valueIterator();
+        while (vit.next()) |l| l.deinit(self.allocator);
+        self.var_slots.deinit(self.allocator);
+    }
+
+    fn addSlot(self: *Ownership, map: *std.AutoHashMapUnmanaged(PageId, std.ArrayListUnmanaged(u32)), page: PageId, slot: u32) !void {
+        const gop = try map.getOrPut(self.allocator, page);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        if (std.mem.indexOfScalar(u32, gop.value_ptr.items, slot) == null) try gop.value_ptr.append(self.allocator, slot);
+    }
+
+    fn ownVar(self: *Ownership, engine: *GraphEngine, ref: u64) !void {
+        if (ref == 0) return;
+        if (var_store_mod.isSlabHead(ref)) {
+            const page = var_store_mod.slabHeadPageId(ref);
+            if (page == 0) return error.DataCorruption;
+            return self.addSlot(&self.var_slots, page, var_store_mod.slabHeadSlot(ref));
+        }
+        try engine.var_store.appendChainPages(self.allocator, ref, &self.var_pages);
+    }
+
+    fn ownProps(self: *Ownership, engine: *GraphEngine, head: u64) !void {
+        if (head == 0) return;
+        if (prop_store_mod.isSlabHead(head)) {
+            try self.addSlot(&self.props_slots, prop_store_mod.slabPageId(head), prop_store_mod.slabSlot(head));
+        } else {
+            try engine.prop_store.appendLegacyChainPages(self.allocator, head, &self.props_pages);
+        }
+        var iter = engine.prop_store.getAllProperties(head);
+        defer iter.deinit();
+        while (try iter.next()) |_| {
+            if (iter.last_var_ref) |ref| try self.ownVar(engine, ref);
+        }
+    }
+
+    fn walk(self: *Ownership, engine: *GraphEngine) !void {
+        const Ctx = struct {
+            own: *Ownership,
+            engine: *GraphEngine,
+            err: ?anyerror = null,
+
+            fn node(c: *@This(), rec: NodeRec) !void {
+                try c.own.ownProps(c.engine, rec.prop_head);
+                try c.own.ownVar(c.engine, rec.label_head);
+                if (rec.out_head == 0) return;
+                var iter = c.engine.adj_out.expand(rec.out_head, null);
+                defer iter.deinit();
+                while (try iter.next()) |entry| try c.own.ownProps(c.engine, entry.prop_head);
+            }
+
+            fn callback(c: *@This(), _: NodeId, rec: NodeRec) void {
+                if (c.err != null) return;
+                c.node(rec) catch |e| {
+                    c.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .own = self, .engine = engine };
+        try engine.node_store.scanNodes(engine.manifest.next_node_id, &ctx, Ctx.callback);
+        if (ctx.err) |e| return e;
     }
 };
 
 pub fn scrubDeadSpace(engine: *GraphEngine) !ScrubReport {
     if (engine.txn_manager.activeCount() != 0) return error.TransactionsOpen;
 
-    var report: ScrubReport = .{};
-    var legacy: std.AutoHashMapUnmanaged(PageId, void) = .empty;
-    defer legacy.deinit(engine.allocator);
-    try collectLiveLegacyPropPages(engine, &legacy);
+    // The proof first: every live reference resolved, before any change.
+    var own = Ownership{ .allocator = engine.allocator };
+    defer own.deinit();
+    try own.walk(engine);
 
+    var report: ScrubReport = .{};
     const txn = try engine.beginTxn();
     var committed = false;
     errdefer if (!committed) engine.abortTxn(txn) catch {};
@@ -75,24 +173,80 @@ pub fn scrubDeadSpace(engine: *GraphEngine) !ScrubReport {
     try zeroFreePages(engine, txn, .props, &engine.free_space_props, &report);
     try zeroFreePages(engine, txn, .var_store, &engine.free_space_var, &report);
 
+    // Property store: owned slab pages scrubbed against their live slots,
+    // live legacy chain pages kept, the fill page emptied of dead slots,
+    // every other allocated page (owned by nobody) zeroed and freed.
+    const props_fill = engine.prop_store.currentFillPage();
     const props_pages = try filePages(engine, .props, &engine.free_space_props);
     var page: PageId = 1;
     while (page < props_pages) : (page += 1) {
         if (!engine.free_space_props.isAllocated(page)) continue;
-        if (legacy.contains(page)) continue;
-        const zeroed = try engine.prop_store.scrubDeadSlabBytes(page);
-        if (zeroed == 0) continue;
-        try engine.logPage(txn, .props, page);
-        report.slab_pages_scrubbed += 1;
-        report.slab_bytes_zeroed += zeroed;
+        if (own.props_pages.contains(page)) continue;
+        if (own.props_slots.get(page)) |live| {
+            const zeroed = try engine.prop_store.scrubSlabPageOwned(page, live.items);
+            if (zeroed == 0) continue;
+            try engine.logPage(txn, .props, page);
+            report.slab_pages_scrubbed += 1;
+            report.slab_bytes_zeroed += zeroed;
+            continue;
+        }
+        if (props_fill != null and props_fill.? == page) {
+            const zeroed = engine.prop_store.scrubSlabPageOwned(page, &.{}) catch 0;
+            if (zeroed == 0) continue;
+            try engine.logPage(txn, .props, page);
+            report.slab_pages_scrubbed += 1;
+            report.slab_bytes_zeroed += zeroed;
+            continue;
+        }
+        try freeOrphan(engine, txn, .props, &engine.free_space_props, page, &report);
+    }
+
+    // Var store: the same, with slab blocks.
+    const var_fill = engine.var_store.currentFillPage();
+    const var_pages = try filePages(engine, .var_store, &engine.free_space_var);
+    page = 1;
+    while (page < var_pages) : (page += 1) {
+        if (!engine.free_space_var.isAllocated(page)) continue;
+        if (own.var_pages.contains(page)) continue;
+        if (own.var_slots.get(page)) |live| {
+            const zeroed = try engine.var_store.scrubSlabBlockOwned(page, live.items);
+            if (zeroed == 0) continue;
+            try engine.logPage(txn, .var_store, page);
+            report.var_slab_blocks_scrubbed += 1;
+            report.var_slab_bytes_zeroed += zeroed;
+            continue;
+        }
+        if (var_fill != null and var_fill.? == page) {
+            const zeroed = engine.var_store.scrubSlabBlockOwned(page, &.{}) catch 0;
+            if (zeroed == 0) continue;
+            try engine.logPage(txn, .var_store, page);
+            report.var_slab_blocks_scrubbed += 1;
+            report.var_slab_bytes_zeroed += zeroed;
+            continue;
+        }
+        try freeOrphan(engine, txn, .var_store, &engine.free_space_var, page, &report);
     }
 
     try engine.commitTxn(txn);
     committed = true;
     // The next checkpoint writes the cleared pages (and truncates the WAL
     // holding the old images) even when nothing else changed.
-    if (report.free_pages_zeroed != 0 or report.slab_bytes_zeroed != 0) engine.markPersistenceDirty();
+    if (report.free_pages_zeroed != 0 or report.slab_bytes_zeroed != 0 or report.var_slab_bytes_zeroed != 0 or report.orphan_pages_freed != 0) engine.markPersistenceDirty();
     return report;
+}
+
+/// An allocated page no live record owns: its body zeroed (WAL-imaged) and
+/// the page freed (it returns to the free list when the scrub commits).
+fn freeOrphan(engine: *GraphEngine, txn: u64, file: FileId, fsm: anytype, page: PageId, report: *ScrubReport) !void {
+    const frame = try engine.buffer_pool.pin(file, page);
+    const frame_idx = engine.buffer_pool.frameIndex(frame);
+    const body = frame.dataSlice()[page_mod.PAGE_HEADER_SIZE..];
+    const holds = std.mem.indexOfNone(u8, body, &.{0}) != null;
+    if (holds) @memset(body, 0);
+    engine.buffer_pool.unpin(frame_idx, holds);
+    if (holds) try engine.logPage(txn, file, page);
+    try fsm.freePage(page);
+    report.orphan_pages_freed += 1;
 }
 
 /// Pages to consider in `file`: up to the larger of the file's page count
@@ -106,7 +260,6 @@ fn zeroFreePages(engine: *GraphEngine, txn: u64, file: FileId, fsm: anytype, rep
     const pager = engine.buffer_pool.pagers[@intFromEnum(file)] orelse return;
     const on_disk = try pager.pageCount();
     const total = @max(on_disk, fsm.total_pages);
-
     var page: PageId = 1;
     while (page < total) : (page += 1) {
         if (fsm.isAllocated(page)) continue;
@@ -123,45 +276,6 @@ fn zeroFreePages(engine: *GraphEngine, txn: u64, file: FileId, fsm: anytype, rep
         try engine.logPage(txn, file, page);
         report.free_pages_zeroed += 1;
     }
-}
-
-/// The pages of every live legacy property chain: each live node's own
-/// chain and each of its edges' chains (out- and in-adjacency).
-fn collectLiveLegacyPropPages(engine: *GraphEngine, out: *std.AutoHashMapUnmanaged(PageId, void)) !void {
-    const Ctx = struct {
-        engine: *GraphEngine,
-        out: *std.AutoHashMapUnmanaged(PageId, void),
-        err: ?anyerror = null,
-
-        fn add(self: *@This(), head: u64) !void {
-            try self.engine.prop_store.appendLegacyChainPages(self.engine.allocator, head, self.out);
-        }
-
-        fn edges(self: *@This(), store: anytype, head: u64) !void {
-            if (head == 0) return;
-            var iter = store.expand(head, null);
-            defer iter.deinit();
-            while (try iter.next()) |entry| try self.add(entry.prop_head);
-        }
-
-        fn callback(self: *@This(), _: NodeId, rec: NodeRec) void {
-            if (self.err != null) return;
-            self.add(rec.prop_head) catch |e| {
-                self.err = e;
-                return;
-            };
-            self.edges(&self.engine.adj_out, rec.out_head) catch |e| {
-                self.err = e;
-                return;
-            };
-            self.edges(&self.engine.adj_in, rec.in_head) catch |e| {
-                self.err = e;
-            };
-        }
-    };
-    var ctx = Ctx{ .engine = engine, .out = out };
-    try engine.node_store.scanNodes(engine.manifest.next_node_id, &ctx, Ctx.callback);
-    if (ctx.err) |e| return e;
 }
 
 // ============================================================================
@@ -182,10 +296,7 @@ fn dirContains(dir_path: []const u8, needle: []const u8) !bool {
         if (entry.kind != .file) continue;
         const data = dir.readFileAlloc(io, entry.path, testing.allocator, .limited(1 << 30)) catch continue;
         defer testing.allocator.free(data);
-        if (std.mem.indexOf(u8, data, needle) != null) {
-            std.debug.print("'{s}' is in {s}\n", .{ needle, entry.path });
-            return true;
-        }
+        if (std.mem.indexOf(u8, data, needle) != null) return true;
     }
     return false;
 }
@@ -332,4 +443,65 @@ test "SONNY-6700: scrubDeadSpace clears superseded var-store slab runs and alloc
     const got = (try engine.getProperty(rn2.prop_head, "keep", testing.allocator)).?;
     defer @import("property.zig").freeDecoded(testing.allocator, got);
     try testing.expectEqualStrings("SCRUB-6700-LIVE", got.string);
+}
+
+test "SONNY-6700: the ownership proof keeps every live byte: node and edge properties (inline and overflowed), labels, a deleted neighbour; a second scrub changes nothing; all of it reads back after reopen" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const uuid = [_]u8{0x71} ** 16;
+    var engine = try GraphEngine.create(testing.allocator, td.path, uuid, test_support.testConfig());
+    var open = true;
+    defer if (open) engine.close() catch {};
+
+    var ids: [6]NodeId = undefined;
+    for (&ids, 0..) |*id, i| {
+        id.* = try engine.allocNode();
+        try engine.putNode(id.*, test_support.emptyNode(1));
+        try engine.addLabel(id.*, @intCast(10 + i));
+        try engine.addLabel(id.*, 100);
+        var rec = (try engine.getNode(id.*)).?;
+        var buf: [32]u8 = undefined;
+        const v = try std.fmt.bufPrint(&buf, "LIVE-6700-N{d}", .{i});
+        rec.prop_head = try engine.putProperty(rec.prop_head, "k", .{ .string = v });
+        if (i == 3) rec.prop_head = try engine.putProperty(rec.prop_head, "big", .{ .string = bigValue("LIVE-6700-BIG") });
+        try engine.putNode(id.*, rec);
+    }
+    const e01 = try engine.addEdge(ids[0], ids[1], 1);
+    const e12 = try engine.addEdge(ids[1], ids[2], 1);
+    try engine.setEdgeProperty(ids[0], ids[1], e01, "w", .{ .string = "LIVE-6700-E01" });
+    try engine.setEdgeProperty(ids[1], ids[2], e12, "w", .{ .string = bigValue("LIVE-6700-EBIG") });
+    try engine.deleteNode(ids[5]);
+    try engine.checkpoint();
+
+    _ = try engine.scrubDeadSpace();
+    const again = try engine.scrubDeadSpace();
+    try testing.expectEqual(ScrubReport{}, again);
+    try engine.checkpoint();
+    try engine.close();
+    open = false;
+
+    engine = try GraphEngine.open(testing.allocator, td.path, uuid, test_support.testConfig());
+    open = true;
+    for (ids[0..5], 0..) |id, i| {
+        const rec = (try engine.getNode(id)).?;
+        const labels = try engine.label_store.getLabels(rec.label_head, testing.allocator);
+        defer testing.allocator.free(labels);
+        try testing.expectEqualSlices(u32, &.{ @intCast(10 + i), 100 }, labels);
+        var buf: [32]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "LIVE-6700-N{d}", .{i});
+        const got = (try engine.getProperty(rec.prop_head, "k", testing.allocator)).?;
+        defer @import("property.zig").freeDecoded(testing.allocator, got);
+        try testing.expectEqualStrings(want, got.string);
+        if (i == 3) {
+            const big = (try engine.getProperty(rec.prop_head, "big", testing.allocator)).?;
+            defer @import("property.zig").freeDecoded(testing.allocator, big);
+            try testing.expectEqualStrings(bigValue("LIVE-6700-BIG"), big.string);
+        }
+    }
+    const w01 = (try engine.getEdgeProperty(ids[0], e01, "w", testing.allocator)).?;
+    defer @import("property.zig").freeDecoded(testing.allocator, w01);
+    try testing.expectEqualStrings("LIVE-6700-E01", w01.string);
+    const w12 = (try engine.getEdgeProperty(ids[1], e12, "w", testing.allocator)).?;
+    defer @import("property.zig").freeDecoded(testing.allocator, w12);
+    try testing.expectEqualStrings(bigValue("LIVE-6700-EBIG"), w12.string);
 }
