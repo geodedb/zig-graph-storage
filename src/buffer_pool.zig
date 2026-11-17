@@ -128,12 +128,19 @@ pub const FillHook = struct {
     set: *const fn (ctx: *anyopaque, file: FileId, page: ?PageId) void,
 };
 
+/// SONNY-6716: frames of the pool kept back from a transaction that holds the
+/// rest. No-steal keeps every page an open transaction dirtied in the pool, so
+/// a transaction larger than the pool fails with `error.BufferPoolFull`; if it
+/// took the LAST frame, the caller could not undo it (the undo itself pins
+/// pages). A thread inside `enterUndoReplay` may use these frames.
 pub fn undoReserve(capacity: u32) u32 {
-    return 0 * capacity;
+    return @max(2, capacity / 8);
 }
 
 threadlocal var undo_replay_depth: u32 = 0;
 
+/// SONNY-6716: this thread is undoing a failed statement. It may use the
+/// frames `undoReserve` keeps back.
 pub fn enterUndoReplay() void {
     undo_replay_depth += 1;
 }
@@ -1506,8 +1513,27 @@ pub const BufferPool = struct {
         if (self.metrics) |m| m.page_writes += 1;
     }
 
+    /// SONNY-6716: frames held for an open transaction (not the committed,
+    /// unsynced ones, which a WAL sync releases). Caller holds `mutex`.
+    fn openTxnHeldLocked(self: *BufferPool) u32 {
+        var n: u32 = 0;
+        for (self.held.items) |idx| {
+            if (self.frames[idx].hold == .open_txn) n += 1;
+        }
+        return n;
+    }
+
     /// Get a free frame index, evicting if necessary.
     fn getFrame(self: *BufferPool) !u32 {
+        // SONNY-6716: open transactions hold their dirty pages (no-steal). Past
+        // `capacity - undoReserve` held frames a new page is refused, so the
+        // caller's undo of the failed transaction still has frames to work in.
+        if (undo_replay_depth == 0 and self.capacity > undoReserve(self.capacity) and
+            self.held.items.len + undoReserve(self.capacity) >= self.capacity and
+            self.openTxnHeldLocked() + undoReserve(self.capacity) >= self.capacity)
+        {
+            return error.BufferPoolFull;
+        }
         // Try free list first
         if (self.free_list.pop()) |idx| {
             return idx;
