@@ -32,6 +32,7 @@ const types = @import("types.zig");
 const engine_mod = @import("engine.zig");
 const engine_undo = @import("engine_undo.zig");
 const prop_store_mod = @import("prop_store.zig");
+const var_store_mod = @import("var_store.zig");
 const page_mod = @import("page.zig");
 const node_mod = @import("node.zig");
 
@@ -273,4 +274,62 @@ test "SONNY-6692: scrubDeadSpace refuses while a transaction is open" {
     try testing.expectError(error.TransactionsOpen, engine.scrubDeadSpace());
     try engine.abortTxn(txn);
     _ = try engine.scrubDeadSpace();
+}
+
+/// SONNY-6700: an allocated page of `file` no record owns (as a leak or a
+/// crash leaves one), holding `marker`.
+fn leakPage(engine: *GraphEngine, file: FileId, fsm: anytype, marker: []const u8) !PageId {
+    const p = try fsm.allocPage();
+    const frame = try engine.buffer_pool.pinNew(file, p);
+    const idx = engine.buffer_pool.frameIndex(frame);
+    @memcpy(frame.dataSlice()[page_mod.PAGE_HEADER_SIZE + 64 ..][0..marker.len], marker);
+    engine.buffer_pool.unpin(idx, true);
+    engine.markPersistenceDirty();
+    return p;
+}
+
+test "SONNY-6700: scrubDeadSpace clears superseded var-store slab runs and allocated pages no record owns; live labels and properties read back" {
+    var td = try test_support.TestDataDir.init(testing.allocator);
+    defer td.deinit();
+    const engine = try GraphEngine.create(testing.allocator, td.path, [_]u8{0x70} ** 16, test_support.testConfig());
+    defer engine.close() catch {};
+
+    // Live: a node with labels (a var-store slab run) and a property.
+    const n = try engine.allocNode();
+    try engine.putNode(n, test_support.emptyNode(1));
+    try engine.addLabel(n, 7);
+    try engine.addLabel(n, 9);
+    var rn = (try engine.getNode(n)).?;
+    rn.prop_head = try engine.putProperty(rn.prop_head, "keep", .{ .string = "SCRUB-6700-LIVE" });
+    try engine.putNode(n, rn);
+
+    // Superseded: a small var-store run (packed into the shared slab block)
+    // written and freed; and an orphaned props page and var-store page.
+    const ref = try engine.var_store.write("SCRUB-6700-VARSLAB-OLD");
+    try testing.expect(var_store_mod.isSlabHead(ref));
+    try engine.var_store.free(ref);
+    _ = try leakPage(engine, .props, &engine.free_space_props, "SCRUB-6700-ORPHAN-PROPS");
+    _ = try leakPage(engine, .var_store, &engine.free_space_var, "SCRUB-6700-ORPHAN-VAR");
+    try engine.checkpoint();
+    const dead = [_][]const u8{ "SCRUB-6700-VARSLAB-OLD", "SCRUB-6700-ORPHAN-PROPS", "SCRUB-6700-ORPHAN-VAR" };
+    for (dead) |m| try testing.expect(try dirContains(td.path, m));
+
+    const report = try engine.scrubDeadSpace();
+    try engine.checkpoint();
+    var remaining: usize = 0;
+    for (dead) |m| {
+        if (try dirContains(td.path, m)) remaining += 1;
+    }
+    if (remaining != 0) {
+        std.debug.print("SONNY-6700: {d} of {d} dead values still on disk after scrubDeadSpace + checkpoint ({any})\n", .{ remaining, dead.len, report });
+        return error.DeadBytesRemain;
+    }
+
+    const rn2 = (try engine.getNode(n)).?;
+    const labels = try engine.label_store.getLabels(rn2.label_head, testing.allocator);
+    defer testing.allocator.free(labels);
+    try testing.expectEqualSlices(u32, &.{ 7, 9 }, labels);
+    const got = (try engine.getProperty(rn2.prop_head, "keep", testing.allocator)).?;
+    defer @import("property.zig").freeDecoded(testing.allocator, got);
+    try testing.expectEqualStrings("SCRUB-6700-LIVE", got.string);
 }
