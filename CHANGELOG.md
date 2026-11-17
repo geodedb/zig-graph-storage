@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.29] - 2026-11-17
+
+### Fixed
+
+- A transaction larger than the buffer pool took every frame of it. No-steal
+  keeps each page an open transaction dirtied in the pool, so such a
+  transaction fails with `error.BufferPoolFull`; but it failed only when no
+  frame was left, and the caller's undo of it (which pins pages too) then
+  failed as well, leaving part of the statement applied. A transaction now
+  cannot take the last `buffer_pool.undoReserve(capacity)` frames
+  (`max(2, capacity / 8)`); the thread undoing a failed statement brackets
+  its work with `buffer_pool.enterUndoReplay()` / `leaveUndoReplay()` and may
+  use them. Committed pages were never the cause: they stay evictable, and
+  a run of 1500 committed transactions in an 8-frame pool never fails.
+  `ShardedGraphEngine` still gives each shard `buffer_pool_pages / 16`
+  frames: a pool of fewer than about 8 frames per shard cannot finish one
+  statement that creates two nodes and a relationship (SONNY-6716).
+
 ## [0.4.28] - 2026-11-17
 
 ### Security
