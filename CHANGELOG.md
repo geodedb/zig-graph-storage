@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.30] - 2026-11-17
+
+### Changed
+
+- wal v0.1.25 -> v0.1.27, uuid (untagged `c8206cb`) -> v0.1.10 and otel v0.1.28 -> v0.1.30 (grpc-zig v0.1.16), so this library and its consumers (geode) resolve a single wal, otel and thread-pool (SONNY-6630).
+
 ## [0.4.29] - 2026-11-17
 
 ### Fixed

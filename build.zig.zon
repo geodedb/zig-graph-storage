@@ -1,6 +1,6 @@
 .{
     .name = .graph_storage,
-    .version = "0.4.29",
+    .version = "0.4.30",
     .fingerprint = 0x713d4f134b894cf5,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
@@ -15,12 +15,12 @@
             // genuine torn tail is truncated. Moves thread_pool to v0.2.11.
             // v0.1.25: truncateAfter fails closed the same way (graph-storage
             // does not call it). Same thread_pool v0.2.11.
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.25#eca478cae4784f4dc311acab31659beaea065508",
-            .hash = "wal-0.1.25-EqPqpqU_CACws_QxxCu906MZjIvJFGLkRmXHvLAY_i4U",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.27#e8d1c51ea00e7788fe950e6f3251c48e8852d2bc",
+            .hash = "wal-0.1.27-EqPqpqU_CAB-RfhJaHAM2nOpRpSxl6sykpzcdKXPuKpd",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=c8206cbf2f3abc756b62b9e099715c81a452a2aa#c8206cbf2f3abc756b62b9e099715c81a452a2aa",
-            .hash = "uuid-0.1.9-tL1iruPmHAAJ2ebApUBKroge9t-yDmrcPJ-2A2FEduNj",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.10#5547a8a0d86c67315d292f81411f6237ee61cf5c",
+            .hash = "uuid-0.1.10-tL1iroznHACRKPV4rc3sSf8tJtvHw8VfF-Btd4F1giHh",
         },
         .thread_pool = .{
             // v0.2.11: the version wal v0.1.24 pins (no diamond).
@@ -32,8 +32,8 @@
             // human-readable `ref` tag (v0.1.8) may trail the version declared
             // by the upstream build.zig.zon at that commit (otel-0.1.7); the
             // label mismatch originates upstream and is expected.
-            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.28#e56f1c1fe9385c8cc0d93ec118eb5538a23d2966",
-            .hash = "otel-0.1.28-B0v3lj-uNQAmn4BzC6lmEzihawdobgIFviswkb2hpfFN",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.30#dbf58bae612ef3f5f78c62c130b4c6d63f5aa297",
+            .hash = "otel-0.1.30-B0v3lrGuNQDL0D3_KAb6qK6MaYmz2QeutCp0Sg3SL1H7",
             .lazy = true,
         },
     },
