@@ -26,6 +26,97 @@ pub fn checkHostLayout(endian: std.builtin.Endian, usize_bytes: usize) error{Uns
     if (endian != .little or usize_bytes != 8) return error.UnsupportedHostLayout;
 }
 
+/// SONNY-6938: a page bitmap that readers query without a lock while its one
+/// writer (serialised by the caller) sets, clears and grows it.
+///
+/// `std.DynamicBitSet.resize` reallocates the word array and frees the old
+/// one, so a reader still holding the old pointer read freed memory: a live
+/// page read as free (NodeStore.getNode reported the node missing) or the
+/// read faulted. Here a growth copies the words into a new array, publishes
+/// it, and keeps the old array until `deinit`; readers load the array and
+/// each word atomically. Capacity at least doubles on each growth, so the
+/// retired arrays together are never larger than the live one.
+pub const PageBitmap = struct {
+    const Word = usize;
+    const word_bits = @bitSizeOf(Word);
+
+    allocator: Allocator,
+    /// The live word array. Readers load it with `.acquire`; the writer
+    /// stores it with `.release` once the new array holds every word.
+    words: [*]Word,
+    /// Length of `words` in words. Writer only.
+    cap: usize,
+    /// Arrays replaced by a growth. A reader may still be reading one.
+    retired: std.ArrayListUnmanaged([]Word) = .empty,
+
+    pub fn init(allocator: Allocator, bit_len: usize) !PageBitmap {
+        const n = @max(wordCount(bit_len), 1);
+        const words = try allocator.alloc(Word, n);
+        @memset(words, 0);
+        return .{ .allocator = allocator, .words = words.ptr, .cap = n };
+    }
+
+    pub fn deinit(self: *PageBitmap) void {
+        for (self.retired.items) |old| self.allocator.free(old);
+        self.retired.deinit(self.allocator);
+        self.allocator.free(self.words[0..self.cap]);
+        self.* = undefined;
+    }
+
+    pub fn wordCount(bit_len: usize) usize {
+        return (bit_len + word_bits - 1) / word_bits;
+    }
+
+    /// Safe against a concurrent `set`, `unset` or `ensureWords`.
+    pub fn isSet(self: *const PageBitmap, index: usize) bool {
+        const words = @atomicLoad([*]Word, &self.words, .acquire);
+        const w = @atomicLoad(Word, &words[index / word_bits], .acquire);
+        return (w & maskBit(index)) != 0;
+    }
+
+    /// Writer only.
+    pub fn set(self: *PageBitmap, index: usize) void {
+        std.debug.assert(index / word_bits < self.cap);
+        _ = @atomicRmw(Word, &self.words[index / word_bits], .Or, maskBit(index), .release);
+    }
+
+    /// Writer only.
+    pub fn unset(self: *PageBitmap, index: usize) void {
+        std.debug.assert(index / word_bits < self.cap);
+        _ = @atomicRmw(Word, &self.words[index / word_bits], .And, ~maskBit(index), .release);
+    }
+
+    /// Writer only: hold at least `n` words. Added words are zero.
+    pub fn ensureWords(self: *PageBitmap, n: usize) !void {
+        if (n <= self.cap) return;
+        const new_cap = @max(n, self.cap * 2);
+        try self.retired.ensureUnusedCapacity(self.allocator, 1);
+        const new = try self.allocator.alloc(Word, new_cap);
+        @memcpy(new[0..self.cap], self.words[0..self.cap]);
+        @memset(new[self.cap..], 0);
+        const old = self.words[0..self.cap];
+        @atomicStore([*]Word, &self.words, new.ptr, .release);
+        self.cap = new_cap;
+        self.retired.appendAssumeCapacity(old);
+    }
+
+    /// Writer only: the first `n` words, for (de)serialisation.
+    pub fn wordSlice(self: *const PageBitmap, n: usize) []Word {
+        std.debug.assert(n <= self.cap);
+        return self.words[0..n];
+    }
+
+    /// Writer only: clear every word from `n` on.
+    pub fn clearFrom(self: *PageBitmap, n: usize) void {
+        var i = n;
+        while (i < self.cap) : (i += 1) @atomicStore(Word, &self.words[i], 0, .release);
+    }
+
+    fn maskBit(index: usize) Word {
+        return @as(Word, 1) << @as(std.math.Log2Int(Word), @intCast(index % word_bits));
+    }
+};
+
 /// Page-level free space tracking using an in-memory bitmap.
 /// Page 0 is always reserved (bitmap metadata page).
 /// The bitmap is rebuilt from store files on startup.
@@ -34,7 +125,11 @@ pub const FreeSpaceManager = struct {
     /// Unused by the manager itself; null for a detached (offline) bitmap.
     buffer_pool: ?*BufferPool,
     file_id: FileId,
-    bitmap: std.DynamicBitSet,
+    /// SONNY-6938: readable without a lock (see `PageBitmap`).
+    bitmap: PageBitmap,
+    /// Pages the bitmap describes. Written only by the writer, with
+    /// `.release` after the bitmap can hold them; `isAllocated` loads it
+    /// with `.acquire`.
     total_pages: u64,
     /// Hint for where to start scanning for the next free page.
     /// Updated after each allocation to avoid re-scanning already-full regions.
@@ -48,7 +143,7 @@ pub const FreeSpaceManager = struct {
     deferred_frees: std.ArrayListUnmanaged(PageId) = .empty,
 
     pub fn init(allocator: Allocator, buffer_pool: *BufferPool, file_id: FileId) !FreeSpaceManager {
-        var bitmap = try std.DynamicBitSet.initEmpty(allocator, 64);
+        var bitmap = try PageBitmap.init(allocator, 64);
         // Reserve page 0 (bitmap metadata page)
         bitmap.set(0);
 
@@ -65,7 +160,7 @@ pub const FreeSpaceManager = struct {
     /// SONNY-6461: a manager with no buffer pool, for reading a persisted
     /// bitmap offline (see `FreeStore`). Same initial state as `init`.
     pub fn initDetached(allocator: Allocator, file_id: FileId) !FreeSpaceManager {
-        var bitmap = try std.DynamicBitSet.initEmpty(allocator, 64);
+        var bitmap = try PageBitmap.init(allocator, 64);
         bitmap.set(0);
         return .{
             .allocator = allocator,
@@ -164,11 +259,11 @@ pub const FreeSpaceManager = struct {
         self.deferred_frees.clearRetainingCapacity();
     }
 
-    /// Check if a page is allocated.
+    /// Check if a page is allocated. SONNY-6938: safe without a lock while
+    /// the writer allocates, frees or grows the bitmap.
     pub fn isAllocated(self: *const FreeSpaceManager, page_id: PageId) bool {
-        const idx: usize = @intCast(page_id);
-        if (idx >= self.total_pages) return false;
-        return self.bitmap.isSet(idx);
+        if (page_id >= @atomicLoad(u64, &self.total_pages, .acquire)) return false;
+        return self.bitmap.isSet(@intCast(page_id));
     }
 
     /// Number of free pages (excluding page 0 which is always reserved).
@@ -198,8 +293,8 @@ pub const FreeSpaceManager = struct {
     /// Expand to accommodate at least `min_pages` total pages.
     pub fn ensureCapacity(self: *FreeSpaceManager, min_pages: u64) !void {
         if (min_pages <= self.total_pages) return;
-        try self.bitmap.resize(@intCast(min_pages), false);
-        self.total_pages = min_pages;
+        try self.bitmap.ensureWords(maskCount(min_pages));
+        @atomicStore(u64, &self.total_pages, min_pages, .release);
     }
 
     /// Size of the fixed header (total_pages + next_free_hint).
@@ -226,7 +321,7 @@ pub const FreeSpaceManager = struct {
 
         const mc = maskCount(self.total_pages);
         if (mc > 0) {
-            const masks = self.bitmap.unmanaged.masks[0..mc];
+            const masks = self.bitmap.wordSlice(mc);
             const src = std.mem.sliceAsBytes(masks);
             @memcpy(buf[header_size .. header_size + src.len], src);
         }
@@ -255,15 +350,18 @@ pub const FreeSpaceManager = struct {
         const needed = header_size + mc * @sizeOf(usize);
         if (buf.len < needed) return error.UnexpectedEof;
 
-        self.total_pages = total_pages;
-        self.next_free_hint = @intCast(next_free_hint);
-        try self.bitmap.resize(@intCast(total_pages), false);
-
+        try self.bitmap.ensureWords(mc);
         if (mc > 0) {
-            const masks = self.bitmap.unmanaged.masks[0..mc];
+            const masks = self.bitmap.wordSlice(mc);
             const dst = std.mem.sliceAsBytes(masks);
             @memcpy(dst, buf[header_size .. header_size + dst.len]);
+            // Bits past total_pages describe no page.
+            const tail_bits = total_pages % @bitSizeOf(usize);
+            if (tail_bits != 0) masks[mc - 1] &= (@as(usize, 1) << @intCast(tail_bits)) - 1;
         }
+        self.bitmap.clearFrom(mc);
+        @atomicStore(u64, &self.total_pages, total_pages, .release);
+        self.next_free_hint = @intCast(next_free_hint);
         if (!self.bitmap.isSet(0)) return error.InvalidData;
         return needed;
     }
