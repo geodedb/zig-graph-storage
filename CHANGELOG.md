@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.31] - 2026-11-22
+
+### Fixed
+
+- A reader could see a live node as missing while a writer grew the
+  free-space bitmap. `FreeSpaceManager` kept the bitmap in a
+  `std.DynamicBitSet`, whose resize frees the old word array; `getNode`,
+  `getRawSlot`, `scanNodes` and the property store's reads check
+  `isAllocated` without a lock, so a reader holding the old array read
+  freed memory: an allocated page read as free, or the read faulted. The
+  bitmap is now a `PageBitmap`: a growth publishes a new array and keeps
+  the old one until `deinit` (capacity doubles, so retired arrays together
+  are never larger than the live one), words and `total_pages` are read and
+  written atomically, and `isAllocated` is safe against a concurrent
+  allocate, free or growth (SONNY-6938).
+
 ## [0.4.30] - 2026-11-17
 
 ### Changed

@@ -377,6 +377,110 @@ test "scanNodes skips unallocated pages" {
     try testing.expectEqual(@as(NodeId, npp), ctx.last_id);
 }
 
+// SONNY-6938: a reader takes no lock while the single writer (which geode
+// serialises under the shard lock) creates nodes. `getNode` checks the
+// free-space bitmap first; when the writer's `putNode` grows that bitmap the
+// old word array is freed, and a reader still holding it sees the live node's
+// page as free and reports the node missing. Each round starts from a fresh
+// bitmap (one word) and grows it to `GROW_WORDS` words, so every round moves
+// the word array several times while the readers read.
+const Sonny6938 = struct {
+    const READERS: usize = 4;
+    const ROUNDS: usize = 150;
+    /// Live nodes on pages 1..LIVE_PAGES, all in the bitmap's first word.
+    const LIVE_PAGES: u64 = 40;
+    /// The writer grows the bitmap one word (64 pages) at a time up to here.
+    const GROW_WORDS: u64 = 256;
+
+    const Shared = struct {
+        store: *NodeStore,
+        npp: u64,
+        done: std.atomic.Value(bool) = .init(false),
+        failures: std.atomic.Value(u32) = .init(0),
+        reads: std.atomic.Value(u64) = .init(0),
+    };
+
+    fn reader(sh: *Shared, seed: u64) void {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        var n: u64 = 0;
+        while (!sh.done.load(.acquire)) {
+            const page = 1 + r.uintLessThan(u64, LIVE_PAGES);
+            const id = page * sh.npp + r.uintLessThan(u64, sh.npp);
+            const got = sh.store.getNode(id) catch null;
+            n += 1;
+            const ok = if (got) |rec| rec.txn_stamp == id + 1 else false;
+            if (!ok) {
+                const f = sh.failures.fetchAdd(1, .monotonic);
+                if (f < 4) std.debug.print(
+                    "SONNY-6938: node {d} (page {d}) read as missing while the writer grew the bitmap\n",
+                    .{ id, page },
+                );
+            }
+        }
+        _ = sh.reads.fetchAdd(n, .monotonic);
+    }
+};
+
+test "SONNY-6938: getNode never reports a live node missing while a writer grows the free-space bitmap" {
+    // 128 frames: the readers' 40 live pages stay resident while the writer
+    // touches a new page per step.
+    var env = try SingleStoreEnv.init(testing.allocator, .nodes, "nodes.store", 4096, 128);
+    env.register();
+    defer env.deinit();
+
+    var store = NodeStore.init(&env.pool, &env.fsm, 4096);
+    const npp: u64 = store.nodes_per_page;
+
+    var failures: u32 = 0;
+    var reads: u64 = 0;
+    for (0..Sonny6938.ROUNDS) |round| {
+        // A fresh one-word bitmap, so this round's growth moves it again.
+        env.fsm.deinit();
+        env.fsm = try FreeSpaceManager.init(testing.allocator, &env.pool, .nodes);
+        var page: u64 = 1;
+        while (page <= Sonny6938.LIVE_PAGES) : (page += 1) {
+            var slot: u64 = 0;
+            while (slot < npp) : (slot += 1) {
+                const id = page * npp + slot;
+                var rec = makeTestNode(0);
+                rec.txn_stamp = id + 1;
+                try store.putNode(id, rec);
+            }
+        }
+
+        var sh = Sonny6938.Shared{ .store = &store, .npp = npp };
+        var threads: [Sonny6938.READERS]std.Thread = undefined;
+        var spawned: usize = 0;
+        errdefer {
+            sh.done.store(true, .release);
+            for (threads[0..spawned]) |t| t.join();
+        }
+        while (spawned < Sonny6938.READERS) : (spawned += 1) {
+            threads[spawned] = try std.Thread.spawn(.{}, Sonny6938.reader, .{ &sh, 0x6938 + round * 16 + spawned });
+        }
+
+        // The writer: one new node per word, each on a page past the bitmap's
+        // end, so every putNode grows it.
+        var word: u64 = 1;
+        while (word < Sonny6938.GROW_WORDS) : (word += 1) {
+            const id = word * 64 * npp;
+            var rec = makeTestNode(0);
+            rec.txn_stamp = id + 1;
+            try store.putNode(id, rec);
+        }
+
+        sh.done.store(true, .release);
+        for (threads[0..spawned]) |t| t.join();
+        spawned = 0;
+        failures += sh.failures.load(.monotonic);
+        reads += sh.reads.load(.monotonic);
+    }
+
+    try testing.expect(reads > 0);
+    try testing.expectEqual(@as(u32, 0), failures);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
