@@ -19,7 +19,6 @@ const testing = std.testing;
 const GraphEngine = gs.GraphEngine;
 const test_support = gs.test_support;
 
-
 fn cfgPool(pool: u32, deferred: bool) gs.GraphConfig {
     var cfg = test_support.testConfig();
     cfg.buffer_pool_auto_size = false;
